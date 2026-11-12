@@ -1803,6 +1803,85 @@ def __test_late_real_close_dropped_after_forming_finalisation__():
     assert closed_at_slot[0].volume == 500.0
 
 
+def __test_late_ticks_dropped_after_watchdog_closes_their_slot__(caplog):
+    """A feed that stalls past the grace and then flushes the slot's ticks.
+
+    The watchdog closes the forming slot from its real data; the ticks the
+    feed delivers for that slot afterwards are late, not the next period's:
+    none reaches the consumer, they are reported once at INFO, and the next
+    slot's ticks pass again (live: bybit cycle 402, ~90 s of WS silence).
+    """
+    base_ts = (int(time.time()) - 200) * 1000
+    forming = OHLCV(timestamp=base_ts + 60_000, open=100.0, high=106.0,
+                    low=99.0, close=105.0, volume=500.0, is_closed=False)
+    late_ticks = [OHLCV(timestamp=base_ts + 60_000, open=100.0, high=107.0,
+                        low=99.0, close=106.0 + i, volume=510.0 + i, is_closed=False)
+                  for i in range(2)]
+    next_tick = OHLCV(timestamp=base_ts + 120_000, open=106.0, high=106.0,
+                      low=106.0, close=106.0, volume=1.0, is_closed=False)
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0),
+               forming, *late_ticks, next_tick]
+    provider = _FormingThenLateClose(updates, stall_seconds=0.3)
+
+    bars: list[OHLCV] = []
+    seen_transition = False
+    with caplog.at_level(logging.INFO):
+        for item in live_ohlcv_generator(provider, "BTC/USDT", "1"):
+            if item is LIVE_TRANSITION:
+                seen_transition = True
+                continue
+            if not seen_transition:
+                continue
+            bars.append(item)
+            if item.timestamp == base_ts + 120_000 or len(bars) >= 8:
+                break
+
+    slot = [b for b in bars if b.timestamp == base_ts + 60_000]
+    assert [b.is_closed for b in slot][-1] is True
+    finalised_at = next(i for i, b in enumerate(bars)
+                        if b.timestamp == base_ts + 60_000 and b.is_closed)
+    assert not any(b.timestamp == base_ts + 60_000 and not b.is_closed
+                   for b in bars[finalised_at:]), "late ticks reached the consumer"
+    assert bars[finalised_at].close == 105.0
+    assert bars[-1] == next_tick, "the next slot's ticks must pass"
+    reports = [r for r in caplog.records if "late intra-bar updates" in r.getMessage()]
+    assert len(reports) == 1 and reports[0].levelno == logging.INFO
+
+
+def __test_late_ticks_dropped_after_watchdog_synthesises_their_slot__():
+    """The same for a slot the watchdog filled with a V=0 synth: a tick the
+    feed delivers for it afterwards never reaches the consumer."""
+    # Far enough back that the watchdog fills slots +120 s and +180 s
+    # during the stall, and close enough that +240 s is still forming.
+    base_ts = (int(time.time()) - 300) * 1000
+    late_tick = OHLCV(timestamp=base_ts + 120_000, open=101.0, high=101.0,
+                      low=101.0, close=101.0, volume=3.0, is_closed=False)
+    next_tick = OHLCV(timestamp=base_ts + 240_000, open=102.0, high=102.0,
+                      low=102.0, close=102.0, volume=1.0, is_closed=False)
+    updates = [_make_ohlcv(base_ts, is_closed=True, close=100.0),
+               _make_ohlcv(base_ts + 60_000, is_closed=True, close=100.0),
+               late_tick, next_tick]
+    provider = _FormingThenLateClose(updates, stall_seconds=0.3)
+
+    bars: list[OHLCV] = []
+    seen_transition = False
+    for item in live_ohlcv_generator(provider, "BTC/USDT", "1"):
+        if item is LIVE_TRANSITION:
+            seen_transition = True
+            continue
+        if not seen_transition:
+            continue
+        bars.append(item)
+        if item.timestamp == base_ts + 240_000 or len(bars) >= 12:
+            break
+
+    synth = [b for b in bars if b.timestamp == base_ts + 120_000]
+    assert synth and all(b.is_closed and b.volume == 0.0 for b in synth), (
+        f"only the watchdog's synth may stand for the slot, got {synth}"
+    )
+    assert bars[-1] == next_tick
+
+
 def __test_forming_bar_finalised_even_when_soft_cap_drops_queue_updates__():
     """Forming tracking is independent of the intra-bar queue soft-cap.
 

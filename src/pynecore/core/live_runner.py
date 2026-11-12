@@ -870,6 +870,15 @@ def live_ohlcv_generator(
         # synth. Cleared when a closed bar supersedes its slot or once it
         # has been finalised.
         last_forming_bar: OHLCV | None = None
+        # Newest slot the boundary watchdog closed itself (from the forming
+        # bar or as a V=0 synth), and the newest one whose late intra-bar
+        # updates were already reported. A feed that stalls past the grace
+        # and then flushes its backlog delivers that slot's ticks after the
+        # watchdog settled it (live: bybit cycle 402, 2026-11-12, ~90 s of
+        # silence on ETHUSDT.P): they are dropped here as late, not handed to
+        # the consumer as a provider mis-stamping its forming bar.
+        watchdog_settled_ts: int | None = None
+        late_ticks_reported_ts: int | None = None
         # Tracks whether the last observed market state was open. Flips to
         # False on the first synth-skip in a closed period (emits a single
         # INFO log) and back to True when a real bar arrives.
@@ -958,8 +967,8 @@ def live_ohlcv_generator(
                 try:
                     connect_task.result()
                     return
-                except BaseException as exc:
-                    if not _is_transient_connect_error(exc):
+                except BaseException as connect_error:
+                    if not _is_transient_connect_error(connect_error):
                         raise
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -968,7 +977,7 @@ def live_ohlcv_generator(
                     wait = min(delay, remaining)
                     log = logger.warning if _warn_this_attempt(attempt) else logger.debug
                     log("Initial connect failed (attempt %d): %s; "
-                        "retrying in %.1fs", attempt, exc, wait)
+                        "retrying in %.1fs", attempt, connect_error, wait)
                     try:
                         await asyncio.wait_for(stop_aevent.wait(), timeout=wait)
                         # Shutdown requested mid-backoff: surface the last
@@ -1324,6 +1333,16 @@ def live_ohlcv_generator(
                             )
                             backpressure_reported = False
                             backpressure_peak = 0
+                    elif (watchdog_settled_ts is not None
+                            and bar_update.timestamp <= watchdog_settled_ts):
+                        if late_ticks_reported_ts != watchdog_settled_ts:
+                            late_ticks_reported_ts = watchdog_settled_ts
+                            broker_info(
+                                "late intra-bar updates for ts=%d after the "
+                                "boundary watchdog closed it — dropped (the "
+                                "feed delivered them past the bar's close)",
+                                bar_update.timestamp,
+                            )
                     else:
                         # Remember the latest forming bar BEFORE the queue
                         # soft-cap. Finalisation state must not depend on
@@ -1476,6 +1495,7 @@ def live_ohlcv_generator(
                                 and last_forming_bar.timestamp == synth_ts):
                             finalized = last_forming_bar._replace(is_closed=True)
                             last_closed_bar = finalized
+                            watchdog_settled_ts = finalized.timestamp
                             last_forming_bar = None
                             synth_streak = 0
                             broker_info(
@@ -1538,6 +1558,7 @@ def live_ohlcv_generator(
                                 last_ask.close),
                         )
                         last_closed_bar = synth
+                        watchdog_settled_ts = synth.timestamp
                         # Explicit log marker so the V=0 in the next
                         # OHLCV line is unambiguously framework synth,
                         # not a provider-side closed bar whose
