@@ -603,7 +603,9 @@ impl Engine<'_, '_> {
         match self.kind(node).clone() {
             Kind::DictComp { key, value, .. } => {
                 self.expr(key)?;
-                self.expr(value)?;
+                if let Some(value) = value {
+                    self.expr(value)?;
+                }
             }
             Kind::ListComp { elt, .. }
             | Kind::SetComp { elt, .. }

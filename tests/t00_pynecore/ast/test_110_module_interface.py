@@ -499,9 +499,9 @@ def _transforms(monkeypatch):
     seen: list[str] = []
     real = PyneLoader.source_to_code
 
-    def counted(self, data, source_path, *, _optimize: int = -1):
+    def counted(self, data, source_path, fullname=None, *, _optimize: int = -1):
         seen.append(str(Path(source_path).resolve()))
-        return real(self, data, source_path, _optimize=_optimize)
+        return real(self, data, source_path, fullname, _optimize=_optimize)
 
     with monkeypatch.context() as patch:
         patch.setattr(PyneLoader, 'source_to_code', counted)

@@ -757,7 +757,7 @@ fn definite_bindings(ast: &Ast, stmt: NodeId) -> (HashSet<String>, HashSet<Strin
             bound.insert(name.clone());
             Vec::new()
         }
-        Kind::Import { names } | Kind::ImportFrom { names, .. } => {
+        Kind::Import { names, .. } | Kind::ImportFrom { names, .. } => {
             bound.extend(names.iter().map(|&alias| alias_name(ast, alias)));
             Vec::new()
         }

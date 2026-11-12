@@ -33,6 +33,11 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Operating System :: OS Independent",
 ]
 
@@ -103,7 +108,7 @@ replay = "pynecore.providers.replay:ReplayProvider"
 # carry ``pynecore.core._native_profiler``, which has no pure-Python twin: its test
 # checks it profiles a run (on Python 3.13+, the profiler's minimum).
 [tool.cibuildwheel]
-build = "cp311-* cp312-* cp313-* cp314-*"
+build = "cp311-* cp312-* cp313-* cp314-* cp315-*"
 skip = "*-win32 *-manylinux_i686 *-musllinux_i686"
 test-requires = ["pytest>=9.1", "pytest-spec", "tzdata"]
 test-command = """\

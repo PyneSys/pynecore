@@ -57,7 +57,7 @@ impl Visitor for BindingCounter {
                 self.bind(Some(name));
                 generic_visit_ro(self, ast, id);
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 for &alias in names {
                     let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
                     self.bind(Some(
@@ -175,7 +175,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     let mut typing_names: HashMap<String, usize> = HashMap::new();
     for &stmt in body {
         match ast.kind(stmt) {
-            Kind::ImportFrom { module: Some(name), names, level }
+            Kind::ImportFrom { module: Some(name), names, level, .. }
                 if name == "typing" && *level == Some(0) =>
             {
                 for &alias in names {
@@ -188,7 +188,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
                     }
                 }
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 for &alias in names {
                     let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
                     if name == "typing" {

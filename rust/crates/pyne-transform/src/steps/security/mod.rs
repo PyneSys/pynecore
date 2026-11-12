@@ -197,7 +197,7 @@ impl Security {
         // adds the import itself)
         if self.needs_barmerge {
             let alias = ast.add(Kind::Alias { name: "pynecore.lib.barmerge".into(), asname: None });
-            let import = ast.add(Kind::Import { names: vec![alias] });
+            let import = ast.add(Kind::Import { names: vec![alias], is_lazy: None });
             let Kind::Module { body, .. } = ast.kind(node) else { unreachable!() };
             let at = future_end(ast, body);
             module_body(ast, node).insert(at, import);
@@ -209,6 +209,7 @@ impl Security {
                 module: Some("pynecore.core.security".into()),
                 names: vec![alias],
                 level: Some(0),
+                is_lazy: None,
             });
             let Kind::Module { body, .. } = ast.kind(node) else { unreachable!() };
             let at = future_end(ast, body);

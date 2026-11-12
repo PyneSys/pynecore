@@ -44,6 +44,7 @@ pub(crate) fn safe_convert_import(ast: &mut Ast) -> NodeId {
         module: Some("pynecore.core".into()),
         names: vec![alias],
         level: Some(0),
+        is_lazy: None,
     })
 }
 
@@ -267,7 +268,7 @@ impl SafeConvert {
                         _ => continue,
                     }
                 }
-                Kind::Import { names } => binds_by_import(ast, names),
+                Kind::Import { names, .. } => binds_by_import(ast, names),
                 _ => continue,
             };
             if bound {

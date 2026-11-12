@@ -367,9 +367,9 @@ def _counted(monkeypatch, app: Path):
     counts = {"dependency": 0, "transform": 0}
     real_transform = PyneLoader.source_to_code
 
-    def transform(self, data, path, *, _optimize: int = -1):
+    def transform(self, data, path, fullname=None, *, _optimize: int = -1):
         counts["transform" if Path(path).resolve() == app.resolve() else "dependency"] += 1
-        return real_transform(self, data, path, _optimize=_optimize)
+        return real_transform(self, data, path, fullname, _optimize=_optimize)
 
     monkeypatch.setattr(PyneLoader, "source_to_code", transform)
     yield counts

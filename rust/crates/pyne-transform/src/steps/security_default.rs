@@ -116,6 +116,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         module: Some("pynecore.types.na".into()),
         names: vec![alias],
         level: Some(0),
+        is_lazy: None,
     });
     let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
     body.insert(insert_at, import);

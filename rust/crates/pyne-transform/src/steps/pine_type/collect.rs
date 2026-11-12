@@ -58,7 +58,7 @@ impl Engine<'_, '_> {
         let statements = facts::module_statements(self.ast, body);
         for &stmt in &statements {
             match self.kind(stmt).clone() {
-                Kind::Import { names } => {
+                Kind::Import { names, .. } => {
                     for alias in names {
                         let Kind::Alias { name, asname } = self.kind(alias).clone() else {
                             continue;
@@ -77,7 +77,7 @@ impl Engine<'_, '_> {
                         }
                     }
                 }
-                Kind::ImportFrom { module: Some(module), names, level }
+                Kind::ImportFrom { module: Some(module), names, level, .. }
                     if !module.is_empty() && level.unwrap_or(0) == 0 =>
                 {
                     for alias in names {

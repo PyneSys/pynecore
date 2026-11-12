@@ -238,7 +238,7 @@ impl Capture<'_> {
                 let name = name.clone();
                 self.bind(scope, name, current);
             }
-            Kind::Import { names } | Kind::ImportFrom { names, .. } => {
+            Kind::Import { names, .. } | Kind::ImportFrom { names, .. } => {
                 let names: Vec<String> =
                     names.iter().map(|&alias| import_binding(self.ast, alias)).collect();
                 for name in names {
@@ -392,7 +392,7 @@ impl Capture<'_> {
                 let name = name.clone();
                 self.bind(scope, name, node);
             }
-            Kind::Import { names } | Kind::ImportFrom { names, .. } => {
+            Kind::Import { names, .. } | Kind::ImportFrom { names, .. } => {
                 let names: Vec<String> =
                     names.iter().map(|&alias| import_binding(self.ast, alias)).collect();
                 for name in names {
@@ -451,7 +451,7 @@ impl Capture<'_> {
                 path.extend_from_slice(&parts[1..]);
                 return self.resolve_path(&path, owner, &seen);
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 let found =
                     names.iter().copied().find(|&alias| import_binding(self.ast, alias) == *first);
                 let Some(alias) = found else { return Ok(None) };
@@ -462,7 +462,7 @@ impl Capture<'_> {
                 }
                 (name.clone(), parts[prefix.len()..].to_vec(), Some(0))
             }
-            Kind::ImportFrom { module, names, level } => {
+            Kind::ImportFrom { module, names, level, .. } => {
                 let found = names.iter().copied().find(|&alias| {
                     let Kind::Alias { name, asname } = self.ast.kind(alias) else { unreachable!() };
                     asname.as_ref().unwrap_or(name) == first

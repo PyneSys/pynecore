@@ -480,7 +480,7 @@ fn import_bindings(ast: &Ast, node: NodeId, pynecore: bool, out: &mut HashSet<St
             }
             out.extend(names.iter().map(|&alias| alias_binding(ast, alias).0));
         }
-        Kind::Import { names } => {
+        Kind::Import { names, .. } => {
             for &alias in names {
                 let (bound, name) = alias_binding(ast, alias);
                 if is_pynecore_module(Some(name)) == pynecore {

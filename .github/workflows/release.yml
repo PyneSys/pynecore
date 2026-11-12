@@ -19,9 +19,9 @@ jobs:
   #
   # The wheels of one platform are split over parallel jobs. The first wheel of a
   # job compiles the whole Rust dependency tree (4.5 to 9.5 minutes), the ones after
-  # it reuse it (about 2 minutes each), so a job builds two wheels: one per job would
-  # pay the full compile everywhere. The split stays within the Free plan's 20
-  # concurrent jobs (17 here, plus the two other jobs) and 5 concurrent macOS jobs;
+  # it reuse it (about 2 minutes each), so a job builds two or three wheels: one per job
+  # would pay the full compile everywhere. The split stays within the Free plan's 20
+  # concurrent jobs (17 here, plus the three other jobs) and 5 concurrent macOS jobs;
   # macos-15-intel compiles slowest, so it runs three jobs. ``build`` is passed to
   # cibuildwheel as CIBW_BUILD, overriding [tool.cibuildwheel] build; together the
   # selectors cover that list exactly.
@@ -33,22 +33,22 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, wheels: cp311-cp312-manylinux, build: "cp311-manylinux_* cp312-manylinux_*" }
-          - { os: ubuntu-latest, wheels: cp313-cp314-manylinux, build: "cp313-manylinux_* cp314-manylinux_*" }
+          - { os: ubuntu-latest, wheels: cp313-cp315-manylinux, build: "cp313-manylinux_* cp314-manylinux_* cp315-manylinux_*" }
           - { os: ubuntu-latest, wheels: cp311-cp312-musllinux, build: "cp311-musllinux_* cp312-musllinux_*" }
-          - { os: ubuntu-latest, wheels: cp313-cp314-musllinux, build: "cp313-musllinux_* cp314-musllinux_*" }
+          - { os: ubuntu-latest, wheels: cp313-cp315-musllinux, build: "cp313-musllinux_* cp314-musllinux_* cp315-musllinux_*" }
           - { os: ubuntu-24.04-arm, wheels: cp311-cp312-manylinux, build: "cp311-manylinux_* cp312-manylinux_*" }
-          - { os: ubuntu-24.04-arm, wheels: cp313-cp314-manylinux, build: "cp313-manylinux_* cp314-manylinux_*" }
+          - { os: ubuntu-24.04-arm, wheels: cp313-cp315-manylinux, build: "cp313-manylinux_* cp314-manylinux_* cp315-manylinux_*" }
           - { os: ubuntu-24.04-arm, wheels: cp311-cp312-musllinux, build: "cp311-musllinux_* cp312-musllinux_*" }
-          - { os: ubuntu-24.04-arm, wheels: cp313-cp314-musllinux, build: "cp313-musllinux_* cp314-musllinux_*" }
+          - { os: ubuntu-24.04-arm, wheels: cp313-cp315-musllinux, build: "cp313-musllinux_* cp314-musllinux_* cp315-musllinux_*" }
           - { os: windows-latest, wheels: cp311-cp312, build: "cp311-* cp312-*" }
-          - { os: windows-latest, wheels: cp313-cp314, build: "cp313-* cp314-*" }
+          - { os: windows-latest, wheels: cp313-cp315, build: "cp313-* cp314-* cp315-*" }
           - { os: windows-11-arm, wheels: cp311-cp312, build: "cp311-* cp312-*" }
-          - { os: windows-11-arm, wheels: cp313-cp314, build: "cp313-* cp314-*" }
+          - { os: windows-11-arm, wheels: cp313-cp315, build: "cp313-* cp314-* cp315-*" }
           - { os: macos-15-intel, wheels: cp311, build: "cp311-*" }
           - { os: macos-15-intel, wheels: cp312, build: "cp312-*" }
-          - { os: macos-15-intel, wheels: cp313-cp314, build: "cp313-* cp314-*" }
+          - { os: macos-15-intel, wheels: cp313-cp315, build: "cp313-* cp314-* cp315-*" }
           - { os: macos-latest, wheels: cp311-cp312, build: "cp311-* cp312-*" }
-          - { os: macos-latest, wheels: cp313-cp314, build: "cp313-* cp314-*" }
+          - { os: macos-latest, wheels: cp313-cp315, build: "cp313-* cp314-* cp315-*" }
 
     steps:
       - uses: actions/checkout@v6
@@ -61,7 +61,7 @@ jobs:
         if: runner.os != 'Linux'
 
       - name: Build and test wheels
-        uses: pypa/cibuildwheel@v4.2.0
+        uses: pypa/cibuildwheel@v4.3.5
         env:
           CIBW_BUILD: ${{ matrix.build }}
         with:
@@ -120,10 +120,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   # The native transform against the Python pipeline it ports: the Rust tests,
-  # the WebAssembly build, and the parity gates over the repository's own sources
+  # the WebAssembly build, and the parity gates over the repository's own sources. The
+  # gates run under two interpreters, as the transform follows the running one's
+  # ``repr`` and ``ast.unparse``; the wasm gate needs the job's own WebAssembly build.
   native-transform:
-    name: Native transform gates
+    name: Native transform gates on Python ${{ matrix.python }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.13', '3.15']
 
     steps:
       - uses: actions/checkout@v6
@@ -132,7 +138,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.13'
+          python-version: ${{ matrix.python }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:

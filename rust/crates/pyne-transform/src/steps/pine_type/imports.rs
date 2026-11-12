@@ -341,7 +341,7 @@ impl Engine<'_, '_> {
             if self.module_path.is_empty() { None } else { Some(path_parent(&self.module_path)) };
         for stmt in facts::module_statements(self.ast, body) {
             match self.kind(stmt).clone() {
-                Kind::Import { names } => {
+                Kind::Import { names, .. } => {
                     for alias in names {
                         let Kind::Alias { name, asname } = self.kind(alias).clone() else {
                             continue;
@@ -358,7 +358,7 @@ impl Engine<'_, '_> {
                         }
                     }
                 }
-                Kind::ImportFrom { module, names, level } => {
+                Kind::ImportFrom { module, names, level, .. } => {
                     let level = level.unwrap_or(0);
                     let module = module.unwrap_or_default();
                     let mut package: Option<String> = None;

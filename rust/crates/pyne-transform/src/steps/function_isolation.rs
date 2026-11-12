@@ -442,7 +442,7 @@ impl ScopeIndex {
                 }
                 self.generic(ast, id, layout)?;
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 for &alias in names {
                     let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
                     let first = name.split('.').next().unwrap_or(name);
@@ -455,7 +455,7 @@ impl ScopeIndex {
                     }
                 }
             }
-            Kind::ImportFrom { module, names, level } => {
+            Kind::ImportFrom { module, names, level, .. } => {
                 for &alias in names {
                     let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
                     let bound = asname.as_deref().unwrap_or(name).to_string();
@@ -1168,7 +1168,7 @@ impl FunctionIsolation<'_, '_> {
         match ast.kind(id).clone() {
             Kind::DictComp { key, value, .. } => {
                 let key = self.expr(ast, key);
-                let value = self.expr(ast, value);
+                let value = value.map(|value| self.expr(ast, value));
                 let Kind::DictComp { key: a, value: b, .. } = ast.kind_mut(id) else {
                     unreachable!()
                 };
@@ -1526,6 +1526,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
             module: Some("pynecore.core.instance_state".into()),
             names,
             level: Some(0),
+            is_lazy: None,
         });
         let Kind::Module { body, .. } = ast.kind(module) else { unreachable!() };
         let body = body.clone();

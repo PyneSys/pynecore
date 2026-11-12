@@ -302,6 +302,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
             module: Some("pynecore.core.instance_state".into()),
             names,
             level: Some(0),
+            is_lazy: None,
         });
         body.insert(index, import);
     }

@@ -624,9 +624,14 @@ impl Unparser<'_> {
             }
             Kind::DictComp { key, value, generators } => {
                 self.out.push('{');
-                self.traverse(*key)?;
-                self.out.push_str(": ");
-                self.traverse(*value)?;
+                if let Some(value) = value {
+                    self.traverse(*key)?;
+                    self.out.push_str(": ");
+                    self.traverse(*value)?;
+                } else {
+                    self.out.push_str("**");
+                    self.traverse(*key)?;
+                }
                 self.generators(generators)?;
                 self.out.push('}');
             }

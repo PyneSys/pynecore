@@ -326,7 +326,7 @@ impl ImplicitConversion {
                 Kind::ClassDef { name, .. } => {
                     self.module_classes.insert(name.clone());
                 }
-                Kind::ImportFrom { module: Some(from), names, level }
+                Kind::ImportFrom { module: Some(from), names, level, .. }
                     if from == "dataclasses"
                         && level.unwrap_or(0) == 0
                         && self.module_classes.is_empty() =>
@@ -373,6 +373,7 @@ impl ImplicitConversion {
                 module: Some("pynecore.core".to_string()),
                 names: vec![alias],
                 level: Some(0),
+                is_lazy: None,
             });
             let position = import_position(ast, module);
             insert_statement(ast, module, position, import);
@@ -384,6 +385,7 @@ impl ImplicitConversion {
                 module: Some("dataclasses".to_string()),
                 names: vec![alias],
                 level: Some(0),
+                is_lazy: None,
             });
             let position = import_position(ast, module);
             insert_statement(ast, module, position, import);
@@ -506,7 +508,7 @@ fn binds_safe_convert(ast: &Ast, module: NodeId) -> bool {
                     return true;
                 }
             }
-            Kind::Import { names }
+            Kind::Import { names, .. }
                 if names.iter().any(|&alias| {
                     alias_of(alias) == ("pynecore.core.safe_convert", Some("safe_convert"))
                 }) =>

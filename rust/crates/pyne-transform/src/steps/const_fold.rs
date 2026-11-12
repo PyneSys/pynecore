@@ -811,7 +811,7 @@ impl Transformer for Folder<'_> {
                     | Kind::SetComp { elt, generators }
                     | Kind::GeneratorExp { elt, generators } => (vec![*elt], generators.clone()),
                     Kind::DictComp { key, value, generators } => {
-                        (vec![*key, *value], generators.clone())
+                        (std::iter::once(*key).chain(*value).collect(), generators.clone())
                     }
                     _ => unreachable!(),
                 };
@@ -846,7 +846,7 @@ impl Transformer for Folder<'_> {
                     | Kind::GeneratorExp { elt, .. } => *elt = folded[0],
                     Kind::DictComp { key, value, .. } => {
                         *key = folded[0];
-                        *value = folded[1];
+                        *value = folded.get(1).copied();
                     }
                     _ => unreachable!(),
                 }
@@ -1096,7 +1096,7 @@ impl ScopeBindings {
                 self.visit_all(ast, keywords);
                 self.visit_all(ast, decorator_list);
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 for &alias in names {
                     let bound = alias_binding(ast, alias, true);
                     self.count(&bound);
@@ -1248,7 +1248,7 @@ impl ConstFold {
             Kind::ExceptHandler { name: Some(name), .. } => {
                 found.insert(name.clone());
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 found.extend(names.iter().map(|&alias| alias_binding(ast, alias, true)));
             }
             Kind::ImportFrom { names, .. } => {

@@ -336,7 +336,7 @@ impl SafeDivision {
         // name the emitted calls read
         for &stmt in body {
             let bound = match ast.kind(stmt) {
-                Kind::ImportFrom { module, names, level } => {
+                Kind::ImportFrom { module, names, level, .. } => {
                     let expected = if *level == Some(0) { "pynecore.core" } else { "core" };
                     module.as_deref() == Some(expected)
                         && names.iter().any(|&alias| {
@@ -345,7 +345,7 @@ impl SafeDivision {
                                     && matches!(asname.as_deref(), None | Some("safe_convert")))
                         })
                 }
-                Kind::Import { names } => binds_by_import(ast, names),
+                Kind::Import { names, .. } => binds_by_import(ast, names),
                 _ => continue,
             };
             if bound {

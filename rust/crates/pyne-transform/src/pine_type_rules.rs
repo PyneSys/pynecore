@@ -1855,7 +1855,7 @@ impl FactoryFields {
         let mut binding = None;
         for &stmt in &self.body[..before.min(self.body.len())] {
             match ast.kind(stmt) {
-                Kind::ImportFrom { module, names, level } => {
+                Kind::ImportFrom { module, names, level, .. } => {
                     for &alias in names {
                         let Kind::Alias { name: imported, asname } = ast.kind(alias) else {
                             continue;
@@ -1869,7 +1869,7 @@ impl FactoryFields {
                         }
                     }
                 }
-                Kind::Import { names } => {
+                Kind::Import { names, .. } => {
                     for &alias in names {
                         let Kind::Alias { name: imported, asname } = ast.kind(alias) else {
                             continue;

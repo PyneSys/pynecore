@@ -255,7 +255,7 @@ pub(super) fn reachable_scopes(
 pub(super) fn module_imports(ast: &Ast, statements: &[NodeId]) -> HashSet<String> {
     let mut names = HashSet::new();
     for &stmt in statements {
-        let (Kind::Import { names: aliases } | Kind::ImportFrom { names: aliases, .. }) =
+        let (Kind::Import { names: aliases, .. } | Kind::ImportFrom { names: aliases, .. }) =
             ast.kind(stmt)
         else {
             continue;

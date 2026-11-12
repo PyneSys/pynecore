@@ -704,7 +704,7 @@ pub fn script_bool_na(ast: &Ast, module: NodeId) -> Option<bool> {
                     }
                 }
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 for &alias in names {
                     let Kind::Alias { name, asname: Some(asname) } = ast.kind(alias) else {
                         continue;

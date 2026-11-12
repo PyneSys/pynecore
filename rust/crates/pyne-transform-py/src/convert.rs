@@ -110,8 +110,13 @@ impl<'py> FromPython<'py> {
             let value = match obj.getattr(field.name) {
                 Ok(value) => value,
                 Err(_) => match field.kind {
-                    // Older Pythons lack the newer list fields (``type_params``)
-                    FieldKind::Nodes | FieldKind::Strs => continue,
+                    // Older Pythons lack the newer list and optional fields
+                    // (``type_params``, ``is_lazy``): they keep their empty default
+                    FieldKind::Nodes
+                    | FieldKind::Strs
+                    | FieldKind::OptNode
+                    | FieldKind::OptStr
+                    | FieldKind::OptInt => continue,
                     _ => {
                         return Err(unsupported(format!(
                             "{type_name} without its {} field",

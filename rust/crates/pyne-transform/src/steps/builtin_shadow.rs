@@ -131,7 +131,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
     };
     let mut aliases = HashMap::new();
     for &stmt in body {
-        let Kind::Import { names } = ast.kind(stmt) else { continue };
+        let Kind::Import { names, .. } = ast.kind(stmt) else { continue };
         for &alias in names {
             let Kind::Alias { name: module_name, asname: Some(asname) } = ast.kind(alias) else {
                 continue;

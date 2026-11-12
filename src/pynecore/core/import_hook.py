@@ -1304,8 +1304,17 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
         return self.source_to_code(self.get_data(source_path), source_path)
 
     # noinspection PyMethodOverriding
-    def source_to_code(self, data: bytes | str, path: str, *, _optimize: int = -1):
-        """Transform source to code if needed"""
+    def source_to_code(self, data: bytes | str, path: str, fullname: str | None = None, *,
+                       _optimize: int = -1):
+        """
+        Transform source to code if needed.
+
+        :param data: The module source.
+        :param path: The source file path.
+        :param fullname: The module name; Python 3.15+ passes it from
+                         :meth:`~importlib.abc.SourceLoader.get_code`, the transform does not use it.
+        :param _optimize: The optimization level for :func:`compile`.
+        """
         path: Path = Path(path)
 
         # Fast prefilter: require @pyne as a standalone token, not just any substring.
