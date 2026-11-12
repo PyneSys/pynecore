@@ -68,12 +68,17 @@ TradingView fills every order on the bar's prices, which for a forex or CFD feed
 @script.strategy("Spread-aware strategy", spread_type=strategy.spread.trade)
 ```
 
-| Value                   | Effect                                                                                     |
-|-------------------------|--------------------------------------------------------------------------------------------|
-| `strategy.spread.none`  | Default. Orders fill on the bar's prices, as on TradingView                                |
-| `strategy.spread.trade` | Buy fills pay the spread on top of the bid-side price; sell fills stay on the bid side    |
+| Value                      | Effect                                                                                                          |
+|----------------------------|-----------------------------------------------------------------------------------------------------------------|
+| `strategy.spread.none`     | Default. Orders fill on the bar's prices, as on TradingView                                                     |
+| `strategy.spread.trade`    | Buys fill at the ask, sells at the bid; every order is triggered by the side it trades on                       |
+| `strategy.spread.opposite` | Fills as with `trade`; stop orders are triggered by the other side: buy stops by the bid, sell stops by the ask |
 
-The spread is taken from the data's ask side (see [Ask Side](advanced/ohlcv-reader-writer.md#ask-side)), at the point of the bar the fill happens on: the open for a market order, the extreme a stop triggered on, the close for an order filled on the close. On a bar without an ask side the spread is `syminfo.avg_spread`, so the setting also works on bid-only data. Like slippage, the spread is charged on market and stop-triggered fills, not on limit fills, which fill at their limit price. Orders are still triggered by the bid side, and commission is charged on top of the spread.
+The spread is taken from the data's ask side (see [Ask Side](advanced/ohlcv-reader-writer.md#ask-side)), at the point of the bar the fill happens on: the open for a market order, the extreme a leg of the bar runs to for an order triggered on that leg, the close for an order filled on the close. On a bar without an ask side the spread is `syminfo.avg_spread`, so the setting also works on bid-only data. Commission is charged on top of the spread.
+
+With `trade`, an order is triggered by the price it trades on. A buy limit fills only when the ask reaches it, and then at its limit price; a buy stop fills when the ask reaches it, at its stop price. A sell order is triggered by the bid, as without a spread. A market buy pays the spread on top of the bid.
+
+`opposite` follows the "opposite side" stop trigger of some platforms. A buy stop waits for the bid to reach it and then fills at the ask, one spread above its level. A sell stop, such as the stop loss of a long, waits for the ask and then fills at the bid, one spread below its level. Limit orders are triggered as with `trade`. Trailing stops follow the side that triggers them.
 
 `spread_type` is an ordinary setting, so the `[script]` section of the TOML file can override it like any other.
 

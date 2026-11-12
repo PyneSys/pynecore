@@ -6907,6 +6907,10 @@
    "kind": "value",
    "ty": "o:lib#Spread"
   },
+  "strategy.spread.opposite": {
+   "kind": "value",
+   "ty": "o:lib#Spread"
+  },
   "strategy.spread.trade": {
    "kind": "value",
    "ty": "o:lib#Spread"

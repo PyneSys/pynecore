@@ -81,7 +81,7 @@ with PyneComp, run by PyneCore, and every comparable output is compared with Tra
 | Commission models            | full         | Fixed, percent, per-contract                                                                                                                |
 | Margin calls                 | full         | TradingView-exact 10-step algorithm                                                                                                         |
 | Slippage                     | full         | Configurable tick-based slippage                                                                                                            |
-| Spread costs                 | extension    | `spread_type=strategy.spread.trade` charges buys the bid/ask spread; TradingView has no such setting                                        |
+| Spread costs                 | extension    | `spread_type=strategy.spread.trade` / `.opposite` trades buys at the ask and sells at the bid; TradingView has no such setting              |
 | Equity tracking              | full         | Equity curve, drawdown, P&L                                                                                                                 |
 | Trade logging                | full         | CSV export with all trade fields                                                                                                            |
 | `strategy.close_all()`       | full         |                                                                                                                                             |

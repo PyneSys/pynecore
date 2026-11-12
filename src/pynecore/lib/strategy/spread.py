@@ -8,3 +8,4 @@ from ...types.strategy import Spread
 
 none = Spread("none")
 trade = Spread("trade")
+opposite = Spread("opposite")

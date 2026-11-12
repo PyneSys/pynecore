@@ -491,6 +491,8 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo',
 # The ``lib.syminfo`` cells behind its module properties, by SymInfo slot: the
 # property name itself must keep its function.
 _SYMINFO_PROPERTY_CELLS = {'prefix': '_prefix', 'ticker': '_ticker'}
+# Optional provider details, set on ``lib.syminfo`` only when the provider supplies them
+_SYMINFO_OPTIONAL = frozenset(('avg_spread', 'taker_fee', 'maker_fee'))
 
 
 # noinspection PyUnusedLocal
@@ -508,6 +510,9 @@ def _set_lib_syminfo_properties(syminfo: SymInfo):
                 setattr(lib.syminfo, _SYMINFO_PROPERTY_CELLS.get(slot_name, slot_name), value)
             except AttributeError:
                 pass
+        elif slot_name in _SYMINFO_OPTIONAL and hasattr(lib.syminfo, slot_name):
+            # Not supplied for this symbol: drop the value an earlier run left behind
+            delattr(lib.syminfo, slot_name)
 
     lib.syminfo.root = syminfo.ticker
     lib.syminfo.tickerid = syminfo.prefix + ':' + syminfo.ticker

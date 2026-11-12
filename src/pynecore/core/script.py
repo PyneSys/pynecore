@@ -663,7 +663,10 @@ class Script:
                             ``strategy.spread.none`` (default) fills every order on the bar's
                             prices as TradingView does. ``strategy.spread.trade`` fills buy
                             orders at the ask: the bid price plus the bar's spread, taken from
-                            the data's ask side, or ``syminfo.avg_spread`` on a bar without one
+                            the data's ask side, or ``syminfo.avg_spread`` on a bar without one.
+                            Every order is triggered by the side it trades on.
+                            ``strategy.spread.opposite`` fills the same way, but triggers stop
+                            orders by the other side: buy stops by the bid, sell stops by the ask
         :param _broker_requirements: Broker capability requirements of the script, internal use only
         """
         script = cls()

@@ -2753,6 +2753,9 @@
     "none": {
       "type": "variable"
     },
+    "opposite": {
+      "type": "variable"
+    },
     "trade": {
       "type": "variable"
     }
