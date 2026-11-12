@@ -4054,6 +4054,13 @@ class ScriptRunner:
                         drawing_snapshot.save()
                         if child_snapshot:
                             child_snapshot.save()
+                        # The previous bar's close may never have come, leaving its
+                        # last intra-bar run's outputs behind. Their claimed plot ids
+                        # would number this bar's titles (``Plot 1``) as new sites.
+                        lib._plot_data.clear()
+                        lib._viz_dyn.clear()
+                        lib._viz_seq.clear()
+                        lib._plot_ids.clear()
                         if run_on_every_tick:
                             # Broker sync runs before the script so orders queued by the
                             # previous tick dispatch now, and async fills from watch_orders
