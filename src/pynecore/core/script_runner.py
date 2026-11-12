@@ -1163,9 +1163,11 @@ def _security_merge_group(sid: str, all_sec_ids: list[str], contexts: dict,
     stable = bool(contexts[sid].get('group_stable'))
     group_sids = [other for other in all_sec_ids
                   if _security_group(other, contexts) == group]
-    if any(states[other].depends & unresolved_ids for other in group_sids):
-        # A member depends on a context whose symbol or timeframe only exists
-        # once its own signal runs, so it cannot be started with the group: the
+    withheld_ids = unresolved_ids | {other for other, state in states.items()
+                                     if state.gaps_pending}
+    if any(states[other].depends & withheld_ids for other in group_sids):
+        # A member depends on a context whose symbol, timeframe or gaps mode only
+        # exists once its own signal runs, so it cannot be started with the group: the
         # child waits for that peer's registry record, which the chart sends at
         # a signal LATER in ``main()``. Merging pools that wait onto every
         # member, and the chart's read of the primary waits for all of them
@@ -2641,6 +2643,9 @@ class ScriptRunner:
                 sec_result_locks = {
                     sid: state.result_lock for sid, state in sec_states.items()
                 }
+                # Contexts whose gaps mode only arrives with their first signal
+                runtime_gaps_ids = frozenset(
+                    sid for sid, state in sec_states.items() if state.gaps_pending)
                 # One condition per context — for EVERY sid in
                 # ``__security_contexts__``, including the ones whose symbol or
                 # timeframe only resolves at runtime. The sid set is static
@@ -2716,14 +2721,15 @@ class ScriptRunner:
                 def _sec_registry() -> dict:
                     """Peer records for the children spawned from now on.
 
-                    A context still waiting for its runtime symbol/timeframe is
-                    OMITTED, not guessed: "absent" is what tells a consumer to
+                    A context still waiting for its runtime symbol/timeframe or
+                    gaps mode is OMITTED, not guessed: "absent" is what tells a consumer to
                     wait for the record rather than pair against a placeholder.
                     Everything already resolved is included, so a child spawned
                     later starts with as much as the chart knows.
                     """
                     return {_sid: _sec_record(_sid) for _sid in sec_states  # noqa
-                            if _sid not in deferred_sec_ids}
+                            if _sid not in deferred_sec_ids
+                            and not sec_states[_sid].gaps_pending}  # noqa
 
                 def _publish_sec_record(_sid: str) -> None:
                     """Push one freshly resolved context's record to every child.
@@ -3198,6 +3204,11 @@ class ScriptRunner:
                     if (resolved_path is not None and sid not in no_process_ids
                             and sid not in sec_processes):
                         _prepare_security_context(sid, resolved_path)
+                    if sid in runtime_gaps_ids:
+                        # Left out of the registry until its gaps mode arrived
+                        # (see ``_sec_registry``): a child spawned earlier waits
+                        # for this record instead of pairing with ``gaps_off``.
+                        _publish_sec_record(sid)
 
                 # First-read callback for static contexts. The ``sec_processes``
                 # check makes it safe to call after the deferred resolver too —

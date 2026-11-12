@@ -387,9 +387,18 @@ impl Security {
                 }
                 _ => None,
             };
+            // The same holds for ``gaps``, also a Pine "simple" -- e.g.
+            // ``gap ? barmerge.gaps_on : barmerge.gaps_off`` held in a local.
+            let gaps_rt = match gaps {
+                Some(gaps) if !is_module_level_expr(ast, gaps) => {
+                    Some(clone(ast, gaps, &mut HashMap::new()))
+                }
+                _ => None,
+            };
             let symbol_copy = symbol.map(|symbol| clone(ast, symbol, &mut HashMap::new()));
             let timeframe_copy = timeframe.map(|tf| clone(ast, tf, &mut HashMap::new()));
-            self.signal_args.insert(sec_id.clone(), [symbol_copy, timeframe_copy, lookahead_rt]);
+            self.signal_args
+                .insert(sec_id.clone(), [symbol_copy, timeframe_copy, lookahead_rt, gaps_rt]);
 
             // For __security_contexts__ at module level: only values evaluable at
             // module scope; function parameters etc. become None
@@ -406,9 +415,12 @@ impl Security {
             if is_ltf {
                 entries.insert("is_ltf".into(), constant(ast, Constant::Bool(true)));
             } else {
-                let gaps_expr = match gaps {
-                    Some(gaps) => clone(ast, gaps, &mut HashMap::new()),
-                    None => default_gaps(ast),
+                // A runtime gaps mode would NameError at module load: None is its
+                // placeholder, resolved by the first ``__sec_signal__``
+                let gaps_expr = match (gaps_rt, gaps) {
+                    (Some(_), _) => constant(ast, Constant::None),
+                    (None, Some(gaps)) => clone(ast, gaps, &mut HashMap::new()),
+                    (None, None) => default_gaps(ast),
                 };
                 entries.insert("gaps".into(), gaps_expr);
                 if let Some(lookahead) = lookahead {
@@ -495,7 +507,7 @@ impl Security {
         let mut runtime_sec_ids: HashSet<String> = HashSet::new();
         let mut needed_names: HashSet<String> = HashSet::new();
         for sid in &sec_ids {
-            let [symbol, timeframe, _] = self.signal_args[sid];
+            let [symbol, timeframe, _, _] = self.signal_args[sid];
             let runtime_resolved = resolved_at_runtime(ast, symbol, timeframe);
             if runtime_resolved && !reached.contains(sid) && !self.keep_top.contains(sid) {
                 self.deferred_by_reach.insert(sid.clone());

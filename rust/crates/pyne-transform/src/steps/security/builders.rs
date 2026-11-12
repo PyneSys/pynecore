@@ -99,22 +99,28 @@ fn in_same_context(ast: &mut Ast, sec_id: &str) -> NodeId {
     ast.add(Kind::Compare { left: sid, ops: vec![CmpOperator::In], comparators: vec![same] })
 }
 
-/// The arguments of one `__sec_signal__`: the sid, the symbol and timeframe (None
-/// when absent), and the runtime lookahead when there is one.
-fn signal_args(ast: &mut Ast, sec_id: &str, args: [Option<NodeId>; 3]) -> Vec<NodeId> {
-    let [symbol, timeframe, lookahead] = args;
+/// The positional arguments of one `__sec_signal__` (`_signal_call_args`):
+/// `(sid, symbol, timeframe[, lookahead[, gaps]])`, symbol and timeframe None when
+/// absent. A lookahead or gaps mode that is not module-level evaluable (an
+/// input-derived Pine "simple" value) follows them, still passed from the top block
+/// when its chain is hoistable -- the binding it reads is moved above that block. A
+/// runtime gaps mode without a runtime lookahead passes None in the lookahead's
+/// place.
+fn signal_args(ast: &mut Ast, sec_id: &str, args: [Option<NodeId>; 4]) -> Vec<NodeId> {
+    let [symbol, timeframe, lookahead, gaps] = args;
+    let mut tail = vec![symbol, timeframe];
+    if lookahead.is_some() || gaps.is_some() {
+        tail.push(lookahead);
+    }
+    if gaps.is_some() {
+        tail.push(gaps);
+    }
     let mut out = vec![str_constant(ast, sec_id)];
-    for expr in [symbol, timeframe] {
+    for expr in tail {
         out.push(match expr {
             Some(expr) => clone(ast, expr, &mut Default::default()),
             None => constant(ast, Constant::None),
         });
-    }
-    // A lookahead that is not module-level evaluable (an input-derived Pine
-    // "simple" value) is still passed here when its chain is hoistable -- the
-    // binding it reads is moved above this block.
-    if let Some(lookahead) = lookahead {
-        out.push(clone(ast, lookahead, &mut Default::default()));
     }
     out
 }
@@ -165,7 +171,7 @@ impl Security {
     }
 
     /// A single inline signal for a runtime-dependent symbol / timeframe /
-    /// lookahead (`_inline_signal`).
+    /// lookahead / gaps (`_inline_signal`).
     pub(crate) fn inline_signal(&self, ast: &mut Ast, sec_id: &str) -> NodeId {
         let args = signal_args(ast, sec_id, self.signal_args[sec_id]);
         let call = func_call(ast, "__sec_signal__", args);
