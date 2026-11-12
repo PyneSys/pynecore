@@ -57,7 +57,7 @@
   },
   "Security": {
     "module": "security",
-    "digest": "98e48d8261ce2db147c00cb0373d31c449444962be9dc11e1dd2a36e49b13801"
+    "digest": "84c792ce26c4cceef6682977001f47c80671615d752394f65e2ecc1e591cb570"
   },
   "PersistentSeries": {
     "module": "persistent_series",

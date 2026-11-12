@@ -263,8 +263,8 @@ class SecurityTransformer(ast_walk.NodeTransformer):
            __sec_wait__("sec_id")
 
     Also creates module-level __security_contexts__ dict with metadata for each context.
-    Non-constant symbol/timeframe/lookahead values (e.g., function parameters or
-    input-derived expressions) are stored as None in __security_contexts__ and
+    Non-constant symbol/timeframe/lookahead/gaps values (e.g., function parameters
+    or input-derived expressions) are stored as None in __security_contexts__ and
     resolved at runtime via __sec_signal__ arguments.
 
     Every context also carries a ``group`` key: the ordinal of the group of
@@ -292,7 +292,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         self._counter = 0
         self._all_contexts: dict[str, dict[str, ast.expr]] = {}
         self._signal_args: dict[
-            str, tuple[ast.expr | None, ast.expr | None, ast.expr | None]
+            str, tuple[ast.expr | None, ast.expr | None, ast.expr | None, ast.expr | None]
         ] = {}
         self._needs_barmerge = False
         self._needs_ltf_unzip = False
@@ -920,30 +920,48 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             ]
         )
 
+    def _signal_call_args(self, sec_id: str) -> list[ast.expr]:
+        """The arguments of one ``__sec_signal__`` for ``sec_id``.
+
+        The sid, the symbol and timeframe (None when absent), then the runtime
+        lookahead and the runtime gaps mode when the context has one. A
+        lookahead or gaps mode that is not module-level evaluable (an
+        input-derived Pine "simple" value) is passed here — in the top block
+        when its chain is hoistable, the binding it reads being moved above
+        that block, inline otherwise. The gaps mode stands after the lookahead,
+        so a context with a runtime gaps mode alone passes None in the
+        lookahead's place.
+
+        :param sec_id: the context id
+        :return: the argument expressions, each a fresh clone
+        """
+        sym_expr, tf_expr, la_expr, gaps_expr = self._signal_args[sec_id]
+        args: list[ast.expr] = [ast.Constant(value=sec_id)]
+        for expr in (sym_expr, tf_expr):
+            args.append(ast_walk.clone(expr) if expr is not None
+                        else ast.Constant(value=None))
+        if la_expr is not None or gaps_expr is not None:
+            args.append(ast_walk.clone(la_expr) if la_expr is not None
+                        else ast.Constant(value=None))
+        if gaps_expr is not None:
+            args.append(ast_walk.clone(gaps_expr))
+        return args
+
     def _signal_block(self, sec_ids: list[str]) -> ast.If:
         """Build chart-context signal block for function start.
 
         Passes actual symbol and timeframe expressions to __sec_signal__
         so that runtime values (e.g., function parameters) are available.
 
-        Only includes sec_ids whose symbol/timeframe are module-level
-        expressions (constants or lib.* refs). Runtime-dependent signals
-        are emitted inline before their write blocks by _transform_body.
+        Only includes sec_ids whose signal arguments are module-level
+        expressions (constants or lib.* refs) or hoistable chains over such.
+        Runtime-dependent signals are emitted inline before their write
+        blocks by _transform_body.
         """
-        body = []
-        for s in sec_ids:
-            args: list[ast.expr] = [ast.Constant(value=s)]
-            sym_expr, tf_expr, la_expr = self._signal_args[s]
-            args.append(ast_walk.clone(sym_expr) if sym_expr is not None
-                        else ast.Constant(value=None))
-            args.append(ast_walk.clone(tf_expr) if tf_expr is not None
-                        else ast.Constant(value=None))
-            # A lookahead that is not module-level evaluable (an input-derived
-            # Pine "simple" value) is still passed here when its chain is
-            # hoistable — the binding it reads is moved above this block.
-            if la_expr is not None:
-                args.append(ast_walk.clone(la_expr))
-            body.append(ast.Expr(value=self._func_call('__sec_signal__', *args)))
+        body = [
+            ast.Expr(value=self._func_call('__sec_signal__', *self._signal_call_args(s)))
+            for s in sec_ids
+        ]
         return ast.If(
             test=self._is_none_check(),
             body=body,
@@ -952,15 +970,8 @@ class SecurityTransformer(ast_walk.NodeTransformer):
 
     def _inline_signal(self, sec_id: str) -> ast.If:
         """Build a single inline signal for runtime-dependent
-        symbol/timeframe/lookahead."""
-        args: list[ast.expr] = [ast.Constant(value=sec_id)]
-        sym_expr, tf_expr, la_expr = self._signal_args[sec_id]
-        args.append(ast_walk.clone(sym_expr) if sym_expr is not None
-                    else ast.Constant(value=None))
-        args.append(ast_walk.clone(tf_expr) if tf_expr is not None
-                    else ast.Constant(value=None))
-        if la_expr is not None:
-            args.append(ast_walk.clone(la_expr))
+        symbol/timeframe/lookahead/gaps."""
+        args = self._signal_call_args(sec_id)
         return ast.If(
             test=self._is_none_check(),
             body=[ast.Expr(value=self._func_call('__sec_signal__', *args))],
@@ -1354,12 +1365,20 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             lookahead_rt: ast.expr | None = None
             if lookahead is not None and not self._is_module_level_expr(lookahead):
                 lookahead_rt = ast_walk.clone(lookahead)
+            # So is a gaps mode held in a local (``gapout = gap ? barmerge.gaps_on
+            # : barmerge.gaps_off``, ``gaps=gapout``): Pine takes a "simple"
+            # gaps, and the local does not exist where the module-level context
+            # dict is built. Lower-timeframe requests take no gaps.
+            gaps_rt: ast.expr | None = None
+            if not is_ltf and gaps is not None and not self._is_module_level_expr(gaps):
+                gaps_rt = ast_walk.clone(gaps)
 
             # Store actual expressions for __sec_signal__ args (always passed at runtime)
             self._signal_args[sec_id] = (
                 ast_walk.clone(symbol) if symbol is not None else None,
                 ast_walk.clone(timeframe) if timeframe is not None else None,
                 lookahead_rt,
+                gaps_rt,
             )
 
             # For __security_contexts__ at module level: only use values that are
@@ -1379,9 +1398,15 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             if is_ltf:
                 ctx['is_ltf'] = ast.Constant(value=True)
             else:
-                gaps_expr = (
-                    ast_walk.clone(gaps) if gaps is not None else self._default_gaps()
-                )
+                # A runtime gaps (``gaps_rt``) would NameError at module load:
+                # the placeholder None reads as gaps_off until ``__sec_signal__``
+                # passes the actual mode on the first bar.
+                if gaps_rt is not None:
+                    gaps_expr: ast.expr = ast.Constant(value=None)
+                elif gaps is not None:
+                    gaps_expr = ast_walk.clone(gaps)
+                else:
+                    gaps_expr = self._default_gaps()
                 ctx['gaps'] = gaps_expr
                 if lookahead is not None:
                     # A module-level lookahead (``barmerge.lookahead_*``) is
@@ -1465,7 +1490,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         runtime_sec_ids: set[str] = set()
         needed_names: set[str] = set()
         for sid in sec_ids:
-            sym_expr, tf_expr, _la_expr = self._signal_args[sid]
+            sym_expr, tf_expr, _la_expr, _gaps_expr = self._signal_args[sid]
             runtime_resolved = self._resolved_at_runtime(sym_expr, tf_expr)
             if runtime_resolved and sid not in reached and sid not in self._keep_top:
                 self._deferred_by_reach.add(sid)
@@ -1879,7 +1904,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         ctx = self._all_contexts[sid]
         # A runtime lookahead travels in the signal args and is already part of
         # the key below; a module-level one is only in the context.
-        _sym, _tf, la_rt = self._signal_args[sid]
+        _sym, _tf, la_rt, _gaps_rt = self._signal_args[sid]
         la_expr = None if la_rt is not None else ctx.get('lookahead')
         # ``closed_shift`` decides whether the chart runs a developing round on
         # every chart bar of a period or only on its first, and one child runs

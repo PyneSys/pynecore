@@ -1538,6 +1538,8 @@ def create_chart_protocol(
     }
 
     resolved: set[str] = set()
+    # Sids whose runtime gaps mode (a Pine "simple" held in a local) is applied
+    gaps_resolved: set[str] = set()
     # Producers a started consumer needs but that were still unresolved at the
     # time (see ``_start``): each starts at its own first signal instead.
     start_on_resolve: set[str] = set()
@@ -2187,7 +2189,7 @@ def create_chart_protocol(
         return entry[2]
 
     def __sec_signal__(sec_id: str, symbol: str | None = None,
-                       timeframe: str | None = None, lookahead=None,
+                       timeframe: str | None = None, lookahead=None, gaps=None,
                        _scope_id=None):
         """Signal one context's bar, or let its group's primary do it.
 
@@ -2205,7 +2207,20 @@ def create_chart_protocol(
         first member reached schedules the group's round itself, on the
         primary's slot. ``signalled_primaries`` keeps that to ONE round per
         invocation whichever member comes first.
+
+        ``gaps`` is the context's gaps mode when the script holds it in a local
+        (a Pine "simple" such as ``gap ? barmerge.gaps_on : barmerge.gaps_off``):
+        the transformer stored None in ``__security_contexts__``, read as
+        ``gaps_off`` at setup, and passes the actual value here. It is applied
+        on the context's first signal, before anything below: a member adopted
+        into a stable group was resolved from its seed's values, which do not
+        carry the member's own gaps mode, and the mode drives the chart-side
+        read alone.
         """
+        if gaps is not None and sec_id not in gaps_resolved:
+            from pynecore.lib import barmerge
+            gaps_resolved.add(sec_id)
+            states[sec_id].gaps_on = gaps is barmerge.gaps_on
         if sec_id not in signal_order:
             signal_order[sec_id] = len(signal_order)
         seed = adopted_from.get(sec_id)
@@ -3375,7 +3390,7 @@ def create_security_protocol(
     last_own_value: dict[str, object] = {sid: None for sid in sec_ids}
 
     def __sec_signal__(_sid: str, _symbol=None, _timeframe=None, _lookahead=None,
-                       _scope_id=None):
+                       _gaps=None, _scope_id=None):
         pass
 
     def _peer_asof(record: dict) -> int:

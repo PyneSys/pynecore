@@ -903,6 +903,93 @@ def main():
     assert len(signal_call.args) == 3
 
 
+def __test_gaps_runtime_expr_deferred__(log):
+    """A gaps mode held in a local is deferred to __sec_signal__ like a lookahead.
+
+    Pine takes a "simple" ``gaps``, so ``gapout = gap ? gaps_on : gaps_off``
+    followed by ``gaps=gapout`` is valid. The module-level
+    ``__security_contexts__`` literal cannot name the local (it would
+    NameError when the script loads), so it stores None there — read as
+    ``gaps_off`` until resolved — and the signal carries the expression as its
+    5th argument, with None standing in the lookahead's place.
+    """
+    source = """
+def main():
+    gapout = lib.barmerge.gaps_on if cond else lib.barmerge.gaps_off
+    k = lib.request.security(lib.syminfo.tickerid, "D", lib.close, gaps=gapout)
+"""
+    tree = _transform_tree(source)
+
+    ctx_assign = _find_contexts(tree)
+    ctx_dict = ctx_assign.value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    gaps_val = ctx_dict.values[ctx_keys.index('gaps')]
+    assert isinstance(gaps_val, ast.Constant) and gaps_val.value is None
+    assert 'gapout' not in ast.unparse(ctx_assign)
+
+    # ``cond`` is not hoistable, so the signal stands inline after the local
+    func = _find_func(tree)
+    assert isinstance(func.body[0], ast.Assign)  # gapout = ...
+    signal_if = func.body[1]
+    assert isinstance(signal_if, ast.If)
+    signal_call = signal_if.body[0].value
+    assert signal_call.func.id == '__sec_signal__'
+    assert len(signal_call.args) == 5
+    assert isinstance(signal_call.args[3], ast.Constant)
+    assert signal_call.args[3].value is None
+    assert isinstance(signal_call.args[4], ast.Name)
+    assert signal_call.args[4].id == 'gapout'
+    log.info("runtime gaps deferred to __sec_signal__ OK")
+
+
+def __test_gaps_input_derived_is_hoisted__(log):
+    """An input-derived gaps mode rides the top-block signal, its binding hoisted."""
+    source = """
+def main(gap=lib.input.bool(True, "Gaps")):
+    lib.plot(lib.close)
+    gapout = lib.barmerge.gaps_on if gap else lib.barmerge.gaps_off
+    k = lib.request.security(lib.syminfo.tickerid, "D", lib.close, gaps=gapout)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    assert isinstance(func.body[0], ast.Assign)
+    assert func.body[0].targets[0].id == 'gapout'
+    signal_if = func.body[1]
+    assert isinstance(signal_if, ast.If)
+    signal_call = signal_if.body[0].value
+    assert signal_call.func.id == '__sec_signal__'
+    assert len(signal_call.args) == 5
+    assert isinstance(signal_call.args[4], ast.Name)
+    assert signal_call.args[4].id == 'gapout'
+
+    ctx_dict = _find_contexts(tree).value.values[0]
+    ctx_keys = [k.value for k in ctx_dict.keys]
+    gaps_val = ctx_dict.values[ctx_keys.index('gaps')]
+    assert isinstance(gaps_val, ast.Constant) and gaps_val.value is None
+    log.info("input-derived gaps hoisted OK")
+
+
+def __test_gaps_with_runtime_lookahead_signal_args__(log):
+    """Runtime lookahead and gaps together fill the 4th and 5th arguments."""
+    source = """
+def main():
+    mode = lib.barmerge.lookahead_on if cond else lib.barmerge.lookahead_off
+    gapout = lib.barmerge.gaps_on if cond else lib.barmerge.gaps_off
+    k = lib.request.security(lib.syminfo.tickerid, "D", lib.close,
+                             gaps=gapout, lookahead=mode)
+"""
+    tree = _transform_tree(source)
+    func = _find_func(tree)
+    signal_if = func.body[2]
+    assert isinstance(signal_if, ast.If)
+    signal_call = signal_if.body[0].value
+    assert signal_call.func.id == '__sec_signal__'
+    assert len(signal_call.args) == 5
+    assert signal_call.args[3].id == 'mode'
+    assert signal_call.args[4].id == 'gapout'
+    log.info("runtime lookahead + gaps signal args OK")
+
+
 def __test_symbol_call_with_local_arg_deferred__(log):
     """``ticker.heikinashi(<local>)`` must not reach the module-level ctx.
 

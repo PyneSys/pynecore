@@ -5,8 +5,8 @@
 //! Each call gets a sec id, `sec·<sha1(module path)[:8]>·<n>`, and:
 //!
 //! 1. at function start (chart context only), a `__sec_signal__` with its symbol,
-//!    timeframe and runtime lookahead, when those can be evaluated there; inline
-//!    before the write otherwise;
+//!    timeframe, runtime lookahead and runtime gaps mode, when those can be
+//!    evaluated there; inline before the write otherwise;
 //! 2. at the call's statement, a write block (`__sec_write__`) for the security
 //!    process (or a same-context chart), and the call replaced by `__sec_read__`;
 //! 3. at function end (chart context only), a `__sec_wait__`.
@@ -68,8 +68,9 @@ pub(crate) type BindingCounts = (HashMap<String, usize>, HashSet<String>);
 pub(crate) struct Security {
     counter: usize,
     all_contexts: IndexMap<String, Entries>,
-    /// Per sid, the symbol, timeframe and runtime lookahead its signal passes
-    signal_args: HashMap<String, [Option<NodeId>; 3]>,
+    /// Per sid, the symbol, timeframe, runtime lookahead and runtime gaps mode its
+    /// signal passes
+    signal_args: HashMap<String, [Option<NodeId>; 4]>,
     needs_barmerge: bool,
     needs_ltf_unzip: bool,
     ltf_sec_ids: HashSet<String>,

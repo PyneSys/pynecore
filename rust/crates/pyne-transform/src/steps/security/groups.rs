@@ -243,7 +243,7 @@ impl Security {
         let entries = &self.all_contexts[sid];
         // A runtime lookahead travels in the signal args and is already part of
         // the key below; a module-level one is only in the context
-        let [_, _, lookahead_rt] = self.signal_args[sid];
+        let [_, _, lookahead_rt, _] = self.signal_args[sid];
         let lookahead = if lookahead_rt.is_some() { None } else { entries.get("lookahead") };
         let dump_entry = |node: Option<&NodeId>| node.map(|&node| dumped(ast, node));
         // ``closed_shift`` decides the round protocol, and one child runs ONE
