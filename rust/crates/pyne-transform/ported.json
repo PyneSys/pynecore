@@ -81,7 +81,7 @@
   },
   "PineType": {
     "module": "pine_type_transformer",
-    "digest": "87a69f47057ac35d3d773481689e3528fd97243ad2c9dc844353942800a06ffd"
+    "digest": "8d0532f329ac378b6839ca8277dbf7d69d65f4724744be4f910d3944ac4b662e"
   },
   "ImplicitConversion": {
     "module": "implicit_conversion",
@@ -121,7 +121,7 @@
   },
   "FunctionIsolation": {
     "module": "function_isolation",
-    "digest": "da8f8202bf7536a15a43240c20459e6b0be5b1aa4b05cc4b4a7a4625dbb6bfc7"
+    "digest": "4b152aec5337d24b3390795f5b1bfa17d336e496c0d347329b23ff19f1817810"
   },
   "ScriptRequirements": {
     "module": "script_requirements",

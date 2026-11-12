@@ -608,9 +608,10 @@ class _Gate:
         scope = module
         reader: ast.AST | None = None
         for owner in self._scopes:
-            label = 'lambda' if isinstance(owner, ast.Lambda) else owner.name
+            # A lambda's table is named 'lambda' up to Python 3.14, '<lambda>' from 3.15
+            labels = ('lambda', '<lambda>') if isinstance(owner, ast.Lambda) else (owner.name,)
             table = next((child for child in scope.get_children()
-                          if child.get_name() == label and child.get_lineno() == owner.lineno),
+                          if child.get_name() in labels and child.get_lineno() == owner.lineno),
                          None)
             if table is not None:
                 scope, reader = table, owner

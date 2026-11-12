@@ -95,10 +95,10 @@ def __test_helper_load(path: Path, monkeypatch, *modules: str):
     counts = {'transform': 0}
     real = PyneLoader.source_to_code
 
-    def counted(self, data, source_path, *, _optimize: int = -1):
+    def counted(self, data, source_path, fullname=None, *, _optimize: int = -1):
         if Path(source_path).resolve() == path.resolve():
             counts['transform'] += 1
-        return real(self, data, source_path, _optimize=_optimize)
+        return real(self, data, source_path, fullname, _optimize=_optimize)
 
     with monkeypatch.context() as patch, __test_helper_bytecode_writing():
         patch.setattr(PyneLoader, 'source_to_code', counted)
