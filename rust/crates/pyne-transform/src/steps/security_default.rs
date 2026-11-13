@@ -1,11 +1,16 @@
 //! Port of `transformers/security_default.py`: the missing value of a `request.security`
 //! read whose inferred type is bool, or a tuple holding bools, becomes a call of the
-//! runtime-mode bool factory, imported once at the top of the module.
+//! runtime-mode bool factory, imported once at the top of the module; a scalar missing
+//! value of a tuple read becomes one per element.
 
-use pyne_ast::walk::{Walk, copy_location};
+use std::collections::HashMap;
+
+use pyne_ast::walk::{Walk, clone, copy_location};
 use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Value};
 
-use crate::pine_type_rules::{BOOL, TY_ATTR, UNKNOWN, elements_of, is_tuple, stamp_lowering};
+use crate::pine_type_rules::{
+    BOOL, FLOAT, STR, TY_ATTR, UNKNOWN, elements_of, is_numeric, is_tuple, set_ty, stamp_lowering,
+};
 use crate::{Context, Error};
 
 /// The alias the bool factory is imported under
@@ -25,7 +30,8 @@ struct SecurityDefault {
 }
 
 impl SecurityDefault {
-    /// The default with its bool elements resolved under the runtime mode.
+    /// The default with its bool elements resolved under the runtime mode, one per
+    /// element of a tuple read.
     fn default(&mut self, ast: &mut Ast, default: NodeId, ty: &str) -> NodeId {
         if ty == BOOL {
             self.used = true;
@@ -37,23 +43,55 @@ impl SecurityDefault {
         }
         if is_tuple(ty) {
             let types: Vec<String> = elements_of(ty).into_iter().map(str::to_string).collect();
-            let defaults = match ast.kind(default) {
-                Kind::Tuple { elts, .. } if elts.len() == types.len() => elts.clone(),
-                _ => vec![default; types.len()],
+            let values: Vec<NodeId> = match ast.kind(default) {
+                Kind::Tuple { elts, .. } if elts.len() == types.len() => {
+                    let defaults = elts.clone();
+                    let values: Vec<NodeId> = defaults
+                        .iter()
+                        .zip(&types)
+                        .map(|(&value, item)| self.default(ast, value, item))
+                        .collect();
+                    if values == defaults {
+                        return default;
+                    }
+                    values
+                }
+                Kind::Tuple { .. } | Kind::List { .. } => return default,
+                // A scalar default of a tuple read: the security transform could not see
+                // the width (the expression is a call of a tuple-returning function, and
+                // the read stands in a `return`), the type pass did. One `na` per element,
+                // or the unpack at the call site raises
+                _ => types.iter().map(|item| self.element_default(ast, default, item)).collect(),
             };
-            let values: Vec<NodeId> = defaults
-                .iter()
-                .zip(&types)
-                .map(|(&value, item)| self.default(ast, value, item))
-                .collect();
-            if values.iter().zip(&defaults).any(|(value, old)| value != old) {
-                let tuple = ast.add(Kind::Tuple { elts: values, ctx: ExprContext::Load });
-                let tuple = stamp_lowering(ast, tuple, ty);
-                copy_location(ast, tuple, default);
-                return tuple;
-            }
+            let tuple = ast.add(Kind::Tuple { elts: values, ctx: ExprContext::Load });
+            let tuple = stamp_lowering(ast, tuple, ty);
+            copy_location(ast, tuple, default);
+            return tuple;
         }
         default
+    }
+
+    /// The missing value of one element of a tuple read, from a scalar default: the na of
+    /// the element's type, as the implicit conversion makes it from a typeless `na` in a
+    /// tuple-literal default. Any other element keeps the typeless `na`.
+    fn element_default(&mut self, ast: &mut Ast, default: NodeId, ty: &str) -> NodeId {
+        if is_numeric(ty) {
+            let lib = ast.add(Kind::Name { id: "lib".into(), ctx: ExprContext::Load });
+            let nan = ast.add(Kind::Attribute {
+                value: lib,
+                attr: "_na_float".into(),
+                ctx: ExprContext::Load,
+            });
+            copy_location(ast, nan, default);
+            return set_ty(ast, nan, FLOAT);
+        }
+        if ty == STR {
+            let empty = ast.add(Kind::Constant { value: Constant::Str(String::new()), kind: None });
+            copy_location(ast, empty, default);
+            return set_ty(ast, empty, STR);
+        }
+        let value = clone(ast, default, &mut HashMap::new());
+        self.default(ast, value, ty)
     }
 }
 

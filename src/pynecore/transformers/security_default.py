@@ -1,26 +1,28 @@
-"""Preserve boolean types in missing ``request.security`` results."""
+"""Shape the missing value of a ``request.security`` read after type inference."""
 import ast
 
 from . import ast_walk
-from .pine_type_rules import BOOL, elements_of, get_ty, is_tuple, stamp_lowering
+from .pine_type_rules import (BOOL, FLOAT, NUMERIC, STR, elements_of, get_ty, is_tuple, set_ty,
+                              stamp_lowering)
 
 
 _BOOL_NA_NAME = '__sec_bool_na·__'
 
 
 class SecurityDefaultTransformer(ast_walk.NodeTransformer):
-    """Resolve bool defaults after type inference, including tuple elements.
+    """Resolve bool defaults and tuple widths after type inference.
 
     The bool factory reads the running script's mode, so a library's defaults
-    follow its caller just like bool series history and UDT fields do. Other
-    result types retain the defaults the security transform supplied.
+    follow its caller just like bool series history and UDT fields do. A read of
+    a tuple whose width the security transform could not see gets one ``na`` per
+    element. Other defaults stay as the security transform supplied them.
     """
 
     def __init__(self):
         self._used = False
 
     def _default(self, default: ast.expr, ty: str) -> ast.expr:
-        """Build the missing value of a bool, or of a tuple containing bools.
+        """Build the missing value of a bool, or of a tuple.
 
         :param default: The default emitted by the security transform.
         :param ty: The inferred result type.
@@ -35,13 +37,39 @@ class SecurityDefaultTransformer(ast_walk.NodeTransformer):
             types = elements_of(ty)
             if isinstance(default, ast.Tuple) and len(default.elts) == len(types):
                 defaults = default.elts
+                values = [self._default(value, item) for value, item in zip(defaults, types)]
+                if all(value is old for value, old in zip(values, defaults)):
+                    return default
+            elif not isinstance(default, (ast.Tuple, ast.List)):
+                # A scalar default of a tuple read: the security transform could not
+                # see the width (the expression is a call of a tuple-returning
+                # function, and the read stands in a ``return``), the type pass did.
+                # One ``na`` per element, or the unpack at the call site raises
+                values = [self._element_default(default, item) for item in types]
             else:
-                defaults = [default for _ in types]
-            values = [self._default(value, item) for value, item in zip(defaults, types)]
-            if any(value is not old for value, old in zip(values, defaults)):
-                return ast.copy_location(stamp_lowering(
-                    ast.Tuple(elts=values, ctx=ast.Load()), ty), default)
+                return default
+            return ast.copy_location(stamp_lowering(
+                ast.Tuple(elts=values, ctx=ast.Load()), ty), default)
         return default
+
+    def _element_default(self, default: ast.expr, ty: str) -> ast.expr:
+        """Build the missing value of one element of a tuple read from a scalar default.
+
+        The na of the element's type, as the implicit conversion makes it from a
+        typeless ``na`` in a tuple-literal default: the numeric na, the string na,
+        the bool na of the runtime mode. Any other element keeps the typeless ``na``.
+
+        :param default: The scalar default emitted by the security transform.
+        :param ty: The element's inferred type.
+        :return: A new node for the element.
+        """
+        if ty in NUMERIC:
+            return set_ty(ast.copy_location(ast.Attribute(
+                value=ast.Name(id='lib', ctx=ast.Load()), attr='_na_float', ctx=ast.Load()),
+                default), FLOAT)
+        if ty == STR:
+            return set_ty(ast.copy_location(ast.Constant(value=''), default), STR)
+        return self._default(ast_walk.clone(default), ty)
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         self._used = False
@@ -62,9 +90,9 @@ class SecurityDefaultTransformer(ast_walk.NodeTransformer):
                 sub.args[1] = self._default(sub.args[1], get_ty(sub))
         if self._used:
             insert_at = 0
-            if (node.body and isinstance(node.body[0], ast.Expr)
-                    and isinstance(node.body[0].value, ast.Constant)
-                    and isinstance(node.body[0].value.value, str)):
+            first = node.body[0] if node.body else None
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
                 insert_at = 1
             while insert_at < len(node.body):
                 stmt = node.body[insert_at]
