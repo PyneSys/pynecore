@@ -33,10 +33,16 @@ jobs:
 
           now=$(date -u +%s)
           prs=$(gh pr list --state open --base main --limit 200 --json number --jq '.[].number')
+          # GitHub computes mergeability lazily, and a push to main resets it: the
+          # first pass asks for every PR to start the computation, the second reads it
+          for pr in $prs; do
+            gh pr view "$pr" --json mergeable > /dev/null
+          done
+          [[ -n "$prs" ]] && sleep 30
           for pr in $prs; do
             state=$(gh pr view "$pr" --json mergeable --jq .mergeable)
             echo "#$pr: $state"
-            # GitHub computes mergeability lazily: UNKNOWN is retried on the next run
+            # A state still UNKNOWN is retried on the next run
             labels=$(gh pr view "$pr" --json labels --jq '[.labels[].name] | join(",")')
             has_label=false
             [[ ",$labels," == *",$LABEL,"* ]] && has_label=true
