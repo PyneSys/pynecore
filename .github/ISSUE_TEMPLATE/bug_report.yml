@@ -21,11 +21,11 @@ body:
     attributes:
       label: Where does it happen?
       options:
+        - Not sure
         - PyneCore runtime (running Pyne code)
         - PyneComp compiler (Pine Script to Pyne code)
         - pyne CLI
         - Plugin (name it below)
-        - Not sure
     validations:
       required: true
 
