@@ -1075,9 +1075,10 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         """If ``stmt`` is a tuple-unpack assignment whose RHS is exactly
         ``call``, return the LHS arity. Otherwise None.
 
-        Pine statically enforces LHS-arity == RHS-arity for tuple-returning
-        ``request.security()`` (compile errors CE10239 / CE10172), so the
-        unpack target's arity is the authoritative source.
+        Pine allows no more names than the tuple gives (compile errors CE10239 /
+        CE10172), and fewer only where the expression is a function call, whose
+        leading values the names take. Either way the unpack target's arity is
+        the width the read is unpacked into.
 
         Skipped: star-unpack (``*rest``), multi-target (``a = b = sec(...)``),
         annotated/augmented assigns, calls wrapped in a larger expression.
@@ -2439,9 +2440,8 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             new_call = self._func_call(
                 '__sec_signal__', ast.Constant(value=sid), *new_args
             )
-            new_stmt = ast.Expr(value=new_call)
-            ast.copy_location(new_stmt, call)
-            fix_locations(new_stmt)
+            # The arguments are cloned from the helper: they run at the call now
+            new_stmt = anchor_all_at(ast.Expr(value=new_call), call)
             caller_block.body.append(new_stmt)
         if not sig_block.body:
             helper.body.remove(sig_block)

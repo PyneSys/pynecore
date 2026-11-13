@@ -51,6 +51,7 @@ use crate::pine_type_table::{
     Binding, CallSite, ClassSig, ContextKey, ContextResult, DepRecord, Diag, ExportSig, FuncSig,
     ModuleInterface, PineTypeTable, TABLE_ATTR, Unknown, qualify,
 };
+use crate::steps::security_default::requested_functions;
 use crate::{Context, Error, Host};
 
 use facts::{BranchIndex, BranchPath, Pos, ScopeFacts, nid, unchecked};
@@ -180,6 +181,9 @@ struct Engine<'a, 'h> {
     pins_suppressed: Option<Diag>,
     bad_calls: HashSet<NodeId>,
     sec_writes: HashMap<String, Vec<NodeId>>,
+    /// Functions whose every `return` gives a security read: an unpack of their call, like
+    /// one of the read itself, may name fewer values than the tuple gives
+    requested: HashSet<String>,
     q: HashMap<i64, u8>,
     conds: Vec<u8>,
     call_q: HashMap<i64, u8>,
@@ -266,6 +270,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             pins_suppressed: None,
             bad_calls: HashSet::new(),
             sec_writes: HashMap::new(),
+            requested: HashSet::new(),
             q: HashMap::new(),
             conds: Vec::new(),
             call_q: HashMap::new(),
@@ -691,6 +696,7 @@ impl<'a, 'h> Engine<'a, 'h> {
         self.rebound.insert(String::new(), self.module_rebinds.keys().cloned().collect());
         let scan = facts::scan_tree(self.ast, tree)?;
         self.sec_writes = scan.writes;
+        self.requested = requested_functions(self.ast, tree);
         self.collect_imports(&body)?;
         self.collect_classes(tree, &scan.annotations)?;
         self.collect(&body, "")?;

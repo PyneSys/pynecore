@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
-use pyne_ast::locations::fix_locations;
+use pyne_ast::locations::{anchor_all_at, fix_locations};
 use pyne_ast::walk::{
     Transformer, Visited, child_statements, children, clone, copy_location, docstring_end,
     generic_visit, walk,
@@ -482,8 +482,8 @@ impl Security {
             call_args.extend(new_args);
             let new_call = func_call(ast, "__sec_signal__", call_args);
             let new_stmt = expr_stmt(ast, new_call);
-            copy_location(ast, new_stmt, call);
-            if let Err(err) = fix_locations(ast, new_stmt, 1, 0) {
+            // The arguments are cloned from the helper: they run at the call now
+            if let Err(err) = anchor_all_at(ast, new_stmt, call) {
                 self.error.get_or_insert(err);
             }
             if_body_mut(ast, caller_block).push(new_stmt);

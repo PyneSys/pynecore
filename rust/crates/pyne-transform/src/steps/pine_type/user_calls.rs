@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use pyne_ast::{Constant, Kind, NodeId, Value};
+use pyne_ast::{Constant, Int, Kind, NodeId, Value};
 
 use super::facts::{
     self, arg_parts, arity, call_arity, every_param, fits, keyword_parts, reaches_library_methods,
@@ -14,8 +14,9 @@ use crate::data;
 use crate::pine_qualifier::SERIES;
 use crate::pine_type_rules::ImplSig;
 use crate::pine_type_rules::{
-    NUMERIC, OBJECT, PINE_LOOP, TYPELESS, UNKNOWN, builtin_call_type, class_of, impl_sig, join,
-    namespace_of, object_ty, overload_result, param_defaults, pin_for, render_ty,
+    NUMERIC, OBJECT, PINE_LOOP, TYPELESS, UNKNOWN, array_of, builtin_call_type, class_of,
+    elements_of, impl_sig, join, namespace_of, object_ty, overload_result, param_defaults, pin_for,
+    render_ty, tuple_of,
 };
 use crate::pine_type_table::{CallSite, ClassSig, ExportSig};
 
@@ -45,6 +46,9 @@ impl Engine<'_, '_> {
         let name = self.dotted(func).unwrap_or_default();
         if name == "__sec_read__" {
             return self.security_read(node);
+        }
+        if name == "__ltf_unzip__" {
+            return self.ltf_unzip(node);
         }
         if name == "method_call" {
             return match self.method_call(node)? {
@@ -685,6 +689,9 @@ impl Engine<'_, '_> {
         let (_, args, _) = facts::call_parts(self.ast, node).expect("a call");
         let sec_id = args.first().copied();
         let default = args.get(1).copied();
+        let lower_tf = default.is_some_and(
+            |default| matches!(self.kind(default), Kind::List { elts, .. } if elts.is_empty()),
+        );
         let mut parts: Vec<String> = Vec::new();
         if let Some(sec_id) = sec_id
             && let Kind::Constant { value: Constant::Str(id), .. } = self.kind(sec_id)
@@ -693,8 +700,11 @@ impl Engine<'_, '_> {
                 parts.push(self.ty_of(written));
             }
         }
+        if lower_tf {
+            return Ok(lower_tf_type(&parts));
+        }
         if let Some(default) = default
-            && self.dotted(default).as_deref() != Some("lib._na_none")
+            && !self.typeless_default(default)
         {
             parts.push(self.ty_of(default));
         }
@@ -709,6 +719,39 @@ impl Engine<'_, '_> {
             }
         }
         Ok(result)
+    }
+
+    /// Type an `__ltf_unzip__(read, n)` the security transform emitted (`_ltf_unzip`): the
+    /// read's column-major tuple, cut to its leading `n` columns.
+    fn ltf_unzip(&mut self, node: NodeId) -> R<String> {
+        let (_, args, _) = facts::call_parts(self.ast, node).expect("a call");
+        let ty = args.first().map_or_else(|| UNKNOWN.to_string(), |&read| self.ty_of(read));
+        let width = if args.len() == 2 {
+            match self.kind(args[1]) {
+                Kind::Constant { value: Constant::Int(Int::Small(width)), .. } if *width > 0 => {
+                    Some(*width as usize)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let elements = elements_of(&ty);
+        let Some(width) = width.filter(|_| !elements.is_empty()) else {
+            return Ok(OBJECT.to_string());
+        };
+        Ok(tuple_of(&elements[..width.min(elements.len())]))
+    }
+
+    /// Whether a security read's default is the interned typeless `na`, or a tuple of it
+    /// (`_typeless_default`): it has no type to contribute, and its width is the unpack
+    /// target's, which may name fewer values than the write gives.
+    fn typeless_default(&self, default: NodeId) -> bool {
+        if let Kind::Tuple { elts, .. } = self.kind(default) {
+            return !elts.is_empty()
+                && elts.iter().all(|&elt| self.dotted(elt).as_deref() == Some("lib._na_none"));
+        }
+        self.dotted(default).as_deref() == Some("lib._na_none")
     }
 
     /// Walk any implementation of a group the call got ahead of (`_ensure_group`).
@@ -1043,4 +1086,20 @@ impl Engine<'_, '_> {
             &format!("call '{name}' the way it is declared"),
         );
     }
+}
+
+/// The type a lower-timeframe read gives for what its writes put there (`_lower_tf_type`): an
+/// array of the written type, a tuple of arrays for a tuple, `UNKNOWN` when there is no write.
+fn lower_tf_type(written: &[String]) -> String {
+    let mut result = UNKNOWN.to_string();
+    for (index, ty) in written.iter().enumerate() {
+        let elements = elements_of(ty);
+        let column = if elements.is_empty() {
+            array_of(ty)
+        } else {
+            tuple_of(&elements.iter().map(|element| array_of(element)).collect::<Vec<_>>())
+        };
+        result = if index == 0 { column } else { join(&result, &column) };
+    }
+    result
 }

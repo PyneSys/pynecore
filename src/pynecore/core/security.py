@@ -3058,7 +3058,8 @@ def __ltf_unzip__(rows, n):
     raw result is row-major (a list of ``n``-tuples). This transposes it into the
     ``n`` column arrays the tuple-unpack expects, returning ``n`` empty arrays when
     the chart bar has no intrabars (e.g. the lower-timeframe feed does not reach
-    that period).
+    that period). An unpack that names fewer values than the tuple gives takes
+    the leading ``n`` columns, as on TradingView.
 
     Inserted by ``SecurityTransformer`` only for tuple-valued
     ``request.security_lower_tf()`` calls; scalar calls read the array directly.
@@ -3066,7 +3067,8 @@ def __ltf_unzip__(rows, n):
     :param rows: Per-intrabar value tuples (possibly empty when there are no
         intrabars), or ``na`` for a request whose timeframe is higher than the
         script's.
-    :param n: Tuple arity (number of expression elements).
+    :param n: Number of columns: the tuple's arity, or the number of names the
+        read is unpacked into.
     :return: Tuple of ``n`` lists, column-major.
     """
     if rows.__class__ is NA:
@@ -3074,7 +3076,9 @@ def __ltf_unzip__(rows, n):
         return tuple(NA(list) for _ in range(n))
     if not rows:
         return tuple([] for _ in range(n))
-    return tuple(list(col) for col in zip(*rows))
+    if len(rows[0]) == n:
+        return tuple(list(col) for col in zip(*rows))
+    return tuple(list(col) for col, _ in zip(zip(*rows), range(n)))
 
 
 class SecurityChildContext:

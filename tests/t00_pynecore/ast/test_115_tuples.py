@@ -504,6 +504,47 @@ def main():
     assert table.diags == []
 
 
+def __test_a_lower_tf_read_arrives_as_arrays__(tmp_path):
+    """
+    A lower-timeframe read gives one array per written value.
+
+    Direct or through a helper's ``return``, unpacked into every column or into
+    fewer names than the tuple gives: each name is an array of its column's type.
+    """
+    path = _write(tmp_path, 'tup_ltf', '''"""
+@pyne
+"""
+from pynecore.lib import array, close, high, request, script, syminfo
+
+
+def cols(x):
+    return high * x, x, close
+
+
+def get_ltf(tf):
+    return request.security_lower_tf(syminfo.tickerid, tf, cols(1))
+
+
+@script.indicator("t")
+def main():
+    ha, ca = request.security_lower_tf(syminfo.tickerid, "1", cols(1))
+    hb, cb = get_ltf("1")
+    hc, cc, lc = get_ltf("1")
+    closes = request.security_lower_tf(syminfo.tickerid, "1", close)
+    return array.size(ha) + array.size(hb) + array.size(lc) + array.size(closes)
+''')
+
+    _, table = _analysed(path)
+
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    floats, ints = array_of(FLOAT), array_of(INT)
+    assert (types['ha'], types['ca']) == (floats, ints)
+    assert (types['hb'], types['cb']) == (floats, ints)
+    assert (types['hc'], types['cc'], types['lc']) == (floats, ints, floats)
+    assert types['closes'] == floats
+    assert table.diags == []
+
+
 # --- 5. across modules -----------------------------------------------------
 
 

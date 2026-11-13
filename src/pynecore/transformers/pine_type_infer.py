@@ -86,6 +86,7 @@ from .pine_qualifier import (
 )
 from .python_names import is_stdlib
 from .script_entry import is_script_entry
+from .security_default import is_requested, requested_functions
 
 __all__ = ['infer_module', 'lib_classes', 'lib_namespaces', 'lib_routes',
            'lib_star_exports', 'TY_ATTR', 'get_ty', 'set_ty', 'inherit_ty']
@@ -553,6 +554,10 @@ class _Inference:
         #: Security id -> the expressions ``__sec_write__`` publishes under it.
         #: What a ``__sec_read__`` of the same id evaluates to
         self._sec_writes: dict[str, list[ast.expr]] = {}
+        #: Functions whose every ``return`` gives a security read: an unpack of
+        #: their call, like one of the read itself, may name fewer values than
+        #: the tuple gives
+        self._requested: set[str] = set()
         #: Node id -> Pine qualifier THIS walk gave it, the qualifier twin of
         #: ``_ty``: a context reads its own answers back from here
         self._q: dict[int, int] = {}
@@ -965,6 +970,7 @@ class _Inference:
             for name, defs in _module_defs(tree.body).items()}
         self._rebound[''] = set(self._module_rebinds)
         annotations, self._sec_writes = _scan_tree(tree)
+        self._requested = requested_functions(tree)
         self._collect_imports(tree)
         self._collect_classes(tree, annotations)
         self._collect(tree.body, '')
@@ -1410,6 +1416,8 @@ class _Inference:
             case ast.Assign():
                 ty = self._expr(stmt.value)
                 target = stmt.targets[0] if len(stmt.targets) == 1 else None
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    ty = self._leading(target, ty, stmt.value)
                 if isinstance(target, ast.Name):
                     found = self._lookup(target.id)
                     if found is not None:
@@ -2208,6 +2216,27 @@ class _Inference:
             elements = ()
         for index, name in enumerate(names):
             self._store(name, elements[index] if elements else UNKNOWN, source, qual=qual)
+
+    def _leading(self, target: ast.Tuple | ast.List, ty: str, value: ast.expr) -> str:
+        """
+        The type an unpack of a security read binds from.
+
+        A tuple read unpacked into fewer names than the tuple gives takes its
+        leading values, as on TradingView, also through a function whose every
+        ``return`` gives the read. Any other arity mismatch stays one.
+
+        :param target: The tuple or list target
+        :param ty: Type of the value being unpacked
+        :param value: The value being unpacked
+        :return: The leading elements' tuple where the read gives more, else ``ty``
+        """
+        names = len(target.elts)
+        elements = elements_of(ty)
+        if (len(elements) <= names
+                or any(isinstance(element, ast.Starred) for element in target.elts)
+                or not is_requested(value, self._requested)):
+            return ty
+        return tuple_of(elements[:names])
 
     def _target_qual(self, target: ast.expr) -> int:
         """Current qualifier of an augmented-assignment target."""
@@ -3852,6 +3881,8 @@ class _Inference:
         name = dotted_name(node.func) or ''
         if name == '__sec_read__':
             return self._security_read(node)
+        if name == '__ltf_unzip__':
+            return self._ltf_unzip(node)
         if name == 'method_call':
             dispatched = self._method_call(node)
             return dispatched if dispatched is not None else self._unknown_method(node)
@@ -4706,8 +4737,10 @@ class _Inference:
         put there, so the write's expression IS the type -- the two halves are
         one expression the pass split in two, and reading them apart is what
         left every security-fed variable untyped. The DEFAULT joins in as a
-        second possible value, except where it is the interned typeless ``na``:
-        that one says "no value on this bar" and has no type to contribute.
+        second possible value, except where it is the interned typeless ``na``,
+        or a tuple of nothing else: that one says "no value on this bar" and has
+        no type to contribute. Its width is the unpack target's, which may name
+        fewer values than the write gives.
 
         The write's node is read, not a type recorded when it was walked, so
         the answer improves on its own if a re-walk widens the expression.
@@ -4715,16 +4748,25 @@ class _Inference:
         the emitted form guarantees: the transform puts the guarded write
         above the read of the same id, in the same body.
 
+        A lower-timeframe read -- the one whose default is the empty intrabar
+        list -- gives one array per written value: an array of the write's
+        type, or for a tuple a tuple of arrays, one per column. That is the
+        value the unpack sees, after ``__ltf_unzip__`` transposed the intrabar
+        rows, and the empty default adds nothing to it.
+
         :param node: The ``__sec_read__`` call node
         :return: The type the read evaluates to
         """
         sec_id = node.args[0] if node.args else None
         default = node.args[1] if len(node.args) > 1 else None
+        lower_tf = isinstance(default, ast.List) and not default.elts
         parts: list[str] = []
         if isinstance(sec_id, ast.Constant) and isinstance(sec_id.value, str):
             parts += [self._ty_of(written)
                       for written in self._sec_writes.get(sec_id.value, ())]
-        if default is not None and dotted_name(default) != 'lib._na_none':
+        if lower_tf:
+            return _lower_tf_type(parts)
+        if default is not None and not _typeless_default(default):
             parts.append(self._ty_of(default))
         result = UNKNOWN
         if parts:
@@ -4738,6 +4780,24 @@ class _Inference:
             for value, path in _typeless_nas(default, self._ty_of(default)):
                 self._record_widen(value, _na_widen(_element_at(result, path)))
         return result
+
+    def _ltf_unzip(self, node: ast.Call) -> str:
+        """
+        Type an ``__ltf_unzip__(read, n)`` the security transform emitted.
+
+        The read already has the column-major type (see ``_security_read``);
+        the unzip keeps its leading ``n`` columns.
+
+        :param node: The ``__ltf_unzip__`` call node
+        :return: The tuple of the leading arrays, OBJECT when the read is no tuple
+        """
+        ty = self._ty_of(node.args[0]) if node.args else UNKNOWN
+        width = node.args[1] if len(node.args) == 2 else None
+        elements = elements_of(ty)
+        if not elements or not (isinstance(width, ast.Constant)
+                                and type(width.value) is int and width.value > 0):
+            return OBJECT
+        return tuple_of(elements[:width.value])
 
     def _ensure_group(self, key: str, frame: int) -> None:
         """
@@ -5697,6 +5757,36 @@ def _holds_na(node: ast.AST) -> bool:
     :return: True when a typed na may take its place
     """
     return not (isinstance(node, ast.Name) and node.id == _DYN_DEFAULT)
+
+
+def _lower_tf_type(written: Sequence[str]) -> str:
+    """
+    The type a lower-timeframe read gives for what its writes put there.
+
+    :param written: The types of the writes of the read's id
+    :return: An array of the written type, a tuple of arrays for a tuple, UNKNOWN
+             when there is no write
+    """
+    result = UNKNOWN
+    for index, ty in enumerate(written):
+        elements = elements_of(ty)
+        column = tuple_of([array_of(element) for element in elements]) if elements \
+            else array_of(ty)
+        result = column if index == 0 else join(result, column)
+    return result
+
+
+def _typeless_default(node: ast.expr) -> bool:
+    """
+    Whether a security read's default is the interned typeless ``na``, or a tuple of it.
+
+    :param node: The default
+    :return: Whether it is
+    """
+    if isinstance(node, ast.Tuple):
+        return bool(node.elts) and all(dotted_name(element) == 'lib._na_none'
+                                       for element in node.elts)
+    return dotted_name(node) == 'lib._na_none'
 
 
 def _typeless_nas(node: ast.expr, ty: str, path: tuple[int, ...] = ()

@@ -9,9 +9,10 @@ use super::{Engine, Frame, R};
 use crate::pine_qualifier::{CONST, SERIES};
 use crate::pine_type_rules::{
     FLOAT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, UNKNOWN, array_of, bare_wrapper, binop_type,
-    class_of, element_of, elements_of, is_matrix, is_tuple, render_ty,
+    class_of, element_of, elements_of, is_matrix, is_tuple, render_ty, tuple_of,
 };
 use crate::pine_type_table::{Unknown, qualify};
+use crate::steps::security_default::is_requested;
 
 /// One pass of a loop body.
 #[derive(Clone, Copy)]
@@ -35,6 +36,9 @@ impl Engine<'_, '_> {
             Kind::FunctionDef { .. } | Kind::AsyncFunctionDef { .. } => self.definition(stmt)?,
             Kind::Assign { targets, value, .. } => {
                 let mut ty = self.expr(value)?;
+                if targets.len() == 1 {
+                    ty = self.leading(targets[0], ty, value);
+                }
                 if targets.len() == 1
                     && let Kind::Name { id, .. } = self.kind(targets[0])
                     && let Some(found) = self.lookup(id)
@@ -392,6 +396,27 @@ impl Engine<'_, '_> {
             );
         }
         Ok(())
+    }
+
+    /// The type an unpack of a security read binds from (`_leading`): a tuple read unpacked
+    /// into fewer names than the tuple gives takes its leading values, as on TradingView, also
+    /// through a function whose every `return` gives the read. Any other arity mismatch stays
+    /// one.
+    fn leading(&self, target: NodeId, ty: String, value: NodeId) -> String {
+        let names = match self.kind(target) {
+            Kind::Tuple { elts, .. } | Kind::List { elts, .. } => {
+                if elts.iter().any(|&elt| matches!(self.kind(elt), Kind::Starred { .. })) {
+                    return ty;
+                }
+                elts.len()
+            }
+            _ => return ty,
+        };
+        let elements = elements_of(&ty);
+        if elements.len() <= names || !is_requested(self.ast, Some(value), &self.requested) {
+            return ty;
+        }
+        tuple_of(&elements[..names])
     }
 
     /// Bind the names of an unpack, one element type each (`_distribute`).
