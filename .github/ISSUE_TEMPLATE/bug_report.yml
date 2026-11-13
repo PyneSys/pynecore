@@ -1,0 +1,94 @@
+name: Bug report
+description: Report one problem in PyneCore, PyneComp, the pyne CLI or a plugin.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please report **one problem per issue**. Each issue is checked, fixed, released and closed
+        on its own. If you found several problems, open one issue for each; an overview issue
+        that links them is welcome. See [CONTRIBUTING.md](https://github.com/PyneSys/pynecore/blob/main/CONTRIBUTING.md).
+
+  - type: checkboxes
+    id: single
+    attributes:
+      label: Scope
+      options:
+        - label: This issue reports exactly one problem.
+          required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Where does it happen?
+      options:
+        - PyneCore runtime (running Pyne code)
+        - PyneComp compiler (Pine Script to Pyne code)
+        - pyne CLI
+        - Plugin (name it below)
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What is wrong
+      description: One or two sentences on the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: |
+        The smallest script that shows the problem. For a compiler problem, paste the Pine Script
+        source and the code PyneComp produced. Add the data it runs on, or how to get it.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: The output, value or error you get. Paste tracebacks in full.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+      description: What should happen instead.
+    validations:
+      required: true
+
+  - type: input
+    id: tradingview
+    attributes:
+      label: TradingView measurement
+      description: |
+        If the expected result comes from TradingView, give the symbol, timeframe and Pine
+        version you measured it on. Leave empty if it does not.
+      placeholder: e.g. CAPITALCOM:EURUSD 60, //@version=6
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      value: |
+        - PyneCore version:
+        - PyneComp version (if the code was compiled):
+        - Plugin and version (if any):
+        - OS:
+        - Python version:
+        - How you ran the script (e.g. `pyne run`, import from your own app):
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
