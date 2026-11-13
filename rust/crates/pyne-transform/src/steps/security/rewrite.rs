@@ -356,6 +356,15 @@ impl Security {
                     let arity = elts.len() as i64;
                     ast.set_extra(call, "_tuple_len", Value::Int(Int::Small(arity)));
                 }
+                // So does a call of one of the module's functions that returns a
+                // tuple (``request.security(s, tf, pack())``, ``pack() => [a, b]``)
+                else if let Some(expression) = expression
+                    && let Kind::Call { func, .. } = ast.kind(expression)
+                    && let Kind::Name { id, .. } = ast.kind(*func)
+                    && let Some(&width) = self.tuple_funcs.get(id)
+                {
+                    ast.set_extra(call, "_tuple_len", Value::Int(Int::Small(width)));
+                }
             }
 
             if let Some(expression) = expression

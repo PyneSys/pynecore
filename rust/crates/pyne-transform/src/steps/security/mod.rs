@@ -40,6 +40,7 @@ use indexmap::IndexMap;
 use pyne_ast::walk::{clone, future_end};
 use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Unsupported, Value};
 
+use self::collection::find_tuple_funcs;
 use self::dependencies::DependencyAnalyzer;
 use self::predicates::has_security_call;
 use crate::sha1::sha1_hex;
@@ -87,6 +88,9 @@ pub(crate) struct Security {
     deferred_by_reach: HashSet<String>,
     /// The deferred sids that must stay in the top block anyway (the re-run)
     keep_top: HashSet<String>,
+    /// Width of the tuple each of the module's functions returns, by name
+    /// (`find_tuple_funcs`); filled before the functions are lowered
+    tuple_funcs: HashMap<String, i64>,
     /// Bindings of the function scope chain being processed, innermost last
     scopes: Vec<SeriesScope>,
     /// The binding counts [`Security::lowered_hoistable`] keeps per function
@@ -111,6 +115,7 @@ impl Security {
             sid_call: HashMap::new(),
             deferred_by_reach: HashSet::new(),
             keep_top,
+            tuple_funcs: HashMap::new(),
             scopes: Vec::new(),
             binding_counts_memo: HashMap::new(),
             error: None,
@@ -152,6 +157,7 @@ impl Security {
         } else {
             None
         };
+        self.tuple_funcs = find_tuple_funcs(ast, node);
         self.visit_nested_defs(ast, node)?;
 
         if self.all_contexts.is_empty() {

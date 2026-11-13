@@ -3280,3 +3280,144 @@ def main():
 """
     assert __test_helper_closed_shift_flags(source) == [False, False, False, True]
     log.info("the tuple-valued lib calls and the ternary container stayed out")
+
+
+def _read_default(tree: ast.Module, func_name: str) -> ast.expr:
+    """The default argument of the one ``__sec_read__`` in ``func_name``."""
+    reads = [n for n in ast.walk(_find_func(tree, func_name))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == '__sec_read__']
+    assert len(reads) == 1
+    return reads[0].args[1]
+
+
+def __test_tuple_default_from_a_function_returning_a_literal__(log):
+    """A read whose expression calls a function returning a tuple literal defaults
+    to a tuple of ``na`` of that width.
+
+    The expression ``pack()`` shows no tuple, and the security call standing in
+    ``get()``'s return hides the unpack target ``a, b = get("W")``; the read used
+    to default to one scalar ``na`` and the unpack raised ``TypeError`` before the
+    first HTF bar closed. The width is taken from ``pack()`` itself.
+    """
+    source = """
+def pack():
+    return (lib.ta.sma(lib.close, 3), lib.ta.highest(lib.high, 2))
+def get(tf):
+    return lib.request.security(lib.syminfo.tickerid, tf, pack())
+def main():
+    a, b = get("W")
+"""
+    default = _read_default(_transform_tree(source), 'get')
+    assert isinstance(default, ast.Tuple) and len(default.elts) == 2
+    assert all(ast.unparse(e) == 'lib.na' for e in default.elts)
+    log.info("tuple default from a returned literal OK")
+
+
+def __test_tuple_default_from_a_block_result_name__(log):
+    """A returned name every assignment gives a tuple of one width counts too (the
+    block-result pattern of compiled code); a nested function's returns do not."""
+    source = """
+def pack():
+    def inner():
+        return lib.close
+    if lib.close > lib.open:
+        __block_result__ = (lib.close, lib.open, inner())
+    else:
+        __block_result__ = (lib.open, lib.close, lib.high)
+    return __block_result__
+def main():
+    v = lib.request.security(lib.syminfo.tickerid, "W", pack())
+"""
+    default = _read_default(_transform_tree(source), 'main')
+    assert isinstance(default, ast.Tuple) and len(default.elts) == 3
+    log.info("tuple default from a block-result name OK")
+
+
+def __test_scalar_function_keeps_the_scalar_default__(log):
+    """A function returning a scalar, or tuples of two widths, gives no tuple default."""
+    source = """
+def one():
+    return lib.ta.sma(lib.close, 3)
+def mixed(flag):
+    if flag:
+        return (lib.close, lib.open)
+    return (lib.close, lib.open, lib.high)
+def main():
+    v = lib.request.security(lib.syminfo.tickerid, "W", one())
+def other():
+    w = lib.request.security(lib.syminfo.tickerid, "W", mixed(True))
+"""
+    tree = _transform_tree(source)
+    assert ast.unparse(_read_default(tree, 'main')) == 'lib.na'
+    assert ast.unparse(_read_default(tree, 'other')) == 'lib.na'
+    log.info("scalar default kept OK")
+
+
+def _contexts_by_sid(tree: ast.Module) -> dict[str, dict[str, ast.expr]]:
+    ctx_dict = _find_contexts(tree).value
+    out = {}
+    for key, value in zip(ctx_dict.keys, ctx_dict.values):
+        out[key.value] = {k.value: v for k, v in zip(value.keys, value.values)}
+    return out
+
+
+def _depends(ctx: dict[str, ast.expr]) -> list[str]:
+    deps = ctx['depends']
+    assert isinstance(deps, ast.List)
+    return [e.value for e in deps.elts]
+
+
+def __test_depends_is_found_through_an_intermediate_name__(log):
+    """A context whose expression reads another context's result through a local
+    bound from it depends on that context: ``d`` reads ``k`` of the same round."""
+    source = """
+def main():
+    k = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(lib.close, 3))
+    x = k * 2
+    d = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(x, 3))
+    lib.plot(d)
+"""
+    contexts = _contexts_by_sid(_transform_tree(source))
+    k_sid, d_sid = contexts
+    assert _depends(contexts[k_sid]) == []
+    assert _depends(contexts[d_sid]) == [k_sid]
+    log.info("depends through an intermediate name OK")
+
+
+def __test_a_helpers_context_is_signalled_before_the_call_that_reads_it__(log):
+    """The context of a helper (``k = htf(close)``) is lifted into ``main``'s top
+    block, so its round starts with the bar, and the context reading its result
+    depends on it; the reader standing in a helper (``d = htf(k)``) depends on
+    the context whose result it is passed."""
+    read_in_function = """
+def htf(src):
+    return lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(src, 3))
+def main():
+    k = htf(lib.close)
+    d = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(k, 3))
+    lib.plot(d)
+"""
+    tree = _transform_tree(read_in_function)
+    contexts = _contexts_by_sid(tree)
+    helper_sid, d_sid = contexts
+    top = _find_func(tree).body[0]
+    assert isinstance(top, ast.If)
+    signalled = [stmt.value.args[0].value for stmt in top.body]
+    assert set(signalled) == {helper_sid, d_sid}
+    assert _depends(contexts[d_sid]) == [helper_sid]
+    # The helper itself only writes and reads: its signal stands in main
+    assert '__sec_signal__' not in ast.unparse(_find_func(tree, 'htf'))
+
+    reader_in_function = """
+def htf(src):
+    return lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(src, 3))
+def main():
+    k = lib.request.security(lib.syminfo.tickerid, "W", lib.ta.sma(lib.close, 3))
+    d = htf(k)
+    lib.plot(d)
+"""
+    contexts = _contexts_by_sid(_transform_tree(reader_in_function))
+    helper_sid, k_sid = contexts
+    assert _depends(contexts[helper_sid]) == [k_sid]
+    log.info("a helper's context is signalled in the caller and depended on OK")

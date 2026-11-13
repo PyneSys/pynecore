@@ -304,6 +304,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         # Sids whose __sec_signal__ is emitted in the function's top block
         # (module-level or hoistable arguments). Only these may be depended on.
         self._top_sec_ids: set[str] = set()
+        #: Width of the tuple each of the module's functions returns, by name
+        #: (see :meth:`_find_tuple_funcs`); filled before the functions are lowered
+        self._tuple_funcs: dict[str, int] = {}
         #: The call each sid stands for: the blocks emitted for a sid run at its line
         self._sid_call: dict[str, ast.Call] = {}
         # Runtime-resolved sids kept out of the top block because their call is
@@ -373,6 +376,79 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             kwargs.get('ignore_invalid_symbol', args[5] if len(args) > 5 else None),
             kwargs.get('currency', args[6] if len(args) > 6 else None),
         )
+
+    def _find_tuple_funcs(self, module: ast.Module) -> dict[str, int]:
+        """Width of the tuple each of the module's functions returns, by name.
+
+        A read whose expression is a tuple literal, or that is itself unpacked
+        into names, defaults to a tuple of ``na`` of that width (see
+        :meth:`_detect_tuple_arity`). An expression that CALLS a function
+        returning a tuple (``request.security(s, tf, pack())`` with
+        ``pack() => [a, b]``) shows neither, and the security call standing in
+        another function's ``return`` hides the unpack target too -- the read
+        then answered one scalar ``na`` and ``[a, b] = get(tf)`` raised before
+        the first HTF bar closed. The width is taken from the function instead:
+        every ``return`` gives a tuple literal of one width, or a name every
+        assignment of the function gives such a literal (the block-result
+        pattern of the compiled code). A name defined twice with different
+        widths is left out.
+
+        :param module: the module, before its functions are lowered
+        :return: function name -> tuple width (2 or more)
+        """
+        widths: dict[str, int] = {}
+        clashing: set[str] = set()
+        for fn in ast_walk.walk(module):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            width = self._returned_tuple_width(fn)
+            if width is None:
+                continue
+            if widths.get(fn.name, width) != width:
+                clashing.add(fn.name)
+            widths[fn.name] = width
+        for name in clashing:
+            widths.pop(name)
+        return widths
+
+    @classmethod
+    def _returned_tuple_width(cls, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int | None:
+        """The width of the tuple ``fn`` returns, None when it does not return one.
+
+        :param fn: the function
+        :return: the width when every ``return`` is a tuple literal of that width,
+            or a name whose every assignment in the function is one
+        """
+        # The function's OWN statements: a nested function's returns are its own
+        nodes = [n for stmt in fn.body
+                 if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 for n in cls._walk_skip_funcs(stmt)]
+        returned = [n.value for n in nodes if isinstance(n, ast.Return) and n.value is not None]
+        if not returned:
+            return None
+        widths: set[int] = set()
+        for value in returned:
+            if isinstance(value, ast.Name):
+                assigned = [n.value for n in nodes
+                            if isinstance(n, ast.Assign) and len(n.targets) == 1
+                            and isinstance(n.targets[0], ast.Name)
+                            and n.targets[0].id == value.id]
+                assigned += [n.value for n in nodes
+                             if isinstance(n, ast.AnnAssign) and n.value is not None
+                             and isinstance(n.target, ast.Name) and n.target.id == value.id]
+                if not assigned:
+                    return None
+            else:
+                assigned = [value]
+            for item in assigned:
+                if not isinstance(item, (ast.Tuple, ast.List)) or any(
+                        isinstance(e, ast.Starred) for e in item.elts):
+                    return None
+                widths.add(len(item.elts))
+        if len(widths) != 1:
+            return None
+        width = widths.pop()
+        return width if width >= 2 else None
 
     @staticmethod
     def _walk_skip_funcs(node: ast.AST):
@@ -1342,6 +1418,11 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                 # scalar ``na`` and crash the unpack at the call site.
                 if isinstance(expression, (ast.Tuple, ast.List)):
                     call._tuple_len = len(expression.elts)  # type: ignore[attr-defined]
+                # So does a call of one of the module's functions that returns a
+                # tuple (``request.security(s, tf, pack())``, ``pack() => [a, b]``)
+                elif (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)
+                        and expression.func.id in self._tuple_funcs):
+                    call._tuple_len = self._tuple_funcs[expression.func.id]  # type: ignore[attr-defined]
 
             if expression is not None:
                 bad = self._find_forbidden_strategy_state(expression)
@@ -2442,9 +2523,10 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             new_call = self._func_call(
                 '__sec_signal__', ast.Constant(value=sid), *new_args
             )
-            new_stmt = ast.Expr(value=new_call)
-            ast.copy_location(new_stmt, call)
-            fix_locations(new_stmt)
+            # The arguments were cloned from the helper's signal and name its
+            # lines: every node of the lifted statement runs for the CALL in the
+            # caller, so the whole statement is located there
+            new_stmt = anchor_all_at(ast.Expr(value=new_call), call)
             caller_block.body.append(new_stmt)
         if not sig_block.body:
             helper.body.remove(sig_block)
@@ -2589,6 +2671,7 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         # lowering is going to defer one.
         original = (ast_walk.clone(node) if not self._keep_top and self._may_defer(node)
                     else None)
+        self._tuple_funcs = self._find_tuple_funcs(node)
         self._visit_nested_defs(node)
 
         if self._all_contexts:

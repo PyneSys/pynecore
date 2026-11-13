@@ -5,7 +5,7 @@ import pytest
 
 from pynecore.core.ohlcv import OHLCVWriter
 from pynecore.core.script_runner import ScriptRunner
-from pynecore.types.na import NA, na_bool, set_bool_na
+from pynecore.types.na import NA, isna_num, na_bool, set_bool_na
 from pynecore.types.ohlcv import OHLCV
 
 
@@ -75,7 +75,10 @@ def __test_missing_bool_security_results_keep_the_script_mode__(tmp_path, syminf
             else:
                 assert row['value'] is missing, (i, row)
                 assert row['tuple_bool'] is missing, (i, row)
-                assert isinstance(row['tuple_price'], NA)
+                # The float element of a tuple read is the typed float na, as in a
+                # tuple-literal read: the security transform knows the width of the
+                # tuple ``pair()`` returns and emits the tuple default itself
+                assert isna_num(row['tuple_price']), (i, row)
                 assert row['eq'] is (na_bool if three_state else True), (i, row)
                 assert row['ne'] is (na_bool if three_state else True), (i, row)
                 assert row['nz'] is False, (i, row)

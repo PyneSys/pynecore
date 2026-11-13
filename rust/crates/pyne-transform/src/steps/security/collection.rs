@@ -221,6 +221,94 @@ pub(crate) fn walk_skip_funcs_body(ast: &Ast, function: NodeId) -> Vec<NodeId> {
     out
 }
 
+/// Width of the tuple each of the module's functions returns, by name
+/// (`_find_tuple_funcs`): every `return` gives a tuple (or list) literal of one
+/// width, or a name every assignment of the function gives such a literal (the
+/// block-result pattern of compiled code). A name defined twice with different
+/// widths is left out. A read whose expression CALLS such a function
+/// (`request.security(s, tf, pack())`) defaults to a tuple of `na` of that width.
+pub(crate) fn find_tuple_funcs(ast: &Ast, module: NodeId) -> HashMap<String, i64> {
+    let mut widths: HashMap<String, i64> = HashMap::new();
+    let mut clashing: HashSet<String> = HashSet::new();
+    for node in walk(ast, module) {
+        if !is_function(ast.kind(node)) {
+            continue;
+        }
+        let Some(width) = returned_tuple_width(ast, node) else { continue };
+        let name = function_name(ast, node);
+        if widths.get(name).is_some_and(|&known| known != width) {
+            clashing.insert(name.to_string());
+        }
+        widths.insert(name.to_string(), width);
+    }
+    for name in clashing {
+        widths.remove(&name);
+    }
+    widths
+}
+
+/// The width of the tuple `function` returns, None when it does not return one
+/// (`_returned_tuple_width`): every `return` of its OWN body is a tuple literal of
+/// that width, or a name whose every assignment in the body is one.
+fn returned_tuple_width(ast: &Ast, function: NodeId) -> Option<i64> {
+    let nodes = walk_skip_funcs_body(ast, function);
+    let returned: Vec<NodeId> = nodes
+        .iter()
+        .filter_map(|&node| match ast.kind(node) {
+            Kind::Return { value: Some(value) } => Some(*value),
+            _ => None,
+        })
+        .collect();
+    if returned.is_empty() {
+        return None;
+    }
+    let mut widths: HashSet<i64> = HashSet::new();
+    for value in returned {
+        let assigned: Vec<NodeId> = match ast.kind(value) {
+            Kind::Name { id, .. } => {
+                let mut assigned = Vec::new();
+                for &node in &nodes {
+                    match ast.kind(node) {
+                        Kind::Assign { targets, value, .. } if targets.len() == 1 => {
+                            if matches!(ast.kind(targets[0]), Kind::Name { id: target, .. } if target == id)
+                            {
+                                assigned.push(*value);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for &node in &nodes {
+                    if let Kind::AnnAssign { target, value: Some(value), .. } = ast.kind(node)
+                        && matches!(ast.kind(*target), Kind::Name { id: target, .. } if target == id)
+                    {
+                        assigned.push(*value);
+                    }
+                }
+                if assigned.is_empty() {
+                    return None;
+                }
+                assigned
+            }
+            _ => vec![value],
+        };
+        for item in assigned {
+            let (Kind::Tuple { elts, .. } | Kind::List { elts, .. }) = ast.kind(item) else {
+                return None;
+            };
+            if elts.iter().any(|&e| matches!(ast.kind(e), Kind::Starred { .. })) {
+                return None;
+            }
+            widths.insert(elts.len() as i64);
+        }
+    }
+    if widths.len() != 1 {
+        return None;
+    }
+    let width = widths.into_iter().next()?;
+    (width >= 2).then_some(width)
+}
+
 /// The first `lib.strategy.<state attr>` of an expression, breadth first
 /// (`_find_forbidden_strategy_state`).
 pub(crate) fn find_forbidden_strategy_state(ast: &Ast, expr: NodeId) -> Option<NodeId> {
