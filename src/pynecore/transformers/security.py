@@ -271,9 +271,9 @@ class SecurityTransformer(ast_walk.NodeTransformer):
     contexts that are guaranteed to resolve to the very same feed, or None when
     the context stands alone. Two contexts share a group when their signal
     arguments are SYNTACTICALLY identical — the key is
-    ``(symbol, timeframe, lookahead, is_ltf, ignore_invalid_symbol)``, each
-    expression compared by ``ast.dump`` of the substituted signal argument (the
-    module-level expression for a lookahead that has one, the runtime one
+    ``(symbol, timeframe, lookahead, runtime gaps, is_ltf, ignore_invalid_symbol)``,
+    each expression compared by ``ast.dump`` of the substituted signal argument
+    (the module-level expression for a lookahead that has one, the runtime one
     otherwise). Only contexts signalled in the top block qualify: those run at
     function entry with the same bindings, so an identical expression there
     yields an identical value on every bar, input-derived timeframes included.
@@ -996,45 +996,17 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             ]
         )
 
-    def _signal_call_args(self, sec_id: str) -> list[ast.expr]:
-        """The arguments of one ``__sec_signal__`` for ``sec_id``.
-
-        The sid, the symbol and timeframe (None when absent), then the runtime
-        lookahead and the runtime gaps mode when the context has one. A
-        lookahead or gaps mode that is not module-level evaluable (an
-        input-derived Pine "simple" value) is passed here — in the top block
-        when its chain is hoistable, the binding it reads being moved above
-        that block, inline otherwise. The gaps mode stands after the lookahead,
-        so a context with a runtime gaps mode alone passes None in the
-        lookahead's place.
-
-        :param sec_id: the context id
-        :return: the argument expressions, each a fresh clone
-        """
-        sym_expr, tf_expr, la_expr, gaps_expr = self._signal_args[sec_id]
-        args: list[ast.expr] = [ast.Constant(value=sec_id)]
-        for expr in (sym_expr, tf_expr):
-            args.append(ast_walk.clone(expr) if expr is not None
-                        else ast.Constant(value=None))
-        if la_expr is not None or gaps_expr is not None:
-            args.append(ast_walk.clone(la_expr) if la_expr is not None
-                        else ast.Constant(value=None))
-        if gaps_expr is not None:
-            args.append(ast_walk.clone(gaps_expr))
-        return args
-
     def _signal_block(self, sec_ids: list[str]) -> ast.If:
         """Build chart-context signal block for function start.
 
         Passes actual symbol and timeframe expressions to __sec_signal__
         so that runtime values (e.g., function parameters) are available.
 
-        Only includes sec_ids whose signal arguments are module-level
-        expressions (constants or lib.* refs) or hoistable chains over such.
-        Runtime-dependent signals are emitted inline before their write
-        blocks by _transform_body.
+        Only includes sec_ids whose symbol/timeframe are module-level
+        expressions (constants or lib.* refs). Runtime-dependent signals
+        are emitted inline before their write blocks by _transform_body.
         """
-        body = [
+        body: list[ast.stmt] = [
             ast.Expr(value=self._func_call('__sec_signal__', *self._signal_call_args(s)))
             for s in sec_ids
         ]
@@ -1047,12 +1019,38 @@ class SecurityTransformer(ast_walk.NodeTransformer):
     def _inline_signal(self, sec_id: str) -> ast.If:
         """Build a single inline signal for runtime-dependent
         symbol/timeframe/lookahead/gaps."""
-        args = self._signal_call_args(sec_id)
         return ast.If(
             test=self._is_none_check(),
-            body=[ast.Expr(value=self._func_call('__sec_signal__', *args))],
+            body=[ast.Expr(value=self._func_call('__sec_signal__',
+                                                 *self._signal_call_args(sec_id)))],
             orelse=[]
         )
+
+    def _signal_call_args(self, sec_id: str) -> list[ast.expr]:
+        """The positional arguments of one context's ``__sec_signal__``.
+
+        ``(sid, symbol, timeframe[, lookahead[, gaps]])``: symbol and timeframe
+        are None when absent. A lookahead or gaps mode that is not module-level
+        evaluable (an input-derived Pine "simple" value) follows them; it is
+        still passed from the top block when its chain is hoistable, the binding
+        it reads being moved above that block. A runtime gaps mode without a
+        runtime lookahead passes None in the lookahead's place. The arguments
+        are positional because the group key and the signal lift read them
+        positionally.
+
+        :param sec_id: The context's id.
+        :return: Fresh clones of the argument expressions.
+        """
+        sym_expr, tf_expr, la_expr, gaps_expr = self._signal_args[sec_id]
+        args: list[ast.expr] = [ast.Constant(value=sec_id)]
+        tail = [sym_expr, tf_expr]
+        if la_expr is not None or gaps_expr is not None:
+            tail.append(la_expr)
+        if gaps_expr is not None:
+            tail.append(gaps_expr)
+        for expr in tail:
+            args.append(ast_walk.clone(expr) if expr is not None else ast.Constant(value=None))
+        return args
 
     def _at_call(self, stmt: _Stmt, sec_id: str) -> _Stmt:
         """Locate a statement emitted for ``sec_id`` at its call's point.
@@ -1446,12 +1444,10 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             lookahead_rt: ast.expr | None = None
             if lookahead is not None and not self._is_module_level_expr(lookahead):
                 lookahead_rt = ast_walk.clone(lookahead)
-            # So is a gaps mode held in a local (``gapout = gap ? barmerge.gaps_on
-            # : barmerge.gaps_off``, ``gaps=gapout``): Pine takes a "simple"
-            # gaps, and the local does not exist where the module-level context
-            # dict is built. Lower-timeframe requests take no gaps.
+            # The same holds for ``gaps``, also a Pine "simple" — e.g.
+            # ``gap ? barmerge.gaps_on : barmerge.gaps_off`` held in a local.
             gaps_rt: ast.expr | None = None
-            if not is_ltf and gaps is not None and not self._is_module_level_expr(gaps):
+            if gaps is not None and not self._is_module_level_expr(gaps):
                 gaps_rt = ast_walk.clone(gaps)
 
             # Store actual expressions for __sec_signal__ args (always passed at runtime)
@@ -1479,16 +1475,14 @@ class SecurityTransformer(ast_walk.NodeTransformer):
             if is_ltf:
                 ctx['is_ltf'] = ast.Constant(value=True)
             else:
-                # A runtime gaps (``gaps_rt``) would NameError at module load:
-                # the placeholder None reads as gaps_off until ``__sec_signal__``
-                # passes the actual mode on the first bar.
+                # A runtime gaps mode would NameError at module load: None is
+                # its placeholder, resolved by the first ``__sec_signal__``.
                 if gaps_rt is not None:
-                    gaps_expr: ast.expr = ast.Constant(value=None)
+                    ctx['gaps'] = ast.Constant(value=None)
                 elif gaps is not None:
-                    gaps_expr = ast_walk.clone(gaps)
+                    ctx['gaps'] = ast_walk.clone(gaps)
                 else:
-                    gaps_expr = self._default_gaps()
-                ctx['gaps'] = gaps_expr
+                    ctx['gaps'] = self._default_gaps()
                 if lookahead is not None:
                     # A module-level lookahead (``barmerge.lookahead_*``) is
                     # consumed at module load to wire the HTF transport. An
@@ -1956,7 +1950,10 @@ class SecurityTransformer(ast_walk.NodeTransformer):
         to — symbol, timeframe, lookahead and ``ignore_invalid_symbol`` — plus
         ``closed_shift``, which decides the round protocol the shared child runs.
         ``gaps`` and ``currency`` are left out on purpose: they only shape how
-        the chart side reads the result, not what the child loads. A
+        the chart side reads the result, not what the child loads. A runtime
+        ``gaps`` is the exception, because it is a signal argument: a stable
+        group's member that has not signalled yet is resolved with the seed's
+        arguments, gaps mode included, so those must be the member's own. A
         lower-timeframe context never gets one (its write path is its own).
 
         There are two kinds of key, and they never match each other:

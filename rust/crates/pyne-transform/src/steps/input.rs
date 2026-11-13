@@ -221,6 +221,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         module: Some("builtins".into()),
         names: vec![alias],
         level: Some(0),
+        is_lazy: None,
     });
     let Kind::Module { body, .. } = ast.kind(module) else { unreachable!() };
     let position = future_end(ast, body);

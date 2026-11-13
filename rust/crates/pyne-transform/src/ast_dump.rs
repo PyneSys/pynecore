@@ -3,10 +3,11 @@
 //! content stamp of a module without a source path (`function_isolation`).
 //!
 //! The text follows the interpreter the host names: before 3.12 a definition has no
-//! `type_params`, before 3.13 an empty list is written out, and a value is written as
-//! that interpreter's `repr` writes it.
+//! `type_params`, before 3.13 an empty list is written out, before 3.15 an import has
+//! no `is_lazy` and a `ctx=Load()` is written out, and a value is written as that
+//! interpreter's `repr` writes it.
 
-use pyne_ast::{Ast, CLASSES, Constant, FieldRef, NodeId, Unsupported};
+use pyne_ast::{Ast, CLASSES, Constant, ExprContext, FieldRef, NodeId, Unsupported};
 
 use crate::unparse::py_repr;
 
@@ -14,7 +15,11 @@ type R<T> = Result<T, Unsupported>;
 
 /// Whether a class has a field on this interpreter.
 pub fn has_field(field: &str, python: (u32, u32)) -> bool {
-    field != "type_params" || python >= (3, 12)
+    match field {
+        "type_params" => python >= (3, 12),
+        "is_lazy" => python >= (3, 15),
+        _ => true,
+    }
 }
 
 /// `ast.dump(node, include_attributes=...)` as the interpreter `python` names writes it.
@@ -36,6 +41,7 @@ impl Dumper<'_> {
         let kind = ast.kind(node);
         let class = &CLASSES[kind.class_index()];
         let omit_empty = python >= (3, 13);
+        let omit_load = python >= (3, 15);
         out.push_str(class.name);
         out.push('(');
         let mut first = true;
@@ -121,7 +127,7 @@ impl Dumper<'_> {
                 FieldRef::ExprContext(value) => {
                     text.push_str(value.name());
                     text.push_str("()");
-                    true
+                    !(omit_load && *value == ExprContext::Load)
                 }
                 FieldRef::Operator(value) => {
                     text.push_str(value.name());

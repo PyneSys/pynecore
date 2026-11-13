@@ -396,12 +396,10 @@ impl Security {
                 }
                 _ => None,
             };
-            // So is a gaps mode held in a local (``gapout = gap ? barmerge.gaps_on :
-            // barmerge.gaps_off``, ``gaps=gapout``): Pine takes a "simple" gaps, and
-            // the local does not exist where the module-level context dict is built.
-            // Lower-timeframe requests take no gaps.
+            // The same holds for ``gaps``, also a Pine "simple" -- e.g.
+            // ``gap ? barmerge.gaps_on : barmerge.gaps_off`` held in a local.
             let gaps_rt = match gaps {
-                Some(gaps) if !is_ltf && !is_module_level_expr(ast, gaps) => {
+                Some(gaps) if !is_module_level_expr(ast, gaps) => {
                     Some(clone(ast, gaps, &mut HashMap::new()))
                 }
                 _ => None,
@@ -426,9 +424,8 @@ impl Security {
             if is_ltf {
                 entries.insert("is_ltf".into(), constant(ast, Constant::Bool(true)));
             } else {
-                // A runtime gaps (``gaps_rt``) would NameError at module load: the
-                // placeholder None reads as gaps_off until ``__sec_signal__`` passes
-                // the actual mode on the first bar
+                // A runtime gaps mode would NameError at module load: None is its
+                // placeholder, resolved by the first ``__sec_signal__``
                 let gaps_expr = match (gaps_rt, gaps) {
                     (Some(_), _) => constant(ast, Constant::None),
                     (None, Some(gaps)) => clone(ast, gaps, &mut HashMap::new()),

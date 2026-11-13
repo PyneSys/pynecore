@@ -174,7 +174,7 @@ fn scope_bindings(ast: &Ast, nodes: &[NodeId]) -> (Names, Names, Names) {
                     bound.insert(name.clone());
                 }
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 for &item in names {
                     let (name, asname) = alias(ast, item);
                     if !binds_typing_module(name, asname) {
@@ -394,7 +394,7 @@ impl Stripper {
         match ast.kind(id).clone() {
             Kind::DictComp { key, value, .. } => {
                 let key = self.visit_expr(ast, key);
-                let value = self.visit_expr(ast, value);
+                let value = value.map(|value| self.visit_expr(ast, value));
                 if let Kind::DictComp { key: k, value: v, .. } = ast.kind_mut(id) {
                     *k = key;
                     *v = value;

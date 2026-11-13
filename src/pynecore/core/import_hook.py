@@ -1306,11 +1306,14 @@ class PyneLoader(importlib.machinery.SourceFileLoader):
     # noinspection PyMethodOverriding
     def source_to_code(self, data: bytes | str, path: str, fullname: str | None = None, *,
                        _optimize: int = -1):
-        """Transform source to code if needed.
+        """
+        Transform source to code if needed.
 
-        ``fullname`` is the module name ``SourceLoader.get_code`` passes as a third
-        positional argument from Python 3.15 on; earlier versions pass two. It is
-        not needed here, the path identifies the module.
+        :param data: The module source.
+        :param path: The source file path.
+        :param fullname: The module name; Python 3.15+ passes it from
+                         :meth:`~importlib.abc.SourceLoader.get_code`, the transform does not use it.
+        :param _optimize: The optimization level for :func:`compile`.
         """
         path: Path = Path(path)
 

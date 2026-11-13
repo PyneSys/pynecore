@@ -95,7 +95,7 @@ impl NaBindings {
     /// Update the bindings past a top-level statement.
     fn track(&mut self, ast: &Ast, stmt: NodeId) {
         match ast.kind(stmt) {
-            Kind::ImportFrom { module, names, level } => {
+            Kind::ImportFrom { module, names, level, .. } => {
                 let module = module.as_deref().unwrap_or("");
                 let pynecore = module == "pynecore" || module.starts_with("pynecore.");
                 for &alias in names {
@@ -107,7 +107,7 @@ impl NaBindings {
                     }
                 }
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 for &alias in names {
                     let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
                     let root = name.split('.').next().unwrap_or(name);
@@ -157,6 +157,7 @@ fn import_from(ast: &mut Ast, module: &str, name: &str, asname: Option<&str>) ->
         module: Some(module.to_string()),
         names: vec![alias],
         level: Some(0),
+        is_lazy: None,
     })
 }
 

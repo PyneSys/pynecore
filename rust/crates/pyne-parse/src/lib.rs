@@ -39,6 +39,7 @@ pub fn parse_module_as(source: &str, python: (u32, u32)) -> Result<(Ast, NodeId)
     let module = parsed.into_syntax();
     let mut lower = Lowerer::new(&mut ast, source);
     lower.legacy_fstrings = python < (3, 12);
+    lower.import_laziness = (python >= (3, 15)).then_some(0);
     let body = lower.suite(&module.body)?;
     let module = lower.ast.add(Kind::Module { body, type_ignores: Vec::new() });
     Ok((ast, module))
@@ -109,6 +110,8 @@ struct Lowerer<'a> {
     line_starts: Vec<usize>,
     /// Whether f-strings take their CPython 3.11 shape
     legacy_fstrings: bool,
+    /// The `is_lazy` of an eager import: `0` from CPython 3.15 (PEP 810), absent before
+    import_laziness: Option<i64>,
     /// The f-string token being lowered, which a 3.11 format spec stands at
     fstring_token: Option<TextRange>,
     /// How many format specs the field being lowered stands in
@@ -138,6 +141,7 @@ impl<'a> Lowerer<'a> {
             source,
             line_starts,
             legacy_fstrings: false,
+            import_laziness: None,
             fstring_token: None,
             spec_depth: 0,
         }
@@ -356,7 +360,7 @@ impl<'a> Lowerer<'a> {
                 if node.is_lazy {
                     return Err(Unsupported("lazy import".into()));
                 }
-                Kind::Import { names: self.aliases(&node.names) }
+                Kind::Import { names: self.aliases(&node.names), is_lazy: self.import_laziness }
             }
             ra::Stmt::ImportFrom(node) => {
                 if node.is_lazy {
@@ -366,6 +370,7 @@ impl<'a> Lowerer<'a> {
                     module: node.module.as_ref().map(|module| module.id.to_string()),
                     names: self.aliases(&node.names),
                     level: Some(i64::from(node.level)),
+                    is_lazy: self.import_laziness,
                 }
             }
             ra::Stmt::Global(node) => {
@@ -819,7 +824,7 @@ impl<'a> Lowerer<'a> {
                     Some(key) => self.expr(key)?,
                     None => return Err(Unsupported("dict comprehension without a key".into())),
                 },
-                value: self.expr(&node.value)?,
+                value: Some(self.expr(&node.value)?),
                 generators: self.comprehensions(&node.generators)?,
             },
             ra::Expr::Generator(node) => return self.generator(node),

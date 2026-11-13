@@ -336,6 +336,7 @@ impl FloatTolerance {
             module: Some("pynecore.types.na".into()),
             names: vec![alias],
             level: Some(0),
+            is_lazy: None,
         });
         let Kind::Module { body, .. } = ast.kind_mut(node) else { unreachable!() };
         body.insert(position, import);

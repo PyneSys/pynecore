@@ -266,6 +266,7 @@ impl Requirements {
             module: Some("pynecore.core.broker.models".into()),
             names: vec![alias],
             level: Some(0),
+            is_lazy: None,
         });
         let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
         body.insert(at, import);

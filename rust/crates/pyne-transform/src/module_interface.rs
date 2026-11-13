@@ -752,7 +752,7 @@ impl Bindings {
 
     fn import(&mut self, ast: &Ast, stmt: NodeId, index: usize, conditional: bool) {
         match ast.kind(stmt) {
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 for &alias in names {
                     let Kind::Alias { name, asname } = ast.kind(alias) else { continue };
                     // ``import a.b`` binds ``a``; ``import a.b as x`` binds ``a.b`` itself
@@ -766,7 +766,7 @@ impl Bindings {
                     self.bind(&bound, Binding { index, node: Some(stmt), conditional, target });
                 }
             }
-            Kind::ImportFrom { module, names, level } => {
+            Kind::ImportFrom { module, names, level, .. } => {
                 let module = module.clone().unwrap_or_default();
                 let level = level.unwrap_or(0);
                 for &alias in names {

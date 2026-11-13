@@ -823,7 +823,7 @@ impl NameIndex {
             Kind::ExceptHandler { name: Some(name), .. } => {
                 self.bound.insert(name.clone());
             }
-            Kind::Import { names } => {
+            Kind::Import { names, .. } => {
                 let trusted = toplevel.contains(&id);
                 for &alias in names {
                     let Kind::Alias { name, asname } = ast.kind(alias) else { continue };
@@ -838,7 +838,7 @@ impl NameIndex {
                 }
                 return;
             }
-            Kind::ImportFrom { module, names, level } => {
+            Kind::ImportFrom { module, names, level, .. } => {
                 let module = module.as_deref().filter(|module| !module.is_empty());
                 let trusted = toplevel.contains(&id) && level.unwrap_or(0) == 0;
                 for &alias in names {
@@ -876,7 +876,7 @@ fn rebinds(ast: &Ast, root: NodeId, target: &str) -> bool {
         Kind::ExceptHandler { name, .. }
         | Kind::MatchAs { name, .. }
         | Kind::MatchStar { name } => name.as_deref() == Some(target),
-        Kind::Import { names } | Kind::ImportFrom { names, .. } => names.iter().any(|&alias| {
+        Kind::Import { names, .. } | Kind::ImportFrom { names, .. } => names.iter().any(|&alias| {
             matches!(ast.kind(alias), Kind::Alias { name, asname }
                 if asname.as_deref().unwrap_or(name.split('.').next().unwrap_or_default()) == target)
         }),
@@ -1117,6 +1117,7 @@ impl<'t> CallInline<'t> {
             module: Some(SUPPORT_MODULE.to_string()),
             names,
             level: Some(0),
+            is_lazy: None,
         });
         let Kind::Module { body, .. } = ast.kind(module) else { unreachable!() };
         let mut position = 0;

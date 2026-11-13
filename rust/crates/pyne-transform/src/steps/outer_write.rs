@@ -187,7 +187,7 @@ fn scan_function(ast: &Ast, func: NodeId) -> Scan {
                     }
                     continue;
                 }
-                Kind::Import { names: aliases } | Kind::ImportFrom { names: aliases, .. } => {
+                Kind::Import { names: aliases, .. } | Kind::ImportFrom { names: aliases, .. } => {
                     for &alias in aliases {
                         let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
                         let bound = match asname {

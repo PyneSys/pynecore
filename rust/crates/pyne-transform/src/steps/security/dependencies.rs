@@ -557,7 +557,7 @@ impl<'a> DependencyAnalyzer<'a> {
                         continue;
                     }
                     Kind::Constant { .. } => continue,
-                    Kind::Import { names } | Kind::ImportFrom { names, .. } => {
+                    Kind::Import { names, .. } | Kind::ImportFrom { names, .. } => {
                         for &alias in names {
                             let Kind::Alias { name, asname } = ast.kind(alias) else {
                                 unreachable!()
@@ -937,7 +937,7 @@ impl<'a> DependencyAnalyzer<'a> {
                     add(&mut counts, id, 1);
                     continue;
                 }
-                Kind::Import { names } | Kind::ImportFrom { names, .. } => {
+                Kind::Import { names, .. } | Kind::ImportFrom { names, .. } => {
                     for &alias in names {
                         let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
                         let spelled = asname.as_deref().unwrap_or(name);
@@ -1986,7 +1986,7 @@ impl LoopNameWalk {
                 }
                 return;
             }
-            Kind::Import { names } | Kind::ImportFrom { names, .. } => {
+            Kind::Import { names, .. } | Kind::ImportFrom { names, .. } => {
                 for &alias in names {
                     let Kind::Alias { name, asname } = ast.kind(alias) else { unreachable!() };
                     let spelled = asname.as_deref().unwrap_or(name);

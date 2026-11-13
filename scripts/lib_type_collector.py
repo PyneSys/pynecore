@@ -256,6 +256,12 @@ def collect_routes() -> dict[str, str]:
     (``lib.log`` defines its rich handler only where rich is in use) -- a
     registry recording them would differ between two machines.
 
+    A callable defined outside pynecore is left out for the same reason: a lib
+    module's own import (``lib.string.localcontext`` from ``decimal``) is no lib
+    API, and its route follows the interpreter's build -- ``decimal`` is the C
+    ``_decimal`` (a builtin) where the interpreter was built with libmpdec and the
+    pure-Python ``_pydecimal`` where it was not.
+
     Every lib module must be imported first (``LibTypeCollector._import_lib``):
     a submodule is reachable as an attribute of its package only once loaded.
 
@@ -286,13 +292,25 @@ def _record_routes(path: str, owner: object, routes: dict[str, str]) -> None:
             if value.__name__ == f'pynecore.{key}':
                 _record_routes(key, value, routes)
             continue
-        if isinstance(value, type):
+        if isinstance(value, type) or not _defined_in_pynecore(value):
             continue
         route = classify_callee(value)
         if route != _UNIFORM:
             routes[key] = route
         if _is_namespace(value):
             _record_routes(key, value, routes)
+
+
+def _defined_in_pynecore(value: object) -> bool:
+    """
+    Whether a lib member is pynecore's own: a function, or an instance of a class,
+    defined in a pynecore module.
+
+    :param value: A member of a lib module
+    :return: False for what a lib module imported from elsewhere
+    """
+    module = getattr(value, '__module__', None)
+    return isinstance(module, str) and (module == 'pynecore' or module.startswith('pynecore.'))
 
 
 def _is_namespace(value: object) -> bool:

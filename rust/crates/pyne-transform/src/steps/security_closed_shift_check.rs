@@ -108,7 +108,7 @@ fn binds_name(ast: &Ast, module: NodeId, name: &str) -> bool {
             }
             continue;
         }
-        if let Kind::Import { names } | Kind::ImportFrom { names, .. } = kind {
+        if let Kind::Import { names, .. } | Kind::ImportFrom { names, .. } = kind {
             for &alias in names {
                 let Kind::Alias { name: alias_name, asname } = ast.kind(alias) else {
                     unreachable!()

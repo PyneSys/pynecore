@@ -99,30 +99,28 @@ fn in_same_context(ast: &mut Ast, sec_id: &str) -> NodeId {
     ast.add(Kind::Compare { left: sid, ops: vec![CmpOperator::In], comparators: vec![same] })
 }
 
-/// The arguments of one `__sec_signal__` (`_signal_call_args`): the sid, the symbol
-/// and timeframe (None when absent), then the runtime lookahead and the runtime gaps
-/// mode when there is one. The gaps mode stands after the lookahead, so a context
-/// with a runtime gaps mode alone passes None in the lookahead's place.
+/// The positional arguments of one `__sec_signal__` (`_signal_call_args`):
+/// `(sid, symbol, timeframe[, lookahead[, gaps]])`, symbol and timeframe None when
+/// absent. A lookahead or gaps mode that is not module-level evaluable (an
+/// input-derived Pine "simple" value) follows them, still passed from the top block
+/// when its chain is hoistable -- the binding it reads is moved above that block. A
+/// runtime gaps mode without a runtime lookahead passes None in the lookahead's
+/// place.
 fn signal_args(ast: &mut Ast, sec_id: &str, args: [Option<NodeId>; 4]) -> Vec<NodeId> {
     let [symbol, timeframe, lookahead, gaps] = args;
+    let mut tail = vec![symbol, timeframe];
+    if lookahead.is_some() || gaps.is_some() {
+        tail.push(lookahead);
+    }
+    if gaps.is_some() {
+        tail.push(gaps);
+    }
     let mut out = vec![str_constant(ast, sec_id)];
-    for expr in [symbol, timeframe] {
+    for expr in tail {
         out.push(match expr {
             Some(expr) => clone(ast, expr, &mut Default::default()),
             None => constant(ast, Constant::None),
         });
-    }
-    // A lookahead or gaps mode that is not module-level evaluable (an input-derived
-    // Pine "simple" value) is still passed here when its chain is hoistable -- the
-    // binding it reads is moved above this block.
-    if lookahead.is_some() || gaps.is_some() {
-        out.push(match lookahead {
-            Some(lookahead) => clone(ast, lookahead, &mut Default::default()),
-            None => constant(ast, Constant::None),
-        });
-    }
-    if let Some(gaps) = gaps {
-        out.push(clone(ast, gaps, &mut Default::default()));
     }
     out
 }

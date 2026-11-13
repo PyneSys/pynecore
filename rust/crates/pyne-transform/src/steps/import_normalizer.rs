@@ -22,7 +22,7 @@ fn is_lib_import(ast: &Ast, id: NodeId) -> bool {
 
 fn is_lib_module_import(ast: &Ast, id: NodeId) -> bool {
     match ast.kind(id) {
-        Kind::Import { names } => {
+        Kind::Import { names, .. } => {
             names.iter().any(|&alias| is_lib_module(alias_name(ast, alias).0))
         }
         _ => false,
@@ -91,7 +91,7 @@ fn rebinds(ast: &Ast, stmt: NodeId, name: &str, stored: &HashSet<String>) -> boo
             let (alias_name, asname) = alias_name(ast, alias);
             asname.unwrap_or(alias_name) == name
         }),
-        Kind::Import { names } => names.iter().any(|&alias| {
+        Kind::Import { names, .. } => names.iter().any(|&alias| {
             let (alias_name, asname) = alias_name(ast, alias);
             asname.unwrap_or_else(|| alias_name.split('.').next().unwrap()) == name
                 && !alias_name.starts_with("pynecore.lib")
@@ -175,7 +175,7 @@ impl ImportNormalizer<'_> {
             return;
         }
         self.needs_lib_import = true;
-        let Kind::Import { names } = ast.kind(stmt) else { unreachable!() };
+        let Kind::Import { names, .. } = ast.kind(stmt) else { unreachable!() };
         for &alias in names {
             let (name, asname) = alias_name(ast, alias);
             if !is_lib_module(name) {
@@ -378,7 +378,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
 
     // A lib-module alias rebound later in the module denotes that binding from there on
     for (index, &stmt) in body.iter().enumerate() {
-        if let Kind::Import { names } = ast.kind(stmt) {
+        if let Kind::Import { names, .. } = ast.kind(stmt) {
             for &alias in names {
                 let (name, asname) = alias_name(ast, alias);
                 if is_lib_module(name) {
@@ -434,12 +434,13 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
             module: Some("pynecore".into()),
             names: vec![alias],
             level: Some(0),
+            is_lazy: None,
         }));
     }
     for submodule in &normalizer.required_submodules {
         let alias =
             ast.add(Kind::Alias { name: format!("pynecore.lib.{submodule}"), asname: None });
-        imports.push(ast.add(Kind::Import { names: vec![alias] }));
+        imports.push(ast.add(Kind::Import { names: vec![alias], is_lazy: None }));
     }
 
     // Insert imports after the docstring and the ``__future__`` block

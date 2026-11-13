@@ -58,6 +58,9 @@ SCRIPT_DECORATORS: Final = frozenset({'indicator', 'strategy', 'library'})
 #: The two roots a ``script`` chain may hang from.
 _LIB_MODULES: Final = ('pynecore.lib', 'pynecore')
 
+#: The symbol table name of a lambda: 'lambda' up to Python 3.14, '<lambda>' from 3.15.
+_LAMBDA_TABLE_NAMES: Final = ('lambda', '<lambda>')
+
 #: How a rejected node is named in a message.
 _NODE_LABELS: Final[dict[str, str]] = {
     'AsyncFunctionDef': "'async def'", 'AsyncFor': "'async for'",
@@ -608,8 +611,7 @@ class _Gate:
         scope = module
         reader: ast.AST | None = None
         for owner in self._scopes:
-            # A lambda's table is named 'lambda' up to Python 3.14, '<lambda>' from 3.15
-            labels = ('lambda', '<lambda>') if isinstance(owner, ast.Lambda) else (owner.name,)
+            labels = _LAMBDA_TABLE_NAMES if isinstance(owner, ast.Lambda) else (owner.name,)
             table = next((child for child in scope.get_children()
                           if child.get_name() in labels and child.get_lineno() == owner.lineno),
                          None)

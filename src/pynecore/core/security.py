@@ -143,6 +143,12 @@ def _lookahead_mode(value) -> Lookahead:
     return Lookahead.OFF
 
 
+def _is_gaps_on(value) -> bool:
+    """Whether a ``barmerge.gaps_*`` singleton selects ``gaps_on``."""
+    from pynecore.lib import barmerge
+    return value is barmerge.gaps_on
+
+
 # Upper bound of a single wait on the registry event while a child waits for a
 # runtime-resolved peer's record. Not a sleep: the event ends the wait the
 # moment the record lands; this only bounds how often ``stop_event`` is
@@ -403,6 +409,11 @@ class SecurityState:
     # the security process should emit a ghost-bar write step on chart bars
     # that fall inside an unclosed HTF period.
     lookahead: Lookahead = Lookahead.OFF
+
+    # The gaps mode is a runtime value (a Pine "simple" such as
+    # ``gap ? barmerge.gaps_on : barmerge.gaps_off``) that the context's first
+    # signal has yet to bring. ``gaps_on`` reads as ``gaps_off`` until then.
+    gaps_pending: bool = False
 
     # Per-sec_id HTF aggregator (chart-side). Populated by
     # ``setup_security_states`` for every same-symbol HTF context — drives
@@ -1538,8 +1549,6 @@ def create_chart_protocol(
     }
 
     resolved: set[str] = set()
-    # Sids whose runtime gaps mode (a Pine "simple" held in a local) is applied
-    gaps_resolved: set[str] = set()
     # Producers a started consumer needs but that were still unresolved at the
     # time (see ``_start``): each starts at its own first signal instead.
     start_on_resolve: set[str] = set()
@@ -1745,8 +1754,8 @@ def create_chart_protocol(
 
     def _resolve_context(sec_id: str, state: SecurityState,
                          symbol: str | None, timeframe: str | None,
-                         lookahead) -> None:
-        """Resolve a context once: its lookahead mode, its feed, its bar grid.
+                         lookahead, gaps) -> None:
+        """Resolve a context once: its lookahead and gaps modes, its feed, its bar grid.
 
         This is what a context's FIRST ``__sec_signal__`` performs, and it is
         also what the chart performs for a stable group's members on the seed's
@@ -1758,11 +1767,19 @@ def create_chart_protocol(
         :param symbol: The symbol its signal names, or None.
         :param timeframe: The timeframe its signal names, or None.
         :param lookahead: Its runtime lookahead value, or None.
+        :param gaps: Its runtime gaps mode, or None.
         """
         if sec_id in resolved:
             return
         resolved.add(sec_id)
-        signal_values[sec_id] = (symbol, timeframe, lookahead)
+        signal_values[sec_id] = (symbol, timeframe, lookahead, gaps)
+        if gaps is not None:
+            # Input-derived (Pine "simple") gaps mode: the transformer stored
+            # None in __security_contexts__ and passes the actual value here.
+            # Set BEFORE the callbacks below: the peer record they publish and
+            # the child they may spawn carry ``gaps_on``.
+            state.gaps_on = _is_gaps_on(gaps)
+            state.gaps_pending = False
         if lookahead is not None:
             # Input-derived (Pine "simple") lookahead: the transformer stored
             # None in __security_contexts__ and passes the actual value here.
@@ -1929,9 +1946,10 @@ def create_chart_protocol(
                 producer = states.get(producer_id)
                 if producer is None or producer.started:
                     continue
-                if producer_id in unresolved_ids:
+                if producer_id in unresolved_ids or producer.gaps_pending:
                     # Its symbol or timeframe only exists once its own signal
-                    # runs, so there is nothing to spawn yet. Marking it started
+                    # runs, so there is nothing to spawn yet; a gaps mode still
+                    # pending would spawn it with the wrong one. Marking it started
                     # here would skip it for good; its signal starts it instead.
                     # The consumer's child waits for the producer's registry
                     # record meanwhile, which the chart sends at that signal.
@@ -2207,24 +2225,11 @@ def create_chart_protocol(
         first member reached schedules the group's round itself, on the
         primary's slot. ``signalled_primaries`` keeps that to ONE round per
         invocation whichever member comes first.
-
-        ``gaps`` is the context's gaps mode when the script holds it in a local
-        (a Pine "simple" such as ``gap ? barmerge.gaps_on : barmerge.gaps_off``):
-        the transformer stored None in ``__security_contexts__``, read as
-        ``gaps_off`` at setup, and passes the actual value here. It is applied
-        on the context's first signal, before anything below: a member adopted
-        into a stable group was resolved from its seed's values, which do not
-        carry the member's own gaps mode, and the mode drives the chart-side
-        read alone.
         """
-        if gaps is not None and sec_id not in gaps_resolved:
-            from pynecore.lib import barmerge
-            gaps_resolved.add(sec_id)
-            states[sec_id].gaps_on = gaps is barmerge.gaps_on
         if sec_id not in signal_order:
             signal_order[sec_id] = len(signal_order)
         seed = adopted_from.get(sec_id)
-        if seed is not None and signal_values[sec_id] != (symbol, timeframe, lookahead):
+        if seed is not None and signal_values[sec_id] != (symbol, timeframe, lookahead, gaps):
             # The chart resolved this context from its group's seed because the
             # compile-time key said the two name the same feed. They do not, so
             # the key rule is wrong — and silently carrying on would run the
@@ -2232,7 +2237,7 @@ def create_chart_protocol(
             raise RuntimeError(
                 f"security context '{sec_id}' was resolved from its group seed "
                 f"'{seed}' as {signal_values[sec_id]!r} but signalled "
-                f"{(symbol, timeframe, lookahead)!r}"
+                f"{(symbol, timeframe, lookahead, gaps)!r}"
             )
         primary = merge_primary.get(sec_id)
         if primary is None:
@@ -2242,7 +2247,7 @@ def create_chart_protocol(
             # SECOND round for a context that has already signalled. A context
             # whose signal stands in a loop body is left out — there every
             # iteration signals, as before.
-            _signal_context(sec_id, states[sec_id], symbol, timeframe, lookahead)
+            _signal_context(sec_id, states[sec_id], symbol, timeframe, lookahead, gaps)
             _mirror_members(sec_id)
             if not states[sec_id].in_loop:
                 signalled_primaries.add(sec_id)
@@ -2254,11 +2259,11 @@ def create_chart_protocol(
         # (that is what the key proves, and ``__sec_signal__`` raises above when
         # a member disagrees), so the member's own arguments drive the primary's
         # round.
-        _signal_context(primary, states[primary], symbol, timeframe, lookahead)
+        _signal_context(primary, states[primary], symbol, timeframe, lookahead, gaps)
         _mirror_members(primary)
 
     def _signal_context(sec_id: str, state: SecurityState,
-                        symbol: str | None, timeframe: str | None, lookahead):
+                        symbol: str | None, timeframe: str | None, lookahead, gaps):
         signalled_this_call.add(sec_id)
 
         # Resolve deferred symbol/timeframe on first call. The two callbacks are
@@ -2268,7 +2273,7 @@ def create_chart_protocol(
         # context's bar grid unloaded and every target of this bar computed off
         # an arithmetic guess. ``prepare_fn`` itself skips sids that already
         # have a process (a deferred context prepares inside the resolver).
-        _resolve_context(sec_id, state, symbol, timeframe, lookahead)
+        _resolve_context(sec_id, state, symbol, timeframe, lookahead, gaps)
 
         # No-process contexts (same-context, ignored): skip advance/wait
         if sec_id in no_process_ids:
@@ -3008,7 +3013,7 @@ def _trace_first_reads(read, signal_values: dict[str, tuple],
     """Wrap the chart-side read so every context's first read is logged.
 
     :param read: The chart-side ``__sec_read__``.
-    :param signal_values: Per sid, the ``(symbol, timeframe, lookahead)`` its
+    :param signal_values: Per sid, the ``(symbol, timeframe, lookahead, gaps)`` its
         signal resolved to.
     :param same_context_ids: Sids sharing the chart's symbol and timeframe.
     :param missing_data_ids: Sids resolved at runtime with no feed behind them;
@@ -3021,7 +3026,8 @@ def _trace_first_reads(read, signal_values: dict[str, tuple],
     def __sec_read__(sec_id: str, default=None, _scope_id=None):
         if sec_id not in traced:
             traced.add(sec_id)
-            symbol, timeframe, _lookahead = signal_values.get(sec_id) or (None, None, None)
+            symbol, timeframe, _lookahead, _gaps = (signal_values.get(sec_id)
+                                                    or (None, None, None, None))
             stack = []
             for info in reversed(inspect.stack(0)):
                 filename = os.path.abspath(info.filename)
@@ -4690,12 +4696,15 @@ def setup_security_states(
         plain_ltf = False
         if is_ltf:
             is_gaps_on = False
+            gaps_pending = False
             same_tf = False
             resampler = None  # chart-side resampler not needed for LTF
             lookahead_mode = Lookahead.OFF  # LTF has no lookahead concept
         else:
             gaps_val = ctx.get('gaps', barmerge.gaps_off)
             is_gaps_on = gaps_val is barmerge.gaps_on
+            # None: a runtime gaps mode, which the first signal brings
+            gaps_pending = gaps_val is None
             same_tf = (timeframe == chart_timeframe)
             # Plain security with a FINER timeframe than the chart: scalar
             # LTF merge (last/first intrabar of the chart bar), no resampler,
@@ -4778,6 +4787,7 @@ def setup_security_states(
             plain_ltf_span_ms=(tf_module._in_seconds(timeframe) * 1000
                                if plain_ltf else 0),
             lookahead=lookahead_mode,
+            gaps_pending=gaps_pending,
             htf_aggregator=htf_aggregator,
             na_on_developing=na_on_developing,
             session_starts=anchor_starts,

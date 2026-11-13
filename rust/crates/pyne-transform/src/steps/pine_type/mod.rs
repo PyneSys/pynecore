@@ -654,7 +654,7 @@ impl<'a, 'h> Engine<'a, 'h> {
                         }
                     }
                 }
-                Kind::Import { names } => {
+                Kind::Import { names, .. } => {
                     for &alias in names {
                         if let Kind::Alias { name, asname } = self.ast.kind(alias)
                             && name.starts_with("pynecore.lib")
