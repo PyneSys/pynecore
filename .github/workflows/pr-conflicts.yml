@@ -32,10 +32,11 @@ jobs:
             --description "Does not merge into main; closed after $GRACE_DAYS days" 2>/dev/null || true
 
           now=$(date -u +%s)
-          gh pr list --state open --base main --limit 200 --json number \
-            --jq '.[].number' | while read -r pr; do
-            # GitHub computes mergeability lazily: UNKNOWN is retried on the next run
+          prs=$(gh pr list --state open --base main --limit 200 --json number --jq '.[].number')
+          for pr in $prs; do
             state=$(gh pr view "$pr" --json mergeable --jq .mergeable)
+            echo "#$pr: $state"
+            # GitHub computes mergeability lazily: UNKNOWN is retried on the next run
             labels=$(gh pr view "$pr" --json labels --jq '[.labels[].name] | join(",")')
             has_label=false
             [[ ",$labels," == *",$LABEL,"* ]] && has_label=true
