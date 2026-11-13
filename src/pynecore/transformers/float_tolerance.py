@@ -26,22 +26,15 @@ _ORDERING_FORMS: dict[type, tuple[float, type]] = {
     ast.GtE: (-EPSILON, ast.LtE),
 }
 
-# The operators that must hold for two operands that are already equal. Their
-# difference form alone cannot decide those: ``inf - inf`` is nan, which makes
-# every comparison against the bound false, so the raw comparison is kept in
-# front of the tolerant one (see ``_rewrite_pair``).
-_NON_STRICT_FORMS = (ast.LtE, ast.GtE)
-
 _TOLERANT_OPS = (ast.Lt, ast.Gt, ast.LtE, ast.GtE, ast.Eq, ast.NotEq)
 
-# How many times the rewrite reads each operand of a comparison: the strict
-# orderings evaluate a single difference, the non-strict ones a raw comparison
-# plus that difference, and ``==``/``!=`` add the type guard and the exact
-# branch on top.
+# How many times the rewrite reads each operand of a comparison: the orderings
+# evaluate a single difference, ``==`` adds the type guard and the exact branch,
+# and ``!=`` reads each operand twice more for its finiteness test.
 _READS: dict[type, int] = {
     ast.Lt: 1, ast.Gt: 1,
-    ast.LtE: 2, ast.GtE: 2,
-    ast.Eq: 4, ast.NotEq: 3,
+    ast.LtE: 1, ast.GtE: 1,
+    ast.Eq: 3, ast.NotEq: 5,
 }
 
 # The only operands whose evaluation provably cannot run user code. The test
@@ -103,15 +96,25 @@ class FloatToleranceTransformer(Rule):
 
         a <  b   ->  -1e-10 >  a - b
         a >  b   ->   1e-10 <  a - b
-        a <= b   ->  a <= b or  1e-10 >= a - b
-        a >= b   ->  a >= b or -1e-10 <= a - b
-        a == b   ->  a == b or -1e-10 <= a - b <= 1e-10
-        a != b   ->  1e-10 < (d := a - b) or -1e-10 > d
+        a <= b   ->   1e-10 >= a - b
+        a >= b   ->  -1e-10 <= a - b
+        a == b   ->  -1e-10 <= a - b <= 1e-10
+        a != b   ->  (1e-10 < (d := a - b) or -1e-10 > d) and a - a == b - b
 
     The forms are written over the difference instead of over ``abs()`` so a na
     operand can never satisfy them: a native nan difference makes every one of
     them False, and an ``NA`` object propagates itself through the subtraction
     into comparisons that are False by definition.
+
+    An infinity is a na operand to ``==`` and ``!=`` and a value to the
+    orderings, as measured on TradingView: ``inf == inf`` and ``inf != 1.0``
+    are both false, ``inf > 1e300`` and ``-inf < inf`` are true, and two
+    infinities of the same sign are neither ordered nor equal (``inf >= inf``
+    is false). The difference forms give exactly that, as ``inf - inf`` is nan
+    and ``inf - x`` an infinity outside the tolerance band. ``!=`` alone needs
+    more: the difference of two finite operands may overflow to an infinity
+    (``1.7e308 != -1.7e308`` is true on TradingView), so the operands themselves
+    are tested, ``x - x`` being 0 for a finite x and nan for an infinity.
 
     False is the whole answer only where a bool has two states. A script that
     keeps Pine's three-state bool (``na_bool``, i.e. v4/v5) answers ``na``
@@ -131,15 +134,6 @@ class FloatToleranceTransformer(Rule):
     ``==``, and so does an ``NA`` object. A constant operand is never na, so it
     contributes no test. Infinities are untouched: the test reads the operands,
     not their nan difference.
-
-    The operators that must hold for already-equal operands (``<=``, ``>=``,
-    ``==``) keep the raw comparison in front of the tolerant one. The
-    difference form alone cannot decide them for two equal infinities, whose
-    difference is nan — and ``inf`` is a normal value here, produced by
-    ``safe_div`` on a zero denominator with IEEE-754 comparison semantics. The
-    raw comparison stays na-correct (nan and ``NA`` compare False) and doubles
-    as a short circuit for the ordered case. The strict orderings and ``!=``
-    need no such prefix: they are already false for two equal infinities.
 
     Integers keep exact semantics automatically: an int difference is either 0
     or at least 1, so no tolerance can ever bridge it. Only ``==``/``!=`` are
@@ -244,13 +238,6 @@ class FloatToleranceTransformer(Rule):
         form = _ORDERING_FORMS.get(type(op))
         if form is not None:
             bound, cmp_op = form
-            if type(op) in _NON_STRICT_FORMS:
-                return ast.BoolOp(op=ast.Or(), values=[
-                    _bool_compare(left=left, ops=[type(op)()], comparators=[right]),
-                    _bool_compare(left=ast.Constant(value=bound), ops=[cmp_op()],
-                                  comparators=[ast.BinOp(left=left_ref(), op=ast.Sub(),
-                                                         right=right_ref())]),
-                ])
             return _bool_compare(left=ast.Constant(value=bound), ops=[cmp_op()],
                                  comparators=[ast.BinOp(left=left, op=ast.Sub(), right=right)])
 
@@ -263,25 +250,32 @@ class FloatToleranceTransformer(Rule):
         else:
             guard = ast.BoolOp(op=ast.Or(), values=[guard_left, guard_right])
 
+        tolerant: ast.expr
         if isinstance(op, ast.Eq):
-            tolerant: ast.expr = ast.BoolOp(op=ast.Or(), values=[
-                _bool_compare(left=left_ref(), ops=[ast.Eq()], comparators=[right_ref()]),
-                _bool_compare(
-                    left=ast.Constant(value=-EPSILON), ops=[ast.LtE(), ast.LtE()],
-                    comparators=[ast.BinOp(left=left_ref(), op=ast.Sub(), right=right_ref()),
-                                 ast.Constant(value=EPSILON)]),
-            ])
+            tolerant = _bool_compare(
+                left=ast.Constant(value=-EPSILON), ops=[ast.LtE(), ast.LtE()],
+                comparators=[ast.BinOp(left=left_ref(), op=ast.Sub(), right=right_ref()),
+                             ast.Constant(value=EPSILON)])
         else:
             self._temp_counter += 1
             diff = f"__cmp{self._temp_counter}__"
-            tolerant = ast.BoolOp(op=ast.Or(), values=[
+            tolerant = ast.BoolOp(op=ast.And(), values=[
+                ast.BoolOp(op=ast.Or(), values=[
+                    _bool_compare(
+                        left=ast.Constant(value=EPSILON), ops=[ast.Lt()],
+                        comparators=[ast.NamedExpr(
+                            target=ast.Name(id=diff, ctx=ast.Store()),
+                            value=ast.BinOp(left=left_ref(), op=ast.Sub(), right=right_ref()))]),
+                    _bool_compare(left=ast.Constant(value=-EPSILON), ops=[ast.Gt()],
+                                  comparators=[ast.Name(id=diff, ctx=ast.Load())]),
+                ]),
+                # Both operands finite: ``x - x`` is 0 for a finite x and nan for an
+                # infinity, so two finite operands whose difference overflows still
+                # differ, and an infinite one never does
                 _bool_compare(
-                    left=ast.Constant(value=EPSILON), ops=[ast.Lt()],
-                    comparators=[ast.NamedExpr(
-                        target=ast.Name(id=diff, ctx=ast.Store()),
-                        value=ast.BinOp(left=left_ref(), op=ast.Sub(), right=right_ref()))]),
-                _bool_compare(left=ast.Constant(value=-EPSILON), ops=[ast.Gt()],
-                              comparators=[ast.Name(id=diff, ctx=ast.Load())]),
+                    left=ast.BinOp(left=left_ref(), op=ast.Sub(), right=left_ref()),
+                    ops=[ast.Eq()],
+                    comparators=[ast.BinOp(left=right_ref(), op=ast.Sub(), right=right_ref())]),
             ])
         exact = _bool_compare(left=left_ref(), ops=[type(op)()], comparators=[right_ref()])
         return ast.IfExp(test=guard, body=tolerant, orelse=exact)

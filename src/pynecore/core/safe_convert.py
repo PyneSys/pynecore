@@ -38,11 +38,12 @@ def safe_div(a: PyneFloat, b: PyneFloat):
     """
     Safe division mimicking Pine Script semantics.
 
-    Pine's `na()` predicate reports inf/-inf/nan as NA, but arithmetic and
-    comparisons on those values follow IEEE-754 (e.g. `inf > 40` is true).
-    Native floats give exactly that: division by zero returns raw inf/-inf/nan,
-    the `na()` predicate (`not isfinite`) reports them as na, and arithmetic
-    and comparisons on them follow IEEE-754 natively.
+    Pine's `na()` predicate reports inf/-inf/nan as NA, but arithmetic on those
+    values follows IEEE-754, and so does ordering against a finite value (e.g.
+    `inf > 40` is true). Native floats give exactly that: division by zero
+    returns raw inf/-inf/nan, and the `na()` predicate (`not isfinite`) reports
+    them as na. Comparisons follow the rewrite in `transformers.float_tolerance`,
+    where `==` and `!=` treat an infinity as na.
 
     @param a: The numerator.
     @param b: The denominator.

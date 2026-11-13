@@ -38,20 +38,18 @@ def equal(a, b) -> bool:
     ints an exact comparison is already the tolerant one (an int difference is
     either 0 or at least 1).
 
-    The raw comparison comes first, exactly as in the operator rewrite: two
-    equal infinities have a nan difference, which the tolerance band would
-    reject even though they are equal under IEEE-754.
+    An infinity equals nothing, itself included, exactly as in the operator
+    rewrite: its difference is nan or an infinity, both outside the tolerance
+    band (``array.indexof`` and ``array.includes`` do not find an infinity on
+    TradingView).
 
     :param a: Left operand
     :param b: Right operand
     :return: True if the operands are equal under Pine's comparison rule
     """
-    if a == b:
-        return True
     if a.__class__ is float or b.__class__ is float:
-        difference = a - b
-        return -EPSILON <= difference <= EPSILON
-    return False
+        return -EPSILON <= a - b <= EPSILON
+    return a == b
 
 
 def lower_bound(values: list[float], x: float) -> int:

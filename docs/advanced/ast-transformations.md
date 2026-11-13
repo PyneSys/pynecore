@@ -1042,14 +1042,15 @@ Gives the comparison operators TradingView's tolerant float semantics. Pine trea
 ```python
 a <  b   ->  -1e-10 >  a - b
 a >  b   ->   1e-10 <  a - b
-a <= b   ->  a <= b or  1e-10 >= a - b
-a >= b   ->  a >= b or -1e-10 <= a - b
-a == b   ->  a == b or -1e-10 <= a - b <= 1e-10
-a != b   ->  1e-10 < (d := a - b) or -1e-10 > d
+a <= b   ->   1e-10 >= a - b
+a >= b   ->  -1e-10 <= a - b
+a == b   ->  -1e-10 <= a - b <= 1e-10
+a != b   ->  (1e-10 < (d := a - b) or -1e-10 > d) and a - a == b - b
 ```
 
 Key aspects:
 - The forms are written over the difference rather than `abs()`, so a na operand can never satisfy them: a native `nan` difference makes every form false, and an `NA` object propagates through the subtraction
+- An infinity is a na operand to `==` and `!=` and a value to the orderings, as on TradingView: `inf == inf` and `inf != 1.0` are false, `inf > 1e300` and `-inf < inf` are true, and two infinities of the same sign are neither ordered nor equal. `!=` tests its operands for finiteness (`x - x` is 0 only for a finite `x`), because the difference of two finite operands can overflow to an infinity and they still differ
 - A script that keeps Pine's three-state bool (`na_bool`, i.e. v4/v5) answers `na` for a comparison with a na operand, so each rewritten comparison gets a tail that checks the operands for na; a two-state (v6) script pays nothing
 - Integers keep exact semantics automatically (an int difference is 0 or at least 1). `==` and `!=` are guarded by a runtime type test because Pine also allows them on strings, colors and object references
 - Operands that are not simple names or constants are bound once with a walrus, at the operand's first evaluated position

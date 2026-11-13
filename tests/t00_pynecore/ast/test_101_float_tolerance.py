@@ -115,30 +115,41 @@ def __test_float_tolerance_na_is_false_everywhere__():
             assert _eval(expr, a=na, b=na) is False, f"{expr} with two {na!r}"
 
 
-def __test_float_tolerance_infinities_keep_ieee_semantics__():
-    """ ``safe_div`` returns raw inf/-inf on a zero denominator and documents
-    that comparisons on them follow IEEE-754; the tolerance must not change
-    that, even though ``inf - inf`` is nan """
+def __test_float_tolerance_infinities__():
+    """ An infinity is a na operand to ``==``/``!=`` and a value to the
+    orderings (TradingView, CAPITALCOM:EURUSD 1D, v5 and v6) """
     for value in (inf, -inf):
         same = dict(a=value, b=value)
-        assert _eval("a == b", **same) is True, f"{value} == itself"
-        assert _eval("a <= b", **same) is True, f"{value} <= itself"
-        assert _eval("a >= b", **same) is True, f"{value} >= itself"
-        assert _eval("a != b", **same) is False, f"{value} != itself"
-        assert _eval("a < b", **same) is False, f"{value} < itself"
-        assert _eval("a > b", **same) is False, f"{value} > itself"
-        assert equal(value, value) is True, f"equal({value}, {value})"
+        for expr in ("a == b", "a != b", "a <= b", "a >= b", "a < b", "a > b"):
+            assert _eval(expr, **same) is False, f"{value}: {expr}"
+        assert equal(value, value) is False, f"equal({value}, {value})"
+        for finite in (1.0, 1e300, -1e300):
+            for a, b in ((value, finite), (finite, value)):
+                assert _eval("a == b", a=a, b=b) is False, f"{a} == {b}"
+                assert _eval("a != b", a=a, b=b) is False, f"{a} != {b}"
+                assert equal(a, b) is False, f"equal({a}, {b})"
 
     opposite = dict(a=inf, b=-inf)
     assert _eval("a == b", **opposite) is False
+    assert _eval("a != b", **opposite) is False
     assert _eval("a > b", **opposite) is True
+    assert _eval("a >= b", **opposite) is True
     assert _eval("a <= b", **opposite) is False
+    assert _eval("a < b", a=-inf, b=inf) is True
     assert equal(inf, -inf) is False
 
-    # A finite operand still orders against an infinity the IEEE way
+    # A finite operand orders against an infinity the IEEE way
+    assert _eval("a > b", a=inf, b=1e300) is True
     assert _eval("a >= b", a=inf, b=1.0) is True
     assert _eval("a <= b", a=inf, b=1.0) is False
     assert _eval("a <= b", a=-inf, b=1.0) is True
+    assert _eval("a < b", a=-inf, b=-1e300) is True
+
+    # Two finite operands whose difference overflows still differ
+    huge = dict(a=1.7e308, b=-1.7e308)
+    assert _eval("a != b", **huge) is True
+    assert _eval("a == b", **huge) is False
+    assert _eval("a > b", **huge) is True
 
 
 def __test_float_tolerance_operand_is_not_re_read_after_a_side_effect__():
@@ -163,9 +174,9 @@ def __test_float_tolerance_operand_is_not_re_read_after_a_side_effect__():
     assert run("a <= mutate()", 1.0 + 1e-9, 1.0 - 1e-11) is True
 
     # A side-effect-free right operand needs no binding
-    assert _rewrite("a == b") == "a == b or -1e-10 <= a - b <= 1e-10 " \
+    assert _rewrite("a == b") == "-1e-10 <= a - b <= 1e-10 " \
                                  "if a.__class__ is float or b.__class__ is float else a == b"
-    assert _rewrite("a <= b") == "a <= b or 1e-10 >= a - b"
+    assert _rewrite("a <= b") == "1e-10 >= a - b"
 
 
 def __test_float_tolerance_property_and_subscript_also_rebind__():

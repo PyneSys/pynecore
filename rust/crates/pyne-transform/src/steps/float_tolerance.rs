@@ -36,10 +36,9 @@ fn ordering_form(op: CmpOperator) -> Option<(f64, CmpOperator)> {
 /// How many times the rewrite reads each operand of one comparison.
 fn reads(op: CmpOperator) -> usize {
     match op {
-        CmpOperator::Lt | CmpOperator::Gt => 1,
-        CmpOperator::LtE | CmpOperator::GtE => 2,
-        CmpOperator::Eq => 4,
-        CmpOperator::NotEq => 3,
+        CmpOperator::Lt | CmpOperator::Gt | CmpOperator::LtE | CmpOperator::GtE => 1,
+        CmpOperator::Eq => 3,
+        CmpOperator::NotEq => 5,
         _ => unreachable!("not a tolerant operator"),
     }
 }
@@ -202,15 +201,6 @@ impl FloatTolerance {
         (right, right_ref): (NodeId, &Reference),
     ) -> Result<NodeId, Error> {
         if let Some((bound, cmp_op)) = ordering_form(op) {
-            if matches!(op, CmpOperator::LtE | CmpOperator::GtE) {
-                let raw = bool_compare(ast, left, vec![op], vec![right]);
-                let bound = float(ast, bound);
-                let left = left_ref.node(ast)?;
-                let right = right_ref.node(ast)?;
-                let difference = sub(ast, left, right);
-                let tolerant = bool_compare(ast, bound, vec![cmp_op], vec![difference]);
-                return Ok(bool_op(ast, BoolOperator::Or, vec![raw, tolerant]));
-            }
             let bound = float(ast, bound);
             let difference = sub(ast, left, right);
             return Ok(bool_compare(ast, bound, vec![cmp_op], vec![difference]));
@@ -227,21 +217,12 @@ impl FloatTolerance {
         };
 
         let tolerant = if op == CmpOperator::Eq {
-            let a = left_ref.node(ast)?;
-            let b = right_ref.node(ast)?;
-            let exact = bool_compare(ast, a, vec![CmpOperator::Eq], vec![b]);
             let low = float(ast, -EPSILON);
             let a = left_ref.node(ast)?;
             let b = right_ref.node(ast)?;
             let difference = sub(ast, a, b);
             let high = float(ast, EPSILON);
-            let within = bool_compare(
-                ast,
-                low,
-                vec![CmpOperator::LtE, CmpOperator::LtE],
-                vec![difference, high],
-            );
-            bool_op(ast, BoolOperator::Or, vec![exact, within])
+            bool_compare(ast, low, vec![CmpOperator::LtE, CmpOperator::LtE], vec![difference, high])
         } else {
             self.temp_counter += 1;
             let diff = format!("__cmp{}__", self.temp_counter);
@@ -255,7 +236,16 @@ impl FloatTolerance {
             let low = float(ast, -EPSILON);
             let reread = name(ast, &diff, ExprContext::Load);
             let below = bool_compare(ast, low, vec![CmpOperator::Gt], vec![reread]);
-            bool_op(ast, BoolOperator::Or, vec![above, below])
+            let differs = bool_op(ast, BoolOperator::Or, vec![above, below]);
+            // Both operands finite: `x - x` is 0 for a finite x and nan for an infinity
+            let a = left_ref.node(ast)?;
+            let a_again = left_ref.node(ast)?;
+            let left_zero = sub(ast, a, a_again);
+            let b = right_ref.node(ast)?;
+            let b_again = right_ref.node(ast)?;
+            let right_zero = sub(ast, b, b_again);
+            let finite = bool_compare(ast, left_zero, vec![CmpOperator::Eq], vec![right_zero]);
+            bool_op(ast, BoolOperator::And, vec![differs, finite])
         };
         let a = left_ref.node(ast)?;
         let b = right_ref.node(ast)?;
