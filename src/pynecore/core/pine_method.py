@@ -65,7 +65,7 @@ def _get_builtin_method(method_name: str, var: Any) -> Callable | None:
             # never drawn) must dispatch to that builtin namespace, which treats
             # na as a no-op the way Pine does. An na of a UDT (or untyped) type
             # matches nothing here and falls through to user-method dispatch.
-            declared = var.type
+            declared = var.__pyne_na_type__
             if declared is None:
                 return None
             var_type = declared if isinstance(declared, type) else type(declared)
@@ -265,7 +265,7 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
             # is looked up by its DECLARED type instead.
             receiver_type = type(var)
             if receiver_type is NA:
-                declared = var.type
+                declared = var.__pyne_na_type__
                 receiver_type = declared if isinstance(declared, type) else type(declared)
             elif receiver_type not in _PINE_SCALAR_TYPES:
                 try:

@@ -39,7 +39,7 @@ def _na_of(value: Any) -> Any:
     if cls is str:
         return na_str
     if cls is NA:
-        return _NA_UNTYPED if value.type is None or value is _NA_UNTYPED else value
+        return _NA_UNTYPED if value.__pyne_na_type__ is None or value is _NA_UNTYPED else value
     if isinstance(value, (float, int)):
         return na_float
     if isinstance(value, str):

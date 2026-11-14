@@ -2,7 +2,8 @@ from math import isfinite
 from typing import Any, TypeVar, Generic, Type, Self
 
 __all__ = [
-    'NA', 'na_float', 'na_int', 'na_bool', 'na_str', 'isna_num', 'set_bool_na', 'new_bool_na',
+    'NA', 'NaFieldError', 'na_float', 'na_int', 'na_bool', 'na_str', 'isna_num', 'set_bool_na',
+    'new_bool_na',
 ]
 
 T = TypeVar('T')
@@ -65,6 +66,27 @@ def set_bool_na(enabled: bool) -> None:
     _bool_na_seen = _bool_na_seen or enabled
 
 
+class NaFieldError(RuntimeError):
+    """A script read or wrote a field of an object that is na."""
+
+
+def _field_error(na_type: Any, name: str) -> NaFieldError | None:
+    """The error for touching ``name`` on an na of ``na_type``, if it is a field.
+
+    Only the objects whose fields a script reads directly carry the
+    ``__pyne_object__`` marker: user-defined types and ``chart.point``. A drawing
+    is read through its namespace getters, which answer na for an na drawing.
+
+    :param na_type: The type the na stands for.
+    :param name: The attribute name.
+    :return: The error to raise, or None when ``name`` is no field of such a type.
+    """
+    if not getattr(na_type, '__pyne_object__', False) \
+            or name not in getattr(na_type, '__dataclass_fields__', ()):
+        return None
+    return NaFieldError(f"field '{name}' of an na {na_type.__name__} object is not available")
+
+
 class NA(Generic[T]):
     """
     Class representing NA (Not Available) values for non-numeric types.
@@ -87,7 +109,9 @@ class NA(Generic[T]):
     comparison is False. A typeless na concatenated with a string gives the
     string, the way the string na does.
     """
-    __slots__ = ('type',)
+    # The declared type lives under a name no field can take: ``type`` is a legal
+    # field name of a user-defined type, and its read on an na object must raise
+    __slots__ = ('__pyne_na_type__',)
 
     _type_cache: dict[Type | None, 'NA'] = {}
 
@@ -109,7 +133,7 @@ class NA(Generic[T]):
             return cls._type_cache[type]  # type: ignore[reportReturnType]
         except KeyError:
             na = super().__new__(cls)
-            na.type = type
+            object.__setattr__(na, '__pyne_na_type__', type)
             cls._type_cache[type] = na
             return na
 
@@ -117,19 +141,29 @@ class NA(Generic[T]):
     def __init__(self, type: Type[T] | T | None = int) -> None:
         """
         Initialize a new NA value with an optional type parameter.
-        The default type is int.
+        The default type is int. ``__new__`` returns the interned na of the type,
+        which already holds it.
         """
-        self.type = type
+
+    @property
+    def type(self) -> Type[T] | T | None:
+        """The type the na stands for."""
+        na_type = self.__pyne_na_type__
+        error = _field_error(na_type, 'type')
+        if error is not None:
+            raise error
+        return na_type
 
     def __reduce__(self) -> tuple:
         # Pickle rebuilds through ``__new__(cls)`` otherwise, and the default
         # type there is int -- which is the native nan, not an NA object
-        return NA, (self.type,)
+        return NA, (self.__pyne_na_type__,)
 
     def __repr__(self) -> str:
-        if self.type is None:
+        na_type = self.__pyne_na_type__
+        if na_type is None:
             return "NA"
-        return f"NA[{self.type.__name__}]"  # type: ignore
+        return f"NA[{na_type.__name__}]"  # type: ignore
 
     def __str__(self) -> str:
         return ""
@@ -138,7 +172,7 @@ class NA(Generic[T]):
         return "NaN"
 
     def __hash__(self) -> int:
-        return hash(self.type)
+        return hash(self.__pyne_na_type__)
 
     def __int__(self) -> 'NA[int]':
         # We solve this with an AST Transformer
@@ -243,12 +277,12 @@ class NA(Generic[T]):
     def __eq__(self, _: Any) -> bool:
         # A na bool compared with == or != is na again (TV v5, measured), the
         # one place the third state propagates instead of collapsing to false
-        if self.type is bool:
+        if self.__pyne_na_type__ is bool:
             return self  # type: ignore[return-value]
         return False
 
     def __ne__(self, _: Any) -> bool:
-        if self.type is bool:
+        if self.__pyne_na_type__ is bool:
             return self  # type: ignore[return-value]
         return False
 
@@ -272,7 +306,19 @@ class NA(Generic[T]):
         # Don't return self for special attributes
         if name.startswith('__'):
             raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+        # A field of an na object stops the script (measured on TradingView: the
+        # read, a method reading it, ``na(t.v)`` and a nested field alike)
+        error = _field_error(self.__pyne_na_type__, name)
+        if error is not None:
+            raise error
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        error = _field_error(self.__pyne_na_type__, name)
+        if error is not None:
+            raise error
+        # An na is an interned, shared sentinel: nothing on it may change
+        raise AttributeError(f"'{self.__class__.__name__}' object is read-only")
 
     def __getitem__(self, _: Any) -> Self:
         return self

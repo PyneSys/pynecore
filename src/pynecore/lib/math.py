@@ -215,7 +215,7 @@ def _na_of_operands(numbers: tuple[Any, ...]) -> Any:
     a contract on the caller.
     """
     for n in numbers:
-        if n == n or not isinstance(n, NA) or n.type is not None:
+        if n == n or not isinstance(n, NA) or n.__pyne_na_type__ is not None:
             return na_float
     return NA(None)
 

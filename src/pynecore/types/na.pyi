@@ -11,8 +11,14 @@ T = TypeVar('T')
 def isna_num(x: Any) -> bool: ...
 
 
+class NaFieldError(RuntimeError): ...
+
+
 class NA(Generic[T]):
-    type: Type[T] | T | None
+    __pyne_na_type__: Type[T] | T | None
+
+    @property
+    def type(self) -> Type[T] | T | None: ...
 
     # The "plain T" lie at its root: a constructed NA value types as T, so
     # lib functions can return NA(X) under a plain -> X annotation and na
@@ -74,6 +80,7 @@ class NA(Generic[T]):
 
     # Catch-all for attribute access and indexing
     def __getattr__(self, name: str) -> Any: ...
+    def __setattr__(self, name: str, value: Any) -> None: ...
     def __getitem__(self, _: Any) -> Any: ...
     def __call__(self, *_: Any, **__: Any) -> Any: ...
 

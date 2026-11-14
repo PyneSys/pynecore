@@ -11,7 +11,7 @@ from ..types import linefill as linefill_types
 from ..types import matrix as matrix_types
 from ..types import polyline as polyline_types
 from ..types import table as table_types
-from ..types.na import NA
+from ..types.na import NA, NaFieldError
 
 __all__ = ['udt', 'udt_copy']
 
@@ -89,6 +89,11 @@ def udt_copy(obj: Any, **changes: Any) -> Any:
             raise TypeError(f"{obj_type.__name__} copy takes no field overrides")
         return builtin(obj)
     if isinstance(obj, NA):
+        na_type = obj.__pyne_na_type__
+        if isinstance(na_type, type) and getattr(na_type, '__pyne_object__', False):
+            # Copying an na user-defined object reads its fields: it stops the script
+            # (measured on TradingView), unlike an na drawing
+            raise NaFieldError(f"an na {na_type.__name__} object cannot be copied")
         if changes:
             # An na holds no fields to override. Dropping them silently would answer a
             # typo in hand-written Pyne with a plausible-looking na, so it is refused
@@ -148,5 +153,7 @@ def udt(cls: Type[T]) -> Type[T]:
     # Add the methods to the class
     decorated_cls.copy = copy  # type: ignore
     decorated_cls.new = new
+    # Its fields are read directly: touching one on an na instance is an error
+    decorated_cls.__pyne_object__ = True  # type: ignore
 
     return decorated_cls

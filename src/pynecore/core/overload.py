@@ -238,7 +238,7 @@ def _check_type(value: Any, expected_type: Type, strict: bool = False) -> bool:
 
     # Handle NA values - Pine Script allows NA for any basic type
     if isinstance(value, NA):
-        na_type = value.type
+        na_type = value.__pyne_na_type__
         # A typeless `na` is assignable to anything, like in Pine
         if na_type is None:
             return True
@@ -420,7 +420,7 @@ def _type_token(value: Any) -> Any:
     if t is int or t is float or t is str or t is bool:
         return t
     if isinstance(value, NA):
-        return NA, value.type
+        return NA, value.__pyne_na_type__
     if t is dict:
         if value:
             _k, _v = next(iter(value.items()))

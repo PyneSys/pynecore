@@ -1093,9 +1093,10 @@ def nz(source: Any, replacement: Any = 0.0) -> Any:
         return source if _math.isfinite(source) else replacement
     if isinstance(source, NA):
         # nz on a bool answers a bool (TV: ``nz(na_bool)`` is false)
-        if source.type is bool:
+        na_type = source.__pyne_na_type__
+        if na_type is bool:
             return bool(replacement)
-        if source.type is _Color and type(replacement) is float:
+        if na_type is _Color and type(replacement) is float:
             return _Color('#00000000')
         return replacement
     return source

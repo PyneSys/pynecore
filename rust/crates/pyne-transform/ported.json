@@ -37,7 +37,7 @@
   },
   "ConstFold": {
     "module": "const_fold",
-    "digest": "3d1ee2f83e5220d900ceca7f580790b4a6971195e61ce1d8d1f25eb6060dec38"
+    "digest": "ed7433ee7e1439e0976c5e277b11ab63d2b02a4bb70abb7eb45abab2fece139f"
   },
   "DynamicDefault": {
     "module": "dynamic_default",
