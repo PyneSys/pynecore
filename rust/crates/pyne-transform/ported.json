@@ -13,7 +13,7 @@
   },
   "BuiltinShadow": {
     "module": "builtin_shadow",
-    "digest": "a1615c7920d55d0fb4366f11061098bfd7f85c97c71b55d656d0a39950f024af"
+    "digest": "0731734b0add1a1ef918a848ff409f699264c27798f4b21bc2028926e1136122"
   },
   "ImportNormalizer": {
     "module": "import_normalizer",
@@ -69,7 +69,7 @@
   },
   "ModuleProperty": {
     "module": "module_property",
-    "digest": "89cc52e30689bb403d30e8707085a26ff569025c7c21acd9e815f8f284145f20"
+    "digest": "1b6d0590f617b1418526f2119abb05b8904d1115e354167ae375159bee17dcc3"
   },
   "TaVariableHoist": {
     "module": "ta_variable_hoist",
