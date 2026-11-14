@@ -276,6 +276,10 @@ pub struct Step {
 /// while they match.
 pub const PORTED: &str = include_str!("../ported.json");
 
+/// The SHA-256 of [`PORTED`] in hex (`build.rs`): the pipeline's digest, for a host
+/// that needs only that and not the file's text.
+pub const PORTED_SHA256: &str = data::PORTED_SHA256;
+
 /// Every step with a native port.
 pub static STEPS: &[Step] = &[
     Step { name: "ImportLifter", run: steps::import_lifter::run },

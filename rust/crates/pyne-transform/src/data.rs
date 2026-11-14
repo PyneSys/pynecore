@@ -1,4 +1,5 @@
-//! The data files of `pynecore/transformers`, compiled in.
+//! The data files of `pynecore/transformers`, compiled in as `static` tables
+//! (`build.rs` writes them from the JSON): nothing is parsed when the crate runs.
 //!
 //! They are part of a step's source closure (see `transformers/native.py`): a
 //! regenerated file changes the digest of every step that reads it, so a binary
@@ -7,48 +8,130 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
+
+mod tables {
+    use super::{InlineStatic, JsonStatic as J, LibStatic};
+
+    /// Per interpreter, its `str.isprintable` rejections ([`super::PrintTable`]).
+    type Unprintable = &'static [((u32, u32), &'static [(u32, u32)])];
+
+    include!(concat!(env!("OUT_DIR"), "/data_tables.rs"));
+}
+
+pub(crate) use tables::PORTED_SHA256;
+
+/// The `u16` that stands for `None` of an optional string or list (`build.rs`).
+const NONE: u16 = u16::MAX;
+
+/// A string of the tables, by its index.
+fn s(id: u16) -> &'static str {
+    let id = usize::from(id);
+    let start = if id == 0 { 0 } else { tables::ENDS[id - 1] as usize };
+    &tables::TEXT[start..tables::ENDS[id] as usize]
+}
+
+fn opt_s(id: u16) -> Option<String> {
+    (id != NONE).then(|| s(id).to_string())
+}
+
+/// A list of strings, `(start, len)` in `POOL`.
+fn list((start, len): (u16, u16)) -> Vec<String> {
+    let start = usize::from(start);
+    tables::POOL[start..start + usize::from(len)].iter().map(|&id| s(id).to_string()).collect()
+}
+
+fn opt_list(range: (u16, u16)) -> Option<Vec<String>> {
+    (range.0 != NONE).then(|| list(range))
+}
+
+fn pairs(items: &[(u16, u16)]) -> HashMap<String, String> {
+    items.iter().map(|&(key, value)| (s(key).to_string(), s(value).to_string())).collect()
+}
+
+/// An entry of `lib_types.json`'s `names`, or one implementation of an overload
+/// group, as `build.rs` writes it: strings by index, lists as ranges.
+pub(crate) struct LibStatic {
+    kind: u16,
+    ty: u16,
+    callable: bool,
+    ret: u16,
+    params: (u16, u16),
+    names: (u16, u16),
+    defaults: u8,
+    default_ty: (u16, u16),
+    /// A range of `BOOLS`
+    default_none_ok: (u16, u16),
+    vararg: bool,
+    kwarg: bool,
+    /// A range of `IMPLS`
+    impls: (u16, u16),
+}
+
+impl LibStatic {
+    fn impls(&self) -> &'static [LibStatic] {
+        let start = usize::from(self.impls.0);
+        &tables::IMPLS[start..start + usize::from(self.impls.1)]
+    }
+}
+
+/// A function of `call_inline_templates.json` as `build.rs` writes it.
+pub(crate) enum InlineStatic {
+    Derive { params: (u16, u16), body: &'static JsonStatic },
+    Varargs { builtin: u16, na_anchor: u16, builtins_anchor: u16 },
+}
+
+/// A JSON value as `build.rs` writes it: an inline template's body.
+#[allow(dead_code)] // the variants the current templates hold vary
+pub(crate) enum JsonStatic {
+    Null,
+    Bool(bool),
+    U(u64),
+    I(i64),
+    /// A float by its bits
+    F(u64),
+    S(u16),
+    A(&'static [JsonStatic]),
+    O(&'static [(u16, JsonStatic)]),
+}
+
+impl JsonStatic {
+    fn value(&self) -> Value {
+        match self {
+            JsonStatic::Null => Value::Null,
+            JsonStatic::Bool(flag) => Value::Bool(*flag),
+            JsonStatic::U(n) => Value::from(*n),
+            JsonStatic::I(n) => Value::from(*n),
+            JsonStatic::F(bits) => Value::from(f64::from_bits(*bits)),
+            JsonStatic::S(id) => Value::String(s(*id).to_string()),
+            JsonStatic::A(items) => Value::Array(items.iter().map(JsonStatic::value).collect()),
+            JsonStatic::O(map) => Value::Object(
+                map.iter().map(|(key, item)| (s(*key).to_string(), item.value())).collect(),
+            ),
+        }
+    }
+}
 
 /// `module_properties.json`: module -> member name -> its `"type"` (`"property"` or
 /// `"variable"`; `module_property.module_properties`).
 pub fn module_properties() -> &'static HashMap<String, HashMap<String, String>> {
     static REGISTRY: OnceLock<HashMap<String, HashMap<String, String>>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let text = include_str!("../../../../src/pynecore/transformers/module_properties.json");
-        let document: HashMap<String, HashMap<String, HashMap<String, String>>> =
-            serde_json::from_str(text).expect("module_properties.json");
-        document
-            .into_iter()
-            .map(|(module, members)| {
-                let members = members
-                    .into_iter()
-                    .map(|(name, mut entry)| (name, entry.remove("type").expect("type")))
-                    .collect();
-                (module, members)
-            })
+        tables::MODULE_PROPERTIES
+            .iter()
+            .map(|&(module, members)| (s(module).to_string(), pairs(members)))
             .collect()
     })
-}
-
-/// `lib_types.json`, the generated lib registry (`lib_registry.lib_registry`).
-fn lib_registry() -> &'static Map<String, Value> {
-    static DOCUMENT: OnceLock<Map<String, Value>> = OnceLock::new();
-    DOCUMENT.get_or_init(|| {
-        let text = include_str!("../../../../src/pynecore/transformers/lib_types.json");
-        serde_json::from_str(text).expect("lib_types.json")
-    })
-}
-
-/// A top-level section of the lib registry.
-fn section(name: &str) -> &'static Value {
-    lib_registry().get(name).unwrap_or_else(|| panic!("lib_types.json has no {name}"))
 }
 
 /// `lib_types.json`'s `star_exports`: lib module -> its `__all__` (`lib_registry.lib_star_exports`).
 pub fn star_exports() -> &'static HashMap<String, Vec<String>> {
     static EXPORTS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
     EXPORTS.get_or_init(|| {
-        serde_json::from_value(section("star_exports").clone()).expect("star_exports")
+        tables::STAR_EXPORTS
+            .iter()
+            .map(|&(module, names)| (s(module).to_string(), list(names)))
+            .collect()
     })
 }
 
@@ -56,7 +139,7 @@ pub fn star_exports() -> &'static HashMap<String, Vec<String>> {
 /// (`lib_registry.lib_routes`).
 pub fn routes() -> &'static HashMap<String, String> {
     static ROUTES: OnceLock<HashMap<String, String>> = OnceLock::new();
-    ROUTES.get_or_init(|| serde_json::from_value(section("routes").clone()).expect("routes"))
+    ROUTES.get_or_init(|| pairs(tables::ROUTES))
 }
 
 /// `lib_types.json`'s `classes`: lib class name -> its fields and their types, in
@@ -64,19 +147,12 @@ pub fn routes() -> &'static HashMap<String, String> {
 pub fn classes() -> &'static HashMap<String, Vec<(String, String)>> {
     static CLASSES: OnceLock<HashMap<String, Vec<(String, String)>>> = OnceLock::new();
     CLASSES.get_or_init(|| {
-        let Value::Object(classes) = section("classes") else { panic!("classes") };
-        classes
+        tables::CLASSES
             .iter()
-            .map(|(name, fields)| {
-                let Value::Object(fields) = fields else { panic!("classes.{name}") };
-                let fields = fields
-                    .iter()
-                    .map(|(field, ty)| {
-                        let ty = ty.as_str().unwrap_or_else(|| panic!("classes.{name}.{field}"));
-                        (field.clone(), ty.to_string())
-                    })
-                    .collect();
-                (name.clone(), fields)
+            .map(|&(name, fields)| {
+                let fields =
+                    fields.iter().map(|&(field, ty)| (s(field).to_string(), s(ty).to_string()));
+                (s(name).to_string(), fields.collect())
             })
             .collect()
     })
@@ -85,9 +161,7 @@ pub fn classes() -> &'static HashMap<String, Vec<(String, String)>> {
 /// `lib_types.json`'s `scalar_classes`: lib class name -> the scalar type it is.
 pub fn scalar_classes() -> &'static HashMap<String, String> {
     static SCALARS: OnceLock<HashMap<String, String>> = OnceLock::new();
-    SCALARS.get_or_init(|| {
-        serde_json::from_value(section("scalar_classes").clone()).expect("scalar_classes")
-    })
+    SCALARS.get_or_init(|| pairs(tables::SCALAR_CLASSES))
 }
 
 /// An entry of `lib_types.json`'s `names` (`lib_registry.lib_types()[name]`): the
@@ -112,26 +186,17 @@ pub struct LibName {
 pub fn lib_names() -> &'static HashMap<String, LibName> {
     static NAMES: OnceLock<HashMap<String, LibName>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let Value::Object(names) = section("names") else { panic!("names") };
-        let text = |entry: &Value, field: &str| {
-            entry.get(field).and_then(Value::as_str).map(str::to_string)
-        };
-        names
+        tables::NAMES
             .iter()
             .map(|(name, entry)| {
-                let impl_rets = entry
-                    .get("impls")
-                    .and_then(Value::as_array)
-                    .map(|impls| impls.iter().map(|item| text(item, "ret")).collect())
-                    .unwrap_or_default();
                 let entry = LibName {
-                    kind: text(entry, "kind").unwrap_or_else(|| panic!("names.{name}.kind")),
-                    ty: text(entry, "ty"),
-                    callable: entry.get("callable").and_then(Value::as_bool).unwrap_or(false),
-                    ret: text(entry, "ret"),
-                    impl_rets,
+                    kind: s(entry.kind).to_string(),
+                    ty: opt_s(entry.ty),
+                    callable: entry.callable,
+                    ret: opt_s(entry.ret),
+                    impl_rets: entry.impls().iter().map(|item| opt_s(item.ret)).collect(),
                 };
-                (name.clone(), entry)
+                (s(*name).to_string(), entry)
             })
             .collect()
     })
@@ -168,38 +233,23 @@ pub struct LibEntry {
     pub impls: Vec<LibEntry>,
 }
 
-fn lib_entry(entry: &Value) -> LibEntry {
-    let text = |field: &str| entry.get(field).and_then(Value::as_str).map(str::to_string);
-    let texts = |field: &str| {
-        entry.get(field).and_then(Value::as_array).map(|items| {
-            items.iter().map(|item| item.as_str().unwrap_or("").to_string()).collect::<Vec<_>>()
-        })
-    };
+fn lib_entry(entry: &LibStatic) -> LibEntry {
+    let (start, len) = entry.default_none_ok;
     LibEntry {
-        kind: text("kind").unwrap_or_default(),
-        ty: text("ty"),
-        callable: entry.get("callable").and_then(Value::as_bool).unwrap_or(false),
-        ret: text("ret"),
-        params: texts("params"),
-        names: texts("names"),
-        defaults: entry.get("defaults").and_then(Value::as_i64).unwrap_or(0),
-        default_ty: texts("default_ty").unwrap_or_default(),
-        default_none_ok: entry
-            .get("default_none_ok")
-            .and_then(Value::as_array)
-            .map(|items| items.iter().map(|item| item.as_bool().unwrap_or(false)).collect()),
-        vararg: entry.get("vararg").is_some_and(|value| !value.is_null()),
-        kwarg: entry.get("kwarg").is_some_and(|value| match value {
-            Value::Null => false,
-            Value::Bool(flag) => *flag,
-            Value::String(text) => !text.is_empty(),
-            _ => true,
+        kind: s(entry.kind).to_string(),
+        ty: opt_s(entry.ty),
+        callable: entry.callable,
+        ret: opt_s(entry.ret),
+        params: opt_list(entry.params),
+        names: opt_list(entry.names),
+        defaults: i64::from(entry.defaults),
+        default_ty: list(entry.default_ty),
+        default_none_ok: (start != NONE).then(|| {
+            tables::BOOLS[usize::from(start)..usize::from(start) + usize::from(len)].to_vec()
         }),
-        impls: entry
-            .get("impls")
-            .and_then(Value::as_array)
-            .map(|impls| impls.iter().map(lib_entry).collect())
-            .unwrap_or_default(),
+        vararg: entry.vararg,
+        kwarg: entry.kwarg,
+        impls: entry.impls().iter().map(lib_entry).collect(),
     }
 }
 
@@ -207,8 +257,7 @@ fn lib_entry(entry: &Value) -> LibEntry {
 pub fn lib_entries() -> &'static HashMap<String, LibEntry> {
     static ENTRIES: OnceLock<HashMap<String, LibEntry>> = OnceLock::new();
     ENTRIES.get_or_init(|| {
-        let Value::Object(names) = section("names") else { panic!("names") };
-        names.iter().map(|(name, entry)| (name.clone(), lib_entry(entry))).collect()
+        tables::NAMES.iter().map(|(name, entry)| (s(*name).to_string(), lib_entry(entry))).collect()
     })
 }
 
@@ -257,48 +306,29 @@ pub struct InlineTemplates {
 pub fn inline_templates() -> &'static InlineTemplates {
     static TEMPLATES: OnceLock<InlineTemplates> = OnceLock::new();
     TEMPLATES.get_or_init(|| {
-        let text = include_str!("../../../../src/pynecore/transformers/call_inline_templates.json");
-        let document: Map<String, Value> =
-            serde_json::from_str(text).expect("call_inline_templates.json");
-        let section = |name: &str| {
-            document
-                .get(name)
-                .unwrap_or_else(|| panic!("call_inline_templates.json has no {name}"))
-                .clone()
-        };
-        let text = |entry: &Value, field: &str| {
-            entry
-                .get(field)
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("call_inline_templates.json: no {field}"))
-                .to_string()
-        };
-        let Value::Object(functions) = section("functions") else { panic!("functions") };
-        let functions = functions
+        let functions = tables::INLINE_FUNCTIONS
             .iter()
-            .map(|(name, entry)| {
-                let function = match entry.get("kind").and_then(Value::as_str) {
-                    Some("derive") => InlineFunction::Derive {
-                        params: serde_json::from_value(entry["params"].clone())
-                            .unwrap_or_else(|_| panic!("functions.{name}.params")),
-                        body: entry["body"].clone(),
-                    },
-                    Some("varargs") => InlineFunction::Varargs {
-                        builtin: text(entry, "builtin"),
-                        na_anchor: text(entry, "na_anchor"),
-                        builtins_anchor: text(entry, "builtins_anchor"),
-                    },
-                    other => panic!("functions.{name}.kind {other:?}"),
+            .map(|(name, function)| {
+                let function = match function {
+                    InlineStatic::Derive { params, body } => {
+                        InlineFunction::Derive { params: list(*params), body: body.value() }
+                    }
+                    InlineStatic::Varargs { builtin, na_anchor, builtins_anchor } => {
+                        InlineFunction::Varargs {
+                            builtin: s(*builtin).to_string(),
+                            na_anchor: s(*na_anchor).to_string(),
+                            builtins_anchor: s(*builtins_anchor).to_string(),
+                        }
+                    }
                 };
-                (name.clone(), function)
+                (s(*name).to_string(), function)
             })
             .collect();
         InlineTemplates {
             functions,
-            callees: serde_json::from_value(section("callees")).expect("callees"),
-            loop_ranges: serde_json::from_value(section("loop_ranges")).expect("loop_ranges"),
-            varargs_arities: serde_json::from_value(section("varargs_arities"))
-                .expect("varargs_arities"),
+            callees: pairs(tables::INLINE_CALLEES),
+            loop_ranges: list(tables::LOOP_RANGES),
+            varargs_arities: tables::VARARGS_ARITIES.to_vec(),
         }
     })
 }
@@ -323,26 +353,16 @@ pub type PrintTable = ((u32, u32), Vec<(u32, u32)>);
 pub fn python_names() -> &'static PythonNames {
     static NAMES: OnceLock<PythonNames> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let text = include_str!("../../../../src/pynecore/transformers/python_names.json");
-        let mut document: HashMap<String, serde_json::Value> =
-            serde_json::from_str(text).expect("python_names.json");
-        let mut section = |name: &str| document.remove(name).expect("python_names.json section");
-        let names = |value: serde_json::Value| -> HashSet<String> {
-            serde_json::from_value(value).expect("python_names.json names")
-        };
-        let builtins = names(section("builtins"));
-        let keywords = names(section("keywords"));
-        let stdlib = names(section("stdlib"));
-        let tables: HashMap<String, Vec<(u32, u32)>> =
-            serde_json::from_value(section("unprintable")).expect("python_names.json unprintable");
-        let unprintable = tables
-            .into_iter()
-            .map(|(version, ranges)| {
-                let (major, minor) = version.split_once('.').expect("major.minor");
-                ((major.parse().expect("major"), minor.parse().expect("minor")), ranges)
-            })
-            .collect();
-        PythonNames { builtins, keywords, stdlib, unprintable }
+        let names = |range| list(range).into_iter().collect();
+        PythonNames {
+            builtins: names(tables::BUILTINS),
+            keywords: names(tables::KEYWORDS),
+            stdlib: names(tables::STDLIB),
+            unprintable: tables::UNPRINTABLE
+                .iter()
+                .map(|(version, ranges)| (*version, ranges.to_vec()))
+                .collect(),
+        }
     })
 }
 
