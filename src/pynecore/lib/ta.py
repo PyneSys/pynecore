@@ -338,7 +338,6 @@ def cmo(series: float, length: int) -> PyneFloat:
     return 100 * (sum1 - sum2) / total
 
 
-# noinspection PyUnusedLocal,PyShadowingBuiltins
 def cog(source: Series[float], length: int) -> PyneFloat:
     """
     Calculate the Center of Gravity (COG) of the source series with the given length.
@@ -821,6 +820,7 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
+    assert length > 0, "Invalid length, length must be greater than 0!"
     if _series_length:
         return _series_window_extreme(source, length, True, _bars, _tuple, _check_eq)
     # The bar clock addresses the ring: a Python int inside the machine
@@ -971,7 +971,6 @@ for _impl in getattr(highest, '__pyne_impls__'):
     getattr(_impl.func, '__pyne_layout__')['per_call'] = True
 
 
-# noinspection PyUnusedLocal
 @overload
 def highestbars(source: Series[float], length: int, _series_length: bool | None = False) -> PyneInt:
     """
@@ -1267,6 +1266,7 @@ def lowest(source: Series[float], length: int,
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
+    assert length > 0, "Invalid length, length must be greater than 0!"
     if _series_length:
         return _series_window_extreme(source, length, False, _bars, _tuple, _check_eq)
     # The bar clock addresses the ring: a Python int inside the machine
@@ -1368,7 +1368,6 @@ for _impl in getattr(lowest, '__pyne_impls__'):
     getattr(_impl.func, '__pyne_layout__')['per_call'] = True
 
 
-# noinspection PyUnusedLocal
 @overload
 def lowestbars(source: Series[float], length: int, _series_length: bool | None = False) -> PyneInt:
     """
@@ -1886,7 +1885,6 @@ def _rank_nearest(ranks: list[float], percentage: float) -> float:
     return ranks[rank - 1]
 
 
-# noinspection PyUnusedLocal,PyProtectedMember
 def percentile_linear_interpolation(source: Series[float], length: int, percentage: int | float) \
         -> PyneFloat:
     """
@@ -1981,7 +1979,6 @@ percentile_linear_interpolation.__pyne_shared_call_site__ = True
 getattr(percentile_linear_interpolation, '__pyne_layout__')['per_call'] = True
 
 
-# noinspection PyUnusedLocal,PyProtectedMember
 def percentile_nearest_rank(source: Series[float], length: int, percentage: int | float) \
         -> PyneFloat:
     """
@@ -2955,7 +2952,6 @@ def swma(source: Series[float]) -> PyneFloat:
     return (source + 2 * source[1] + 2 * source[2] + source[3]) / 6
 
 
-# noinspection PyUnusedLocal
 @module_function_property
 def tr(handle_na: bool = False) -> PyneFloat:
     """
@@ -3108,7 +3104,6 @@ def valuewhen(condition: bool, source: TFIB, occurrence: int) -> TFIB:
     return cast(TFIB, na_float)
 
 
-# noinspection PyUnusedLocal
 @module_function_property
 def vwap(source: Series[float] | None = None, anchor: bool | None = None,
          stdev_mult: float | None = None) -> PyneFloat | tuple[PyneFloat, PyneFloat, PyneFloat]:
