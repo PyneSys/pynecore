@@ -17,6 +17,18 @@ statement and replaces the call with the temp's name. The assignment stays in
 the same statement list, so block-level conditional execution keeps its gap
 semantics and loop bodies keep their per-iteration frequency.
 
+The test of an ``elif`` (Pine ``else if``) is a lazy position of the whole
+``if`` statement, not a statement of the ``else`` block: TradingView keeps its
+history fresh on every bar the ``if`` statement runs. Its calls are hoisted
+before the head of the chain. An ``if`` nested in an ``else`` block is a
+statement of that block and keeps the gaps. The two have the same tree; an
+``elif`` starts in the column of the ``if`` it continues, on a later line.
+
+A call that may read a name a ``:=`` of the same statement (for an ``elif``: of
+the chain's tests) binds stays in place: hoisted, it would read the name before
+the assignment runs. With such a ``:=`` present, a call with a nested call counts
+as a reader too, since a local helper can read the name through its closure.
+
 ``while`` tests are deliberately left untouched (they re-evaluate per
 iteration — a hoist above the loop would freeze them), and lambdas /
 comprehensions are not descended into (deferred or repeated evaluation).
@@ -41,6 +53,53 @@ def _is_inline_series(node: ast.expr) -> bool:
             and node.func.id == 'inline_series')
 
 
+def _walrus_targets(exprs: list[ast.expr]) -> set[str]:
+    """The names the ``:=`` expressions of a statement bind.
+
+    :param exprs: The statement's expressions.
+    :return: Every name a ``NamedExpr`` among them assigns.
+    """
+    names: set[str] = set()
+    for expr in exprs:
+        for node in ast_walk.walk(expr):
+            if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+    return names
+
+
+def _may_read(node: ast.Call, names: set[str]) -> bool:
+    """Whether a call may read any of ``names``.
+
+    :param node: The call.
+    :param names: Names to look for.
+    :return: True when a ``Name`` of the subtree is one of them, or when the
+             subtree contains a nested call: a local helper can read them
+             through its closure.
+    """
+    return bool(names) and any(
+        (isinstance(sub, ast.Name) and sub.id in names)
+        or (isinstance(sub, ast.Call) and sub is not node)
+        for sub in ast_walk.walk(node))
+
+
+def _elif_of(node: ast.If) -> ast.If | None:
+    """The ``elif`` that continues an ``if`` statement, if any.
+
+    :param node: An ``if`` statement.
+    :return: The ``If`` of its ``orelse`` when that was written as ``elif``, else None.
+    """
+    if len(node.orelse) != 1 or not isinstance(node.orelse[0], ast.If):
+        return None
+    child = node.orelse[0]
+    line = getattr(node, 'lineno', None)
+    child_line = getattr(child, 'lineno', None)
+    if line is None or child_line is None or child_line <= line:
+        return None
+    if getattr(child, 'col_offset', None) != getattr(node, 'col_offset', None):
+        return None
+    return child
+
+
 class _ExprHoister(ast_walk.NodeTransformer):
     """Rewrite one statement's expression tree: every ``inline_series`` call
     in a lazy position is appended to ``hoisted`` as a temp assignment and
@@ -49,11 +108,13 @@ class _ExprHoister(ast_walk.NodeTransformer):
     ``_lazy`` is True while the current subtree only evaluates when
     short-circuiting (``and``/``or`` operands after the first) or ternary
     branch selection reaches it. Inner calls are collected before outer ones,
-    so the emitted assignments are ordered definition-before-use.
+    so the emitted assignments are ordered definition-before-use. A call
+    that may read a name of ``bound`` (assigned by a ``:=`` of the statement) stays.
     """
 
-    def __init__(self, transformer: 'InlineSeriesHoistTransformer'):
+    def __init__(self, transformer: 'InlineSeriesHoistTransformer', bound: set[str]):
         self._transformer = transformer
+        self._bound = bound
         self.hoisted: list[ast.stmt] = []
         self._lazy = False
 
@@ -99,7 +160,7 @@ class _ExprHoister(ast_walk.NodeTransformer):
         return node
 
     def visit_Call(self, node: ast.Call) -> ast.expr:
-        if not (self._lazy and _is_inline_series(node)):
+        if not (self._lazy and _is_inline_series(node)) or _may_read(node, self._bound):
             return cast(ast.expr, self.generic_visit(node))
         # The hoisted call runs at statement level: its arguments leave the
         # lazy context, so nested positions are judged from an eager root
@@ -150,6 +211,10 @@ class InlineSeriesHoistTransformer:
         """Process one statement list; returns the list with hoists inserted."""
         new_body: list[ast.stmt] = []
         for stmt in body:
+            # The elif tests belong to this statement: hoisted before its
+            # nested lists are processed, so only the calls left in place
+            # remain for them
+            chain = self._hoist_elif_tests(stmt) if isinstance(stmt, ast.If) else []
             # Nested statement lists first — each is its own hoist target,
             # which keeps block-level (gap) semantics intact
             for field in self._STMT_LIST_FIELDS:
@@ -159,15 +224,41 @@ class InlineSeriesHoistTransformer:
             for handler in getattr(stmt, 'handlers', ()):
                 handler.body = self._process_body(handler.body)
             new_body.extend(self._hoist_from(stmt))
+            new_body.extend(chain)
             new_body.append(stmt)
         return new_body
+
+    def _hoist_elif_tests(self, stmt: ast.If) -> list[ast.stmt]:
+        """Rewrite the tests of the ``elif`` chain continuing ``stmt``; return
+        the temp assignments to place before ``stmt``.
+
+        :param stmt: The head of a possible ``if`` / ``elif`` chain.
+        :return: Temp assignments for every ``inline_series`` call of the elif tests.
+        """
+        chain: list[ast.If] = []
+        branch = _elif_of(stmt)
+        while branch is not None:
+            chain.append(branch)
+            branch = _elif_of(branch)
+        if not chain:
+            return []
+        hoister = _ExprHoister(self, _walrus_targets([stmt.test] + [b.test for b in chain]))
+        for branch in chain:
+            branch.test = hoister.visit_as(branch.test, True)
+        return hoister.hoisted
 
     def _hoist_from(self, stmt: ast.stmt) -> list[ast.stmt]:
         """Rewrite the statement's own expression fields; return the temp
         assignments to place before it."""
         if isinstance(stmt, self._SKIP_EXPR_STMTS):
             return []
-        hoister = _ExprHoister(self)
+        exprs: list[ast.expr] = []
+        for _, value in ast.iter_fields(stmt):
+            if isinstance(value, ast.expr):
+                exprs.append(value)
+            elif isinstance(value, list) and value and isinstance(value[0], ast.expr):
+                exprs.extend(value)
+        hoister = _ExprHoister(self, _walrus_targets(exprs))
         for field, value in ast.iter_fields(stmt):
             if isinstance(stmt, ast.While) and field == 'test':
                 continue  # re-evaluated per iteration — must stay in place

@@ -127,6 +127,152 @@ def main(gate, lazy_gate, v):
         assert ns['main'](state, True, True, 30) == 10.0
 
 
+def __test_elif_test_fresh_history__():
+    """ The history in an ``elif`` test advances on every bar the ``if``
+    statement runs, also when an earlier branch is taken (TV v6:
+    ``else if (bar_index * 1.0)[1] == bar_index - 1`` holds on every bar it is
+    reached, CAPITALCOM:EURUSD 1D) """
+    ns, dump = _transform('''
+from pynecore.core.series import inline_series
+
+def main(first, v):
+    r = 0
+    if first:
+        r = 1
+    elif inline_series(v * 1.0, 1) == v - 1:
+        r = 2
+    return r
+''')
+    tree = ast.parse(dump)
+    fn = next(s for s in tree.body if isinstance(s, ast.FunctionDef))
+    head = next(s for s in fn.body if isinstance(s, ast.If))
+    # hoisted before the head of the chain, which stays an elif
+    assert fn.body.index(head) > next(i for i, s in enumerate(fn.body)
+                                      if '__hist_0__ =' in ast.unparse(s))
+    assert 'elif __hist_0__ ==' in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    with _bars() as next_bar:
+        assert ns['main'](state, True, 0) == 1
+        next_bar()
+        assert ns['main'](state, False, 1) == 2
+        next_bar()
+        assert ns['main'](state, True, 2) == 1
+        next_bar()
+        # the bar before took the first branch; the elif history still moved
+        assert ns['main'](state, False, 3) == 2
+
+
+def __test_elif_chain_hoists_every_test__():
+    """ Every test of a longer ``elif`` chain goes before its head (hoist-only
+    dump) """
+    tree = InlineSeriesHoistTransformer().visit(ast.parse('''
+def main(a, v):
+    if a == 0:
+        r = 0
+    elif inline_series(v, 1) > 0:
+        r = 1
+    elif inline_series(v, 2) > 0:
+        r = 2
+    else:
+        r = 3
+    return r
+'''))
+    fn = tree.body[0]
+    assert isinstance(fn, ast.FunctionDef)
+    assert [ast.unparse(s) for s in fn.body[:2]] == [
+        '__hist_0__ = inline_series(v, 1)', '__hist_1__ = inline_series(v, 2)']
+    dump = ast.unparse(tree)
+    assert 'elif __hist_0__ > 0:' in dump
+    assert 'elif __hist_1__ > 0:' in dump
+
+
+def __test_walrus_dependency_stays_in_place__():
+    """ A call reading a name a ``:=`` of the statement (for an ``elif``: of
+    the chain's tests) binds is not hoisted: hoisted, it would read the name
+    before the assignment runs """
+    tree = InlineSeriesHoistTransformer().visit(ast.parse('''
+def main(v):
+    if (current := v) < 0:
+        r = 1
+    elif inline_series(current * 1.0, 1) > 0:
+        r = 2
+    elif inline_series(v, 1) > 0:
+        r = 3
+    else:
+        r = 0
+    s = (c := v) > 0 and inline_series(c, 1) > 0
+    return r, s
+'''))
+    fn = tree.body[0]
+    assert isinstance(fn, ast.FunctionDef)
+    assert ast.unparse(fn.body[0]) == '__hist_0__ = inline_series(v, 1)'
+    dump = ast.unparse(tree)
+    assert 'elif __hist_0__ > 0:' in dump
+    # the dependent calls keep their place (and the block-level history)
+    assert 'elif inline_series(current * 1.0, 1) > 0:' in dump
+    assert 'inline_series(c, 1) > 0' in dump
+    assert '__hist_1__' not in dump
+    ns: dict = {'inline_series': lambda value, _: value}
+    exec(compile(tree, '<test>', 'exec'), ns)
+    assert ns['main'](2) == (2, True)
+
+
+def __test_walrus_dependency_through_helper_stays_in_place__():
+    """ With a ``:=`` in the statement, a call reaching a local helper stays: the
+    helper can read the bound name through its closure """
+    tree = InlineSeriesHoistTransformer().visit(ast.parse('''
+def main(v):
+    def read_current():
+        return current * 1.0
+
+    if (current := v) < 0:
+        r = 1
+    elif inline_series(read_current(), 1) > 0:
+        r = 2
+    elif inline_series(v, 1) > 0:
+        r = 3
+    else:
+        r = 0
+    return r
+'''))
+    dump = ast.unparse(tree)
+    assert 'elif inline_series(read_current(), 1) > 0:' in dump
+    assert '__hist_0__ = inline_series(v, 1)' in dump
+    assert '__hist_1__' not in dump
+    ns: dict = {'inline_series': lambda value, _: value}
+    exec(compile(tree, '<test>', 'exec'), ns)
+    assert ns['main'](2) == 2
+
+
+def __test_if_nested_in_else_keeps_gap_semantics__():
+    """ An ``if`` nested in an ``else`` block is a statement of that block: its
+    test keeps the gaps (TV v6: ``1 0 2`` where the ``else if`` form gives
+    ``1 2 2``) """
+    ns, dump = _transform('''
+from pynecore.core.series import inline_series
+
+def main(first, v):
+    r = 0
+    if first:
+        r = 1
+    else:
+        if inline_series(v * 1.0, 1) == v - 1:
+            r = 2
+    return r
+''')
+    assert '__hist_' not in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    with _bars() as next_bar:
+        assert ns['main'](state, True, 0) == 1
+        next_bar()
+        assert ns['main'](state, False, 1) == 0  # first time reached: no history
+        next_bar()
+        assert ns['main'](state, True, 2) == 1
+        next_bar()
+        # [1] is the value of the last bar that reached the test (1), not 2
+        assert ns['main'](state, False, 3) == 0
+
+
 def __test_nested_lazy_inside_hoisted_args__():
     """ A lazy inline_series nested in a hoisted call's argument is hoisted
     too, definition-before-use (hoist-only dump: the slot pipeline would

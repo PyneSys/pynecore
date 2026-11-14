@@ -4,10 +4,16 @@
 //! Every `inline_series(...)` call in a ternary branch or in an `and` / `or`
 //! operand after the first is bound to a `__hist_<n>__` temporary assigned just
 //! before its statement, in the same statement list. `while` tests, lambdas and
-//! comprehensions are left alone.
+//! comprehensions are left alone. The test of an `elif` is a lazy position of the
+//! whole `if` statement: its calls go before the head of the chain. A call that
+//! may read a name a `:=` of the same statement (for an `elif`: of the chain's
+//! tests) binds stays in place; with such a `:=` present, a nested call counts as a
+//! reader too (a local helper can read the name through its closure).
 
 use pyne_ast::locations::fix_locations;
-use pyne_ast::walk::{Transformer, Visited, generic_visit};
+use std::collections::HashSet;
+
+use pyne_ast::walk::{Transformer, Visited, generic_visit, walk};
 use pyne_ast::{Ast, Category, ExprContext, FieldKind, FieldMut, FieldRef, Kind, NodeId};
 
 use crate::{Context, Error};
@@ -29,10 +35,53 @@ fn is_inline_series(ast: &Ast, id: NodeId) -> bool {
     }
 }
 
+/// The names the `:=` expressions of a statement bind.
+fn walrus_targets(ast: &Ast, exprs: &[NodeId]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for &expr in exprs {
+        for node in walk(ast, expr) {
+            if let &Kind::NamedExpr { target, .. } = ast.kind(node)
+                && let Kind::Name { id, .. } = ast.kind(target)
+            {
+                names.insert(id.clone());
+            }
+        }
+    }
+    names
+}
+
+/// Whether a call may read any of `names`: a `Name` of the subtree is one of them,
+/// or the subtree contains a nested call (a local helper can read them through its
+/// closure).
+fn may_read(ast: &Ast, id: NodeId, names: &HashSet<String>) -> bool {
+    !names.is_empty()
+        && walk(ast, id).into_iter().any(|node| match ast.kind(node) {
+            Kind::Name { id, .. } => names.contains(id),
+            Kind::Call { .. } => node != id,
+            _ => false,
+        })
+}
+
+/// The `elif` that continues an `if` statement: the single `If` of its `orelse`,
+/// starting in the column of the `if` on a later line (an `if` nested in an
+/// `else` block is indented deeper).
+fn elif_of(ast: &Ast, id: NodeId) -> Option<NodeId> {
+    let Kind::If { orelse, .. } = ast.kind(id) else { return None };
+    let &[child] = orelse.as_slice() else { return None };
+    if !matches!(ast.kind(child), Kind::If { .. }) {
+        return None;
+    }
+    let (loc, child_loc) = (ast[id].loc, ast[child].loc);
+    let (Some(line), Some(child_line)) = (loc.lineno, child_loc.lineno) else { return None };
+    (child_line > line && child_loc.col_offset == loc.col_offset).then_some(child)
+}
+
 /// Rewrites one statement's expression tree: every `inline_series` call in a lazy
-/// position becomes a temporary assignment in `hoisted`, inner calls first.
+/// position becomes a temporary assignment in `hoisted`, inner calls first. A call
+/// that may read a name of `bound` (assigned by a `:=` of the statement) stays.
 struct ExprHoister<'a> {
     counter: &'a mut usize,
+    bound: HashSet<String>,
     hoisted: Vec<NodeId>,
     /// Whether the current subtree only evaluates when short-circuiting or
     /// ternary branch selection reaches it
@@ -88,7 +137,11 @@ impl Transformer for ExprHoister<'_> {
             | Kind::SetComp { .. }
             | Kind::DictComp { .. }
             | Kind::GeneratorExp { .. } => {}
-            Kind::Call { args, keywords, .. } if self.lazy && is_inline_series(ast, id) => {
+            Kind::Call { args, keywords, .. }
+                if self.lazy
+                    && is_inline_series(ast, id)
+                    && !may_read(ast, id, &self.bound) =>
+            {
                 let (args, keywords) = (args.clone(), keywords.clone());
                 // The hoisted call runs at statement level: its arguments leave the
                 // lazy context, so nested positions are judged from an eager root
@@ -127,6 +180,9 @@ impl InlineSeriesHoist {
     fn process_body(&mut self, ast: &mut Ast, body: Vec<NodeId>) -> Vec<NodeId> {
         let mut new_body = Vec::with_capacity(body.len());
         for stmt in body {
+            // The elif tests belong to this statement: hoisted before its nested
+            // lists are processed, so only the calls left in place remain for them
+            let chain = self.hoist_elif_tests(ast, stmt);
             // Nested statement lists first: each is its own hoist target, which
             // keeps block-level (gap) semantics intact
             let class = ast.kind(stmt).class();
@@ -159,9 +215,41 @@ impl InlineSeriesHoist {
                 *body = processed;
             }
             new_body.extend(self.hoist_from(ast, stmt));
+            new_body.extend(chain);
             new_body.push(stmt);
         }
         new_body
+    }
+
+    /// Rewrite the tests of the `elif` chain continuing `stmt`; returns the
+    /// temporary assignments to place before `stmt`.
+    fn hoist_elif_tests(&mut self, ast: &mut Ast, stmt: NodeId) -> Vec<NodeId> {
+        let mut chain = Vec::new();
+        let mut branch = elif_of(ast, stmt);
+        while let Some(id) = branch {
+            chain.push(id);
+            branch = elif_of(ast, id);
+        }
+        if chain.is_empty() {
+            return Vec::new();
+        }
+        let tests: Vec<NodeId> = std::iter::once(stmt)
+            .chain(chain.iter().copied())
+            .map(|id| {
+                let &Kind::If { test, .. } = ast.kind(id) else { unreachable!() };
+                test
+            })
+            .collect();
+        let bound = walrus_targets(ast, &tests);
+        let mut hoister =
+            ExprHoister { counter: &mut self.counter, bound, hoisted: Vec::new(), lazy: false };
+        for id in chain {
+            let &Kind::If { test, .. } = ast.kind(id) else { unreachable!() };
+            let test = hoister.visit_as(ast, test, true);
+            let Kind::If { test: slot, .. } = ast.kind_mut(id) else { unreachable!() };
+            *slot = test;
+        }
+        hoister.hoisted
     }
 
     /// Rewrite the statement's own expression fields; returns the temporary
@@ -175,9 +263,27 @@ impl InlineSeriesHoist {
             return Vec::new();
         }
         let is_while = matches!(ast.kind(stmt), Kind::While { .. });
-        let mut hoister =
-            ExprHoister { counter: &mut self.counter, hoisted: Vec::new(), lazy: false };
         let class = ast.kind(stmt).class();
+        let mut exprs = Vec::new();
+        for (index, field) in class.fields.iter().enumerate() {
+            match ast.kind(stmt).field(index) {
+                FieldRef::Node(&value) | FieldRef::OptNode(&Some(value))
+                    if matches!(field.kind, FieldKind::Node | FieldKind::OptNode)
+                        && is_category(ast, value, Category::Expr) =>
+                {
+                    exprs.push(value);
+                }
+                FieldRef::Nodes(items)
+                    if items.first().is_some_and(|&first| is_category(ast, first, Category::Expr)) =>
+                {
+                    exprs.extend(items.iter().copied());
+                }
+                _ => {}
+            }
+        }
+        let bound = walrus_targets(ast, &exprs);
+        let mut hoister =
+            ExprHoister { counter: &mut self.counter, bound, hoisted: Vec::new(), lazy: false };
         for (index, field) in class.fields.iter().enumerate() {
             // A while test is re-evaluated per iteration: it must stay in place
             if is_while && field.name == "test" {

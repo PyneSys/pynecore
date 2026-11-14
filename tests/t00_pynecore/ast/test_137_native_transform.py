@@ -23,6 +23,7 @@ __test_helper_SOURCE = '''"""
 """
 from pynecore import lib
 from pynecore.core.pine_udt import udt
+from pynecore.core.series import inline_series
 from pynecore.lib import close, hl2, na, plot, request, syminfo, timeframe
 from pynecore.types import Matrix, Series
 
@@ -55,6 +56,43 @@ def helper(x):
         return math.max(1, 2)
 
     return ta.sma(x, 2) + absolute(x) + inner()
+
+
+def branch(x):
+    r = 0.0
+    if x > 0:
+        r = 1.0
+    elif inline_series(x * 1.0, 1) > 0:
+        r = 2.0
+    elif inline_series(x, 2) > 0 or (inline_series(x, 1) if r else x) > 0:
+        r = 3.0
+    else:
+        if inline_series(x * 1.0, 1) > 1:
+            r = 4.0
+    return r
+
+
+def walrus_dependency(x):
+    if (current := x) < 0:
+        r = 1.0
+    elif inline_series(current * 1.0, 1) > 0 or inline_series(x, 3) > 0:
+        r = 2.0
+    else:
+        r = 0.0
+    return r + ((c := x) > 0 and inline_series(c, 1) > 0)
+
+
+def walrus_helper_dependency(x):
+    def read_current():
+        return current * 1.0
+
+    if (current := x) < 0:
+        r = 1.0
+    elif inline_series(read_current(), 1) > 0 or inline_series(x, 2) > 0:
+        r = 2.0
+    else:
+        r = 0.0
+    return r
 
 
 def htf(tf, symbol=syminfo.tickerid):

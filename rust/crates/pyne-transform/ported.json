@@ -45,7 +45,7 @@
   },
   "InlineSeriesHoist": {
     "module": "inline_series_hoist",
-    "digest": "abd8432a290a5fea81a3debdeee661fb465c19b25ec295559a8c6dd5fecf5480"
+    "digest": "a4a0392db2b4a4b9b6e118055ebb7c50a3eb8a81572f1345309da1105cd0b48e"
   },
   "PineTruthiness": {
     "module": "pine_truthiness",
