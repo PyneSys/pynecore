@@ -6182,6 +6182,61 @@ class SimPosition(PositionBase):
             self._enforce_post_bar_risk()
         self._finalize_new_closed_trades()
 
+    def process_orders_live_tick(self, prev: OHLCV | None, update: OHLCV) -> None:
+        """
+        Fill orders on one live update of the forming bar (paper trading).
+
+        On realtime bars every update from the feed is a tick the emulator can fill
+        on, and an order a script places on a tick fills on the next available one.
+        Each update is therefore processed as soon as it arrives, before the body
+        runs on it, so the body sees the fills of this tick and the orders it places
+        compete only for prices that come after it.
+
+        A live update carries the forming bar so far (open, the extremes reached
+        since the open, the latest price), so the stretch of the path that belongs
+        to this tick alone is rebuilt from the previous update:
+
+        - The first update of a bar is walked whole: the bar opens at its ``open``,
+          and the orders queued at the previous bar's close fill there.
+        - A later update opens and closes at its latest price, the price of the
+          tick. An extreme the update moved past the previous one was reached
+          since the previous tick, so the walk visits it too. A price-based order
+          whose level the price stepped over between two ticks fills at the tick
+          price, the same rule a gap between two bars follows.
+
+        The update is walked as one sub-bar by :meth:`process_orders_magnified`.
+        Trades closed on the earlier ticks of the same bar are kept in
+        ``new_closed_trades``, so it holds the whole bar's closes when the bar
+        closes, the same as after a bar-close pass.
+
+        :param prev: The previous live update, or ``None`` at the first update.
+        :param update: The live update to fill on.
+        """
+        same_bar = prev is not None and prev.timestamp == update.timestamp
+        if not same_bar:
+            self.process_orders_magnified([update], update)
+            return
+
+        assert prev is not None
+        price = update.close
+        high = update.high if update.high > prev.high else price
+        low = update.low if update.low < prev.low else price
+        ask = update.ask
+        if ask is not None:
+            ask_price = ask.close
+            prev_ask = prev.ask
+            ask_high = ask.high if prev_ask is not None and ask.high > prev_ask.high else ask_price
+            ask_low = ask.low if prev_ask is not None and ask.low < prev_ask.low else ask_price
+            ask = _AskOHLC(open=ask_price, high=max(ask_high, ask_price),
+                           low=min(ask_low, ask_price), close=ask_price)
+        tick = update._replace(open=price, high=max(high, price), low=min(low, price),
+                               ask=ask)
+
+        closed_earlier = list(self.new_closed_trades)
+        self.process_orders_magnified([tick], tick)
+        if closed_earlier:
+            self.new_closed_trades[:0] = closed_earlier
+
 
 #
 # Functions

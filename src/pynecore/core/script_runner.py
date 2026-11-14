@@ -1987,7 +1987,7 @@ class ScriptRunner:
         else:
             position.process_orders_magnified(sub_bars, candle)
 
-    def _log_sim_fills(self, position) -> None:
+    def _log_sim_fills(self, position, closed_from: int = 0) -> None:
         """Narrate paper-trading fills in ``--live`` mode without a broker.
 
         The :class:`SimPosition` fills orders locally and silently. This is the
@@ -1997,9 +1997,12 @@ class ScriptRunner:
         entries are announced once per open trade, tracked by object identity.
 
         :param position: The active :class:`SimPosition`.
+        :param closed_from: Index of the first closed trade not narrated yet.
+            Fills processed tick by tick keep the bar's earlier closes in
+            ``new_closed_trades``, which were narrated on their own tick.
         """
         d = self._price_decimals
-        for t in position.new_closed_trades:
+        for t in position.new_closed_trades[closed_from:]:
             side = "long" if t.size > 0 else "short"
             sim_info(
                 "EXIT %s %s qty=%g entry=%.*f exit=%.*f pnl=%+.2f",
@@ -3923,6 +3926,15 @@ class ScriptRunner:
                 # The warmup loop just executed that bar, so an update continuing
                 # it has a run to discard.
                 bar_executed = True
+                # Paper trading with a body that runs on every tick fills on every
+                # tick too: an order placed on one tick fills on the next one, and
+                # the body sees the fills of the tick it runs on. Broker mode syncs
+                # the exchange on every tick instead.
+                paper_ticks = (is_strat and position is not None and not broker_mode
+                               and run_on_every_tick)
+                prev_live_update: OHLCV | None = None
+                # Closed trades of the current bar already narrated by [SIM] lines
+                sim_logged_closed = 0
 
                 live_stream = itertools.chain([first_live_update], ohlcv_iterator)
                 for bar_update in live_stream:
@@ -4053,6 +4065,9 @@ class ScriptRunner:
                     if on_tick is not None:
                         on_tick(candle)
 
+                    tick_prev = prev_live_update
+                    prev_live_update = candle
+
                     if is_new_bar and not bar_update.is_closed:
                         # ── Bar open (first intra-bar tick) ──
                         sub_bars = [candle]
@@ -4085,7 +4100,13 @@ class ScriptRunner:
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
                                 cast('BrokerPosition', position).update_unrealized_pnl(float(lib.close))
+                            if paper_ticks:
+                                sim_position.process_orders_live_tick(tick_prev, candle)
+                                self._log_sim_fills(position)
+                                sim_logged_closed = len(sim_position.new_closed_trades)
                             _run_libs_and_main()
+                            if paper_ticks:
+                                sim_position.settle_immediate_closes()
                             bar_executed = True
                         last_bar_timestamp = candle.timestamp
 
@@ -4102,7 +4123,13 @@ class ScriptRunner:
                                     and not lib._strategy_suppressed:
                                 self._process_orders(position)
                                 cast('BrokerPosition', position).update_unrealized_pnl(float(lib.close))
+                            if paper_ticks:
+                                sim_position.process_orders_live_tick(tick_prev, candle)
+                                self._log_sim_fills(position, sim_logged_closed)
+                                sim_logged_closed = len(sim_position.new_closed_trades)
                             _run_libs_and_main()
+                            if paper_ticks:
+                                sim_position.settle_immediate_closes()
                             bar_executed = True
 
                     elif bar_update.is_closed:
@@ -4242,8 +4269,16 @@ class ScriptRunner:
                             # script with no var slots still has to re-execute
                             # its body on a fill, exactly like the historical
                             # path does.
+                            closed_from = 0
                             if is_strat and position:
-                                if sub_bars:
+                                if paper_ticks and not is_new_bar:
+                                    # The bar's earlier ticks are filled already: only
+                                    # the closing update is left. The body ran on
+                                    # every tick right after its fills, so there is
+                                    # no calc_on_order_fills re-execution to make up.
+                                    sim_position.process_orders_live_tick(tick_prev, candle)
+                                    closed_from = sim_logged_closed
+                                elif sub_bars:
                                     if var_snapshot:
                                         _coof_magnified_loop(sub_bars, candle)
                                         if var_snapshot.has_vars:
@@ -4263,7 +4298,7 @@ class ScriptRunner:
                             # them so live sim mode has the same per-fill
                             # visibility as broker mode's ``[BROKER]`` lines.
                             if is_strat and position:
-                                self._log_sim_fills(position)
+                                self._log_sim_fills(position, closed_from)
 
                             lib._plot_data.clear()
                             lib._viz_dyn.clear()
@@ -4278,6 +4313,15 @@ class ScriptRunner:
 
                         if is_strat and position:
                             self._process_deferred_margin_call(position)
+
+                        # Pine ``process_orders_on_close=true``: the orders this close
+                        # placed get a fill attempt at the close, as on a historical bar.
+                        if (is_strat and position and not broker_mode
+                                and not lib._strategy_suppressed
+                                and self.script.process_orders_on_close):
+                            closed_before = len(sim_position.new_closed_trades)
+                            sim_position.process_orders_at_close()
+                            self._log_sim_fills(position, closed_before)
 
                         # A late update repeating this timestamp finds a run to
                         # discard; a new bar clears the flag again.

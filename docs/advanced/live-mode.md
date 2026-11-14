@@ -5,7 +5,7 @@ title: "Live Mode"
 description: "Run PyneCore scripts on live provider data after historical replay. Configure tick updates, persistent intrabar state, paper trading and broker order routing."
 icon: "stream"
 date: "2026-04-08"
-lastmod: "2026-10-25"
+lastmod: "2026-11-14"
 draft: false
 toc: true
 categories: ["Live Trading"]
@@ -137,13 +137,36 @@ This uses the same `VarSnapshot` mechanism as the bar magnifier's COOF loop.
 
 ## Order Processing
 
-Strategies use **magnifier-style order processing** in live mode: intra-bar ticks are
-accumulated as `sub_bars`.  When the bar closes, `process_orders_magnified(sub_bars, final_bar)`
-runs — checking limit, stop, and trailing stop orders against each tick's OHLCV in chronological
-order.  This gives tick-level fill accuracy even in paper trading.
+How paper trading fills orders on a live bar depends on when the strategy executes.
 
-If `calc_on_order_fills=True`, the COOF re-execution loop runs on bar close as well — exactly
-as it does in backtesting with the bar magnifier.
+**With `calc_on_every_tick=true`** every update is a tick the simulator fills on, before the
+script executes on it.  An order placed on one tick fills on the next one, and the script sees
+the fill on the tick it happened on — `strategy.position_size` changes inside the bar, as on
+TradingView's realtime bars.  A live update carries the forming bar so far (its open, the
+extremes since the open, the latest price), so each tick is filled on its own part of the bar
+only:
+
+- The first update of a bar is filled whole: the orders queued at the previous bar's close fill
+  at the bar's open.
+- A later update is filled at its latest price.  A high or low it moved past the previous update
+  was reached since the previous tick, so a price-based order at that level fills there, at its
+  own price.
+- A price-based order whose level the price stepped over between two ticks fills at the tick
+  price, the same rule a gap between two bars follows.  Nothing before the order was placed —
+  the bar's open, an earlier extreme — can fill it.
+
+The script executing right after the fills of every tick plays the role of the
+`calc_on_order_fills` re-execution, so no separate re-execution loop runs.
+
+**Otherwise** the script executes on the bar close only, and the orders it places there are
+filled on the next bar's ticks.  The ticks are accumulated as `sub_bars`, and when that bar
+closes `process_orders_magnified(sub_bars, final_bar)` checks limit, stop and trailing stop
+orders against them in chronological order.  If `calc_on_order_fills=True`, the COOF
+re-execution loop runs on bar close as well — exactly as it does in backtesting with the bar
+magnifier.
+
+With `--broker` the exchange fills the orders: the order book is synced on every tick the script
+executes on, and on every bar close.
 
 ### Strategy Suppression
 
