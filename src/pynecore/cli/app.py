@@ -1,3 +1,4 @@
+import codecs
 import os
 import sys
 import tomllib
@@ -231,6 +232,28 @@ def print_logo():
         for line in plain_text:
             print(line)
 
+
+def _force_utf8_std_streams():
+    """
+    Switch ``stdout`` and ``stderr`` to UTF-8 when they use another encoding.
+
+    Before Python 3.15 a redirected stream on Windows takes the locale code page (``cp1251``,
+    ``cp1250``, ...), which cannot encode the glyphs the CLI prints (box drawing, check marks,
+    bullets, the logo) and turns every such write into a ``UnicodeEncodeError``. Python 3.15
+    makes UTF-8 the default for these streams; this applies the same rule on older versions.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if encoding is None or reconfigure is None:
+            continue
+        if codecs.lookup(encoding).name != "utf-8":
+            # Without an explicit ``errors`` the handler falls back to ``strict``, dropping
+            # stderr's ``backslashreplace`` and any ``surrogateescape`` set on stdout.
+            reconfigure(encoding="utf-8", errors=stream.errors)
+
+
+_force_utf8_std_streams()
 
 if (not os.getenv("PYNE_NO_LOGO") and not os.getenv("PYNE_QUIET")
         # Don't print logo when completion is requested
