@@ -102,7 +102,8 @@ class _Slot:
     name: str  # debug name for the layout 'names' tuple
     init: ast.expr  # template expression for the layout 'init' tuple
     max_bars_back: ast.expr | None = None  # series slots only
-    series_elem: str | None = None  # series slots only: element type name ('float'/'int') or None
+    series_elem: str | None = None  # series slots only: 'float'/'int'/'bool'/'collection' or None
+    series_pin: int | None = None  # series slots only: the instance-vector entry selecting the kind
     var_elem: str | None = None  # var slots only: the declared scalar type name or None
     call_id: str | None = None  # child/anchor slots only
     in_loop: bool = False  # child slots only
@@ -155,19 +156,24 @@ class ScopeLayout:
         return self._add(_Slot(len(self.slots), 'flag', f'{name}·flag',
                                ast.Constant(value=False), varip=varip))
 
-    def add_series(self, name: str, max_bars_back: ast.expr, elem: str | None = None) -> int:
+    def add_series(self, name: str, max_bars_back: ast.expr, elem: str | None = None,
+                   pin: int | None = None) -> int:
         """Allocate a series slot (``_make_state`` puts a fresh ``SeriesImpl`` here).
 
         :param name: Source-level variable name (debug only).
         :param max_bars_back: Expression for the series' ``max_bars_back`` argument.
-        :param elem: Element type name from the ``Series[T]`` annotation when it
-            is statically known (``'float'`` and ``'int'`` matter: those series
-            get the native nan as their out-of-range na value, and an int series
-            stores every value as a float).
+        :param elem: Element type name when it is statically known (``'float'``
+            and ``'int'`` series get the native nan as their out-of-range na value,
+            an int series stores every value as a float; a ``'collection'`` series
+            keeps a shallow copy of each closed bar's array, matrix or map).
+        :param pin: The index of the scope's instance-vector entry that selects the
+            series kind per instance (a ``'collection'`` entry makes the series a
+            collection series), or None.
         :return: The allocated slot index.
         """
         return self._add(_Slot(len(self.slots), 'series', name, ast.Constant(value=None),
-                               max_bars_back=max_bars_back, series_elem=elem))
+                               max_bars_back=max_bars_back, series_elem=elem,
+                               series_pin=pin))
 
     def add_pin(self, count: int) -> int:
         """Allocate the scope's instance-vector slot.

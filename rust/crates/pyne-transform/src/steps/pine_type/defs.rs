@@ -208,6 +208,13 @@ impl Engine<'_, '_> {
             self.walked.insert(nid);
         }
         let bound = std::mem::take(&mut self.frames[own].names);
+        for target in super::finish::series_locals(self.ast, node) {
+            let Some(target_nid) = self.nid(target) else { continue };
+            let Kind::Name { id, .. } = self.kind(target) else { continue };
+            let ty = bound.get(id).map_or(UNKNOWN, |binding| binding.ty.as_str());
+            let kind = super::finish::history_kind_of(ty);
+            self.local_kinds.entry(target_nid).or_default().insert(cid, kind);
+        }
         self.merge_bindings(key, &bound);
         self.frames[own].names = bound;
         self.record_signature(key, node, index);

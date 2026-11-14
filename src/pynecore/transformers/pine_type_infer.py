@@ -575,6 +575,9 @@ class _Inference:
         self._series_len: dict[int, dict[int, bool]] = {}
         #: Window call node id -> the node, for the stamps written at the end
         self._window_nodes: dict[int, ast.Call] = {}
+        #: Node id of a local ``x: Series`` declaration's target -> context id ->
+        #: its history kind (``_history_kind_of``) in that context
+        self._local_kinds: dict[int, dict[int, str | None]] = {}
 
     # --- scope plumbing --------------------------------------------------
 
@@ -1836,6 +1839,12 @@ class _Inference:
 
         if nid is not None:
             self._walked.add(nid)
+        for target in _series_locals(node):
+            target_nid = node_id(target)
+            if target_nid is not None:
+                binding = bound.get(target.id)
+                self._local_kinds.setdefault(target_nid, {})[cid] = _history_kind_of(
+                    UNKNOWN if binding is None else binding.ty)
         self._merge_bindings(key, bound)
         self._record_signature(key, node, result)
         return result
@@ -3248,7 +3257,26 @@ class _Inference:
             pin = pin_for([self._ty_of(a) for a in node.args])
         return self._record_pin(node, pin)
 
-    def _record_pin(self, node: ast.Call, pin: str | None) -> str | None:
+    def _history_pin(self, node: ast.Call) -> str | None:
+        """
+        The pin of an ``inline_series`` call site in the running context.
+
+        The history of an array, a matrix or a map holds the object as each bar
+        closed it, so the site's ``__pyne_bind__`` factory has to know whether
+        its expression is one. A shared body can be a collection in one context
+        and a scalar in another; the per-context pins then reach each instance
+        through its vector, the way an overload pin does, and nothing needs an
+        annotation for it.
+
+        :param node: The ``inline_series`` call node
+        :return: :data:`_COLLECTION_HISTORY` or None
+        """
+        ty = self._ty_of(node.args[0]) if node.args else UNKNOWN
+        collection = is_array(ty) or is_matrix(ty) or is_map(ty)
+        return self._record_pin(node, _COLLECTION_HISTORY if collection else None,
+                                diagnose=False)
+
+    def _record_pin(self, node: ast.Call, pin: str | None, diagnose: bool = True) -> str | None:
         """
         Merge this context's verdict into the node's pin and stamp both forms.
 
@@ -3271,6 +3299,8 @@ class _Inference:
 
         :param node: The call node
         :param pin: What the running context justified
+        :param diagnose: Whether contexts that disagree are reported; a site whose
+            instances resolve their own pin needs no annotation
         :return: ``pin``
         """
         nid = node_id(node)
@@ -3287,7 +3317,7 @@ class _Inference:
         agreed = len(set(seen.values())) == 1
         set_pin(node, pin if agreed else None)
         set_pins(node, None if agreed else dict(seen))
-        if not agreed and nid not in self._pin_diags:
+        if diagnose and not agreed and nid not in self._pin_diags:
             self._pin_diags.add(nid)
             self._diag(
                 f"overload pin differs per call context: {sorted(set(seen.values()), key=str)}",
@@ -3905,6 +3935,8 @@ class _Inference:
             # builtins are only consulted once the module has no such name
             builtin = BUILTIN_CALL_TYPES.get(name)
             if builtin is not None and isinstance(node.func, ast.Name):
+                if name == 'inline_series':
+                    self._history_pin(node)
                 fallback = self._apply_override(
                     builtin, node.args, node.keywords, _call_arity(node))
                 if fallback is not None:
@@ -5526,7 +5558,9 @@ class _Inference:
         site whose pin differs (``get_pins`` is present), a window call whose
         machine differs (``get_series_lens`` is present), the conversion call of
         a value whose implicit conversion differs (``get_widens`` is present),
-        or a call to a generic callee whose own instance vector differs. They are the same
+        a declared series (a parameter or a local ``x: Series``) that holds an
+        array, a matrix or a map in some contexts only (its history keeps closed-bar copies there), or a
+        call to a generic callee whose own instance vector differs. They are the same
         question one level apart, so the definition is recursive and settled by
         a fixpoint -- making a callee's site vary can make its caller's site
         vary too.
@@ -5535,7 +5569,8 @@ class _Inference:
         that function, in source order: the pin character for an overload site,
         whether the length is series for a window call, the conversion
         (``WIDEN_*``) for a value whose implicit conversion differs
-        (``_stamp_widen_sites``), the callee's own vector (nested) for a
+        (``_stamp_widen_sites``), :data:`_COLLECTION_HISTORY` or None for a
+        declared series, the callee's own vector (nested) for a
         generic one, and None where this
         context reached the site with nothing to say. None means "configure
         nothing" all the way down -- the callee then keeps the all-None default
@@ -5545,9 +5580,11 @@ class _Inference:
         Two stamps come out, and they are the whole contract with
         :mod:`~pynecore.transformers.function_isolation`:
 
-        * ``set_varying`` on a definition -- its varying sites in source order.
-          The list index IS the site's index in every vector of that function,
-          and the isolation pass reserves one state slot to hold the vector.
+        * ``set_varying`` on a definition -- its varying sites in source order,
+          the declared series first. The list index IS the site's index in
+          every vector of that function, and the isolation pass reserves one
+          state slot to hold the vector; the series pass ties a declared
+          series' slot to its index.
         * ``set_vector`` on a call site -- the vector to hand the callee, where
           every context reaching the site agrees on one. A site that is itself
           varying is left unstamped on purpose: it reads its vector out of its
@@ -5568,10 +5605,31 @@ class _Inference:
         impls = [node for key in self._overload_groups for node in self._defs.get(key, ())]
         cids: dict[str, list[int]] = {}
         impl_cids: dict[int, list[int]] = {}
+        context_params: dict[int, tuple[str, ...]] = {}
         for memo_key, result in self.table.contexts.items():
             cids.setdefault(result.key, []).append(result.cid)
+            context_params[result.cid] = result.params
             if result.key in self._overload_groups and memo_key[3] is not None:
                 impl_cids.setdefault(memo_key[3], []).append(result.cid)
+        # A declared series -- a parameter, then the local declarations -- whose
+        # history kind differs per context: the merged type of the name answers
+        # neither, so each instance is told
+        param_kinds: dict[int, dict[int, str | None]] = {}
+        param_sites: dict[str, list[ast.arg | ast.Name]] = {}
+        for key, node in targets.items():
+            sites: list[ast.arg | ast.Name] = []
+            declared: list[tuple[ast.arg | ast.Name, dict[int, str | None]]] = [
+                (arg, {cid: _history_kind(context_params[cid], position)
+                       for cid in cids.get(key, ())})
+                for position, arg in _series_params(node)]
+            for target in _series_locals(node):
+                seen = self._local_kinds.get(node_id(target) or -1, {})
+                declared.append((target, {cid: seen.get(cid) for cid in cids.get(key, ())}))
+            for site, kinds in declared:
+                if len(set(kinds.values())) > 1:
+                    param_kinds[id(site)] = kinds
+                    sites.append(site)
+            param_sites[key] = sites
         own = {key: _own_calls(node) for key, node in targets.items()}
         owner: dict[int, str] = {}
         for key, calls in own.items():
@@ -5588,8 +5646,8 @@ class _Inference:
                 nid = node_id(call)
                 if nid is not None:
                     impl_owner[nid] = impl_nid
-        varying: dict[str, list[ast.Call]] = {
-            key: [call for call in calls if _per_context(call)]
+        varying: dict[str, list[ast.Call | ast.arg | ast.Name]] = {
+            key: [*param_sites[key], *(call for call in calls if _per_context(call))]
             for key, calls in own.items()}
         memo: dict[tuple[str, int], tuple] = {}
 
@@ -5609,7 +5667,9 @@ class _Inference:
             memo[token] = built
             return built
 
-        def entry_of(site: ast.Call, cid: int, stack: frozenset) -> Any:
+        def entry_of(site: ast.Call | ast.arg | ast.Name, cid: int, stack: frozenset) -> Any:
+            if not isinstance(site, ast.Call):
+                return param_kinds[id(site)].get(cid)
             widens = get_widens(site)
             if widens is not None:
                 return widens.get(cid)
@@ -5630,7 +5690,7 @@ class _Inference:
         while changed:
             changed = False
             for key, calls in own.items():
-                found: list[ast.Call] = []
+                found: list[ast.Call | ast.arg | ast.Name] = list(param_sites[key])
                 for call in calls:
                     if _per_context(call):
                         found.append(call)
@@ -5701,6 +5761,11 @@ _CONSTRUCTOR_ELEMENTS: dict[str, tuple[int, ...]] = {
     'matrix.new': (2,),
     'array.from_items': (),
 }
+
+#: The history kind of an array, a matrix or a map, kept as closed-bar copies: the
+#: pin of an ``inline_series`` call site over one, and the instance-vector entry of a
+#: declared series parameter that is one in some contexts only
+_COLLECTION_HISTORY: Final = 'collection'
 
 #: Constructors that fill the container they build with one value, by its
 #: position; ``array.from`` places its items through its own override
@@ -6839,6 +6904,72 @@ def _site_order(call: ast.Call) -> tuple[int, int]:
     if get_widens(call) is not None:
         return node_id(call.args[0]) or 0, 0
     return node_id(call) or 0, 1
+
+
+def _series_params(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[int, ast.arg]]:
+    """
+    The parameters the series pass gives a history slot, by their position among
+    every parameter (the order of a context's parameter types).
+
+    :param node: The definition
+    :return: ``(position, parameter)`` pairs
+    """
+    offset = len(node.args.posonlyargs)
+    found: list[tuple[int, ast.arg]] = []
+    for i, arg in enumerate(node.args.args):
+        annotation = arg.annotation
+        if isinstance(annotation, ast.Subscript):
+            annotation = annotation.value
+        if isinstance(annotation, ast.Name) and annotation.id == 'Series':
+            found.append((offset + i, arg))
+    return found
+
+
+def _series_locals(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Name]:
+    """
+    The targets of a definition's own ``x: Series`` declarations, in source order;
+    a nested definition owns its own.
+
+    :param node: The definition
+    :return: The target names
+    """
+    found: list[ast.Name] = []
+    stack: list[ast.AST] = list(reversed(node.body))
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                ast.Lambda)):
+            continue
+        if isinstance(current, ast.AnnAssign) and isinstance(current.target, ast.Name):
+            annotation = current.annotation
+            if isinstance(annotation, ast.Subscript):
+                annotation = annotation.value
+            if isinstance(annotation, ast.Name) and annotation.id == 'Series':
+                found.append(current.target)
+        stack.extend(reversed(list(ast_walk.iter_child_nodes(current))))
+    return found
+
+
+def _history_kind_of(ty: str) -> str | None:
+    """
+    The history kind of a value of a type: :data:`_COLLECTION_HISTORY` for an
+    array, a matrix or a map, otherwise None.
+
+    :param ty: The type
+    :return: The kind
+    """
+    return _COLLECTION_HISTORY if is_array(ty) or is_matrix(ty) or is_map(ty) else None
+
+
+def _history_kind(params: tuple[str, ...], position: int) -> str | None:
+    """
+    The history kind of a parameter in one context (:func:`_history_kind_of`).
+
+    :param params: The context's parameter types
+    :param position: The parameter's position among them
+    :return: The kind
+    """
+    return _history_kind_of(params[position] if position < len(params) else UNKNOWN)
 
 
 def _per_context(call: ast.Call) -> bool:

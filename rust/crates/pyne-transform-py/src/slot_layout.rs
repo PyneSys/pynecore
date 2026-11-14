@@ -160,6 +160,10 @@ impl<'py> LayoutClasses<'py> {
                 Some(self.node(from, &max_bars_back)?)
             },
             series_elem: optional_string(&get("series_elem")?)?,
+            series_pin: {
+                let pin = get("series_pin")?;
+                if pin.is_none() { None } else { Some(index(&pin)?) }
+            },
             var_elem: optional_string(&get("var_elem")?)?,
             call_id: optional_string(&get("call_id")?)?,
             in_loop: boolean(&get("in_loop")?)?,
@@ -254,6 +258,7 @@ impl<'py> LayoutClasses<'py> {
         };
         kwargs.set_item("max_bars_back", max_bars_back)?;
         kwargs.set_item("series_elem", &slot.series_elem)?;
+        kwargs.set_item("series_pin", slot.series_pin)?;
         kwargs.set_item("var_elem", &slot.var_elem)?;
         kwargs.set_item("call_id", &slot.call_id)?;
         kwargs.set_item("in_loop", slot.in_loop)?;

@@ -46,6 +46,11 @@ fn fill_positions(callee: &str) -> Option<&'static [usize]> {
 /// The map calls that look a key up (`_MAP_KEY_LOOKUPS`).
 const MAP_KEY_LOOKUPS: &[&str] = &["map.get", "map.contains", "map.remove"];
 
+/// The history kind of an array, a matrix or a map, kept as closed-bar copies: the
+/// pin of an `inline_series` call site over one, and the instance-vector entry of a
+/// declared series parameter that is one in some contexts only (`_COLLECTION_HISTORY`).
+pub(super) const COLLECTION_HISTORY: &str = "collection";
+
 /// The shape-reading override forms, in `_SHAPE_FORMS`' order.
 const SHAPE_FORMS: &[&str] = &[
     "array_of_map_keys",
@@ -481,12 +486,29 @@ impl Engine<'_, '_> {
             let types: Vec<String> = args.iter().map(|&arg| self.ty_of(arg)).collect();
             pin = pin_for(&types);
         }
-        self.record_pin(node, pin)
+        self.record_pin(node, pin, true)
+    }
+
+    /// The pin of an `inline_series` call site in the running context
+    /// (`_history_pin`): [`COLLECTION_HISTORY`] when its expression is an array, a
+    /// matrix or a map, whose history the site's factory keeps as closed-bar copies.
+    pub(super) fn history_pin(&mut self, node: NodeId) -> R<Option<String>> {
+        let ty = match facts::call_parts(self.ast, node) {
+            Some((_, args, _)) if !args.is_empty() => self.ty_of(args[0]),
+            _ => UNKNOWN.to_string(),
+        };
+        let collection = is_array(&ty) || is_matrix(&ty) || is_map(&ty);
+        self.record_pin(node, collection.then(|| COLLECTION_HISTORY.to_string()), false)
     }
 
     /// Merge this context's verdict into the node's pin and stamp both forms
-    /// (`_record_pin`).
-    pub(super) fn record_pin(&mut self, node: NodeId, pin: Option<String>) -> R<Option<String>> {
+    /// (`_record_pin`); `diagnose` reports contexts that disagree.
+    pub(super) fn record_pin(
+        &mut self,
+        node: NodeId,
+        pin: Option<String>,
+        diagnose: bool,
+    ) -> R<Option<String>> {
         let Some(nid) = self.nid(node) else {
             set_pin(self.ast, node, pin.as_deref());
             set_pins(self.ast, node, None);
@@ -507,7 +529,7 @@ impl Engine<'_, '_> {
         let pairs: Vec<(i64, Option<String>)> =
             seen.iter().map(|(&cid, pin)| (cid, pin.clone())).collect();
         set_pins(self.ast, node, if agreed { None } else { Some(&pairs) });
-        if !agreed && self.pin_diags.insert(nid) {
+        if diagnose && !agreed && self.pin_diags.insert(nid) {
             let mut values: Vec<&Option<String>> = distinct.into_iter().collect();
             values.sort_by_key(|value| match value {
                 None => "None".to_string(),

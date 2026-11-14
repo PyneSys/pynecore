@@ -138,9 +138,7 @@ impl Transformer for ExprHoister<'_> {
             | Kind::DictComp { .. }
             | Kind::GeneratorExp { .. } => {}
             Kind::Call { args, keywords, .. }
-                if self.lazy
-                    && is_inline_series(ast, id)
-                    && !may_read(ast, id, &self.bound) =>
+                if self.lazy && is_inline_series(ast, id) && !may_read(ast, id, &self.bound) =>
             {
                 let (args, keywords) = (args.clone(), keywords.clone());
                 // The hoisted call runs at statement level: its arguments leave the
@@ -274,7 +272,9 @@ impl InlineSeriesHoist {
                     exprs.push(value);
                 }
                 FieldRef::Nodes(items)
-                    if items.first().is_some_and(|&first| is_category(ast, first, Category::Expr)) =>
+                    if items
+                        .first()
+                        .is_some_and(|&first| is_category(ast, first, Category::Expr)) =>
                 {
                     exprs.extend(items.iter().copied());
                 }

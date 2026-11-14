@@ -51,6 +51,11 @@ as ``func.__pyne_layout__``. An entry is a plain dict with these keys:
     creates the instance, and the helper writes it into this slot. The slot is
     excluded from every rollback: it configures the instance, it is not part
     of what the instance computed.
+``series_pins``
+    Present only next to ``pin``, for a series parameter whose history kind
+    differs per instance: ``(slot, entry)`` pairs; a ``'collection'`` at that
+    entry of the instance vector makes the series slot a
+    :class:`~pynecore.core.series.CollectionSeriesImpl`.
 ``compacted``
     Present and true only for ``@pyne lib`` modules: their series are the
     rolling windows of the builtin machines, which skip na bars on purpose,
@@ -130,7 +135,7 @@ from dataclasses import fields as dataclass_fields, replace as dataclass_replace
 from functools import partial
 
 from .pine_export import Exported, in_module_bool_mode
-from .series import SeriesImpl
+from .series import CollectionSeriesImpl, SeriesImpl
 from ..types.base import Drawing
 from ..types.matrix import Matrix
 from ..types.na import NA, na_float
@@ -200,6 +205,9 @@ def _make_state(layout: dict[str, Any]) -> list:
     state = list(layout['init'])
     compacted = layout.get('compacted', False)
     for slot, max_bars_back, elem in layout['series']:
+        if elem == 'collection':
+            state[slot] = CollectionSeriesImpl(max_bars_back, None, compacted)
+            continue
         # A numeric series keeps the native nan as its na; an int series also
         # stores every value as a float (a Pine int is a double at runtime). A
         # bool series keeps the bool na the script runs with (na or false)
@@ -234,7 +242,31 @@ def _configure(state: list, layout: dict[str, Any], vector: tuple | None) -> lis
         slot: int | None = layout.get('pin')
         if slot is not None:
             state[slot] = vector
+            _select_series(state, layout, vector)
     return state
+
+
+def _select_series(state: list, layout: dict[str, Any], vector: tuple) -> None:
+    """Give the series parameters the vector marks as collections their kind.
+
+    A parameter that holds an array, a matrix or a map in some contexts only gets
+    a plain series from the layout; the instance vector says which instances need
+    the closed-bar copies of a :class:`~pynecore.core.series.CollectionSeriesImpl`.
+    A slot that already is one keeps it, with its history: a carried instance is
+    configured again.
+
+    :param state: The state vector.
+    :param layout: Its layout entry.
+    :param vector: The instance vector.
+    """
+    selected: tuple | None = layout.get('series_pins')
+    if selected is None:
+        return
+    max_bars_back = {slot: limit for slot, limit, _elem in layout['series']}
+    compacted = layout.get('compacted', False)
+    for slot, entry in selected:
+        if vector[entry] == 'collection' and type(state[slot]) is not CollectionSeriesImpl:
+            state[slot] = CollectionSeriesImpl(max_bars_back[slot], None, compacted)
 
 
 def __resolve_slot__(parent: list, slot: int, func: Any, vector: tuple | None = None) -> list:
@@ -450,6 +482,7 @@ def _restore_collected(current: list, snaps: list) -> None:
                 vec[:] = _make_state(layout_)
                 if pin is not None:
                     vec[pin] = configured
+                    _select_series(vec, layout_, configured)
                 continue
         for i, value in snap[1]:
             vec[i] = value
@@ -1322,6 +1355,8 @@ def _rewind_vector(state: list, layout: dict[str, Any]) -> None:
             continue
         in_loop = children.get(slot)
         state[slot] = fresh[slot] if in_loop is None else _rewind_child(state[slot], in_loop)
+    if pin is not None:
+        _select_series(state, layout, state[pin])
 
 
 def _rewind_child(value: Any, in_loop: bool) -> Any:

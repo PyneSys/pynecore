@@ -189,6 +189,9 @@ struct Engine<'a, 'h> {
     call_q: HashMap<i64, u8>,
     series_len: IndexMap<i64, IndexMap<i64, bool>>,
     window_nodes: HashMap<i64, NodeId>,
+    /// Node id of a local `x: Series` declaration's target -> context id -> its
+    /// history kind in that context (`_local_kinds`)
+    local_kinds: HashMap<i64, HashMap<i64, Option<String>>>,
 }
 
 impl<'a, 'h> Engine<'a, 'h> {
@@ -276,6 +279,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             call_q: HashMap::new(),
             series_len: IndexMap::new(),
             window_nodes: HashMap::new(),
+            local_kinds: HashMap::new(),
         }
     }
 

@@ -61,6 +61,13 @@ def _scope_entry_ast(scope: ScopeLayout, compacted: bool = False) -> ast.Dict:
     if scope.pin_slot is not None:
         keys.append('pin')
         values.append(ast.Constant(value=scope.pin_slot))
+        series_pins = [ast.Tuple(elts=[ast.Constant(value=slot.index),
+                                       ast.Constant(value=slot.series_pin)], ctx=ast.Load())
+                       for slot in scope.slots
+                       if slot.kind == 'series' and slot.series_pin is not None]
+        if series_pins:
+            keys.append('series_pins')
+            values.append(ast.Tuple(elts=series_pins, ctx=ast.Load()))
     if compacted:
         keys.append('compacted')
         values.append(ast.Constant(value=True))

@@ -32,7 +32,8 @@ import ast
 
 from . import ast_walk
 from .dynamic_default_guard import is_dynamic_default_guard
-from .pine_type_rules import OBJECT, get_ty, set_ty, stamp_lowering
+from .pine_type_rules import (OBJECT, get_ty, get_varying, is_array, is_map, is_matrix, set_ty,
+                              stamp_lowering)
 from .slot_layout import ModuleLayout, scope_for_function
 
 __all__ = ['SeriesTransformer']
@@ -60,6 +61,9 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         # Inside a parameter-default guard, where an assignment to a series
         # parameter gives it its value instead of writing its history
         self._in_default_guard = False
+        # The instance-varying sites of each enclosing definition, innermost last:
+        # a declared series among them takes its kind from the instance vector
+        self._varying: list[list | tuple] = []
 
     # --- helpers ---------------------------------------------------------
 
@@ -102,17 +106,19 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                                attr=method, ctx=ast.Load()),
             args=args, keywords=[]), get_ty(args[0]) if args else OBJECT)
 
-    def _register(self, var_name: str, elem: str | None = None) -> int:
+    def _register(self, var_name: str, elem: str | None = None,
+                  pin: int | None = None) -> int:
         """Allocate a series slot for a declaration in the current scope.
 
         :param var_name: Source-level variable name.
-        :param elem: Statically known element type name from the ``Series[T]``
-            annotation (``'float'`` and ``'int'`` select the native-nan na value,
-            ``'int'`` also stores every value as a float), or None.
+        :param elem: Statically known element type name (see
+            :meth:`~SeriesTransformer._series_elem`), or None.
+        :param pin: The instance-vector entry that tells the series kind per
+            instance, for a parameter whose history kind differs per context.
         :return: The allocated slot index.
         """
         slot = self.layout.scope(self.current_scope).add_series(
-            var_name, ast.Constant(value=None), elem)
+            var_name, ast.Constant(value=None), elem, pin)
         self.series_slots.setdefault(self.current_scope, {})[var_name] = slot
         self.series_declarations[self.current_scope].add(var_name)
         self.local_vars[self.current_scope].add(var_name)
@@ -127,23 +133,32 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         return isinstance(annotation, ast.Name) and annotation.id == 'Series'
 
     @staticmethod
-    def _series_elem(annotation: ast.expr) -> str | None:
-        """Element type name of a ``Series[T]`` annotation, if statically known.
+    def _series_elem(annotation: ast.expr, ty: str) -> str | None:
+        """Element type name of a series declaration, if statically known.
 
-        Only the scalar names are meaningful downstream: the numeric ones
-        select the native nan as the series' na value, and ``'int'``
-        additionally makes the series store every value as a float (a Pine int
-        is a double at runtime); ``'bool'`` selects the bool na the script runs
-        with. Everything else — bare ``Series``, other element types, complex
-        annotations — yields None.
+        The scalar names select the native nan as the series' na value
+        (``'float'``, ``'int'``; ``'int'`` also stores every value as a float, a
+        Pine int is a double at runtime) or the bool na the script runs with
+        (``'bool'``). ``'collection'`` marks an array, matrix or map series, whose
+        history holds a shallow copy taken when each bar closes. Everything else
+        yields None.
 
         :param annotation: The (Series) type annotation.
-        :return: ``'float'``, ``'int'`` or ``'bool'`` for those element types, otherwise None.
+        :param ty: The Pine type stamped on the declared name (an alias such as
+            ``b: Series = a`` carries the collection only there).
+        :return: ``'float'``, ``'int'``, ``'bool'`` or ``'collection'``, otherwise None.
         """
-        if (isinstance(annotation, ast.Subscript)
-                and isinstance(annotation.slice, ast.Name)
-                and annotation.slice.id in ('float', 'int', 'bool')):
-            return annotation.slice.id
+        if isinstance(ty, str) and (is_array(ty) or is_matrix(ty) or is_map(ty)):
+            return 'collection'
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        elem = annotation.slice
+        if isinstance(elem, ast.Name) and elem.id in ('float', 'int', 'bool'):
+            return elem.id
+        if isinstance(elem, ast.Subscript):
+            elem = elem.value
+        if isinstance(elem, ast.Name) and elem.id in ('list', 'dict', 'Matrix'):
+            return 'collection'
         return None
 
     # --- visitors --------------------------------------------------------
@@ -170,10 +185,16 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         self.series_declarations.setdefault(self.current_scope, set())
 
         param_inits: list[ast.stmt] = []
+        # A parameter that is an array, a matrix or a map in some contexts only is
+        # one of the definition's instance-varying sites; its entry selects the kind
+        varying = get_varying(node) or ()
+        self._varying.append(varying)
         for arg in node.args.args:
             self.local_vars[self.current_scope].add(arg.arg)
             if arg.annotation is not None and self._is_series_type(arg.annotation):
-                slot = self._register(arg.arg, self._series_elem(arg.annotation))
+                pin = next((j for j, site in enumerate(varying) if site is arg), None)
+                slot = self._register(arg.arg, self._series_elem(arg.annotation, get_ty(arg)),
+                                      pin)
                 arg.annotation = (arg.annotation.slice
                                   if isinstance(arg.annotation, ast.Subscript) else None)
                 param_inits.append(ast.Assign(
@@ -199,6 +220,7 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                     insert_pos += 1
             node.body[insert_pos:insert_pos] = param_inits
 
+        self._varying.pop()
         self.scope_stack.pop()
         self.current_scope = '·'.join(self.scope_stack)
         return node
@@ -217,7 +239,10 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         if not self.current_scope:
             raise SyntaxError("Series variables must be declared inside a function")
 
-        slot = self._register(node.target.id, self._series_elem(node.annotation))
+        varying = self._varying[-1] if self._varying else ()
+        pin = next((j for j, site in enumerate(varying) if site is node.target), None)
+        slot = self._register(node.target.id,
+                              self._series_elem(node.annotation, get_ty(node.target)), pin)
         if node.value is None:
             return None
         return ast.copy_location(ast.Assign(

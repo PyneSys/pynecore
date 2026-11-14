@@ -5,7 +5,7 @@ from types import ModuleType
 
 from ..types.na import NA, na_float, na_str
 
-__all__ = ['SeriesImpl', 'inline_series']
+__all__ = ['SeriesImpl', 'CollectionSeriesImpl', 'close_collection_bar', 'inline_series']
 
 T = TypeVar('T')
 
@@ -484,6 +484,53 @@ class SeriesImpl(Generic[T]):
             yield self._buffer[pos]
 
 
+#: Collection series written on the current bar, waiting for the bar to close
+_open_collections: list[CollectionSeriesImpl] = []
+
+
+class CollectionSeriesImpl(SeriesImpl[T]):
+    """
+    The series of an array, a matrix or a map.
+
+    The value is one mutable object that the script keeps changing, so the history
+    must not hold the object itself: ``a[1]`` is the object as it was when the
+    previous bar closed, a shallow copy whose elements are still shared (measured on
+    TradingView, CAPITALCOM:EURUSD 1D, for arrays, matrices and maps alike, also
+    when an alias of the object was recorded before the bar changed it). A write
+    puts the series on the open list; :func:`close_collection_bar` replaces each
+    one's current slot with a copy when the bar is over.
+    """
+
+    __slots__ = ()
+
+    def add(self, value: T | NA[T]) -> T | NA[T]:
+        if self._last_bar_index != SeriesImpl._lib.bar_index:
+            _open_collections.append(self)
+        return SeriesImpl.add(self, value)
+
+    def _close_bar(self) -> None:
+        """Replace the current slot with a shallow copy of its object."""
+        # A rollback (a discarded tick or fill pass) can empty the buffer after the
+        # write that registered it: there is nothing to freeze then
+        if not self._size:
+            return
+        pos = self._write_pos - 1
+        if pos < 0:
+            pos += self._capacity
+        # A list, dict and Matrix copy shallowly; na copies to itself
+        self._buffer[pos] = self._buffer[pos].copy()  # type: ignore[union-attr]
+
+
+def close_collection_bar() -> None:
+    """
+    Freeze the history of every collection series written on the bar that is
+    closing; call it once per bar, before the next bar's code runs.
+    """
+    for series in _open_collections:
+        series._close_bar()
+    _open_collections.clear()
+
+
 class ReadOnlySeriesView(Generic[T]):
     """
     A read-only view for a circular buffer slice that follows Pine-like indexing.
@@ -585,13 +632,14 @@ def _inline_series_instance(_pin: str | None = None,
     iteration at loop sites) through the ``__pyne_bind__`` factory — that is
     what keeps two ``expr[n]`` rewrites in one scope independent (issue #61).
 
-    :param _pin: The call site's overload pin, part of the factory protocol.
-        There is one implementation here, so there is nothing to select.
+    :param _pin: The call site's pin: ``'collection'`` when the expression is an
+        array, matrix or map, whose history is the object as each bar closed it
+        (a :class:`CollectionSeriesImpl`), otherwise None.
     :param _vector: The call site's instance vector, part of the factory
         protocol. The buffer is the whole instance, so there is nothing to configure.
     :return: The bound instance with the public ``inline_series`` signature.
     """
-    series: SeriesImpl = SeriesImpl()
+    series: SeriesImpl = CollectionSeriesImpl() if _pin == 'collection' else SeriesImpl()
 
     def bound(value: T, idx: int) -> T:
         series.add(value)

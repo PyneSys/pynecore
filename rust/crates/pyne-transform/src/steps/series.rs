@@ -24,7 +24,9 @@ use pyne_ast::walk::{Transformer, Visited, children, copy_location, docstring_en
 use pyne_ast::{Ast, Category, Constant, ExprContext, Int, Kind, NodeId, Value};
 
 use crate::dynamic_default_guard::is_dynamic_default_guard;
-use crate::pine_type_rules::{OBJECT, TY_ATTR, UNKNOWN, stamp_lowering};
+use crate::pine_type_rules::{
+    OBJECT, TY_ATTR, UNKNOWN, get_ty, get_varying, is_array, is_map, is_matrix, stamp_lowering,
+};
 use crate::slot_layout::{ModuleLayout, scope_for_function};
 use crate::{Context, Error};
 
@@ -110,13 +112,27 @@ fn is_series_type(ast: &Ast, annotation: NodeId) -> bool {
     }
 }
 
-/// Element type name of a `Series[T]` annotation when it is one of the scalars that
-/// matter downstream (`float`, `int`, `bool`).
-fn series_elem(ast: &Ast, annotation: NodeId) -> Option<String> {
+/// Element type name of a series declaration when it matters downstream: a scalar
+/// (`float`, `int`, `bool`), or `collection` for an array, matrix or map series,
+/// whose history holds a shallow copy taken when each bar closes. `declared` is the
+/// declared name, whose Pine type is the only place an alias (`b: Series = a`)
+/// carries the collection.
+fn series_elem(ast: &Ast, annotation: NodeId, declared: NodeId) -> Option<String> {
+    let ty = get_ty(ast, declared);
+    if is_array(ty) || is_matrix(ty) || is_map(ty) {
+        return Some("collection".into());
+    }
     let Kind::Subscript { slice, .. } = ast.kind(annotation) else { return None };
-    match ast.kind(*slice) {
+    let elem = match ast.kind(*slice) {
         Kind::Name { id, .. } if matches!(id.as_str(), "float" | "int" | "bool") => {
-            Some(id.clone())
+            return Some(id.clone());
+        }
+        Kind::Subscript { value, .. } => *value,
+        _ => *slice,
+    };
+    match ast.kind(elem) {
+        Kind::Name { id, .. } if matches!(id.as_str(), "list" | "dict" | "Matrix") => {
+            Some("collection".into())
         }
         _ => None,
     }
@@ -133,6 +149,9 @@ struct Series<'l> {
     /// Inside a parameter-default guard, where an assignment to a series parameter
     /// gives it its value instead of writing its history
     in_default_guard: bool,
+    /// The instance-varying sites of each enclosing definition, innermost last: a
+    /// declared series among them takes its kind from the instance vector
+    varying: Vec<Vec<NodeId>>,
     error: Option<Error>,
 }
 
@@ -211,10 +230,16 @@ impl Series<'_> {
     }
 
     /// Allocate a series slot for a declaration in the current scope.
-    fn register(&mut self, ast: &mut Ast, var_name: &str, elem: Option<&str>) -> Option<usize> {
+    fn register(
+        &mut self,
+        ast: &mut Ast,
+        var_name: &str,
+        elem: Option<&str>,
+        pin: Option<usize>,
+    ) -> Option<usize> {
         let scope = self.current_scope.clone();
         let max_bars_back = ast.add(Kind::Constant { value: Constant::None, kind: None });
-        let slot = self.layout.scope(&scope).add_series(ast, var_name, max_bars_back, elem);
+        let slot = self.layout.scope(&scope).add_series(ast, var_name, max_bars_back, elem, pin);
         self.series_slots.entry(scope.clone()).or_default().insert(var_name.to_string(), slot);
         // The Python pass indexes these two directly: a scope without them is a KeyError
         let (Some(declared), true) =
@@ -262,6 +287,10 @@ impl Series<'_> {
         let Kind::FunctionDef { args, .. } = ast.kind(id) else { unreachable!() };
         let Kind::Arguments { args: params, .. } = ast.kind(*args) else { unreachable!() };
         let mut param_inits = Vec::new();
+        // A parameter that is an array, a matrix or a map in some contexts only is
+        // one of the definition's instance-varying sites; its entry selects the kind
+        let varying = get_varying(ast, id).unwrap_or_default();
+        self.varying.push(varying.clone());
         for param in params.clone() {
             let Kind::Arg { arg, annotation, .. } = ast.kind(param) else { unreachable!() };
             let (arg, annotation) = (arg.clone(), *annotation);
@@ -270,8 +299,9 @@ impl Series<'_> {
             if !is_series_type(ast, annotation) {
                 continue;
             }
-            let elem = series_elem(ast, annotation);
-            let Some(slot) = self.register(ast, &arg, elem.as_deref()) else {
+            let elem = series_elem(ast, annotation, param);
+            let pin = varying.iter().position(|&site| site == param);
+            let Some(slot) = self.register(ast, &arg, elem.as_deref(), pin) else {
                 return Ok(Visited::Node(id));
             };
             let stripped = match ast.kind(annotation) {
@@ -306,6 +336,7 @@ impl Series<'_> {
             body.splice(insert_pos..insert_pos, param_inits);
         }
 
+        self.varying.pop();
         self.scope_stack.pop();
         self.current_scope = self.scope_stack.join("·");
         Ok(Visited::Node(id))
@@ -341,8 +372,10 @@ impl Series<'_> {
                 "Series variables must be declared inside a function".into(),
             ));
         }
-        let elem = series_elem(ast, annotation);
-        let Some(slot) = self.register(ast, &var_name, elem.as_deref()) else {
+        let elem = series_elem(ast, annotation, target);
+        let pin =
+            self.varying.last().and_then(|sites| sites.iter().position(|&site| site == target));
+        let Some(slot) = self.register(ast, &var_name, elem.as_deref(), pin) else {
             return Ok(Visited::Node(id));
         };
         let Some(value) = value else { return Ok(Visited::Remove) };
@@ -558,6 +591,7 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
         series_declarations: HashMap::new(),
         local_vars: HashMap::new(),
         in_default_guard: false,
+        varying: Vec::new(),
         error: None,
     };
     let answer = pass.visit(ast, module);

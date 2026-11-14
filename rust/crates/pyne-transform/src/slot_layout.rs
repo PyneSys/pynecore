@@ -72,6 +72,8 @@ pub struct Slot {
     pub max_bars_back: Option<NodeId>,
     /// Series slots only: element type name (`float` / `int` / `bool`) or `None`
     pub series_elem: Option<String>,
+    /// Series slots only: the instance-vector entry selecting the kind, or `None`
+    pub series_pin: Option<usize>,
     /// Var slots only: the declared scalar type name or `None`
     pub var_elem: Option<String>,
     /// Child and anchor slots only
@@ -91,6 +93,7 @@ impl Slot {
             init,
             max_bars_back: None,
             series_elem: None,
+            series_pin: None,
             var_elem: None,
             call_id: None,
             in_loop: false,
@@ -154,11 +157,13 @@ impl ScopeLayout {
         name: &str,
         max_bars_back: NodeId,
         elem: Option<&str>,
+        pin: Option<usize>,
     ) -> usize {
         let init = constant(ast, Constant::None);
         let mut slot = Slot::new(self.slots.len(), SlotKind::Series, name.to_string(), init);
         slot.max_bars_back = Some(max_bars_back);
         slot.series_elem = elem.map(str::to_string);
+        slot.series_pin = pin;
         self.add(slot)
     }
 

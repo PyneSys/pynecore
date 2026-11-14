@@ -40,6 +40,7 @@ from pynecore.core.drawing_snapshot import DrawingSnapshot
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
 from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, copy_ohlcv_tail, restore_f32_volume
 from pynecore.core.script_timeframe import ScriptTimeframe
+from pynecore.core.series import close_collection_bar
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
 from pynecore.core import viz
 from pynecore.core.viz import VizWriter
@@ -435,6 +436,9 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo',
         # None on the run's first bar, where ``close`` is still the Source placeholder
         props['_last_close'] = na_float if last_close_bar is None else props['close']
         props['_last_close_bar'] = bar_index
+        # The previous bar is over: its arrays, matrices and maps go into history
+        # as they are now
+        close_collection_bar()
 
     # A Pine int is a double at runtime: the published bar index is a float
     props['bar_index'] = float(bar_index)
@@ -558,6 +562,7 @@ def _reset_lib_vars():
 
     lib._last_close = na_float
     lib._last_close_bar = None
+    close_collection_bar()
     lib._ask_bar = None
 
     lib._time = 0

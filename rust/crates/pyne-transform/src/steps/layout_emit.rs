@@ -78,6 +78,21 @@ fn scope_entry(ast: &mut Ast, scope: &ScopeLayout, compacted: bool) -> NodeId {
     if let Some(pin) = scope.pin_slot {
         keys.push("pin");
         values.push(int(ast, pin));
+        let series_pins: Vec<NodeId> = scope
+            .slots
+            .iter()
+            .filter(|slot| slot.kind == SlotKind::Series)
+            .filter_map(|slot| slot.series_pin.map(|entry| (slot.index, entry)))
+            .map(|(index, entry)| {
+                let index = int(ast, index);
+                let entry = int(ast, entry);
+                tuple(ast, vec![index, entry])
+            })
+            .collect();
+        if !series_pins.is_empty() {
+            keys.push("series_pins");
+            values.push(tuple(ast, series_pins));
+        }
     }
     if compacted {
         keys.push("compacted");

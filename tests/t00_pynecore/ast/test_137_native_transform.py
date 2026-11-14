@@ -154,6 +154,10 @@ def main():
     flat: Series[float] = close
     prev: Series[float] = close
     shift = prev[1]
+    kept: Series[list[float]] = a
+    alias: Series = a
+    grid: Series[Matrix[float]] = m
+    shift += lib.array.size(kept[1]) + lib.array.size(alias[1]) + lib.matrix.rows(grid[1])
     return helper(close) + indicators.ema(close, 3) + smoothed() + Flag().f + trend
 '''
 

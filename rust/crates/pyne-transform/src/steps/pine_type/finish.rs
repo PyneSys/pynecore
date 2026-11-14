@@ -5,15 +5,16 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
-use pyne_ast::walk::{copy_location, walk};
+use pyne_ast::walk::{children, copy_location, walk};
 use pyne_ast::{Constant, ExprContext, Int, Kind, NodeId, Value};
 
 use super::facts::{self, WIDEN_HARMLESS, own_calls, per_context, vector_widen};
+use super::lib_calls::COLLECTION_HISTORY;
 use super::{Engine, R};
 use crate::pine_qualifier::{get_series_lens, set_series_len, set_series_lens};
 use crate::pine_type_rules::{
-    class_of, get_pins, get_varying, get_widen_site, get_widens, set_pin, set_pins, set_varying,
-    set_vector, set_widen_site, set_widens,
+    UNKNOWN, class_of, get_pins, get_varying, get_widen_site, get_widens, is_array, is_map,
+    is_matrix, set_pin, set_pins, set_varying, set_vector, set_widen_site, set_widens,
 };
 
 /// One entry of an instance vector: what one varying site resolves to in one
@@ -47,6 +48,8 @@ type Widens = Option<Vec<(i64, Option<String>)>>;
 /// The state `_stamp_instance_vectors`' two closures share.
 struct Vectors<'e> {
     varying: IndexMap<String, Vec<NodeId>>,
+    /// A declared series parameter's history kind per context, where it differs
+    param_kinds: HashMap<NodeId, HashMap<i64, Option<String>>>,
     memo: HashMap<(String, i64), Rc<Vec<Entry>>>,
     widens: HashMap<NodeId, Widens>,
     series_len: &'e IndexMap<i64, IndexMap<i64, bool>>,
@@ -89,6 +92,9 @@ impl Vectors<'_> {
         cid: i64,
         stack: &HashSet<(String, i64)>,
     ) -> Entry {
+        if let Some(kinds) = self.param_kinds.get(&site) {
+            return Entry::from_text(kinds.get(&cid).and_then(Option::as_ref));
+        }
         let widens = self.widens.entry(site).or_insert_with(|| get_widens(ast, site)).clone();
         if let Some(widens) = widens {
             return match widens.iter().find(|(known, _)| *known == cid) {
@@ -275,14 +281,50 @@ impl Engine<'_, '_> {
             .collect();
         let mut cids: HashMap<String, Vec<i64>> = HashMap::new();
         let mut impl_cids: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut context_params: HashMap<i64, &[String]> = HashMap::new();
         for (memo_key, &index) in &self.contexts {
             let result = &self.results[index];
             cids.entry(result.key.clone()).or_default().push(result.cid);
+            context_params.insert(result.cid, &result.params);
             if self.overload_groups.contains(&result.key)
                 && let Some(def) = memo_key.def
             {
                 impl_cids.entry(def).or_default().push(result.cid);
             }
+        }
+        // A declared series -- a parameter, then the local declarations -- whose
+        // history kind differs per context: the merged type of the name answers
+        // neither, so each instance is told
+        let mut param_kinds: HashMap<NodeId, HashMap<i64, Option<String>>> = HashMap::new();
+        let mut param_sites: HashMap<String, Vec<NodeId>> = HashMap::new();
+        let no_kinds = HashMap::new();
+        for (key, &node) in &targets {
+            let key_cids = cids.get(key).map(Vec::as_slice).unwrap_or(&[]);
+            let mut declared: Vec<(NodeId, HashMap<i64, Option<String>>)> = Vec::new();
+            for (position, param) in series_params(self.ast, node) {
+                let kinds = key_cids
+                    .iter()
+                    .map(|&cid| (cid, history_kind(context_params[&cid], position)))
+                    .collect();
+                declared.push((param, kinds));
+            }
+            for target in series_locals(self.ast, node) {
+                let seen = facts::nid(self.ast, target)
+                    .and_then(|nid| self.local_kinds.get(&nid))
+                    .unwrap_or(&no_kinds);
+                let kinds =
+                    key_cids.iter().map(|&cid| (cid, seen.get(&cid).cloned().flatten())).collect();
+                declared.push((target, kinds));
+            }
+            let mut sites = Vec::new();
+            for (site, kinds) in declared {
+                let distinct: HashSet<&Option<String>> = kinds.values().collect();
+                if distinct.len() > 1 {
+                    param_kinds.insert(site, kinds);
+                    sites.push(site);
+                }
+            }
+            param_sites.insert(key.clone(), sites);
         }
         let own: IndexMap<String, Vec<NodeId>> =
             targets.iter().map(|(key, &node)| (key.clone(), own_calls(self.ast, node))).collect();
@@ -307,14 +349,14 @@ impl Engine<'_, '_> {
         let varying: IndexMap<String, Vec<NodeId>> = own
             .iter()
             .map(|(key, calls)| {
-                (
-                    key.clone(),
-                    calls.iter().copied().filter(|&call| per_context(ast, call)).collect(),
-                )
+                let mut sites = param_sites[key].clone();
+                sites.extend(calls.iter().copied().filter(|&call| per_context(ast, call)));
+                (key.clone(), sites)
             })
             .collect();
         let mut vectors = Vectors {
             varying,
+            param_kinds,
             memo: HashMap::new(),
             widens: HashMap::new(),
             series_len: &self.series_len,
@@ -327,7 +369,7 @@ impl Engine<'_, '_> {
         while changed {
             changed = false;
             for (key, calls) in &own {
-                let mut found: Vec<NodeId> = Vec::new();
+                let mut found: Vec<NodeId> = param_sites[key].clone();
                 for &call in calls {
                     if per_context(ast, call) {
                         found.push(call);
@@ -400,6 +442,66 @@ impl Engine<'_, '_> {
             set_vector(self.ast, node, Some(vector));
         }
     }
+}
+
+/// The parameters the series pass gives a history slot, by their position among
+/// every parameter, the order of a context's parameter types (`_series_params`).
+fn series_params(ast: &pyne_ast::Ast, node: NodeId) -> Vec<(usize, NodeId)> {
+    let Some(args) = facts::args_of(ast, node) else { return Vec::new() };
+    let offset = args.posonlyargs.len();
+    let mut found = Vec::new();
+    for (i, &param) in args.args.iter().enumerate() {
+        let Kind::Arg { annotation: Some(annotation), .. } = ast.kind(param) else { continue };
+        let head = match ast.kind(*annotation) {
+            Kind::Subscript { value, .. } => *value,
+            _ => *annotation,
+        };
+        if matches!(ast.kind(head), Kind::Name { id, .. } if id == "Series") {
+            found.push((offset + i, param));
+        }
+    }
+    found
+}
+
+/// The targets of a definition's own `x: Series` declarations, in source order; a
+/// nested definition owns its own (`_series_locals`).
+pub(super) fn series_locals(ast: &pyne_ast::Ast, node: NodeId) -> Vec<NodeId> {
+    let mut found = Vec::new();
+    let mut stack: Vec<NodeId> = facts::def_body(ast, node).iter().rev().copied().collect();
+    while let Some(current) = stack.pop() {
+        match ast.kind(current) {
+            Kind::FunctionDef { .. }
+            | Kind::AsyncFunctionDef { .. }
+            | Kind::ClassDef { .. }
+            | Kind::Lambda { .. } => continue,
+            Kind::AnnAssign { target, annotation, .. }
+                if matches!(ast.kind(*target), Kind::Name { .. }) =>
+            {
+                let head = match ast.kind(*annotation) {
+                    Kind::Subscript { value, .. } => *value,
+                    _ => *annotation,
+                };
+                if matches!(ast.kind(head), Kind::Name { id, .. } if id == "Series") {
+                    found.push(*target);
+                }
+            }
+            _ => {}
+        }
+        let mut kids = children(ast, current);
+        kids.reverse();
+        stack.extend(kids);
+    }
+    found
+}
+
+/// The history kind of a value of a type (`_history_kind_of`).
+pub(super) fn history_kind_of(ty: &str) -> Option<String> {
+    (is_array(ty) || is_matrix(ty) || is_map(ty)).then(|| COLLECTION_HISTORY.to_string())
+}
+
+/// The history kind of a parameter in one context (`_history_kind`).
+fn history_kind(params: &[String], position: usize) -> Option<String> {
+    history_kind_of(params.get(position).map_or(UNKNOWN, String::as_str))
 }
 
 #[allow(dead_code)]
