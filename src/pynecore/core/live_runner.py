@@ -60,7 +60,53 @@ from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.session import is_in_session, is_point_in_session
 from pynecore.lib.timeframe import _in_seconds
 
-__all__ = ['live_ohlcv_generator', 'download_warmup_in_memory', 'LiveBarStreamer', 'FeedStatus']
+__all__ = ['live_ohlcv_generator', 'download_warmup_in_memory', 'LiveBarStreamer', 'FeedStatus',
+           'LiveStop']
+
+
+class LiveStop:
+    """A stop request for a live stream, settable from any thread.
+
+    :func:`live_ohlcv_generator` waits for the next update without a deadline, so a
+    front end that cannot interrupt the consuming thread with a signal (an IDE bridge
+    reading its stop command on another thread) hands one of these to the stream.
+    :meth:`set` wakes the waiting consumer at once; the iterator then ends like an
+    exhausted one and tears the stream down.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._is_set = False
+        self._wakers: list[Callable[[], None]] = []
+
+    @property
+    def is_set(self) -> bool:
+        """Whether the stop was requested."""
+        return self._is_set
+
+    def set(self) -> None:
+        """Request the stop and wake every stream waiting on it."""
+        with self._lock:
+            if self._is_set:
+                return
+            self._is_set = True
+            wakers = list(self._wakers)
+        for wake in wakers:
+            wake()
+
+    def add_waker(self, wake: Callable[[], None]) -> None:
+        """Call ``wake`` on :meth:`set`, at once when the stop was already requested."""
+        with self._lock:
+            if not self._is_set:
+                self._wakers.append(wake)
+                return
+        wake()
+
+    def remove_waker(self, wake: Callable[[], None]) -> None:
+        """Stop calling ``wake`` on :meth:`set`."""
+        with self._lock:
+            if wake in self._wakers:
+                self._wakers.remove(wake)
 
 
 @dataclass(frozen=True)
@@ -307,6 +353,13 @@ class _Sentinel(BaseException):
 
 _SENTINEL = _Sentinel()
 
+
+class _StopRequest(BaseException):
+    """Marker a :class:`LiveStop` puts on the queue to wake the consumer."""
+
+
+_STOP_REQUEST = _StopRequest()
+
 # Soft cap for intra-bar updates queued ahead of the consumer. Closed
 # bars are never dropped (they go through the blocking ``put`` path),
 # but intra-bar updates are advisory and must not accumulate without
@@ -526,6 +579,7 @@ def live_ohlcv_generator(
         raise_on_connect_failure: bool = False,
         on_interrupt: Callable[[], None] | None = None,
         on_feed_status: Callable[[FeedStatus], None] | None = None,
+        stop: LiveStop | None = None,
 ) -> Generator[OHLCV, None, None]:
     """
     Bridge async watch_ohlcv() to a sync Generator[OHLCV, None, None].
@@ -586,6 +640,9 @@ def live_ohlcv_generator(
                            runs on the provider's background thread, between two awaits of
                            the provider loop: it must return quickly and must not block. An
                            exception it raises is logged and swallowed.
+    :param stop: Ends the iterator when set, from any thread, the same way the stream
+                 ends on its own: no :class:`KeyboardInterrupt`, the teardown runs. The
+                 updates still queued are dropped.
     :return: Iterator yielding OHLCV objects (both closed and intra-bar) interleaved
              with a single ``LIVE_TRANSITION`` sentinel marking the warmup→live boundary.
     """
@@ -1075,15 +1132,26 @@ def live_ohlcv_generator(
                 # A whole bar must have closed past the warmup before anything
                 # can be missing.
                 if elapsed_ms >= 2 * tf_ms:
+                    recovered: list[OHLCV] = []
+
+                    async def _run_backfill(
+                            query: Callable[[str, str, int], Coroutine[Any, Any, list[OHLCV]]],
+                            since_ms: int,
+                    ) -> None:
+                        recovered.extend(await query(watch_symbol, timeframe, since_ms))
+
+                    # Raced against the shutdown signal: a stalled history
+                    # query must not keep a stop waiting for the whole join
+                    # timeout. A stop that wins abandons the query, and the
+                    # main loop below exits on ``stop_event`` at once.
                     try:
-                        recovered = await backfill_closed_bars(
-                            watch_symbol, timeframe, last_historical_timestamp,
-                        )
+                        await _await_or_stop(_run_backfill(
+                            backfill_closed_bars, last_historical_timestamp))
                     except Exception as exc:
                         # Recovery is best-effort: a bot that refuses to start
                         # because a history query failed is worse than one that
                         # starts with a logged hole.
-                        recovered = []
+                        recovered.clear()
                         broker_warning(
                             "startup gap recovery failed: %s — starting anyway,"
                             " any bar missed during subscribe stays missing",
@@ -1768,11 +1836,18 @@ def live_ohlcv_generator(
         thread.join(timeout=startup_join_timeout)
         raise connect_failure[0]
 
+    def _wake_on_stop() -> None:
+        bar_queue.put(_STOP_REQUEST)
+
     def _consumer() -> Generator[OHLCV, None, None]:
         in_warmup_catchup = True
 
+        if stop is not None:
+            stop.add_waker(_wake_on_stop)
         try:
             while True:
+                if stop is not None and stop.is_set:
+                    break
                 if in_warmup_catchup:
                     # Drain bars buffered during warmup without blocking.
                     # An empty queue means warmup catch-up is over: emit
@@ -1784,6 +1859,8 @@ def live_ohlcv_generator(
                         in_warmup_catchup = False
                         continue
 
+                    if item is _STOP_REQUEST:
+                        break
                     if item is _SENTINEL:
                         # Stream ended before any live bar arrived. Still
                         # emit the transition so callers that gate on it
@@ -1812,10 +1889,12 @@ def live_ohlcv_generator(
                             break
                         continue
 
-                    if item is _SENTINEL:
+                    if item is _SENTINEL or item is _STOP_REQUEST:
                         break
                     if isinstance(item, BaseException):
                         raise item
+                    if stop is not None and stop.is_set:
+                        break
 
                     yield item
 
@@ -1829,6 +1908,8 @@ def live_ohlcv_generator(
                 on_interrupt()
             raise
         finally:
+            if stop is not None:
+                stop.remove_waker(_wake_on_stop)
             stop_event.set()
             # Wake a reconnect handshake blocked on ``provider.connect()`` on the
             # broker loop (see ``_async_loop._await_or_stop``), or teardown waits

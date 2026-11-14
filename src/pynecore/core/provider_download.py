@@ -21,7 +21,7 @@ from pynecore.core.plugin import (load_plugin, ProviderError, ProviderPlugin,
                                   is_retryable_provider_error)
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.config import ensure_config
-from pynecore.core.live_runner import FeedStatus, live_ohlcv_generator
+from pynecore.core.live_runner import FeedStatus, LiveStop, live_ohlcv_generator
 from pynecore.lib.timeframe import in_seconds
 from pynecore.core._file_io import exclusive_file_lock, replace_file
 from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
@@ -35,12 +35,16 @@ if TYPE_CHECKING:
 
 __all__ = ['ProviderHistory', 'ProviderSetupError', 'DownloadListener', 'parse_time_value',
            'fetch_provider_symbol_info', 'download_provider_history',
-           'download_provider_history_resilient', 'require_live_provider',
+           'download_provider_history_resilient', 'DownloadStopped', 'require_live_provider',
            'open_live_stream']
 
 
 class ProviderSetupError(Exception):
     """A provider run cannot start: the plugin cannot serve what the run asks of it."""
+
+
+class DownloadStopped(Exception):
+    """A provider download was stopped through its :class:`~pynecore.core.live_runner.LiveStop`."""
 
 
 class DownloadListener:
@@ -628,22 +632,34 @@ _PROVIDER_RETRY_BASE_DELAY = 2.0
 _PROVIDER_RETRY_MAX_DELAY = 60.0
 
 
-def _wait_before_retry(delay: float) -> None:
+def _wait_before_retry(delay: float, stop: LiveStop | None = None) -> None:
     """Block for ``delay`` seconds interruptibly, without a bare sleep.
 
-    Waits on a never-set :class:`threading.Event`, an event-driven,
-    deadline-bounded primitive: a ``Ctrl-C`` (``KeyboardInterrupt`` in the main
-    thread) breaks out of the backoff at once instead of stalling for the full
+    Waits on a :class:`threading.Event`, an event-driven, deadline-bounded
+    primitive: a ``Ctrl-C`` (``KeyboardInterrupt`` in the main thread) or a set
+    ``stop`` breaks out of the backoff at once instead of stalling for the full
     delay, and there is no busy-poll.
 
     :param delay: Maximum seconds to wait.
+    :param stop: Ends the wait when set, from any thread.
+    :raises DownloadStopped: If ``stop`` was set.
     """
-    threading.Event().wait(timeout=delay)
+    woken = threading.Event()
+    if stop is not None:
+        stop.add_waker(woken.set)
+    try:
+        woken.wait(timeout=delay)
+    finally:
+        if stop is not None:
+            stop.remove_waker(woken.set)
+    if stop is not None and stop.is_set:
+        raise DownloadStopped()
 
 
 def download_provider_history_resilient(
         provider_str: str, time_from_str: str | None, *, data_dir: Path, config_dir: Path,
         retry_transient: bool, listener: DownloadListener | None = None,
+        stop: LiveStop | None = None,
 ) -> ProviderHistory:
     """Download provider data, riding out transient broker outages.
 
@@ -668,14 +684,19 @@ def download_provider_history_resilient(
     :param retry_transient: Whether to wait-and-retry on transient errors —
         ``True`` only for long-running ``--broker`` / ``--live`` runs.
     :param listener: Receives the progress, the warnings and every retry wait.
+    :param stop: Ends a retry wait at once when set from another thread (a front end
+        without ``Ctrl-C``); a download pass already running is not interrupted.
     :return: The downloaded history.
     :raises ProviderError: On a permanent failure, or any failure without ``retry_transient``.
+    :raises DownloadStopped: If ``stop`` was set before a retry.
     """
     listener = listener or DownloadListener()
 
     delay = _PROVIDER_RETRY_BASE_DELAY
     attempt = 0
     while True:
+        if stop is not None and stop.is_set:
+            raise DownloadStopped()
         try:
             return download_provider_history(provider_str, time_from_str, data_dir=data_dir,
                                              config_dir=config_dir, listener=listener)
@@ -684,7 +705,7 @@ def download_provider_history_resilient(
                 raise
             attempt += 1
             listener.retry_wait(e, delay, attempt)
-            _wait_before_retry(delay)
+            _wait_before_retry(delay, stop)
             delay = min(delay * 2.0, _PROVIDER_RETRY_MAX_DELAY)
 
 
@@ -709,6 +730,7 @@ def open_live_stream(history: ProviderHistory, *, last_historical_timestamp: int
                      raise_on_connect_failure: bool = False,
                      on_interrupt: Callable[[], None] | None = None,
                      on_feed_status: Callable[[FeedStatus], None] | None = None,
+                     stop: LiveStop | None = None,
                      ) -> Generator[OHLCV, None, None]:
     """
     Start the live stream of a downloaded provider history.
@@ -727,6 +749,7 @@ def open_live_stream(history: ProviderHistory, *, last_historical_timestamp: int
     :param raise_on_connect_failure: Re-raise a failed first connection here.
     :param on_interrupt: Called when a stop lands in the stream, before its teardown.
     :param on_feed_status: Receives every state change of the feed.
+    :param stop: Ends the iterator when set from another thread, with the normal teardown.
     :return: The live iterator.
     :raises ProviderSetupError: If the provider has no live data.
     """
@@ -744,4 +767,5 @@ def open_live_stream(history: ProviderHistory, *, last_historical_timestamp: int
         raise_on_connect_failure=raise_on_connect_failure,
         on_interrupt=on_interrupt,
         on_feed_status=on_feed_status,
+        stop=stop,
     )

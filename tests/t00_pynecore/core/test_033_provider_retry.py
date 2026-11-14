@@ -26,7 +26,8 @@ _DIR = Path("unused")
 def __test_transient_error_retried_until_success__(monkeypatch):
     """A transient failure is retried (with waits) until the download succeeds."""
     waits: list[float] = []
-    monkeypatch.setattr(provider_download, "_wait_before_retry", lambda d: waits.append(d))
+    monkeypatch.setattr(provider_download, "_wait_before_retry",
+                        lambda d, _stop=None: waits.append(d))
 
     sentinel = SimpleNamespace(ohlcv_path="x")
     calls = {"n": 0}
@@ -54,7 +55,8 @@ def __test_transient_error_retried_until_success__(monkeypatch):
 def __test_backoff_saturates_at_cap__(monkeypatch):
     """The retry delay grows exponentially but never exceeds the cap."""
     waits: list[float] = []
-    monkeypatch.setattr(provider_download, "_wait_before_retry", lambda d: waits.append(d))
+    monkeypatch.setattr(provider_download, "_wait_before_retry",
+                        lambda d, _stop=None: waits.append(d))
 
     calls = {"n": 0}
 
@@ -78,7 +80,8 @@ def __test_backoff_saturates_at_cap__(monkeypatch):
 def __test_permanent_error_fails_fast_in_live_mode__(monkeypatch):
     """A permanent failure is raised immediately even with retry enabled — no wait."""
     waits: list[float] = []
-    monkeypatch.setattr(provider_download, "_wait_before_retry", lambda d: waits.append(d))
+    monkeypatch.setattr(provider_download, "_wait_before_retry",
+                        lambda d, _stop=None: waits.append(d))
 
     calls = {"n": 0}
 
@@ -99,7 +102,8 @@ def __test_permanent_error_fails_fast_in_live_mode__(monkeypatch):
 def __test_backtest_does_not_retry_transient__(monkeypatch):
     """With retry disabled (one-shot backtest), even a transient error fails fast."""
     waits: list[float] = []
-    monkeypatch.setattr(provider_download, "_wait_before_retry", lambda d: waits.append(d))
+    monkeypatch.setattr(provider_download, "_wait_before_retry",
+                        lambda d, _stop=None: waits.append(d))
 
     calls = {"n": 0}
 
@@ -128,3 +132,35 @@ def __test_cli_turns_a_provider_failure_into_a_clean_exit__(monkeypatch, capsys)
         run_command._download_provider_data_resilient("p:s@1", None, retry_transient=True)
 
     assert "Error: symbol not found" in capsys.readouterr().err
+
+
+def __test_stop_ends_the_retry_wait__(monkeypatch):
+    """A stop set from another thread ends the backoff at once, no retry follows."""
+    import threading
+    import time
+
+    from pynecore.core.live_runner import LiveStop
+    from pynecore.core.provider_download import DownloadStopped
+
+    calls = {"n": 0}
+
+    def fake_download(*_args, **_kwargs):
+        calls["n"] += 1
+        raise TransientProviderError("broker maintenance")
+
+    monkeypatch.setattr(provider_download, "download_provider_history", fake_download)
+    monkeypatch.setattr(provider_download, "_PROVIDER_RETRY_BASE_DELAY", 30.0)
+
+    stop = LiveStop()
+    timer = threading.Timer(0.1, stop.set)
+    timer.start()
+    started = time.monotonic()
+    with pytest.raises(DownloadStopped):
+        download_provider_history_resilient(
+            "ctrader:pepperstoneuk:BTCUSD@1", "-500", data_dir=_DIR, config_dir=_DIR,
+            retry_transient=True, stop=stop,
+        )
+    timer.join()
+
+    assert time.monotonic() - started < 5.0
+    assert calls["n"] == 1

@@ -402,6 +402,60 @@ def __test_feed_status_hook_failure_does_not_stop_the_feed__():
 
     assert len(bars) == 1
 
+
+class _QuietAfterFirstBar(MockLiveProvider):
+    """Delivers one bar, then waits for data that never comes."""
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        if self._index == 0:
+            self._index += 1
+            return self._bar_updates[0]
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+def __test_live_stop_ends_a_waiting_stream__():
+    """A stop set from another thread ends the iterator blocked on a silent feed"""
+    from pynecore.core.live_runner import LiveStop
+
+    stop = LiveStop()
+    statuses: list[FeedStatus] = []
+    # The current day's bar: no idle bar is due before the stop
+    day_ms = 86_400_000
+    today = int(time.time() * 1000) // day_ms * day_ms
+    provider = _QuietAfterFirstBar([_make_ohlcv(today, is_closed=True)])
+    stream = live_ohlcv_generator(provider, "BTC/USDT", "1D", on_feed_status=statuses.append,
+                                  stop=stop, shutdown_timeout=5.0)
+    items = []
+    for item in stream:
+        items.append(item)
+        if item is not LIVE_TRANSITION:
+            # The bar lands before or after the transition, depending on the race
+            # between the provider thread and the first pull
+            break
+    timer = threading.Timer(0.1, stop.set)
+    timer.start()
+    started = time.monotonic()
+    items.extend(stream)
+    timer.join()
+
+    assert time.monotonic() - started < 5.0
+    assert LIVE_TRANSITION in items
+    assert [b.timestamp for b in items if b is not LIVE_TRANSITION] == [today]
+    assert not provider.is_connected
+    assert statuses[-1].state == 'stopped'
+
+
+def __test_live_stop_set_before_the_first_pull__():
+    """A stop requested before the consumer starts yields nothing"""
+    from pynecore.core.live_runner import LiveStop
+
+    stop = LiveStop()
+    stop.set()
+    provider = MockLiveProvider([_make_ohlcv(1000, is_closed=True)])
+    assert list(live_ohlcv_generator(provider, "BTC/USDT", "1D", stop=stop)) == []
+    assert not provider.is_connected
+
 # --- Initial connect retry tests ---
 
 class InitialConnectFlakyProvider(MockLiveProvider):
@@ -2313,3 +2367,43 @@ def __test_startup_gap_skipped_when_no_full_bar_could_have_closed__():
     _drain(provider, "BTC/USDT", "1D", last_historical_timestamp=now_ms)
 
     assert provider.backfill_calls == []
+
+
+class _StalledBackfillProvider(_BackfillProvider):
+    """Provider whose startup history query never answers."""
+
+    def __init__(self, bar_updates: list[OHLCV]):
+        super().__init__(bar_updates, [])
+        self.backfill_started = threading.Event()
+
+    async def backfill_closed_bars(self, symbol: str, timeframe: str,
+                                   since_ms: int) -> list[OHLCV]:
+        await super().backfill_closed_bars(symbol, timeframe, since_ms)
+        self.backfill_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+def __test_live_stop_abandons_a_stalled_startup_backfill__():
+    """A stop during a pending startup history query disconnects at once"""
+    from pynecore.core.live_runner import LiveStop
+
+    stop = LiveStop()
+    provider = _StalledBackfillProvider([_make_ohlcv(4000, close=400.0)])
+    stream = live_ohlcv_generator(provider, "BTC/USDT", "1D", last_historical_timestamp=1000,
+                                  stop=stop, shutdown_timeout=5.0)
+
+    def _stop_once_backfill_runs() -> None:
+        provider.backfill_started.wait(timeout=5.0)
+        stop.set()
+
+    stopper = threading.Thread(target=_stop_once_backfill_runs)
+    stopper.start()
+    started = time.monotonic()
+    items = list(stream)
+    stopper.join()
+
+    assert provider.backfill_calls == [("BTC/USDT", "1D", 1000)]
+    assert time.monotonic() - started < 5.0
+    assert [item for item in items if item is not LIVE_TRANSITION] == []
+    assert not provider.is_connected
