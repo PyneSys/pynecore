@@ -1,5 +1,5 @@
 """
-Regression tests for :func:`pynecore.cli.commands.run._ohlcv_download_lock`.
+Regression tests for :func:`pynecore.core.provider_download._ohlcv_download_lock`.
 
 Two concurrent runs on the same ``(provider, symbol, timeframe)`` share one
 ``.ohlcv`` file. The warmup download ``seek(0)``-truncates and rewrites it; a
@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from pynecore.cli.commands.run import (
+from pynecore.core.provider_download import (
     _atomic_ohlcv_download_target,
     _ohlcv_download_lock,
 )

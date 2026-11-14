@@ -5,7 +5,7 @@ title: "ScriptRunner API"
 description: "Run PyneCore scripts from Python with ScriptRunner. Configure OHLCV data, symbol metadata and script inputs, then access indicator values and strategy results."
 icon: "play_circle"
 date: "2025-03-31"
-lastmod: "2026-10-25"
+lastmod: "2026-11-14"
 draft: false
 toc: true
 categories: ["Programmatic"]
@@ -97,6 +97,8 @@ ScriptRunner(
 | `last_bar_index`           | `int \| None`      | Index of the last historical bar, for `last_bar_index`         |
 | `last_bar_time`            | `int \| None`      | Time (ms) of the last historical bar, for `last_bar_time`      |
 | `live`                     | `bool`             | Feed is history, then live updates (see Live Mode)             |
+| `live_history_trades`      | `bool`             | Live paper trading: trade on the warmup bars too (Live Mode)   |
+| `history_as_of`            | `int \| None`      | Time (ms) the warmup history was downloaded, at the latest     |
 | `inputs`                   | `dict \| None`     | Override `input()` values at runtime (see below)               |
 | `settings`                 | `dict \| None`     | Override script settings at runtime (see below)                |
 | `security_data`            | `dict \| None`     | OHLCV paths for `request.security()` contexts (see below)      |
@@ -422,15 +424,81 @@ What live mode changes:
 - **Intra-bar updates.** An indicator runs on every update of the forming bar, a strategy only
   with `calc_on_every_tick=true`. `var` variables roll back between these runs and `varip`
   variables keep their value, as in Pine. `run_iter()` yields on bar close only; pass
-  `on_tick=` to see every update.
+  `on_tick=` to see every update, or `yield_ticks=True` to get the forming bar's results too
+  (see below).
 - **Strategy orders start at the transition.** The warmup bars build the script's state, but
   their `strategy.*` orders are ignored, so the strategy does not start with a position it took
   in the past. Orders are simulated (paper trading) unless a broker plugin is attached.
+  `live_history_trades=True` lets a paper-trading strategy trade on the warmup bars too, as a
+  backtest the live phase continues, position and all (see below).
 - **Feed errors are dropped with a warning.** A bar that would move time backwards (a closed bar
   older than the last one, or an update of a bar that is already closed) is not executed.
 
 A feed that only knows closed candles skips the `is_closed=False` updates. It still has to drop
 the candle that is still forming: most REST APIs return it as the last row.
+
+### From a Provider String
+
+`pynecore.core.provider_download` runs a provider the way `pyne run` does, without any terminal
+output: `download_provider_history()` downloads the history of a provider string into its OHLCV
+file (fresh symbol information, `-N` means N real bars), and `open_live_stream()` connects the
+same provider instance and returns the live iterator to chain after the history bars. Progress and
+warnings go to a `DownloadListener` you may subclass; failures are raised (`ProviderError`,
+`ProviderSetupError`, `ValueError` for a bad start value). `download_provider_history_resilient()`
+also rides out transient provider outages, as a long-running live run needs.
+
+```python
+import itertools
+from pynecore.core.ohlcv import OHLCVReader
+from pynecore.core.provider_download import download_provider_history, open_live_stream
+
+history = download_provider_history("ccxt:BYBIT:BTC/USDT:USDT@1", "-500",
+                                    data_dir=workdir / "data", config_dir=workdir / "config")
+with OHLCVReader(history.ohlcv_path) as reader:
+    bars = list(reader.read_from(history.time_from_ts or 0))
+    live = open_live_stream(history, last_historical_timestamp=bars[-1].timestamp,
+                            on_feed_status=show_status)
+    runner = ScriptRunner(Path("rsi.py"), itertools.chain(bars, live), history.syminfo,
+                          live=True)
+    for candle, plot_data in runner.run_iter(yield_ticks=True):
+        ...
+```
+
+The connection opens as soon as `open_live_stream()` is called, so no bar is lost while the
+history runs: the bars that close meanwhile come right after the history, as closed bars.
+
+### Results of the Forming Bar
+
+`run_iter(yield_ticks=True)` also yields an item for every intra-bar update, so the forming
+candle can be drawn on each one. The item carries the update itself, so `candle.is_closed` is
+`False`. It is provisional: the next update of the same bar replaces it, and the bar's close is
+yielded once more, as without the switch.
+
+When the body executed on the update (every update for an indicator, every update with
+`calc_on_every_tick=true` for a strategy), the item carries its results, and a strategy's trade
+list holds the trades closed so far on the bar. When it did not, `plot_data` and the trade list
+are empty: only the candle is new, and the plots of the bar come with its close. The plot, trade
+and viz files are written for closed bars only either way.
+
+```python
+for candle, plot_data in runner.run_iter(yield_ticks=True):
+    if candle.is_closed:
+        commit_bar(candle, plot_data)        # final values of the bar
+    else:
+        update_forming_bar(candle, plot_data)  # replaced by the next update
+```
+
+### Trading on the Warmup Bars
+
+With `live_history_trades=True` a paper-trading strategy runs its `strategy.*` calls on the warmup
+bars too: the history is a backtest, and the live phase continues it with whatever position it
+left. It is off by default, so a live run starts flat at the transition, and it is not available
+with a broker plugin, where only what the broker really trades may enter the record (the
+constructor raises `ValueError` for a broker or a non-live run). The last warmup bar places no
+orders while its period had not ended yet when the history was downloaded: the live feed goes on
+forming that bar, and an order placed on its partial data could fill at a price from before it was
+placed. Pass the download time as `history_as_of` (UNIX ms, no later than the download); without
+it the runner takes the time it was created.
 
 ## Trade Object
 

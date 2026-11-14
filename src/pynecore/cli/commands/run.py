@@ -3,22 +3,15 @@ import json
 import logging
 import os
 import signal
-import tempfile
 import threading
 import time
 import sys
 import tomllib
 
-from contextlib import contextmanager
 from pathlib import Path
-from dataclasses import replace as dc_replace
-from datetime import datetime, timedelta, UTC, tzinfo
+from datetime import datetime, UTC, tzinfo
 from collections.abc import Callable
-from typing import Any, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from pynecore.core.plugin import ProviderPlugin
-from zoneinfo import ZoneInfo
+from typing import Any
 
 from typer import Option, Argument, secho, Exit, colors
 from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
@@ -30,9 +23,7 @@ from ..app import app, app_state
 from ..pluggable import PluggableCommand
 
 from ...utils.rich.date_column import DateColumn
-# noinspection PyProtectedMember
-from pynecore.core._file_io import exclusive_file_lock, replace_file
-from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, OHLCVWriter
+from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader
 from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
 from pynecore.core.data_path import DATA_EXTENSIONS, data_extension, with_data_extension
 from pynecore.core.aggregator import validate_aggregation
@@ -46,9 +37,12 @@ from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.script_runner import ScriptRunner, DataRequirements, SecurityRequirement
 from pynecore.core.profiler import ProfilerUnavailable
 from pynecore.pynesys.compiler import PyneComp
-from pynecore.core.provider_string import ProviderString, is_provider_string, parse_provider_string
-from pynecore.core.session import is_in_session
-from pynecore.core.live_runner import live_ohlcv_generator
+from pynecore.core.provider_string import is_provider_string
+from pynecore.core.provider_download import (
+    DownloadListener, ProviderHistory, ProviderSetupError, download_provider_history_resilient,
+    open_live_stream, parse_time_value, require_live_provider,
+)
+from pynecore.core.plugin import ProviderError
 from ...cli.utils.api_error_handler import APIErrorHandler
 from ...cli.utils.profile_report import print_profile_report
 
@@ -437,367 +431,39 @@ def _format_run_completion_summary(
 
 def _parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetime | int | None:
     """
-    Parse a --from or --to parameter value.
-
-    A date without an explicit UTC offset is taken as UTC, never as the host's local time.
+    Parse a --from or --to parameter value (see :func:`~pynecore.core.provider_download.parse_time_value`).
 
     :param value: The raw string value.
     :param allow_bars: If True, allow negative numbers as bar counts.
     :return: A timezone-aware datetime, a negative int (bar count), or None.
+    :raises Exit: When the value is invalid
     """
-    if value is None:
-        return None
-    value: str = value.strip()
-
-    # Negative number = bar count (only for --from in provider mode)
-    if allow_bars and value.startswith('-'):
-        try:
-            bars = int(value)
-            return bars
-        except ValueError:
-            pass
-
-    # Positive number = days back
     try:
-        days = int(value)
-        if days < 0:
-            secho("Error: Days cannot be negative (use negative numbers only with provider mode for bar count)",
-                  err=True, fg=colors.RED)
-            raise Exit(1)
-        return (datetime.now(UTC) - timedelta(days=days)).replace(second=0, microsecond=0)
-    except ValueError:
-        pass
-
-    # Date string
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        secho(f"Error: Invalid date or number: '{value}'", err=True, fg=colors.RED)
-        raise Exit(1)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
-
-
-class _ProviderData:
-    """Result of provider data download, including the provider instance for live mode."""
-
-    def __init__(self, ohlcv_path: Path, syminfo: 'SymInfo', parsed_string: ProviderString,
-                 provider_instance=None, time_from_ts: int | None = None):
-        self.ohlcv_path = ohlcv_path
-        self.syminfo = syminfo
-        self.provider_instance = provider_instance
-        self.parsed_string: ProviderString = parsed_string
-        # Exact start timestamp (Unix milliseconds) that yields exactly the
-        # requested bar count in ``-N bars`` mode — None when the caller should
-        # use the file's natural start (date/days mode, no bar target).
-        self.time_from_ts = time_from_ts
-
-
-def _missing_slots(real_ts: list[int], start_ts: int, end_ts: int,
-                   tf_seconds: int) -> list[int]:
-    """Return the aligned slot start-timestamps in ``[start_ts, end_ts)`` that
-    have no real bar.
-
-    The expected grid is inferred from the real bars themselves — anchored on
-    the newest real bar and stepped back by ``tf_seconds`` — so the reported
-    slots share the feed's phase and only genuinely-absent slots surface. With
-    no real bars the grid phase is unknown and an empty list is returned.
-
-    :param real_ts: Real (non-gap-fill) bar timestamps; need not be sorted.
-    :param start_ts: Inclusive window start (epoch seconds).
-    :param end_ts: Exclusive window end (epoch seconds).
-    :param tf_seconds: Timeframe length in seconds.
-    :return: Sorted list of missing slot start-timestamps.
-    """
-    if tf_seconds <= 0 or not real_ts:
-        return []
-    present = set(real_ts)
-    anchor = max(real_ts)
-    missing: list[int] = []
-    slot = anchor
-    # Walk the grid back from the newest real bar to ``start_ts``.
-    while slot >= start_ts:
-        if start_ts <= slot < end_ts and slot not in present:
-            missing.append(slot)
-        slot -= tf_seconds
-    missing.reverse()
-    return missing
-
-
-def _classify_missing_slots(missing: list[int], syminfo: 'SymInfo',
-                            tf_seconds: int) -> tuple[list[int], list[int]]:
-    """Split missing slots into in-session anomalies vs closed-session gaps.
-
-    A slot that falls inside a trading session but has no bar is an *anomaly*
-    (incomplete pagination or a venue-omitted tick), while a slot in a
-    known-closed window (weekend, out-of-hours) is an *expected* venue gap.
-    When the symbol carries no ``opening_hours`` (24/7 instrument) every slot
-    is treated as in-session, so any hole is reported as an anomaly.
-
-    :param missing: Missing slot start-timestamps (epoch seconds).
-    :param syminfo: Symbol calendar (``opening_hours``, ``timezone``).
-    :param tf_seconds: Timeframe length in seconds.
-    :return: ``(in_session, closed)`` timestamp lists.
-    """
-    opening_hours = syminfo.opening_hours
-    if not opening_hours:
-        return list(missing), []
-    # noinspection PyBroadException
-    try:
-        tz = ZoneInfo(syminfo.timezone)
-    except Exception:  # noqa: BLE001
-        return list(missing), []
-    in_session: list[int] = []
-    closed: list[int] = []
-    for ts in missing:
-        local_dt = datetime.fromtimestamp(ts, tz)
-        if is_in_session(opening_hours, local_dt, tf_seconds,
-                         syminfo.session_corrections):
-            in_session.append(ts)
-        else:
-            closed.append(ts)
-    return in_session, closed
-
-
-def _merge_intervals(slots: list[int], tf_seconds: int) -> list[tuple[int, int]]:
-    """Coalesce consecutive grid slots into ``[start, end)`` epoch intervals.
-
-    :param slots: Sorted slot start-timestamps (epoch seconds).
-    :param tf_seconds: Timeframe length in seconds.
-    :return: List of ``(start_ts, end_ts)`` half-open intervals.
-    """
-    if not slots:
-        return []
-    intervals: list[tuple[int, int]] = []
-    run_start = slots[0]
-    prev = slots[0]
-    for ts in slots[1:]:
-        if ts == prev + tf_seconds:
-            prev = ts
-            continue
-        intervals.append((run_start, prev + tf_seconds))
-        run_start = ts
-        prev = ts
-    intervals.append((run_start, prev + tf_seconds))
-    return intervals
-
-
-def _format_missing_report(bar_count: int, real_bars: int, oldest_ts: int | None,
-                           in_session: list[int], closed: list[int],
-                           tf_seconds: int, horizon_reached: bool) -> str:
-    """Build a precise, actionable coverage-shortfall message.
-
-    Distinguishes a venue history-horizon limit (extending ``from`` yields no
-    older bars) from in-session holes (incomplete pagination / omitted ticks),
-    and lists the exact missing intervals for each class instead of a vague
-    sparse-coverage count.
-    """
-    def fmt(ts: int) -> str:
-        return datetime.fromtimestamp(ts, UTC).strftime('%Y-%m-%d %H:%M')
-
-    def fmt_intervals(slots: list[int]) -> str:
-        parts = [f"{fmt(a)}..{fmt(b)}Z" for a, b in _merge_intervals(slots, tf_seconds)]
-        return ', '.join(parts)
-
-    lines = [f"Warning: requested {bar_count} bars, got {real_bars} real bars."]
-    if horizon_reached and oldest_ts is not None:
-        lines.append(
-            f"  Venue history horizon reached: oldest bar the feed serves is "
-            f"{fmt(oldest_ts)}Z. The remaining {bar_count - real_bars} bar(s) "
-            f"predate the venue's available history (not a pagination gap)."
-        )
-    if in_session:
-        lines.append(
-            f"  {len(in_session)} in-session slot(s) missing (incomplete "
-            f"pagination or venue-omitted ticks): {fmt_intervals(in_session)}"
-        )
-    if closed:
-        lines.append(
-            f"  {len(closed)} slot(s) fall in known-closed sessions "
-            f"(expected venue gap): {fmt_intervals(closed)}"
-        )
-    if not horizon_reached and not in_session and not closed:
-        lines.append("  Cause could not be localized from the downloaded range.")
-    return '\n'.join(lines)
-
-
-@contextmanager
-def _ohlcv_download_lock(ohlcv_path: Path | None):
-    """Serialize the shared-OHLCV download/rewrite across concurrent processes.
-
-    Two runs on the same ``(provider, symbol, timeframe)`` share one
-    ``.ohlcv`` file. The warmup download truncates and rewrites it; a second
-    process reading (or truncating) that file at the same instant sees a
-    half-written or empty file. An OS advisory lock on a sidecar ``.lock``
-    next to the ``.ohlcv`` makes the second process block in the kernel until
-    the first finishes, then read a complete file.
-
-    POSIX uses ``fcntl.flock`` and Windows uses ``LockFileEx``. Both block in the
-    kernel rather than polling. A process-local lock also serializes separate file
-    handles opened by threads in the same process.
-
-    :param ohlcv_path: The target ``.ohlcv`` path, or ``None`` (live/in-memory
-        feeds with no shared file — nothing to serialize).
-    """
-    if ohlcv_path is None:
-        yield
-        return
-
-    lock_path = ohlcv_path.with_suffix(ohlcv_path.suffix + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive_file_lock(lock_path):
-        yield
-
-
-@contextmanager
-def _atomic_ohlcv_download_target(provider: 'ProviderPlugin'):
-    """Write one provider download privately, then atomically publish it.
-
-    The sidecar lock serializes publishers, while the temporary file keeps the
-    canonical path complete for readers during the entire rewrite. The
-    provider's original path and unopened writer are restored before return.
-
-    The private writer declares the same period as the provider's own writer,
-    so the published file carries the timeframe the provider was built for.
-    ``truncate=True`` turns the empty file ``mkstemp`` reserved into a valid
-    empty OHLCV file instead of an unwritable zero-byte one.
-    """
-    final_path = provider.ohlcv_path
-    if final_path is None:
-        yield
-        return
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, raw_temp_path = tempfile.mkstemp(
-        prefix=f".{final_path.name}.", suffix=".tmp", dir=final_path.parent,
-    )
-    os.close(fd)
-    temp_path = Path(raw_temp_path)
-    original_writer = provider.ohlcv_file
-    # A provider built with an ohlcv_path always has its writer set.
-    assert original_writer is not None
-    try:
-        with _ohlcv_download_lock(final_path):
-            provider.ohlcv_path = temp_path
-            provider.ohlcv_file = OHLCVWriter(
-                temp_path, original_writer.period, truncate=True,
-            )
-            try:
-                yield
-                replace_file(temp_path, final_path)
-            finally:
-                provider.ohlcv_path = final_path
-                provider.ohlcv_file = original_writer
-    finally:
-        temp_path.unlink(missing_ok=True)
-
-
-def _fetch_provider_symbol_info(provider: 'ProviderPlugin') -> SymInfo:
-    """Load the symbol metadata for a provider-mode run, fresh from the venue.
-
-    Provider mode re-downloads the bar data on every run, and the metadata
-    must be just as fresh: the venue publishes dated session exceptions
-    (holidays, trading breaks) only days ahead, so a cached sidecar from an
-    earlier run does not know about them and the live session calendar
-    would treat a closed market as open. When the venue cannot be reached
-    and a cached sidecar exists, the run continues on the cached metadata
-    with a warning rather than failing before the data download gets its
-    own say about the connection.
-    """
-    cached = provider.is_symbol_info_exists()
-    try:
-        return provider.get_symbol_info(force_update=True)
-    except Exception as e:  # plugin exception families differ per venue
-        if not cached:
-            raise
-        secho(f"Warning: symbol info refresh failed ({e}); using the cached symbol info",
-              err=True, fg=colors.YELLOW)
-        return provider.get_symbol_info()
-
-
-def _download_provider_data(provider_str: str, time_from_str: str | None) -> _ProviderData:
-    """
-    Download historical data from a provider and return the result.
-
-    :param provider_str: Provider string (e.g. "ccxt:BYBIT:BTC/USDT:USDT@1D").
-    :param time_from_str: The --from parameter value (date, days, or -bars).
-    :return: _ProviderData with ohlcv_path, syminfo, and provider instance.
-    """
-    from pynecore.core.plugin import load_plugin, ProviderPlugin
-    from pynecore.core.config import ensure_config
-    from pynecore.lib.timeframe import in_seconds
-
-    # Load the provider plugin first so we know whether it is multi-broker,
-    # which controls how the provider string is split (broker vs. symbol).
-    provider_name = provider_str.split(':', 1)[0].lower()
-    provider_class = load_plugin(provider_name)
-    if not issubclass(provider_class, ProviderPlugin):
-        secho(f"Plugin '{provider_name}' is not a data provider.", err=True, fg=colors.RED)
+        return parse_time_value(value, allow_bars=allow_bars)
+    except ValueError as e:
+        secho(f"Error: {e}", err=True, fg=colors.RED)
         raise Exit(1)
 
-    ps = parse_provider_string(provider_str, require_timeframe=True,
-                               multi_broker=provider_class.multi_broker)
-    # Store the normalized (lowercased) provider name so that later
-    # case-sensitive ``load_plugin()`` lookups for security/auto-rate
-    # contexts succeed even when the user typed the provider in a
-    # different case (e.g. ``CCXT:...``).
-    ps = dc_replace(ps, provider=provider_name)
 
-    # Default to -500 bars if --from not specified in provider mode
-    if not time_from_str:
-        time_from_str = "-500"
+class _RichDownloadListener(DownloadListener):
+    """Shows a provider download in the terminal: spinners, a progress bar, warnings."""
 
-    time_from_value = _parse_time_value(time_from_str, allow_bars=True)
-    time_to_dt = datetime.now(UTC).replace(second=0, microsecond=0)
+    def __init__(self) -> None:
+        self._progress: Progress | None = None
+        self._task: Any = None
 
-    # Convert bar count to time range. ``bar_count`` being set signals
-    # the "-N bars" mode — we then guarantee at least N *real* bars
-    # (exchange-provided, non-gap-fill) after download, extending the
-    # from-timestamp on miss. Date/days ranges are left untouched.
-    tf_seconds = in_seconds(ps.timeframe)
-    bar_count: int | None = None
-    if isinstance(time_from_value, int) and time_from_value < 0:
-        bc = abs(time_from_value)
-        bar_count = bc
-        # Pad the request by one bar to absorb the still-forming current
-        # bar that closed-bars-only providers (e.g. Capital.com) filter
-        # out of history responses. Without this, every ``-N`` run
-        # against a now-aligned end-time would burn a wasted retry pass
-        # (``real_bars == N - 1`` on first attempt → retry → success).
-        time_from_dt = time_to_dt - timedelta(seconds=tf_seconds * (bc + 1))
-    else:
-        assert isinstance(time_from_value, datetime)
-        time_from_dt = time_from_value
+    def symbol_info_started(self) -> None:
+        progress = Progress(SpinnerColumn(finished_text="[green]✓"),
+                            TextColumn("{task.description}"))
+        progress.start()
+        self._task = progress.add_task("Fetching symbol info...", total=1)
+        self._progress = progress
 
-    # Load config
-    config = None
-    config_cls: type | None = getattr(provider_class, 'Config', None)
-    if config_cls is not None:
-        config = ensure_config(config_cls,
-                               app_state.config_dir / 'plugins' / f'{provider_name}.toml')
+    def symbol_info_finished(self, ok: bool) -> None:
+        self._stop(ok)
 
-    # Create provider instance. ``provider_symbol`` re-folds the broker into
-    # the symbol for multi-broker providers, which split it off internally.
-    provider_instance: ProviderPlugin = provider_class(
-        symbol=ps.provider_symbol, timeframe=ps.timeframe,
-        ohlcv_dir=app_state.data_dir, config=config
-    )
-
-    # Fetch symbol info
-    with Progress(SpinnerColumn(finished_text="[green]✓"), TextColumn("{task.description}")) as progress:
-        task = progress.add_task("Fetching symbol info...", total=1)
-        syminfo = _fetch_provider_symbol_info(provider_instance)
-        progress.update(task, completed=1)
-
-    # Download OHLCV data (always fresh in provider mode). In bar-count
-    # mode we may re-download with an extended ``from`` until we hit the
-    # target — some feeds omit minutes with no ticks (CFD quiet hours,
-    # illiquid futures), and ``--from -500`` must mean 500 real bars.
-    # The Progress wrapper lives outside the retry loop so a gap-driven
-    # second pass updates the same spinner instead of stamping a
-    # duplicate ``Downloading OHLCV data...`` line.
-    max_retries = 4
-    with Progress(
+    def download_started(self, time_from: datetime) -> None:
+        progress = Progress(
             SpinnerColumn(finished_text="[green]✓"),
             TextColumn("{task.description}"),
             DateColumn(),
@@ -805,207 +471,74 @@ def _download_provider_data(provider_str: str, time_from_str: str | None) -> _Pr
             TimeElapsedColumn(),
             "/",
             TimeRemainingColumn(),
-    ) as progress:
-        task = progress.add_task(
-            "Downloading OHLCV data...", total=1, start_time=time_from_dt,
         )
-        # Oldest real bar the venue served on the previous attempt. When a
-        # further-extended ``from`` fails to pull any older bar, the feed's
-        # history horizon is reached and extending again is pointless — we
-        # stop and surface that precise reason instead of burning retries.
-        prev_oldest_ts: int | None = None
-        # Serialize the truncate-and-rewrite (and the verification reads) against
-        # any concurrent run sharing this ``.ohlcv`` file: a second process waits
-        # on the kernel flock and then reads a complete file, never a
-        # half-truncated one. The lock spans the whole retry loop and the
-        # bar-count pin below so no other process can rewrite the file between
-        # our download and our reads.
-        exact_from_ts: int | None = None
-        with _atomic_ohlcv_download_target(provider_instance):
-            for attempt in range(max_retries + 1):
-                with provider_instance as ohlcv_writer:
-                    ohlcv_writer.truncate()
+        progress.start()
+        self._task = progress.add_task(
+            "Downloading OHLCV data...", total=1, start_time=time_from,
+        )
+        self._progress = progress
 
-                    # Providers take naive UTC datetimes.
-                    time_from_dl = time_from_dt.astimezone(UTC).replace(tzinfo=None)
-                    time_to_dl = time_to_dt.astimezone(UTC).replace(tzinfo=None)
+    def download_attempt(self, time_from: datetime, total_seconds: int) -> None:
+        if self._progress is not None:
+            self._progress.update(self._task, total=total_seconds, completed=0,
+                                  start_time=time_from)
 
-                    total_seconds = int((time_to_dl - time_from_dl).total_seconds())
+    def download_progress(self, elapsed_seconds: int) -> None:
+        if self._progress is not None:
+            self._progress.update(self._task, completed=elapsed_seconds)
 
-                    progress.update(
-                        task, total=total_seconds, completed=0,
-                        start_time=time_from_dl,
-                    )
+    def download_finished(self, ok: bool) -> None:
+        self._stop(False)
 
-                    def cb_progress(current_time: datetime):
-                        elapsed_seconds = int((current_time - time_from_dl).total_seconds())
-                        progress.update(task, completed=elapsed_seconds)
+    def warning(self, message: str) -> None:
+        secho(message, err=True, fg=colors.YELLOW)
 
-                    # One batch for the whole download: a provider that saves bar by
-                    # bar would otherwise pay two fsyncs per bar.
-                    with ohlcv_writer.batched():
-                        provider_instance.download_ohlcv(
-                            time_from_dl, time_to_dl, on_progress=cb_progress,
-                        )
+    def retry_wait(self, error: BaseException, delay: float, attempt: int) -> None:
+        secho(
+            f"Provider temporarily unavailable ({error}); waiting {int(delay)}s "
+            f"before retry #{attempt} (press Ctrl-C to abort)...",
+            err=True, fg=colors.YELLOW,
+        )
 
-                if bar_count is None:
-                    break
-
-                # Collect the real bar timestamps in the requested range. The
-                # reader speaks Unix milliseconds and serves only real bars, so
-                # the count is the venue's own coverage.
-                window_from_ts = int(time_from_dt.timestamp() * 1000)
-                window_to_ts = int(time_to_dt.timestamp() * 1000)
-                with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
-                    real_ts = [b.timestamp for b in r.read_from(
-                        window_from_ts, window_to_ts,
-                    )]
-                real_bars = len(real_ts)
-                oldest_ts = min(real_ts) if real_ts else None
-
-                if real_bars >= bar_count:
-                    break
-
-                # History-horizon check: if extending ``from`` earlier did not
-                # surface any older bar than the previous attempt, the venue has
-                # no more history — retrying cannot help, so report precisely now.
-                horizon_reached = (
-                    prev_oldest_ts is not None and oldest_ts is not None
-                    and oldest_ts >= prev_oldest_ts
-                )
-
-                if horizon_reached or attempt == max_retries:
-                    # The coverage report walks the session calendar, whose
-                    # resolution is one second (``is_in_session``), so the
-                    # millisecond bar timestamps are stepped down here — the
-                    # single place where the two units meet.
-                    grid_ts = [ts // 1000 for ts in real_ts]
-                    missing_slots = _missing_slots(
-                        grid_ts, window_from_ts // 1000, window_to_ts // 1000,
-                        int(tf_seconds),
-                    )
-                    in_session, closed = _classify_missing_slots(
-                        missing_slots, syminfo, int(tf_seconds),
-                    )
-                    secho(
-                        _format_missing_report(
-                            bar_count, real_bars,
-                            None if oldest_ts is None else oldest_ts // 1000,
-                            in_session, closed, int(tf_seconds), horizon_reached,
-                        ),
-                        fg=colors.YELLOW,
-                    )
-                    break
-
-                prev_oldest_ts = oldest_ts
-
-                # Extend the range, anchoring on the oldest bar actually served so
-                # the next pass reaches strictly-older history: request the missing
-                # count of slots before it, plus a multi-day buffer that clears any
-                # single weekend / session gap in one jump. Without the buffer a
-                # weekend between ``from`` and the oldest bar would stall the
-                # oldest cursor and be misread as the venue history horizon. The
-                # over-fetch is harmless — the range is pinned to exactly N real
-                # bars below.
-                anchor_ts = oldest_ts if oldest_ts is not None else window_from_ts
-                missing = bar_count - real_bars
-                candidate = (
-                    datetime.fromtimestamp(anchor_ts / 1000, UTC)
-                    - timedelta(seconds=tf_seconds * (missing + 10))
-                    - timedelta(days=3)
-                )
-                # Only ever move the window start earlier.
-                time_from_dt = min(time_from_dt, candidate)
-
-            assert provider_instance.ohlcv_path is not None
-
-            # For bar-count mode, pin the start timestamp to the N-th last real
-            # bar so the reader serves *exactly* N bars, not the over-fetched
-            # surplus we used to guarantee coverage through gaps.
-            if bar_count is not None:
-                with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
-                    real_ts = [b.timestamp for b in r.read_from(
-                        0, int(time_to_dt.timestamp() * 1000),
-                    )]
-                if len(real_ts) >= bar_count:
-                    exact_from_ts = real_ts[-bar_count]
-
-    return _ProviderData(
-        ohlcv_path=provider_instance.ohlcv_path,
-        syminfo=syminfo,
-        provider_instance=provider_instance,
-        parsed_string=ps,
-        time_from_ts=exact_from_ts,
-    )
-
-
-#: Startup provider-download retry backoff (seconds): the first wait and the
-#: ceiling the exponential growth saturates at. Internal tunables — deliberately
-#: not user config: a live bot should keep trying until the broker returns, and
-#: ~1 minute is a sane poll cadence through a multi-hour maintenance window.
-_PROVIDER_RETRY_BASE_DELAY = 2.0
-_PROVIDER_RETRY_MAX_DELAY = 60.0
-
-
-def _wait_before_retry(delay: float) -> None:
-    """Block for ``delay`` seconds interruptibly, without a bare sleep.
-
-    Waits on a never-set :class:`threading.Event`, an event-driven,
-    deadline-bounded primitive: a ``Ctrl-C`` (``KeyboardInterrupt`` in the main
-    thread) breaks out of the backoff at once instead of stalling for the full
-    delay, and there is no busy-poll.
-
-    :param delay: Maximum seconds to wait.
-    """
-    threading.Event().wait(timeout=delay)
+    def _stop(self, completed: bool) -> None:
+        """End the current display, ticking its task off when it completed."""
+        if self._progress is None:
+            return
+        if completed:
+            self._progress.update(self._task, completed=1)
+        self._progress.stop()
+        self._progress = None
 
 
 def _download_provider_data_resilient(
         provider_str: str, time_from_str: str | None, *, retry_transient: bool,
-) -> _ProviderData:
-    """Download provider data, riding out transient broker outages.
+) -> ProviderHistory:
+    """Download a provider's history for ``pyne run``, with a clean one-line error.
 
-    For a long-running run (``--broker`` / ``--live``) a *transient* provider
-    failure — broker maintenance, a lost route, a dropped connection — must not
-    strand the bot: we wait with capped exponential backoff and keep retrying
-    until the feed returns or the operator interrupts (``Ctrl-C``). A
-    *permanent* failure (unknown symbol, bad credentials, wrong account mode),
-    and every failure of a one-shot backtest, still exits immediately with a
-    clean one-line message instead of a traceback — mirroring ``pyne data
-    download``.
-
-    Retrying is intentionally unbounded for the transient class: a bot is meant
-    to run until told to stop, so giving up after N attempts would re-introduce
-    the very crash we are fixing for any outage longer than the backoff budget.
-    The safeguard against looping on a misclassified error is that the transient
-    set is narrow and source-specific (see ``is_retryable_provider_error`` and
-    the cTrader ``_CONNECTION_CLASS_CODES``), and every wait is logged.
+    See :func:`~pynecore.core.provider_download.download_provider_history_resilient`.
+    A failure it raises exits with its message instead of a traceback, mirroring
+    ``pyne data download``.
 
     :param provider_str: The provider string (e.g. ``ctrader:pepperstoneuk:BTCUSD@1``).
     :param time_from_str: The ``--from`` value (date, days, or ``-bars``).
     :param retry_transient: Whether to wait-and-retry on transient errors —
         ``True`` only for long-running ``--broker`` / ``--live`` runs.
-    :return: The downloaded provider data.
+    :return: The downloaded history.
+    :raises Exit: When the download fails
     """
-    from pynecore.core.plugin import ProviderError, is_retryable_provider_error
+    try:
+        return download_provider_history_resilient(
+            provider_str, time_from_str,
+            data_dir=app_state.data_dir, config_dir=app_state.config_dir,
+            retry_transient=retry_transient, listener=_RichDownloadListener(),
+        )
+    except ProviderSetupError as e:
+        secho(str(e), err=True, fg=colors.RED)
+        raise Exit(1)
+    except (ProviderError, ValueError) as e:
+        secho(f"Error: {e}", err=True, fg=colors.RED)
+        raise Exit(1)
 
-    delay = _PROVIDER_RETRY_BASE_DELAY
-    attempt = 0
-    while True:
-        try:
-            return _download_provider_data(provider_str, time_from_str)
-        except ProviderError as e:
-            if not (retry_transient and is_retryable_provider_error(e)):
-                secho(f"Error: {e}", err=True, fg=colors.RED)
-                raise Exit(1)
-            attempt += 1
-            secho(
-                f"Provider temporarily unavailable ({e}); waiting {int(delay)}s "
-                f"before retry #{attempt} (press Ctrl-C to abort)...",
-                err=True, fg=colors.YELLOW,
-            )
-            _wait_before_retry(delay)
-            delay = min(delay * 2.0, _PROVIDER_RETRY_MAX_DELAY)
 
 
 def _restart_in_place() -> None:
@@ -1217,7 +750,7 @@ def resolve_script(script: Path, api_key: str | None) -> Path:
 
 
 def resolve_data(data: str, time_from: str | None, *,
-                 retry_transient: bool = False) -> tuple[Path, SymInfo, '_ProviderData | None']:
+                 retry_transient: bool = False) -> tuple[Path, SymInfo, ProviderHistory | None]:
     """
     Resolve the chart data of a run: download it from a provider or find the file.
 
@@ -1362,7 +895,7 @@ def check_data_period(reader: OHLCVReader, data_file_period: str | None, data_pa
 
 
 def resolve_time_window(reader: OHLCVReader, time_from: str | None, time_to: str | None,
-                        provider_data: '_ProviderData | None') -> tuple[datetime, datetime]:
+                        provider_data: ProviderHistory | None) -> tuple[datetime, datetime]:
     """
     The time window of a run, from the ``--from`` / ``--to`` options and the data.
 
@@ -1533,6 +1066,12 @@ def run(
                               help="Enable live broker trading — requires a provider plugin that "
                                    "subclasses BrokerPlugin. Implies --live.",
                               rich_help_panel="Live Options"),
+        history_trades: bool = Option(False, "--history-trades",
+                                      help="Live paper trading: let the strategy trade on the "
+                                           "historical bars too, and continue that position live. "
+                                           "By default a live run starts flat when it goes live. "
+                                           "Not available with --broker.",
+                                      rich_help_panel="Live Options"),
         run_label: str | None = Option(None, "--run-label",
                                        help="Optional label to distinguish parallel instances of the "
                                             "same strategy+account+symbol+timeframe. Stored in the "
@@ -1605,6 +1144,11 @@ def run(
 
     if live and not provider_mode:
         secho("Error: --live is only available in provider mode.", err=True, fg=colors.RED)
+        raise Exit(1)
+
+    if history_trades and (broker or not live):
+        secho("Error: --history-trades is available with --live paper trading only, "
+              "not with --broker or in a backtest.", err=True, fg=colors.RED)
         raise Exit(1)
 
     if profile and (live or broker):
@@ -1743,7 +1287,7 @@ def run(
 
             # Probe the plugin against the BrokerPlugin authoring contract
             # before any storage or engine state exists. Authentication has
-            # already run (``_download_provider_data`` drove it), so the
+            # already run (``download_provider_history`` drove it), so the
             # account-id lifecycle is checkable here — and the broker
             # storage below derives the run identity from it.
             from pynecore.core.broker.validation import validate_plugin_contract
@@ -1775,7 +1319,7 @@ def run(
 
             # Open the unified broker storage and register a new run instance.
             # The plugin's account_id is already populated by this point —
-            # _download_provider_data has driven authentication through the
+            # download_provider_history has driven authentication through the
             # provider side, and the plugin stashes the identifier during
             # its session setup.
             from pynecore.core.broker.run_identity import RunIdentity
@@ -1820,11 +1364,10 @@ def run(
             # created only AFTER ``Loading PyneCore`` finishes, so its eager
             # ``WS connect`` log doesn't race the spinner).
             if live and provider_data:
-                from pynecore.core.plugin.live_provider import LiveProviderPlugin
-
-                if not isinstance(provider_data.provider_instance, LiveProviderPlugin):
-                    secho(f"Plugin '{provider_data.parsed_string.provider}' does not support live data.",
-                          err=True, fg=colors.RED)
+                try:
+                    require_live_provider(provider_data)
+                except ProviderSetupError as e:
+                    secho(str(e), err=True, fg=colors.RED)
                     raise Exit(1)
                 assert provider_data.parsed_string.timeframe is not None
                 size = 0
@@ -1922,6 +1465,9 @@ def run(
                         chart_provider_instance = provider_data.provider_instance
                     runner = ScriptRunner(script, ohlcv_iter, syminfo, last_bar_index=size - 1,
                                           last_bar_time=last_bar_time, live=live,
+                                          live_history_trades=history_trades,
+                                          history_as_of=(provider_data.as_of_ts
+                                                         if provider_data else None),
                                           plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
                                           viz_path=viz_path if viz else None, viz_journal=viz_journal,
                                           security_data=security_data,
@@ -1970,12 +1516,8 @@ def run(
             # in the user-visible startup log.
             if live and provider_data:
                 import itertools
-                assert provider_data.parsed_string.timeframe is not None
-                live_iter = live_ohlcv_generator(
-                    provider=provider_data.provider_instance,
-                    symbol=provider_data.parsed_string.symbol,
-                    timeframe=provider_data.parsed_string.timeframe,
-                    syminfo=syminfo,
+                live_iter = open_live_stream(
+                    provider_data,
                     last_historical_timestamp=time_to_ts,
                     shutdown_timeout=shutdown_timeout,
                     event_loop=broker_event_loop,

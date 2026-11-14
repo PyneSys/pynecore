@@ -3,7 +3,7 @@ from typing import cast
 
 import pytest
 
-from pynecore.cli.commands.run import _fetch_provider_symbol_info
+from pynecore.core.provider_download import DownloadListener, fetch_provider_symbol_info
 from pynecore.core.plugin.provider import ProviderPlugin
 from pynecore.core.syminfo import SymInfo
 
@@ -46,25 +46,35 @@ def __test_provider_run_refreshes_symbol_info_despite_a_cached_sidecar__():
     """
     provider = _FakeProvider(cached=True)
 
-    syminfo = _fetch_provider_symbol_info(cast(ProviderPlugin, provider))
+    syminfo = fetch_provider_symbol_info(cast(ProviderPlugin, provider))
 
     assert syminfo.ticker == 'VENUE'
     assert provider.calls == [True]
 
 
-def __test_provider_run_falls_back_to_the_cached_symbol_info_when_the_venue_fails__(capsys):
-    provider = _FakeProvider(cached=True, fail=ConnectionError("venue down"))
+class _RecordingListener(DownloadListener):
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
 
-    syminfo = _fetch_provider_symbol_info(cast(ProviderPlugin, provider))
+    def warning(self, message: str) -> None:
+        self.warnings.append(message)
+
+
+def __test_provider_run_falls_back_to_the_cached_symbol_info_when_the_venue_fails__():
+    provider = _FakeProvider(cached=True, fail=ConnectionError("venue down"))
+    listener = _RecordingListener()
+
+    syminfo = fetch_provider_symbol_info(cast(ProviderPlugin, provider), listener)
 
     assert syminfo.ticker == 'CACHED'
     assert provider.calls == [True, False]
-    assert "symbol info refresh failed" in capsys.readouterr().err
+    assert len(listener.warnings) == 1
+    assert "symbol info refresh failed" in listener.warnings[0]
 
 
 def __test_provider_run_without_a_cache_surfaces_the_venue_failure__():
     provider = _FakeProvider(cached=False, fail=ConnectionError("venue down"))
 
     with pytest.raises(ConnectionError, match="venue down"):
-        _fetch_provider_symbol_info(cast(ProviderPlugin, provider))
+        fetch_provider_symbol_info(cast(ProviderPlugin, provider))
     assert provider.calls == [True]

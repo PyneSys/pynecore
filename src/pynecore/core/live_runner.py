@@ -45,9 +45,10 @@ import sys
 import time
 import threading
 from collections.abc import Callable, Coroutine, Generator
+from dataclasses import dataclass
 from datetime import datetime
 from queue import Queue, Empty, Full
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pynecore.core.syminfo import SymInfo
@@ -59,7 +60,27 @@ from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.session import is_in_session, is_point_in_session
 from pynecore.lib.timeframe import _in_seconds
 
-__all__ = ['live_ohlcv_generator', 'download_warmup_in_memory', 'LiveBarStreamer']
+__all__ = ['live_ohlcv_generator', 'download_warmup_in_memory', 'LiveBarStreamer', 'FeedStatus']
+
+
+@dataclass(frozen=True)
+class FeedStatus:
+    """A state change of a live feed, reported by :func:`live_ohlcv_generator`.
+
+    :ivar state: ``connecting`` before the first connection attempt, ``live`` once data
+        flows (after the subscription, a recovered outage or a reopened market),
+        ``reconnecting`` on every reconnect attempt of an outage, ``market_closed``
+        while the symbol's session calendar says the market is closed, and
+        ``stopped`` when the stream has ended.
+    :ivar attempt: The reconnect attempt, counted from 1 within one outage; 0 otherwise.
+    :ivar offline_seconds: Seconds since the outage began, on ``reconnecting``.
+    :ivar error: The error that started or continues the outage, or closed the market
+        wait, when there is one.
+    """
+    state: Literal['connecting', 'live', 'reconnecting', 'market_closed', 'stopped']
+    attempt: int = 0
+    offline_seconds: float = 0.0
+    error: str | None = None
 
 
 class LiveBarStreamer:
@@ -504,6 +525,7 @@ def live_ohlcv_generator(
         engine_event_stream: Coroutine[Any, Any, Any] | None = None,
         raise_on_connect_failure: bool = False,
         on_interrupt: Callable[[], None] | None = None,
+        on_feed_status: Callable[[FeedStatus], None] | None = None,
 ) -> Generator[OHLCV, None, None]:
     """
     Bridge async watch_ohlcv() to a sync Generator[OHLCV, None, None].
@@ -559,6 +581,11 @@ def live_ohlcv_generator(
                          here: when the provider is also the broker, those
                          fills and any follow-up write travel on the very
                          connection the teardown closes.
+    :param on_feed_status: Called with a :class:`FeedStatus` on every state change of the
+                           feed, so a front end can show it without parsing the log. It
+                           runs on the provider's background thread, between two awaits of
+                           the provider loop: it must return quickly and must not block. An
+                           exception it raises is logged and swallowed.
     :return: Iterator yielding OHLCV objects (both closed and intra-bar) interleaved
              with a single ``LIVE_TRANSITION`` sentinel marking the warmup→live boundary.
     """
@@ -625,6 +652,30 @@ def live_ohlcv_generator(
     # window to run that cleanup while the loop is still ours
     # (:func:`_graceful_shutdown`).
     abandoned_connects: list[asyncio.Task] = []
+
+    # The last state handed to ``on_feed_status``
+    reported_state: list[str | None] = [None]
+
+    def _report(state: Literal['connecting', 'live', 'reconnecting', 'market_closed', 'stopped'],
+                attempt: int = 0, offline_seconds: float = 0.0,
+                error: BaseException | None = None) -> None:
+        """Hand a feed state change to ``on_feed_status``, never letting it break the feed.
+
+        A state equal to the last one reported is a repeat, not a change, except for
+        ``reconnecting``, whose every attempt carries news.
+        """
+        if on_feed_status is None:
+            return
+        if state == reported_state[0] and state != 'reconnecting':
+            return
+        reported_state[0] = state
+        # A front-end hook must not stop the feed, whatever it raises
+        # noinspection PyBroadException
+        try:
+            on_feed_status(FeedStatus(state, attempt, offline_seconds,
+                                      None if error is None else str(error)))
+        except Exception:
+            logger.exception("on_feed_status raised")
 
     def _signal_loop_shutdown() -> None:
         """Mirror ``stop_event`` onto the loop-side ``asyncio.Event``.
@@ -988,6 +1039,7 @@ def live_ohlcv_generator(
                     delay = min(delay * 2.0, provider.max_reconnect_delay)
 
         try:
+            _report('connecting')
             broker_info("WS connect starting (warmup blocks until subscribed)")
             try:
                 await _connect_with_initial_backoff()
@@ -1006,6 +1058,7 @@ def live_ohlcv_generator(
             broker_info("WS connected and subscribed: %s %s@%s",
                         type(provider).__name__, symbol, timeframe)
             connected_event.set()
+            _report('live')
             last_real_update = time.time()
 
             # Startup gap: the warmup download stopped at
@@ -1103,6 +1156,7 @@ def live_ohlcv_generator(
                                 connection_error,
                             )
                             market_open_state = False
+                            _report('market_closed', error=connection_error)
                         try:
                             await asyncio.wait_for(
                                 stop_aevent.wait(),
@@ -1131,6 +1185,7 @@ def live_ohlcv_generator(
                         "Connection error (attempt %d, offline %.0fs): %s",
                         attempts, offline_s, connection_error,
                     )
+                    _report('reconnecting', attempts, offline_s, connection_error)
                     if await _await_or_stop(provider.on_disconnect()):
                         return attempts, True
                     # The exponent is clamped so the power stays a small int;
@@ -1241,6 +1296,7 @@ def live_ohlcv_generator(
                             time.time() - (outage_started or time.time()),
                         )
                         outage_started = None
+                        _report('live')
                     reconnect_attempts = 0
 
                     # Filter duplicates from the historical phase. Strict
@@ -1289,6 +1345,7 @@ def live_ohlcv_generator(
                                 bar_update.timestamp,
                             )
                             market_open_state = True
+                            _report('live')
                         # Backpressure probe: a non-trivial qsize or put
                         # latency here is the smoking gun for consumer-side
                         # lag stalling the asyncio loop. The queue is
@@ -1396,6 +1453,7 @@ def live_ohlcv_generator(
                                     synth_ts,
                                 )
                                 market_open_state = False
+                                _report('market_closed')
                             # Dead WS surfaces via the
                             # ``pending_connection_error`` flag, not by
                             # ``raise``: raising from inside this
@@ -1633,6 +1691,7 @@ def live_ohlcv_generator(
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
             await _graceful_shutdown()
+            _report('stopped')
             bar_queue.put(_SENTINEL)
 
     def _thread_target():

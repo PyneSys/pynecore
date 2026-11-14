@@ -968,6 +968,28 @@ class DataRequirements:
 
 
 # noinspection PyProtectedMember
+def _tick_result(candle: OHLCV, body_ran: bool, is_strat: bool, position) -> tuple:
+    """
+    The item ``run_iter(yield_ticks=True)`` yields for an intra-bar live update.
+
+    Every update is yielded, so the forming candle can be drawn on each one. When
+    the body did not run on it (a strategy without ``calc_on_every_tick``), the
+    plot data is empty and a strategy's trade list too: nothing was calculated on
+    the update, and the runner's own containers still hold an earlier bar's values.
+
+    :param candle: The live update.
+    :param body_ran: Whether the body executed on this update.
+    :param is_strat: Whether the script is a strategy.
+    :param position: The strategy's position, ``None`` for other scripts.
+    :return: ``(candle, plot_data)``, or ``(candle, plot_data, trades)`` for a strategy.
+    """
+    if not is_strat:
+        return candle, (lib._plot_data if body_ran else {})
+    if body_ran and position is not None:
+        return candle, lib._plot_data, position.new_closed_trades
+    return candle, {}, []
+
+
 def _drop_discarded_run(drawing_snapshot: DrawingSnapshot) -> None:
     """
     Undo what a discarded body execution left behind.
@@ -1305,7 +1327,7 @@ class ScriptRunner:
                  '_config_dir', '_symbol_map', '_script_timeframe',
                  '_chart_bar_window',
                  'broker_balance', '_sim_logged_open_ids', '_inputs', '_settings', '_live',
-                 '_profiler')
+                 '_live_history_trades', '_history_as_of', '_profiler')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -1315,6 +1337,8 @@ class ScriptRunner:
                  update_syminfo_every_run: bool = False, last_bar_index: int | None = None,
                  last_bar_time: int | None = None,
                  live: bool = False,
+                 live_history_trades: bool = False,
+                 history_as_of: int | None = None,
                  inputs: dict[str, Any] | None = None,
                  settings: dict[str, Any] | None = None,
                  security_data: 'dict[str, str | Path | PluginSymbol] | None' = None,
@@ -1373,7 +1397,23 @@ class ScriptRunner:
                      bar closes. A closed live bar is executed and yielded as soon as it
                      arrives, while a historical bar is held until the next item shows
                      whether it was the last one. Strategy orders start at the transition:
-                     the warmup bars only build the script's state.
+                     the warmup bars only build the script's state, unless
+                     ``live_history_trades`` is set.
+        :param live_history_trades: Paper trading in live mode: let the strategy trade on the
+                                    warmup bars too, as a backtest that the live phase then
+                                    continues, position and all. Off by default, so a live run
+                                    starts flat at the transition. Not available with
+                                    ``broker_plugin``: a broker run trades for real, and only
+                                    what it really trades may enter its record. The last warmup
+                                    bar places no orders while its period has not ended yet:
+                                    it is the bar the live feed goes on forming, and an order
+                                    placed on its partial data could fill at a price from before
+                                    it was placed.
+        :param history_as_of: UNIX time (ms) no later than the moment the historical bars of a
+                              live feed were downloaded. With ``live_history_trades`` the last
+                              downloaded bar counts as partial when its period had not ended by
+                              then, however late the warmup reaches it. ``None`` takes the time
+                              the runner is created.
         :param inputs: Optional dictionary of input values to pass to the script, keyed by
                        the ``main()`` parameter name; overrides values from .toml files
         :param settings: Optional dictionary of script settings (decorator arguments such as
@@ -1429,11 +1469,15 @@ class ScriptRunner:
         :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
         :raises OSError: If the plot file could not be opened
         :raises ValueError: If a live or broker run is to be profiled
+        :raises ValueError: If ``live_history_trades`` is set outside live paper trading
         :raises ProfilerUnavailable: If profiling is asked for but not possible here
         """
         if profile_path is not None and (live or broker_plugin is not None):
             raise ValueError("Profiling is available for backtests only, not for live or "
                              "broker runs.")
+        if live_history_trades and (not live or broker_plugin is not None):
+            raise ValueError("Trading on the warmup bars is available for live paper trading "
+                             "only, not for backtests or broker runs.")
         self._script_path = script_path
         self._profiler: 'RunProfiler | None' = None
         self._security_data = security_data or {}
@@ -1702,6 +1746,9 @@ class ScriptRunner:
         self.last_bar_index = last_bar_index
         self.last_bar_time = last_bar_time
         self._live = live
+        self._live_history_trades = live_history_trades
+        self._history_as_of = (history_as_of if history_as_of is not None
+                               else int(time.time() * 1000))
         # Pre-increment scheme: bumped at the start of each bar's processing
         # (warmup, live, security loops). Starting at -1 keeps the first
         # processed bar at index 0 — matches Pine ``bar_index`` semantics.
@@ -1945,6 +1992,23 @@ class ScriptRunner:
         if self._broker_store_ctx is not None:
             self._broker_store_ctx.heartbeat()
 
+    def _bar_open_at_download(self, candle: OHLCV) -> bool:
+        """Whether the chart bar opened at ``candle`` was still forming when the history was
+        downloaded.
+
+        Measured against :attr:`~ScriptRunner._history_as_of` with the chart timeframe's
+        nominal length, not against the clock at execution: a bar whose period ended during
+        the warmup still holds the partial data of the download. A timeframe without a fixed
+        length counts as still forming.
+
+        :param candle: The bar to check.
+        :return: ``True`` when the downloaded bar may hold partial data.
+        """
+        period_seconds = _try_in_seconds(self.syminfo.period)
+        if not period_seconds:
+            return True
+        return candle.timestamp + period_seconds * 1000 > self._history_as_of
+
     def _process_orders(self, position) -> None:
         """Run one order-processing step.
 
@@ -2158,7 +2222,8 @@ class ScriptRunner:
         )
 
     def run_iter(self, on_progress: Callable[[datetime], None] | None = None,
-                 on_tick: Callable[[OHLCV], None] | None = None, *, copy_results: bool = True) \
+                 on_tick: Callable[[OHLCV], None] | None = None, *, copy_results: bool = True,
+                 yield_ticks: bool = False) \
             -> Iterator[tuple[OHLCV, dict[str, Any]] | tuple[OHLCV, dict[str, Any], list['Trade']]]:
         """
         Run the script on the data, yielding the results of every bar
@@ -2172,24 +2237,36 @@ class ScriptRunner:
                              bar. With ``False`` the runner yields its own containers, which it
                              refills for the next bar: faster, for a consumer that reads them
                              before asking for the next bar.
+        :param yield_ticks: Live mode: also yield an item for every intra-bar update of the
+                            forming bar. Its candle has ``is_closed=False``; it is provisional,
+                            replaced by the next update of the same bar and by its close, which
+                            is yielded as usual. When the body executed on the update (every
+                            update for an indicator, with ``calc_on_every_tick`` for a
+                            strategy) the item carries its results, and a strategy's
+                            ``new_trades`` holds the trades closed so far on the bar. When it did
+                            not, ``plot_data`` and ``new_trades`` are empty: only the candle is
+                            new. The plot, trade and viz outputs are still written for closed
+                            bars only.
         :return: Iterator over the per-bar results
         :raises AssertionError: If the 'main' function does not return a dictionary
         """
-        results = self._results(on_progress, on_tick)
+        results = self._results(on_progress, on_tick, yield_ticks)
         if not copy_results:
             return results
         return self._copy_results(results)
 
     def _results(self, on_progress: Callable[[datetime], None] | None,
-                 on_tick: Callable[[OHLCV], None] | None) -> Generator:
+                 on_tick: Callable[[OHLCV], None] | None,
+                 yield_ticks: bool = False) -> Generator:
         """
         The generator of :meth:`_run_iter`, under the profiler when the run has one.
 
         :param on_progress: See :meth:`run_iter`
         :param on_tick: See :meth:`run_iter`
+        :param yield_ticks: See :meth:`run_iter`
         :return: The per-bar results
         """
-        results = self._run_iter(on_progress, on_tick)
+        results = self._run_iter(on_progress, on_tick, yield_ticks)
         if self._profiler is None:
             return results
         return cast('RunProfiler', self._profiler).profile(results)
@@ -2220,7 +2297,8 @@ class ScriptRunner:
 
     # noinspection PyProtectedMember
     def _run_iter(self, on_progress: Callable[[datetime], None] | None = None,
-                  on_tick: Callable[[OHLCV], None] | None = None) \
+                  on_tick: Callable[[OHLCV], None] | None = None,
+                  yield_ticks: bool = False) \
             -> Generator[tuple[OHLCV, dict[str, Any]] | tuple[OHLCV, dict[str, Any], list['Trade']],
                          None, None]:
         """
@@ -2228,6 +2306,7 @@ class ScriptRunner:
 
         :param on_progress: Callback to call on every iteration
         :param on_tick: Optional per-update live callback (see :meth:`run`).
+        :param yield_ticks: Also yield the forming bar's results (see :meth:`run_iter`).
         :return: Iterator over the per-bar results, in the runner's own (reused) containers
         """
         from .. import lib
@@ -2237,7 +2316,7 @@ class ScriptRunner:
 
         # Run-scoped like the rest of the lib state: ``_reset_lib_vars`` clears both at the end
         lib._is_live = self._live
-        lib._strategy_suppressed = self._live
+        lib._strategy_suppressed = self._live and not self._live_history_trades
 
         is_strat = self.script.script_type == script_type.strategy
 
@@ -3689,6 +3768,20 @@ class ScriptRunner:
             while next_item is not LIVE_TRANSITION:
                 candle = next_item
                 next_item = next(ohlcv_iterator, LIVE_TRANSITION)
+                # A later version of the same bar comes from the catch-up drain,
+                # which delivers closed bars only
+                caught_up_close = False
+                # Live warmup: the downloaded history may end with the still-forming
+                # bar, and the catch-up drain then delivers that same bar's true
+                # close. Both are one bar, so only the latest version runs: running
+                # both would advance ``bar_index`` twice and let the partial run
+                # place orders that fill on the bar's earlier prices.
+                if is_live:
+                    while (next_item is not LIVE_TRANSITION
+                           and next_item.timestamp == candle.timestamp):
+                        candle = next_item
+                        next_item = next(ohlcv_iterator, LIVE_TRANSITION)
+                        caught_up_close = True
 
                 # --- Script-level higher timeframe ---
                 # The body runs once per COMPLETED HTF bar, on the chart bar whose
@@ -3779,6 +3872,28 @@ class ScriptRunner:
                 if self.first_price is None:
                     self.first_price = lib.close  # type: ignore
                 self.last_price = lib.close  # type: ignore
+
+                # Trading on the warmup bars: the last one may be the bar the live
+                # feed goes on forming (``download_ohlcv`` returns the still-open
+                # current bar). Its run is discarded when the live updates continue
+                # it, but an order it placed would stay in the book and fill on the
+                # bar's earlier prices. The transition lifts the suppression.
+                # Whether it is partial is decided by the time of the download: a
+                # period that ended during the warmup does not complete the
+                # downloaded data. A bar the catch-up closed, or one after the
+                # downloaded history, came from the stream complete.
+                # Order processing is what normally empties the per-bar closed-trade
+                # buffer, so the skipped bar clears it itself: otherwise it would
+                # yield and export the previous bar's closes a second time.
+                if (is_live and next_item is LIVE_TRANSITION
+                        and not lib._strategy_suppressed
+                        and not caught_up_close
+                        and (self.last_bar_time is None
+                             or candle.timestamp <= self.last_bar_time)
+                        and self._bar_open_at_download(candle)):
+                    lib._strategy_suppressed = True
+                    if is_strat and position:
+                        position.new_closed_trades.clear()
 
                 # Intra-bar re-execution path: snapshot, process orders, run the
                 # body again per node (CEHT) or per fill (COOF)
@@ -4108,6 +4223,8 @@ class ScriptRunner:
                             if paper_ticks:
                                 sim_position.settle_immediate_closes()
                             bar_executed = True
+                        if yield_ticks:
+                            yield _tick_result(candle, run_on_every_tick, is_strat, position)
                         last_bar_timestamp = candle.timestamp
 
                     elif not bar_update.is_closed:
@@ -4131,6 +4248,8 @@ class ScriptRunner:
                             if paper_ticks:
                                 sim_position.settle_immediate_closes()
                             bar_executed = True
+                        if yield_ticks:
+                            yield _tick_result(candle, run_on_every_tick, is_strat, position)
 
                     elif bar_update.is_closed:
                         # ── Bar close ──

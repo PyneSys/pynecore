@@ -9,7 +9,7 @@ the exact missing intervals, instead of a vague sparse-coverage count.
 from datetime import date, datetime, time, UTC
 from types import SimpleNamespace
 
-from pynecore.cli.commands.run import (
+from pynecore.core.provider_download import (
     _missing_slots,
     _classify_missing_slots,
     _merge_intervals,

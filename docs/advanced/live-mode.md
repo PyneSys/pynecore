@@ -174,6 +174,12 @@ During the historical phase, all 7 strategy functions (`entry`, `exit`, `close`,
 `cancel`, `cancel_all`, `order`) are no-ops.  Live mode turns this on for the historical phase
 and lifts it at the transition.
 
+With `--history-trades` (paper trading only, not with `--broker`) the historical phase trades
+too: it runs as a backtest, and the live phase continues it with the position it left.  A broker
+run never trades on history, so its record holds only what it really traded.  The last historical
+bar places no orders while its period was still open at the download, because the live feed goes
+on forming that bar.
+
 ## Output
 
 ### Plot CSV
@@ -218,6 +224,7 @@ pyne run script.py ccxt:BYBIT:BTC/USDT:USDT@1 --live -f -500
 |-----------------------|------------------------------------------------------------------------|
 | `--live`, `-l`        | Enable live streaming after historical phase                           |
 | `--broker`            | Route orders to the exchange (implies `--live`; needs a `BrokerPlugin`) |
+| `--history-trades`    | Paper trading: trade on the historical bars too and continue live      |
 | `--shutdown-timeout`  | Max seconds for graceful shutdown (default: 120)                       |
 
 Press `Ctrl+C` to stop live streaming.  The provider goes through a graceful shutdown sequence:
@@ -251,6 +258,13 @@ background thread and `queue.Queue`.  The ScriptRunner is completely data-source
 only needs the history, the `LIVE_TRANSITION` sentinel and the live updates, in this order.  Any
 feed can drive it from Python: see [Live Mode](../programmatic/script-runner.md#live-mode) in the
 ScriptRunner API.
+
+`live_ohlcv_generator(..., on_feed_status=callback)` reports the state of the feed as a
+`FeedStatus`: `connecting`, `live` (data flows, again after an outage or a closed market),
+`reconnecting` (every attempt, with its number, the time offline and the error),
+`market_closed` and `stopped`.  A front end can show it without parsing the log.  The callback
+runs on the provider's background thread, so it must return quickly; an exception it raises is
+logged and does not stop the feed.
 
 ## Limitations
 

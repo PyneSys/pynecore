@@ -9,7 +9,7 @@ from datetime import UTC, datetime, time as datetime_time, timedelta
 
 import pytest
 
-from pynecore.core.live_runner import live_ohlcv_generator, LiveBarStreamer
+from pynecore.core.live_runner import FeedStatus, live_ohlcv_generator, LiveBarStreamer
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.core.syminfo import SymInfo, SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
@@ -364,6 +364,43 @@ def __test_reconnect_retries_indefinitely_and_recovers__():
     # Initial connect + one reconnect per failed watch call.
     assert provider.connect_calls >= 15
 
+
+
+def __test_feed_status_reports_connect_live_and_stop__():
+    """on_feed_status sees the connection come up and the stream end"""
+    statuses: list[FeedStatus] = []
+    provider = MockLiveProvider([_make_ohlcv(1000, is_closed=True)])
+    _drain(provider, "BTC/USDT", "1D", on_feed_status=statuses.append)
+
+    assert [s.state for s in statuses] == ['connecting', 'live', 'stopped']
+
+
+def __test_feed_status_reports_each_reconnect_attempt_and_recovery__():
+    """An outage reports every reconnect attempt, then the restored feed"""
+    statuses: list[FeedStatus] = []
+    updates = [
+        _make_ohlcv(1000, is_closed=True, close=100.0),
+        _make_ohlcv(2000, is_closed=True, close=200.0),
+    ]
+    provider = ReconnectTrackingProvider(updates, fail_at_index=1)
+    _drain(provider, "BTC/USDT", "1D", on_feed_status=statuses.append)
+
+    states = [s.state for s in statuses]
+    assert states == ['connecting', 'live', 'reconnecting', 'live', 'stopped']
+    reconnecting = statuses[2]
+    assert reconnecting.attempt == 1
+    assert reconnecting.error == "Simulated connection loss"
+
+
+def __test_feed_status_hook_failure_does_not_stop_the_feed__():
+    """A raising hook is logged, the bars still arrive"""
+    def _broken(_status: FeedStatus) -> None:
+        raise RuntimeError("front end gone")
+
+    provider = MockLiveProvider([_make_ohlcv(1000, is_closed=True)])
+    _, bars = _drain(provider, "BTC/USDT", "1D", on_feed_status=_broken)
+
+    assert len(bars) == 1
 
 # --- Initial connect retry tests ---
 
