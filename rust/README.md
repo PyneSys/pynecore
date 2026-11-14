@@ -17,6 +17,7 @@ New behaviour is written in Python first; the native step follows.
 | `pyne-transform`      | The ported steps and the step registry                                         |
 | `pyne-transform-py`   | The `pynecore.transformers._native` extension module (PyO3, abi3)              |
 | `pyne-transform-wasm` | The WebAssembly entry                                                          |
+| `pynecore-codes`      | PyneCore's diagnostic codes, generated from `codes/registry.toml` (`no_std`)   |
 
 A node is addressed by a `NodeId`, the way a Python pass holds a reference to an
 `ast.AST` object, so a port can keep ids in sets and maps, share a node between

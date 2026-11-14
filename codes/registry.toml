@@ -1,0 +1,655 @@
+# The diagnostic codes PyneCore reports: the one source of every code a
+# script's run, the rules of Pyne code and the Pyne Edge profile raise.
+# PyneComp keeps the compiler's codes in a registry of its own and reads this
+# one from its pinned PyneCore, so every code of the Pyne chain is in exactly
+# one of the two.
+#
+# `python codes/generate.py` writes the Rust side (rust/crates/pynecore-codes)
+# and one English docs page per code (docs/reference/codes). `--check` fails
+# when a generated file is stale.
+#
+# One table per code. The code is a domain letter and four digits:
+#   R runtime, P Pyne code rules, E Pyne Edge profile,
+#   I internal error (ours, not the user's; always asks for a bug report).
+# PyneComp's registry holds the S, N, T, C, L and V domains and its own I
+# codes.
+#
+#   [R0001]
+#   name = "division_by_zero"        # the constant's name in Rust and Python
+#   severity = "error"               # error | warning | info
+#   title = "Division by zero"
+#   message = "Division by zero."
+#   since = "6.1.0"                  # the release that introduced it, set
+#                                    # when the code is first released
+#   explanation = """
+#   What it means, why, and how to fix it.
+#   """
+#   python = "ZeroDivisionError"     # a runtime code: the built-in exception
+#                                    # class(es) its exception derives from
+#   python_message = "..."           # PyneCore's message today, when a caller
+#                                    # matches it: the same parameters
+#
+# `{name}` is a parameter, `{{` and `}}` are literal braces. A code is never
+# reused with another meaning: a code that is no longer reported keeps its
+# table and gets `retired = "<release>"`.
+
+# Runtime errors: a run stops with one of these at the bar where
+# the condition occurs. The run's output up to that bar is kept.
+
+[R0001]
+name = "division_by_zero"
+severity = "error"
+title = "Division by zero"
+message = "Division by zero."
+python = "ZeroDivisionError"
+explanation = """
+A division, `%` or floor division in Pyne code had a divisor of 0. Pine's own
+operators answer `na` here; plain Python arithmetic in Pyne code stops the
+run, as it does in PyneCore. Guard the divisor, or use the Pine operator.
+"""
+
+[R0002]
+name = "na_to_integer"
+severity = "error"
+title = "An na value converted to an integer"
+message = "An `na` value cannot be converted to an integer."
+python = "ValueError"
+explanation = """
+A value that is `na` reached a place that needs a whole number: an index, a
+size, a count or Python's `int()` / `round()`. Check the value with `na()` or
+replace it with `nz()` first.
+"""
+
+[R0003]
+name = "infinity_to_integer"
+severity = "error"
+title = "An infinite value converted to an integer"
+message = "An infinite value cannot be converted to an integer."
+python = "OverflowError"
+explanation = """
+A value that is positive or negative infinity reached a place that needs a
+whole number: an index, a size, a count, a bar coordinate or Python's
+`int()` / `round()`. Infinity usually comes from a division by a value close
+to 0.
+"""
+
+[R0004]
+name = "assertion_failed"
+severity = "error"
+title = "Assertion failed"
+message = "Assertion failed. {message}"
+python = "AssertionError"
+explanation = """
+An `assert` statement of the script found its condition false. The text after
+it is the assertion's own message.
+"""
+
+[R0005]
+name = "runtime_error"
+severity = "error"
+title = "runtime.error()"
+message = "{message}"
+python = "RuntimeError"
+explanation = """
+The script called `runtime.error()`. The message is the script's own.
+"""
+
+[R0006]
+name = "argument_not_positive"
+severity = "error"
+title = "Argument must be greater than 0"
+message = "`{function}`: `{parameter}` must be greater than 0, but it is {value}."
+python = "AssertionError"
+explanation = """
+A built-in got a length, a period or a multiplier of 0 or less. Pine refuses
+these values too.
+"""
+
+[R0007]
+name = "argument_negative"
+severity = "error"
+title = "Argument must not be negative"
+message = "`{function}`: `{parameter}` must not be negative, but it is {value}."
+python = "AssertionError"
+explanation = """
+A built-in got a negative count, size or offset where only 0 or more is
+meaningful.
+"""
+
+[R0008]
+name = "argument_zero"
+severity = "error"
+title = "Argument must not be 0"
+message = "`{function}`: `{parameter}` must not be 0."
+python = "ValueError"
+explanation = """
+A loop or range got a step of 0, which would never reach its end.
+"""
+
+[R0009]
+name = "percentage_out_of_range"
+severity = "error"
+title = "Percentage out of range"
+message = "`{function}`: `{parameter}` must be between 0 and 100, but it is {value}."
+python = "ValueError"
+explanation = """
+A percentile or rank built-in got a percentage outside 0..100.
+"""
+
+[R0010]
+name = "index_out_of_range"
+severity = "error"
+title = "Index out of range"
+message = "`{function}`: index {index} is out of range for a size of {size}."
+python = "IndexError"
+explanation = """
+An array, matrix or series view was read or written at an index it does not
+have. Indexes start at 0; a negative index counts from the end where the
+built-in allows it.
+"""
+
+[R0011]
+name = "empty_collection"
+severity = "error"
+title = "Empty collection"
+message = "`{function}` needs at least one element, but there is none."
+python = ["IndexError", "RuntimeError"]
+explanation = """
+The built-in takes an element out of an array, a list or a matrix, and there
+is no element to take. Check the size first.
+"""
+
+[R0012]
+name = "size_mismatch"
+severity = "error"
+title = "Sizes do not match"
+message = "`{function}`: the sizes do not match ({left} and {right})."
+python = ["ValueError", "AssertionError"]
+explanation = """
+The built-in combines two arrays or matrices whose sizes or dimensions must
+agree, and they do not.
+"""
+
+[R0013]
+name = "matrix_not_square"
+severity = "error"
+title = "Matrix is not square"
+message = "`{function}` needs a square matrix, but it has {rows} rows and {columns} columns."
+python = "ValueError"
+explanation = """
+The inverse, the determinant, the trace, a power and the eigen decomposition
+exist only for a matrix with as many rows as columns.
+"""
+
+[R0014]
+name = "matrix_singular"
+severity = "error"
+title = "Matrix is singular"
+message = "`{function}`: the matrix is singular."
+python = "ValueError"
+explanation = """
+A singular matrix has no inverse. Its determinant is 0.
+"""
+
+[R0015]
+name = "no_convergence"
+severity = "error"
+title = "Calculation did not converge"
+message = "`{function}` did not converge."
+python = "ValueError"
+explanation = """
+An iterative matrix calculation reached its step limit without a result. The
+matrix usually holds extreme or `na` values.
+"""
+
+[R0016]
+name = "na_object"
+severity = "error"
+title = "An na object"
+message = "`{name}` cannot take an `na` object."
+python = "AttributeError"
+explanation = """
+A field was written, a method called, a length taken or a loop run on an
+object, array or matrix that is `na`. Create the object before it is used,
+or check it with `na()`.
+"""
+
+[R0017]
+name = "unbound_variable"
+severity = "error"
+title = "Variable read before it is assigned"
+message = "`{name}` is read before it is assigned on this path."
+python = "UnboundLocalError"
+explanation = """
+On the path the script took, the variable was not assigned before this read.
+Give it a value before the `if` or loop that assigns it.
+"""
+
+[R0018]
+name = "resource_limit"
+severity = "error"
+title = "Resource limit exceeded"
+message = "The run exceeded the limit of {limit} {resource}."
+explanation = """
+The script created more objects, drawings or memory than the runtime allows,
+or a regular expression needed too many steps. The limit protects the run
+from running out of memory or time.
+"""
+
+[R0019]
+name = "invalid_timeframe"
+severity = "error"
+title = "Invalid timeframe"
+message = "`{timeframe}` is not a valid timeframe."
+python = "AssertionError"
+explanation = """
+A timeframe is a positive multiplier and a unit: `1`, `60`, `1D`, `1W`, `1M`,
+`30S`. An empty string, an unknown unit or a multiplier of 0 is not one.
+"""
+
+[R0020]
+name = "tick_timeframe"
+severity = "error"
+title = "Tick timeframe"
+message = "The tick timeframe `{timeframe}` is not supported here."
+python = "ValueError"
+explanation = """
+A tick timeframe (`1T`) has no fixed length in time, so this built-in cannot
+use it.
+"""
+
+[R0021]
+name = "invalid_session"
+severity = "error"
+title = "Invalid session"
+message = "`{session}` is not a valid session."
+python = "ValueError"
+explanation = """
+A session is one or more `HHMM-HHMM` ranges, optionally followed by `:` and
+the days `1` (Sunday) to `7` (Saturday), separated by commas.
+"""
+
+[R0022]
+name = "invalid_date"
+severity = "error"
+title = "Invalid date"
+message = "`{text}` is not a valid date."
+python = "ValueError"
+explanation = """
+`timestamp()` takes a date in one of its formats, such as `2024-01-31`,
+`2024-01-31T09:30:00+00:00` or `31 Jan 2024 09:30 +0000`. The date must
+exist: a month has 1..12, a day as many as its month.
+"""
+
+[R0023]
+name = "invalid_format"
+severity = "error"
+title = "Invalid format pattern"
+message = "`{pattern}` is not a valid format for `{function}`."
+python = "ValueError"
+explanation = """
+The pattern of `str.format()`, `str.format_time()` or a number format has a
+placeholder or a letter the built-in does not know, or is cut short.
+"""
+
+[R0024]
+name = "invalid_regex"
+severity = "error"
+title = "Invalid regular expression"
+message = "`{pattern}` is not a valid regular expression: {reason}."
+python = "re.error"
+explanation = """
+`str.match()` takes a regular expression; this one does not compile.
+"""
+
+[R0025]
+name = "unknown_timezone"
+severity = "error"
+title = "Unknown time zone"
+message = "`{timezone}` is not a known time zone."
+python = "ValueError"
+explanation = """
+A time zone is an IANA name, such as `America/New_York`, or a UTC offset,
+such as `UTC-5` or `GMT+0530`.
+"""
+
+[R0026]
+name = "security_data_missing"
+severity = "error"
+title = "No data for request.security"
+message = "`request.security` needs the data of {symbol} on the {timeframe} timeframe, and none was given."
+python = "ValueError"
+python_message = "No OHLCV data found for security context (symbol='{symbol}', timeframe='{timeframe}'). Provide data via the security_data parameter, e.g.: security_data={{'{symbol}': 'path/to/data.ohlcv'}}"
+explanation = """
+A `request.security()` call asks for another symbol or timeframe. The run
+reads it from the data handed to it; give the data of this symbol and
+timeframe too.
+"""
+
+[R0027]
+name = "security_timeframe_higher"
+severity = "error"
+title = "Lower timeframe request of a higher timeframe"
+message = "`request.security_lower_tf` cannot request `{timeframe}`, which is higher than the script's `{chart}`."
+python = "RuntimeError"
+python_message = "request.security_lower_tf() requests the '{timeframe}' timeframe, which is higher than the '{chart}' timeframe the script runs on. Use a lower timeframe, or pass ignore_invalid_timeframe=true to get na instead."
+explanation = """
+`request.security_lower_tf()` reads the bars inside each bar of the script,
+so its timeframe must be lower. Pass `ignore_invalid_timeframe = true` to get
+`na` instead of this error.
+"""
+
+[R0028]
+name = "security_varies_in_loop"
+severity = "error"
+title = "request.security that varies in a loop"
+message = "A `request.security` expression changes between the iterations of a loop."
+python = "RuntimeError"
+explanation = """
+A `request.security()` call inside a loop must request the same expression
+on every iteration.
+"""
+
+[R0029]
+name = "strategy_value_not_finite"
+severity = "error"
+title = "Strategy value is not finite"
+message = "`{function}`: {what} is not a finite number."
+python = "ValueError"
+explanation = """
+A strategy order or setting got `na` or an infinite quantity, price or
+offset, where the strategy engine needs a number.
+"""
+
+[R0030]
+name = "strategy_in_security"
+severity = "error"
+title = "Strategy read inside request.security"
+message = "`{function}` reads the strategy inside `request.security`, which has no strategy."
+python = "AttributeError"
+explanation = """
+The expression of a `request.security()` call is evaluated in the requested
+context, where there are no orders and no positions.
+"""
+
+[R0031]
+name = "line_price_xloc"
+severity = "error"
+title = "line.get_price on a time-based line"
+message = "`line.get_price` needs a line created with `xloc.bar_index`."
+python = "RuntimeError"
+explanation = """
+A line whose x coordinates are times has no bar index to read a price at.
+"""
+
+[R0032]
+name = "wrong_operand_type"
+severity = "error"
+title = "Invalid operand"
+message = "`{operation}` cannot take {operand}."
+python = "TypeError"
+explanation = """
+An operation of Pyne code got a value of a type it does not take, such as a
+function where a number is needed.
+"""
+
+[R0033]
+name = "float_range"
+severity = "error"
+title = "Number out of range"
+message = "`{function}`: a result is too large for a number."
+python = "OverflowError"
+explanation = """
+An intermediate result of the calculation is beyond the largest number a
+float holds.
+"""
+
+[R0034]
+name = "decimal_invalid"
+severity = "error"
+title = "Invalid decimal operation"
+message = "`{function}`: the decimal calculation has no result ({why})."
+python = "decimal.InvalidOperation"
+explanation = """
+A calculation in decimal arithmetic, such as a sum of volumes or a currency
+amount, met infinities of both signs or a value too large to round.
+"""
+
+[R0035]
+name = "not_available"
+severity = "error"
+title = "Not available"
+message = "`{function}` is not available."
+python = "NotImplementedError"
+explanation = """
+The built-in has no data source in this runtime. With
+`ignore_invalid_symbol = true` it answers `na` instead.
+"""
+
+[R0036]
+name = "script_timeframe"
+severity = "error"
+title = "Script timeframe does not fit the data"
+message = "The script timeframe `{timeframe}` does not fit the data on `{chart}`: {why}."
+python = "ValueError"
+explanation = """
+A script timeframe folds the bars of the data into longer bars. It must be
+equal to or higher than the data's timeframe, a whole multiple of it, and
+aligned with the data's bars.
+"""
+
+[R0037]
+name = "invalid_data"
+severity = "error"
+title = "Invalid data"
+message = "The data handed to the run is invalid: {why}."
+python = "ValueError"
+explanation = """
+A data file or its symbol description is inconsistent: two sources under one
+key, a symbol description of another symbol, or prices that are not finite.
+"""
+
+[R0038]
+name = "invalid_drawing_argument"
+severity = "error"
+title = "Invalid drawing argument"
+message = "`{function}`: `{parameter}` cannot be {value}."
+python = "TypeError"
+explanation = """
+A drawing built-in got a value it does not take, such as a fractional text
+formatting flag.
+"""
+
+[R0039]
+name = "unknown_method_at_run"
+severity = "error"
+title = "No such method"
+message = "A `{type}` has no method `{method}`."
+python = "AssertionError"
+explanation = """
+A method is called on an object whose type has no method of this name: the
+module of the type, the calling module and the libraries it imports export
+none. A method call on an `na` object of such a type answers the `na` itself.
+"""
+
+[R0040]
+name = "argument_order"
+severity = "error"
+title = "Arguments in the wrong order"
+message = "`{function}`: `{parameter}` ({value}) must not be less than `{other}` ({bound})."
+python = ["ValueError", "AssertionError"]
+explanation = """
+The call takes a range whose end comes first: the end argument is less than
+the start argument. Swap the two, or check how they are calculated.
+"""
+
+[R0041]
+name = "matrix_holds_na"
+severity = "error"
+title = "Matrix with na elements"
+message = "`{function}` cannot take a matrix that holds `na`."
+python = "ValueError"
+explanation = """
+The calculation is not defined for a matrix with `na` elements. Replace the
+`na` elements first, for example with `matrix.fill`, or check the values the
+matrix was built from.
+"""
+
+[R0042]
+name = "invalid_option"
+severity = "error"
+title = "Invalid run option"
+message = "`{option}`: {why}."
+explanation = """
+An option of the run is not usable as given. This is about how the run was
+started, not about the script.
+"""
+
+[R0043]
+name = "na_object_field"
+severity = "error"
+title = "Field of an na object"
+message = "`{name}` is a field of an `na` object."
+python = "pynecore.types.na.NaFieldError"
+explanation = """
+A field was read or written on a user-defined object or a `chart.point` that
+is `na`: directly, through a method, nested (`o.inner.v`) or inside `na()`.
+Create the object before its fields are used, or check the object itself
+with `na()`.
+"""
+
+[R0044]
+name = "na_object_copy"
+severity = "error"
+title = "Copy of an na object"
+message = "An `na` object cannot be copied."
+python = "pynecore.types.na.NaFieldError"
+explanation = """
+`copy()` was called on a user-defined object or a `chart.point` that is
+`na`. A copy reads every field, so the object must exist: create it first,
+or check it with `na()` before copying.
+"""
+
+[R0045]
+name = "syminfo_member_missing"
+severity = "error"
+title = "Symbol detail not given"
+message = "`syminfo.{name}` is not given for this symbol."
+python = "AttributeError"
+python_message = "module 'pynecore.lib.syminfo' has no attribute '{name}'"
+explanation = """
+Some symbol details exist only when the data provider supplies them, such as
+`syminfo.avg_spread`. The symbol of this run has none, so reading it stops the
+run. Add the value to the symbol's description, or do not read it.
+"""
+
+[I0004]
+name = "internal_error"
+severity = "error"
+title = "Internal error"
+message = "Internal error: {what}."
+explanation = """
+An error of PyneAOT, not of the script. Please report it with the script and
+the data attached.
+"""
+
+# The Pyne Edge profile: what a Pyne Edge script may not contain.
+
+[E0001]
+name = "edge_syntax"
+severity = "error"
+title = "Syntax outside the Edge profile"
+message = "{construct} is not allowed in the Pyne Edge profile."
+explanation = """
+The Pyne Edge profile is the subset of Python that compiles to WebAssembly.
+This construct is outside it; a full `@pyne` script can use it.
+"""
+
+[E0002]
+name = "edge_python_builtin"
+severity = "error"
+title = "Python built-in instead of the Pine one"
+message = "`{name}` is Python's built-in here, which is not allowed in the Pyne Edge profile. For {meaning}, import it: `from pynecore.lib import {name}`."
+explanation = """
+Without the import, the name means Python's own built-in, not the Pine
+function of the same name.
+"""
+
+[E0003]
+name = "edge_lambda"
+severity = "error"
+title = "lambda outside a field default"
+message = "`lambda` is allowed only as a `field(default_factory=...)` default of a field."
+explanation = """
+The Pyne Edge profile has no function values. The one `lambda` it takes
+builds a field's default value.
+"""
+
+[E0004]
+name = "edge_assert_message"
+severity = "error"
+title = "assert message that is not a string literal"
+message = "An `assert` message must be a string literal in the Pyne Edge profile."
+explanation = """
+The message is part of the runtime error, so it is fixed when the script is
+compiled.
+"""
+
+[E0005]
+name = "edge_subscript_assignment"
+severity = "error"
+title = "Assignment to a subscript"
+message = "Assigning to a subscript is not allowed in the Pyne Edge profile; use `array.set()`."
+explanation = """
+An array element is set with `array.set(id, index, value)`.
+"""
+
+[E0006]
+name = "edge_import"
+severity = "error"
+title = "Import outside the Edge profile"
+message = "{import} is not allowed in the Pyne Edge profile: only the PyneCore API and `lib.*` libraries can be imported."
+explanation = """
+Relative imports, star imports and modules other than the PyneCore API and
+the user's `lib.*` libraries are outside the profile.
+"""
+
+[E0007]
+name = "edge_decorator"
+severity = "error"
+title = "Decorator outside the Edge profile"
+message = "Only `@script.indicator/strategy/library(...)`, `@method` and `@export` can decorate a function in the Pyne Edge profile."
+explanation = """
+Other decorators change a function at run time, which the compiled form
+cannot follow.
+"""
+
+[E0008]
+name = "edge_class"
+severity = "error"
+title = "Class outside the Edge profile"
+message = "{detail} A class in the Pyne Edge profile is a plain `@udt` or `@dataclass` field list with methods."
+explanation = """
+A class has exactly one `@udt` or `@dataclass` decorator, no base classes or
+keywords, and a body of annotated fields and undecorated methods that take
+their receiver first.
+"""
+
+[E0009]
+name = "edge_call"
+severity = "error"
+title = "Call outside the Edge profile"
+message = "`{name}` cannot be called in the Pyne Edge profile: only defined functions, imported names and {builtins} can."
+explanation = """
+A call goes to a function of the script, an imported name, or one of the few
+Python built-ins the profile keeps.
+"""
+
+[E0010]
+name = "edge_attribute_assignment"
+severity = "error"
+title = "Attribute set on a function or module"
+message = "Assigning an attribute on `{root}` is not allowed in the Pyne Edge profile: functions and modules are not objects."
+explanation = """
+Only objects of user-defined types have fields to set.
+"""

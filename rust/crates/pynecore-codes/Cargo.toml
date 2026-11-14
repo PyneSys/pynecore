@@ -1,0 +1,10 @@
+[package]
+name = "pynecore-codes"
+description = "PyneCore's diagnostic codes, generated from codes/registry.toml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

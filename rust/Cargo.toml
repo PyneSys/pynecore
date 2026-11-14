@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/pyne-ast",
+    "crates/pynecore-codes",
     "crates/pyne-parse",
     "crates/pyne-transform",
     "crates/pyne-transform-py",

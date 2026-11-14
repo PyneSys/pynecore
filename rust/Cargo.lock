@@ -452,6 +452,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pynecore-codes"
+version = "0.1.0"
+
+[[package]]
 name = "pyo3"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

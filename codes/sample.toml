@@ -1,0 +1,35 @@
+# The generator's test registry: one code of every kind the generator handles.
+# Its Rust output is rust/crates/pynecore-codes/tests/sample/registry.rs.
+
+[S0001]
+name = "unexpected_token"
+severity = "error"
+title = "Unexpected token"
+message = "Expected {expected}, found {found}; `{{` opens nothing here."
+fix_title = "Write {expected}"
+fix = "{expected}"
+since = "6.0.0"
+explanation = """
+The parser expected `expected` at this point of the line and found `found`.
+"""
+
+[L0001]
+name = "nbsp_in_version_pragma"
+severity = "warning"
+title = "Non-breaking space in the version pragma"
+message = "The version pragma contains a non-breaking space."
+since = "6.0.0"
+explanation = """
+TradingView rejects the script; Pyne reads the pragma.
+"""
+
+[V0001]
+name = "old_rename"
+severity = "info"
+title = "A retired code"
+message = "Renamed {old} to {new}."
+since = "6.0.0"
+retired = "6.1.0"
+explanation = """
+Kept so the code is never reused.
+"""
