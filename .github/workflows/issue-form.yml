@@ -1,0 +1,52 @@
+name: Issue form check
+
+# Close every new or reopened issue that did not come through an issue template. The web UI
+# forces the templates, but the REST API and `gh issue create --body` do not. A bug report
+# passes when its body has the sections the form writes (`### Scope` with the ticked
+# one-problem box, `### Minimal reproduction`). A feature request passes on its `enhancement`
+# label: the template sets it, and GitHub drops labels sent through the API by anyone without
+# push access. Owners, members and collaborators are never checked.
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Close issues not opened through a template
+        run: |
+          set -euo pipefail
+          event="$GITHUB_EVENT_PATH"
+          number=$(jq -r '.issue.number' "$event")
+          association=$(jq -r '.issue.author_association' "$event")
+          body=$(jq -r '.issue.body // ""' "$event")
+          labels=$(jq -r '[.issue.labels[].name] | join(",")' "$event")
+
+          case "$association" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "#$number: opened by $association, not checked"
+              exit 0
+              ;;
+          esac
+
+          if [[ ",$labels," == *",enhancement,"* ]]; then
+            echo "#$number: feature request template"
+            exit 0
+          fi
+
+          if grep -q '^### Scope' <<< "$body" \
+            && grep -qE '^- \[[xX]\] This issue reports exactly one problem\.' <<< "$body" \
+            && grep -q '^### Minimal reproduction' <<< "$body"; then
+            echo "#$number: bug report form"
+            exit 0
+          fi
+
+          gh issue close "$number" --reason "not planned" --comment "This issue was not opened through an issue template, so it has been closed automatically. Please open it again from https://github.com/$GH_REPO/issues/new/choose and report one problem per issue (see [CONTRIBUTING.md](https://github.com/$GH_REPO/blob/main/CONTRIBUTING.md))."
+          echo "#$number: closed, no template"

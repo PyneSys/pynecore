@@ -4,7 +4,8 @@ Bug reports and pull requests are welcome. These rules keep review fast for both
 
 ## Bug reports
 
-Open an issue with a minimal script that reproduces the problem, the data it runs on (or how to
+Open an issue from [the issue templates](https://github.com/PyneSys/pynecore/issues/new/choose)
+with a minimal script that reproduces the problem, the data it runs on (or how to
 get it), and what you expected instead. When the expected value comes from TradingView, say so.
 
 - **One problem per issue.** Each issue is checked, fixed, released and closed on its own, and
@@ -16,7 +17,9 @@ get it), and what you expected instead. When the expected value comes from Tradi
   the code PyneComp produced.
 
 An issue that reports several problems is not closed for that reason, but we will ask you to
-split it before we work on it.
+split it before we work on it. An issue that was not opened from a template (for example one
+created through the API or `gh issue create --body`) is closed automatically; open it again
+from the templates.
 
 ## Pull requests
 
