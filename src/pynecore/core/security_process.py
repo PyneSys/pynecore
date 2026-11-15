@@ -50,8 +50,10 @@ Three flavors of advance are supported, distinguished by SyncBlock flags:
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 import os
+import pickle
 import sys
 import threading
 import traceback
@@ -73,9 +75,11 @@ from .security_shm import (
     RING_RESUME_ENTRIES, RING_RUNAHEAD_ENTRIES, is_ltf_window,
     is_ltf_chart_developing, is_ltf_live_phase,
 )
+from .error_location import coded, site_of
+from .errors import PyneError, RUNTIME_ROOTS
 from .security import (
     BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_CLOSED_FROM_FEED, DEV_BATCH_DEVELOPING,
-    RUNTIME_ROOTS, actual_bar_close,
+    actual_bar_close,
     create_security_protocol, inject_protocol, iter_dev_batch_records,
     same_calendar,
 )
@@ -2117,17 +2121,31 @@ def security_process_main(
 # report while it is still alive and the chart reads it only after the reap, so
 # the whole report has to fit the pipe's buffer, or the write would block forever.
 _FAILURE_MESSAGE_LIMIT = 500
+# Upper bound of a coded error's pickle in a failure report: the smallest pipe
+# buffer of the supported platforms. A larger one goes as a text report.
+_FAILURE_PICKLE_LIMIT = 4096
 
 
-def _failure_report(exc: BaseException) -> str:
+def _failure_report(exc: BaseException) -> 'str | PyneError':
     """What killed this child: the exception, and where the script raised it.
 
     :param exc: The exception leaving the child's entry point.
-    :return: ``"Type: message (at path:line)"``. The location is the innermost
-        frame outside the runtime, or the innermost frame when the whole
-        traceback is the runtime's. The function name is left out: in a child it
-        is the sliced ``main()`` clone's generated name.
+    :return: A coded error (:func:`~pynecore.core.error_location.coded`) itself,
+        located at the script's line and without a bar: the chart reports it on
+        its own bar. Any other exception as ``"Type: message (at path:line)"``.
+        The location is the innermost frame outside the runtime, or the
+        innermost frame when the whole traceback is the runtime's. The function
+        name is left out: in a child it is the sliced ``main()`` clone's
+        generated name.
     """
+    error = coded(exc)
+    if error is not None:
+        located_error = copy.copy(error)
+        located_error.at = error.at or site_of(exc.__traceback__)
+        located_error.bar_index = located_error.bar_time = None
+        # The report must fit the pipe's buffer, as a text report does
+        if len(pickle.dumps(located_error)) <= _FAILURE_PICKLE_LIMIT:
+            return located_error
     message = str(exc)
     if len(message) > _FAILURE_MESSAGE_LIMIT:
         message = message[:_FAILURE_MESSAGE_LIMIT] + '...'

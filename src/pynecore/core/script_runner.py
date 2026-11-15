@@ -37,6 +37,8 @@ from pynecore.types.session import Session
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.data_path import with_data_extension
 from pynecore.core.drawing_snapshot import DrawingSnapshot
+from pynecore.core.error_location import located
+from pynecore.core.errors import MAIN_MODULE, MODULE_ID, PyneError
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
 from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, copy_ohlcv_tail, restore_f32_volume
 from pynecore.core.script_timeframe import ScriptTimeframe
@@ -226,6 +228,9 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
         name, script_path, loader=import_hook.PyneLoader(name, str(script_path)))
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # The script's module is ``main`` where an error names it, whatever it is
+    # registered under (see core/error_location.py)
+    setattr(module, MODULE_ID, MAIN_MODULE)
     # Registered before it runs, as an import would: the script's own types are
     # looked up through ``sys.modules`` by their ``__module__``
     sys.modules[name] = module
@@ -2484,7 +2489,7 @@ class ScriptRunner:
         # Abnormally died children, filled by ``watch_security_child`` with how
         # each died — lets the chart's per-bar waits stay UNTIMED (see
         # ``_wait_with_liveness``)
-        sec_failed_children: dict[str, str] = {}
+        sec_failed_children: 'dict[str, str | PyneError]' = {}
         sec_resample_dirs: 'list[str]' = []  # per-run temp dirs for HTF feed resampling
         sec_cleanup_fn: Callable[[], None] | None = None
         # Parent ends of the per-child registry pipes, closed at teardown.
@@ -3461,37 +3466,53 @@ class ScriptRunner:
 
             # noinspection PyProtectedMember
             def _run_libs_and_main():
-                if sec_begin_bar_fn is not None:
-                    # noinspection PyCallingNonCallable
-                    sec_begin_bar_fn(lib._time, lib._next_time,
-                                     bool(barstate.isconfirmed))
-                # Broker mode only: open a fresh order-evaluation scope before
-                # any strategy.close() runs, so two same-bar closes net into one
-                # order while a calc_on_every_tick re-issue replaces rather than
-                # doubles the pending close (see BrokerPosition.begin_evaluation).
-                if self._order_sync_engine is not None:
-                    position.begin_evaluation()
-                # Advance hidden ``__auto_rate_*`` subprocesses before
-                # libraries/main run so any ``request.currency_rate`` /
-                # ``currency=`` conversion looks up a freshly-written
-                # close from the rate-source ResultBlock instead of NaN.
-                if signal_rate_sources_fn is not None:
-                    # noinspection PyCallingNonCallable
-                    signal_rate_sources_fn()
-                lib._lib_semaphore = True
-                lib._in_lib_main = True
                 try:
-                    for run_lib_main in lib_mains:
-                        run_lib_main()
-                finally:
-                    lib._in_lib_main = False
-                    lib._lib_semaphore = False
-                try:
-                    r = run_main()
-                finally:
-                    if sec_end_bar_fn is not None:
+                    if sec_begin_bar_fn is not None:
                         # noinspection PyCallingNonCallable
-                        sec_end_bar_fn()
+                        sec_begin_bar_fn(lib._time, lib._next_time,
+                                         bool(barstate.isconfirmed))
+                    # Broker mode only: open a fresh order-evaluation scope before
+                    # any strategy.close() runs, so two same-bar closes net into one
+                    # order while a calc_on_every_tick re-issue replaces rather than
+                    # doubles the pending close (see BrokerPosition.begin_evaluation).
+                    if self._order_sync_engine is not None:
+                        position.begin_evaluation()
+                    # Advance hidden ``__auto_rate_*`` subprocesses before
+                    # libraries/main run so any ``request.currency_rate`` /
+                    # ``currency=`` conversion looks up a freshly-written
+                    # close from the rate-source ResultBlock instead of NaN.
+                    if signal_rate_sources_fn is not None:
+                        # noinspection PyCallingNonCallable
+                        signal_rate_sources_fn()
+                    lib._lib_semaphore = True
+                    lib._in_lib_main = True
+                    try:
+                        for run_lib_main in lib_mains:
+                            run_lib_main()
+                    except Exception as e:
+                        error = located(e, int(lib.bar_index), lib._time)
+                        if error is e:
+                            raise
+                        raise error from None
+                    finally:
+                        lib._in_lib_main = False
+                        lib._lib_semaphore = False
+                    try:
+                        r = run_main()
+                    except Exception as e:
+                        error = located(e, int(lib.bar_index), lib._time)
+                        if error is e:
+                            raise
+                        raise error from None
+                    finally:
+                        if sec_end_bar_fn is not None:
+                            # noinspection PyCallingNonCallable
+                            sec_end_bar_fn()
+                except PyneError as e:
+                    # A security context's error a hook hands over (a child that
+                    # stopped while the end hook drained it) is reported on this bar
+                    located(e, int(lib.bar_index), lib._time)
+                    raise
                 if r is not None:
                     assert isinstance(r, dict), "The 'main' function must return a dictionary!"
                     lib._plot_data.update(r)
@@ -4723,24 +4744,40 @@ class ScriptRunner:
             whatever the body left pending, so running without them freezes
             merged groups and leaves rounds in flight.
             """
-            if sec_begin_bar_fn is not None:
-                # noinspection PyCallingNonCallable
-                sec_begin_bar_fn(lib._time, lib._next_time,
-                                 bool(barstate.isconfirmed))
-            lib._lib_semaphore = True
-            lib._in_lib_main = True
             try:
-                for run_lib_main in lib_mains:
-                    run_lib_main()
-            finally:
-                lib._in_lib_main = False
-                lib._lib_semaphore = False
-            try:
-                return run_main()
-            finally:
-                if sec_end_bar_fn is not None:
+                if sec_begin_bar_fn is not None:
                     # noinspection PyCallingNonCallable
-                    sec_end_bar_fn()
+                    sec_begin_bar_fn(lib._time, lib._next_time,
+                                     bool(barstate.isconfirmed))
+                lib._lib_semaphore = True
+                lib._in_lib_main = True
+                try:
+                    for run_lib_main in lib_mains:
+                        run_lib_main()
+                except Exception as e:
+                    error = located(e, int(lib.bar_index), lib._time)
+                    if error is e:
+                        raise
+                    raise error from None
+                finally:
+                    lib._in_lib_main = False
+                    lib._lib_semaphore = False
+                try:
+                    return run_main()
+                except Exception as e:
+                    error = located(e, int(lib.bar_index), lib._time)
+                    if error is e:
+                        raise
+                    raise error from None
+                finally:
+                    if sec_end_bar_fn is not None:
+                        # noinspection PyCallingNonCallable
+                        sec_end_bar_fn()
+            except PyneError as e:
+                # A security context's error a hook hands over (a child that
+                # stopped while the end hook drained it) is reported on this bar
+                located(e, int(lib.bar_index), lib._time)
+                raise
 
         chart_tf = str(lib.syminfo.period)
         assert self._magnifier_iter is not None

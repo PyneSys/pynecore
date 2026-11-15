@@ -31,6 +31,11 @@ const SUPPORT_ALIAS_PREFIX: &str = "__inl·";
 const ARG_MARK: &str = "_inl_argument";
 /// The state vector parameter of the slot lowering (`state_param.DEFAULT_STATE_PARAM`)
 const DEFAULT_STATE_PARAM: &str = "__state__";
+/// `INLINE_SITES`: the module-level table of the module's inlined calls, which the
+/// run reads to give an error of an inlined body its code
+const INLINE_SITES: &str = "__pyne_inline_sites__";
+/// `_LIB_PREFIX`: the prefix of a template key the function's Pine name is left of
+const LIB_PREFIX: &str = "pynecore.lib.";
 
 fn support_alias(anchor: &str) -> String {
     format!("{SUPPORT_ALIAS_PREFIX}{anchor}__")
@@ -769,6 +774,47 @@ fn probe(ast: &mut Ast, value: NodeId, name: &str) -> NodeId {
     probe
 }
 
+fn constant(ast: &mut Ast, value: Constant) -> NodeId {
+    ast.add(Kind::Constant { value, kind: None })
+}
+
+fn text(ast: &mut Ast, value: &str) -> NodeId {
+    constant(ast, Constant::Str(value.to_string()))
+}
+
+fn tuple(ast: &mut Ast, elts: Vec<NodeId>) -> NodeId {
+    ast.add(Kind::Tuple { elts, ctx: ExprContext::Load })
+}
+
+/// `_name_holder`: the `INLINE_SITES` holder of a value a name holds.
+fn name_holder(ast: &mut Ast, name: &str) -> NodeId {
+    let elts = vec![text(ast, "n"), text(ast, name)];
+    tuple(ast, elts)
+}
+
+/// `_holder`: the `INLINE_SITES` holder of an actual argument that goes in as
+/// itself: a name, a slot read or a constant can be read again, anything else
+/// cannot (a binding overrides it with its temporary).
+fn holder(ast: &mut Ast, id: NodeId, class: ArgClass) -> NodeId {
+    match (class, ast.kind(id).clone()) {
+        (ArgClass::Const, Kind::Constant { value, .. }) => {
+            let elts = vec![text(ast, "c"), constant(ast, value)];
+            tuple(ast, elts)
+        }
+        (ArgClass::Name, Kind::Name { id: name, .. }) => name_holder(ast, &name),
+        (ArgClass::Slot, Kind::Subscript { value, slice, .. }) => {
+            let (Kind::Name { id: state, .. }, Kind::Constant { value: index, .. }) =
+                (ast.kind(value).clone(), ast.kind(slice).clone())
+            else {
+                unreachable!("a slot read is a state name indexed by an int")
+            };
+            let elts = vec![text(ast, "s"), text(ast, &state), constant(ast, index)];
+            tuple(ast, elts)
+        }
+        _ => constant(ast, Constant::None),
+    }
+}
+
 /// A walrus binding `value` to `name`.
 fn bind(ast: &mut Ast, name: &str, value: NodeId) -> NodeId {
     let target = ast.add(Kind::Name { id: name.to_string(), ctx: ExprContext::Store });
@@ -894,6 +940,8 @@ struct CallInline<'t> {
     functions: Vec<NodeId>,
     /// The loop counters proven never na at the current position
     counters: HashSet<String>,
+    /// The `INLINE_SITES` rows of the sites rewritten so far
+    sites: Vec<NodeId>,
     error: Option<Error>,
 }
 
@@ -1020,6 +1068,8 @@ impl<'t> CallInline<'t> {
 
         let mut factories: HashMap<String, Factory> = HashMap::new();
         let mut probes = Vec::new();
+        let mut holders: Vec<NodeId> =
+            args.iter().zip(&classes).map(|(&arg, &kind)| holder(ast, arg, kind)).collect();
         for (index, &kind) in classes.iter().enumerate() {
             if kind == ArgClass::Const {
                 continue;
@@ -1042,6 +1092,7 @@ impl<'t> CallInline<'t> {
                 let copy = arg_copy(ast, argument);
                 let binding = bind(ast, &temp, copy);
                 probes.push(probe(ast, binding, &temp));
+                holders[index] = name_holder(ast, &temp);
                 factories.insert(name, Factory::Temp(temp));
                 continue;
             }
@@ -1060,6 +1111,7 @@ impl<'t> CallInline<'t> {
             let copy = arg_copy(ast, argument);
             let binding = bind(ast, &temp, copy);
             replace_node(ast, expression, anchor, binding);
+            holders[index] = name_holder(ast, &temp);
             factories.insert(name, Factory::Temp(temp));
         }
         if !factories.is_empty() {
@@ -1071,6 +1123,20 @@ impl<'t> CallInline<'t> {
                 ast.add(Kind::BoolOp { op: BoolOperator::And, values: vec![probe, expression] });
         }
 
+        let loc = ast[node].loc;
+        if let Some(line) = loc.lineno {
+            // An unlocated call's emission is anchored at its statement later: no
+            // failing position would point at it
+            let function = key.strip_prefix(LIB_PREFIX).unwrap_or(key).to_string();
+            let elts = vec![
+                constant(ast, Constant::Int(Int::Small(line))),
+                constant(ast, Constant::Int(Int::Small(loc.col_offset.unwrap_or(0)))),
+                text(ast, &function),
+                tuple(ast, holders),
+            ];
+            let row = tuple(ast, elts);
+            self.sites.push(row);
+        }
         stamp_emission(ast, expression, node)?;
 
         // `stamp_lowering` keeps a string stamp it meets and types the rest; the Python
@@ -1103,22 +1169,9 @@ impl<'t> CallInline<'t> {
     fn visit_module(&mut self, ast: &mut Ast, module: NodeId) {
         self.index = NameIndex::build(ast, module);
         self.visit_definitions(ast, module);
-        if self.used.is_empty() || self.error.is_some() {
+        if (self.used.is_empty() && self.sites.is_empty()) || self.error.is_some() {
             return;
         }
-        let names = self
-            .used
-            .iter()
-            .map(|name| {
-                ast.add(Kind::Alias { name: name.clone(), asname: Some(support_alias(name)) })
-            })
-            .collect();
-        let import = ast.add(Kind::ImportFrom {
-            module: Some(SUPPORT_MODULE.to_string()),
-            names,
-            level: Some(0),
-            is_lazy: None,
-        });
         let Kind::Module { body, .. } = ast.kind(module) else { unreachable!() };
         let mut position = 0;
         if let Some(&first) = body.first()
@@ -1134,8 +1187,31 @@ impl<'t> CallInline<'t> {
                 _ => break,
             }
         }
-        let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
-        body.insert(position, import);
+        if !self.sites.is_empty() {
+            let target =
+                ast.add(Kind::Name { id: INLINE_SITES.to_string(), ctx: ExprContext::Store });
+            let value = tuple(ast, std::mem::take(&mut self.sites));
+            let table = ast.add(Kind::Assign { targets: vec![target], value, type_comment: None });
+            let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
+            body.insert(position, table);
+        }
+        if !self.used.is_empty() {
+            let names = self
+                .used
+                .iter()
+                .map(|name| {
+                    ast.add(Kind::Alias { name: name.clone(), asname: Some(support_alias(name)) })
+                })
+                .collect();
+            let import = ast.add(Kind::ImportFrom {
+                module: Some(SUPPORT_MODULE.to_string()),
+                names,
+                level: Some(0),
+                is_lazy: None,
+            });
+            let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
+            body.insert(position, import);
+        }
     }
 
     /// `_loop_counter`: the counter of a `pine_range` loop that is never na in its body.
@@ -1299,6 +1375,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         func_depth: 0,
         functions: Vec::new(),
         counters: HashSet::new(),
+        sites: Vec::new(),
         error: None,
     };
     pass.visit(ast, module);

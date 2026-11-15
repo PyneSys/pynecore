@@ -36,6 +36,7 @@ from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.syminfo import SymInfo, mintick_decimals
 from pynecore.core.script_runner import ScriptRunner, DataRequirements, SecurityRequirement
 from pynecore.core.profiler import ProfilerUnavailable
+from pynecore.core.errors import PyneError
 from pynecore.pynesys.compiler import PyneComp
 from pynecore.core.provider_string import is_provider_string
 from pynecore.core.provider_download import (
@@ -1107,6 +1108,10 @@ def run(
         profile_top: int = Option(15, "--profile-top", min=0, metavar="N",
                                   help="Number of lines listed in the profile summary",
                                   rich_help_panel="Profiling Options"),
+        show_traceback: bool = Option(False, "--traceback",
+                                      help="When the script stops with a coded error "
+                                           "(R0010, ...), print the Python traceback too, "
+                                           "not only the error's line"),
 
 ):
     """
@@ -1777,6 +1782,12 @@ def run(
                 if profile_path is not None:
                     print_profile_report(json.loads(profile_path.read_text(encoding='utf-8')),
                                          profile_path, profile_top, console)
+        except PyneError as e:
+            # The script's own error: one line, as `pyneaot run` writes it
+            if show_traceback:
+                console.print_exception(show_locals=False)
+            secho(f"Error: {e.report()}", err=True, fg=colors.RED)
+            raise Exit(1)
         finally:
             # A broker run that never reached its completion summary ended
             # abnormally (early raise / crash mid-run). Narrate that the

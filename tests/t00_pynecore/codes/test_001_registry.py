@@ -1,7 +1,7 @@
 """
 The diagnostic code generator (``codes/generate.py``): its Python and docs output
 for ``codes/sample.toml``, its validation, the merge of two registries, and that
-the committed outputs match ``codes/registry.toml``.
+the committed outputs (``pynecore.codes`` among them) match ``codes/registry.toml``.
 """
 import importlib.util
 from pathlib import Path
@@ -23,7 +23,7 @@ generate = _load('codes_generate', _REPO_ROOT / 'codes' / 'generate.py')
 
 
 def __test_committed_outputs_match_the_registry__():
-    """The generated Rust side and docs pages are what the registry gives today"""
+    """The generated Python and Rust sides and docs pages are what the registry gives today"""
     assert generate.stale(generate.outputs(), generate.DOCS) == [], \
         "regenerate with `python codes/generate.py` from the pynecore checkout root"
 
@@ -99,6 +99,11 @@ _BAD = [
      'explanation="e"', "only the message's parameters"),
     ('[R0001]\nname="a"\nseverity="error"\ntitle="t"\nmessage="m {a}"\npython_message="{b}"\n'
      'explanation="e"', "python_message needs python"),
+    ('[R0001]\nname="runtime_error"\nseverity="error"\ntitle="t"\nmessage="m"\nexplanation="e"',
+     "built-in's"),
+    ('[R0001]\nname="a"\nseverity="error"\ntitle="t"\nmessage="m"\nexplanation="e"\n'
+     '[R0002]\nname="b"\nseverity="error"\ntitle="t"\nmessage="m"\nexplanation="e"\n'
+     'exception="AError"', "same exception class"),
 ]
 
 

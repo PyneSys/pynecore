@@ -62,6 +62,9 @@ class CompileResponse:
     details: list[str] | None = None
     status_code: int | None = None
     raw_response: dict[str, Any] | None = None
+    #: The line-level sourcemap the compile was asked for: ``{"version": 1,
+    #: "pine_version": <int|None>, "mappings": [[python_line, pine_line], ...]}``.
+    sourcemap: dict[str, Any] | None = None
 
     @property
     def has_validation_errors(self) -> bool:
@@ -368,13 +371,16 @@ class APIClient:
     def compile_script(
             self,
             script: str,
-            strict: bool = False
+            strict: bool = False,
+            sourcemap: bool = False
     ) -> CompileResponse:
         """
         Compile Pine Script to Python via API.
 
         :param script: Pine Script code to compile
         :param strict: Whether to use strict compilation mode
+        :param sourcemap: Also ask for the line-level sourcemap; a server that does not know
+                          the flag answers with the code alone, and the response has none
         :return: CompileResponse with compiled code or error details
         :raises AuthError: If authentication fails
         :raises RateLimitError: If rate limit is exceeded
@@ -388,6 +394,8 @@ class APIClient:
                 "script": script,
                 "strict": str(strict).lower()
             }
+            if sourcemap:
+                data["sourcemap"] = "true"
 
             request = self._make_request(
                 "POST",
@@ -399,10 +407,20 @@ class APIClient:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 # Success - return compiled code
                 compiled_code = response.read().decode('utf-8')
+                compiled_map = None
+                if sourcemap:
+                    try:
+                        body = json.loads(compiled_code)
+                    except ValueError:
+                        body = None
+                    if isinstance(body, dict) and isinstance(body.get("code"), str):
+                        compiled_code = body["code"]
+                        compiled_map = body.get("sourcemap")
                 return CompileResponse(
                     success=True,
                     compiled_code=compiled_code,
-                    status_code=200
+                    status_code=200,
+                    sourcemap=compiled_map if isinstance(compiled_map, dict) else None
                 )
 
         except urllib.error.HTTPError as e:

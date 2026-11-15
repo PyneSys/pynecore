@@ -1,10 +1,12 @@
 """
 Core compilation service for programmatic use.
 """
+import hashlib
+import json
 from pathlib import Path
 
 from pynecore.pynesys.api import (APIClient, APIError, AuthError, RateLimitError, CompilationError, UsageResponse,
-                                  TokenValidationResponse)
+                                  TokenValidationResponse, CompileResponse)
 from pynecore.utils.file_utils import is_updated
 
 
@@ -63,7 +65,8 @@ class PyneComp:
 
         # Compile via API
         try:
-            response = self.api_client.compile_script(script_content, strict=strict)
+            response = self.api_client.compile_script(script_content, strict=strict,
+                                                      sourcemap=True)
 
             if not response.success:
                 raise CompilationError(
@@ -77,6 +80,7 @@ class PyneComp:
             resolved_output.parent.mkdir(parents=True, exist_ok=True)
             with open(resolved_output, 'w', encoding='utf-8') as f:
                 f.write(response.compiled_code)
+            self.write_sourcemap(resolved_output, response, script_content, strict)
 
             # No need to update tracking info with mtime approach
             return resolved_output
@@ -99,6 +103,35 @@ class PyneComp:
         Validate API key.
         """
         return self.api_client.verify_token_local()
+
+    @staticmethod
+    def write_sourcemap(output_path: Path, response: CompileResponse, pine: str,
+                        strict: bool) -> None:
+        """
+        Write the compile's sourcemap beside the output as ``<output>.map``, in the form
+        PyneIDE writes it: stamped with the hashes of the Python code and the Pine source, so a
+        later edit of the ``.py`` invalidates it. A response without a sourcemap (an older
+        server) removes an existing map instead: a stale map must not outlive its code.
+
+        :param output_path: The compiled ``.py`` file
+        :param response: The successful compile response
+        :param pine: The Pine Script source
+        :param strict: Whether the compile was strict
+        """
+        map_path = output_path.with_name(output_path.name + '.map')
+        if response.sourcemap is None:
+            map_path.unlink(missing_ok=True)
+            return
+        stored = dict(response.sourcemap)
+        # The file as written, which on Windows has the platform's line endings
+        stored['py_sha256'] = hashlib.sha256(output_path.read_bytes()).hexdigest()
+        stored['pine_sha256'] = hashlib.sha256(pine.encode('utf-8')).hexdigest()
+        stored['strict'] = strict
+        pine_version = stored.get('pine_version')
+        if isinstance(pine_version, int) and pine_version < 6:
+            # The mappings point at the lines of the v6 script the compiler converted it to
+            stored['converted_source'] = True
+        map_path.write_text(json.dumps(stored), encoding='utf-8')
 
     @staticmethod
     def needs_compilation(pine_file_path: Path, output_file_path: Path) -> bool:

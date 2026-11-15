@@ -1,5 +1,5 @@
-"""Generate the Rust side and the docs pages of PyneCore's diagnostic codes from
-``codes/registry.toml``.
+"""Generate the Python and Rust sides and the docs pages of PyneCore's diagnostic
+codes from ``codes/registry.toml``.
 
     python codes/generate.py          write every generated file
     python codes/generate.py --check  fail when a generated file is stale
@@ -7,15 +7,22 @@
 The registry format is described in its header. The Rust side holds what a
 reported diagnostic needs (code, severity, title, message template and its
 parameters); the explanation and the introducing release are only in the docs.
-A retired code gets a docs page and no constant.
+The Python side (``src/pynecore/codes.py``) holds the same constants and one
+exception class per code. A retired code gets a docs page and no constant.
+
+``codes/format_arg.toml`` holds the test vectors of the parameter formatting both
+sides share; they are written into the Rust crate's tests as well.
 
 The functions below are also PyneComp's generator: it loads its own registry
 and this one with :func:`load`, and writes its outputs over both.
 """
 
 import argparse
+import builtins
+import keyword
 import re
 import string
+import struct
 import subprocess
 import sys
 import tomllib
@@ -29,6 +36,9 @@ RUST_ROOT = ROOT / "rust"
 CRATE = RUST_ROOT / "crates" / "pynecore-codes"
 RUST = CRATE / "src" / "registry.rs"
 SAMPLE_RUST = CRATE / "tests" / "sample" / "registry.rs"
+FORMAT_ARG = ROOT / "codes" / "format_arg.toml"
+FORMAT_ARG_RUST = CRATE / "tests" / "format_arg" / "vectors.rs"
+PYTHON = ROOT / "src" / "pynecore" / "codes.py"
 DOCS = ROOT / "docs" / "reference" / "codes"
 
 #: The domains PyneCore's registry holds: R runtime, P Pyne code rules,
@@ -41,8 +51,9 @@ NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
 SEVERITIES = ("error", "warning", "info")
 FIELDS = {"name", "severity", "title", "message", "since", "explanation", "retired", "fix_title",
-          "fix", "python", "python_message"}
-OPTIONAL = {"since", "retired", "fix_title", "fix", "python", "python_message"}
+          "fix", "python", "python_message", "exception"}
+OPTIONAL = {"since", "retired", "fix_title", "fix", "python", "python_message", "exception"}
+CLASS_RE = re.compile(r"[A-Z][A-Za-z0-9]*Error")
 
 #: The domains of the codes a run raises (``RUNTIME``).
 RUNTIME_DOMAINS = "RI"
@@ -67,6 +78,18 @@ class Code:
     #: class, or several where different built-ins raise different ones for
     #: the same condition.
     python: tuple[str, ...] = ()
+    #: The exception class's name, where the one made of the name would be a
+    #: built-in's.
+    exception: str | None = None
+
+    @property
+    def class_name(self) -> str:
+        """The name of the code's exception class: the registry's ``exception``,
+        or the name in CamelCase ending in ``Error``."""
+        if self.exception is not None:
+            return self.exception
+        camel = "".join(part.capitalize() for part in self.name.split("_"))
+        return camel if camel.endswith("Error") else camel + "Error"
 
 
 def _params(message: str) -> tuple[str, ...]:
@@ -128,9 +151,17 @@ def load(path: Path, domains: str = DOMAINS) -> list[Code]:
                 raise ValueError(f"{where}: python_message needs python and uses only the "
                                  "message's parameters")
         names.add(row["name"])
-        codes.append(Code(code, row["name"], row["severity"], row["title"].strip(), row["message"],
-                          params, row.get("since"), row["explanation"].strip(), row.get("retired"),
-                          row.get("fix_title"), row.get("fix"), tuple(python)))
+        entry = Code(code, row["name"], row["severity"], row["title"].strip(), row["message"],
+                     params, row.get("since"), row["explanation"].strip(), row.get("retired"),
+                     row.get("fix_title"), row.get("fix"), tuple(python), row.get("exception"))
+        if not CLASS_RE.fullmatch(entry.class_name) or hasattr(builtins, entry.class_name):
+            raise ValueError(f"{where}: the exception class {entry.class_name!r} is not a "
+                             "CamelCase name ending in Error, or it is a built-in's (set "
+                             "`exception`)")
+        codes.append(entry)
+    classes = [c.class_name for c in codes]
+    if len(set(classes)) != len(classes):
+        raise ValueError(f"{path.name}: two codes have the same exception class")
     return codes
 
 
@@ -253,6 +284,131 @@ def python(codes: list[Code], sources: str) -> str:
     return "\n".join(lines)
 
 
+def _base(base: str) -> tuple[str | None, str]:
+    """The import a base class of the registry's ``python`` needs, and how the
+    module names it."""
+    if "." not in base:
+        return None, base
+    module, name = base.rsplit(".", 1)
+    if module.startswith("pynecore."):
+        return f"from {module.removeprefix('pynecore')} import {name}", name
+    return f"import {module}", base
+
+
+def _py_str(text: str, indent: int, width: int = 99) -> str:
+    """``text`` as a Python literal, split at spaces into implicitly joined
+    pieces, one per line, so none goes past ``width``."""
+    pieces: list[str] = []
+    for word in re.split(r"(?<= )", text):
+        if pieces and indent + len(repr(pieces[-1] + word)) <= width:
+            pieces[-1] += word
+        else:
+            pieces.append(word)
+    return ("\n" + " " * indent).join(repr(p) for p in pieces) if pieces else "''"
+
+
+def _wrapped(items: list[str], indent: int, width: int = 99) -> list[str]:
+    """``items`` joined by commas into lines no longer than ``width``."""
+    lines = [""]
+    for item in items:
+        if lines[-1] and indent + len(lines[-1]) + len(item) + 2 > width:
+            lines.append("")
+        lines[-1] += ("" if not lines[-1] else " ") + item + ","
+    return [" " * indent + line for line in lines]
+
+
+def _hanging(head: str, items: list[str], tail: str, width: int = 99) -> list[str]:
+    """``head`` + ``items`` joined by ``, `` + ``tail``, the items wrapped onto
+    lines aligned under the first one so none goes past ``width``."""
+    indent = " " * len(head)
+    lines = [head]
+    for i, item in enumerate(items):
+        text = item + (", " if i < len(items) - 1 else tail)
+        if len(lines[-1]) > len(indent) and len(lines[-1] + text.rstrip()) > width:
+            lines[-1] = lines[-1].rstrip()
+            lines.append(indent)
+        lines[-1] += text
+    if not items:
+        lines[-1] += tail
+    return lines
+
+
+def _arg(param: str) -> str:
+    """The keyword argument a parameter is passed as: a Python keyword or a
+    built-in's name gets a trailing underscore."""
+    return param + "_" if keyword.iskeyword(param) or hasattr(builtins, param) else param
+
+
+def exceptions(codes: list[Code], sources: str) -> str:
+    """PyneCore's ``codes`` module: the ``Code`` constants, one exception class
+    per code, ``ALL`` and ``EXCEPTIONS``."""
+    live = [c for c in codes if c.retired is None]
+    imports = {i for c in live for i, _ in map(_base, c.python) if i is not None}
+    stdlib = sorted(i for i in imports if i.startswith("import "))
+    local = sorted(i for i in imports if i.startswith("from "))
+    lines = [
+        f"# {header(sources)}",
+        '"""PyneCore\'s diagnostic codes (``codes/registry.toml``): a ``Code`` constant',
+        "and an exception class per code. The class derives from",
+        ":class:`~pynecore.core.errors.PyneError` and the built-in exceptions the",
+        "registry names, and takes the code's parameters as keyword arguments (a",
+        'parameter named as a Python keyword or built-in with a trailing underscore)."""',
+        "",
+        *stdlib,
+        *([""] if stdlib else []),
+        "from .core.errors import Code, PyneError",
+        *local,
+        "",
+    ]
+    for c in live:
+        fields = [repr(c.code), repr(c.severity), _py_str(c.title, 4), _py_str(c.message, 4),
+                  "(" + ", ".join(repr(p) for p in c.params) + ("," if len(c.params) == 1 else "")
+                  + ")"]
+        if c.fix is not None:
+            fields += [_py_str(c.fix_title, 4), _py_str(c.fix, 4)]
+        lines += [f"{c.name.upper()} = Code(", *(f"    {f}," for f in fields), ")"]
+    for c in live:
+        bases = ", ".join(["PyneError", *(name for _, name in map(_base, c.python))])
+        signature = ["self", *(["*"] if c.params else []),
+                     *(f"{_arg(p)}: object" for p in c.params)]
+        if any(_arg(p) != p for p in c.params):
+            call = ["**{" + ", ".join(f"{p!r}: {_arg(p)}" for p in c.params) + "}"]
+        else:
+            call = [f"{p}={p}" for p in c.params]
+        lines += [
+            "",
+            "",
+            f"class {c.class_name}({bases}):",
+            f'    """{c.code}: {c.title}"""',
+            f"    code = {c.name.upper()}",
+            "",
+            *_hanging("    def __init__(", signature, ") -> None:"),
+            *_hanging("        super().__init__(", call, ")"),
+        ]
+    lines += ["", "", "#: Every reported code by its code.",
+              "ALL: dict[str, Code] = {c.code: c for c in (",
+              *_wrapped([c.name.upper() for c in live], 4), ")}", "",
+              "#: The exception class of every reported code, by its code.",
+              "EXCEPTIONS: dict[str, type[PyneError]] = {c.code.code: c for c in (",
+              *_wrapped([c.class_name for c in live], 4), ")}", ""]
+    return "\n".join(lines)
+
+
+def format_arg_vectors(path: Path) -> list[tuple[float, str]]:
+    """The ``[[case]]`` rows of ``path``: a float and its ``format_arg`` text."""
+    with path.open("rb") as f:
+        rows = tomllib.load(f)["case"]
+    return [(float(row["value"]), row["text"]) for row in rows]
+
+
+def format_arg_rust(vectors: list[tuple[float, str]], sources: str) -> str:
+    """The vectors as a Rust table of the value's bits and its text."""
+    rows = "".join(f"    (0x{struct.unpack('<Q', struct.pack('<d', v))[0]:016x}, "
+                   f"{_rust_str(t)}),\n" for v, t in vectors)
+    return (f"// {header(sources)}\n\n/// `(f64 bits, format_arg text)`.\n"
+            f"pub static VECTORS: &[(u64, &str)] = &[\n{rows}];\n")
+
+
 def _table(rows: list[list[str]]) -> list[str]:
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     out = ["| " + " | ".join(v.ljust(w) for v, w in zip(row, widths)) + " |" for row in rows]
@@ -325,8 +481,12 @@ def outputs() -> dict[Path, str]:
     """Every file generated from PyneCore's registry, and its content."""
     codes = load(REGISTRY)
     sample = load(SAMPLE, ALL_DOMAINS)
+    vectors = format_arg_vectors(FORMAT_ARG)
     files = {RUST: rustfmt(rust(codes, "codes/registry.toml"), "2024", RUST_ROOT),
-             SAMPLE_RUST: rustfmt(rust(sample, "codes/sample.toml"), "2024", RUST_ROOT)}
+             SAMPLE_RUST: rustfmt(rust(sample, "codes/sample.toml"), "2024", RUST_ROOT),
+             FORMAT_ARG_RUST: rustfmt(format_arg_rust(vectors, "codes/format_arg.toml"), "2024",
+                                      RUST_ROOT),
+             PYTHON: exceptions(codes, "codes/registry.toml")}
     pages = docs(codes, "Every code PyneCore reports.")
     files.update({DOCS / name: text for name, text in pages.items()})
     return files

@@ -90,14 +90,14 @@ def __test_a_zero_division_in_a_context_stops_the_run__(runner, log):
         lambda: __test_helper_run(runner, no_merge=False), seconds=90)
 
     assert raised is not None, "the chart finished normally after a zero division"
-    assert isinstance(raised, RuntimeError), (
-        f"expected a RuntimeError, got {type(raised).__name__}: {raised}")
+    assert isinstance(raised, ZeroDivisionError), (
+        f"expected the context's ZeroDivisionError, got {type(raised).__name__}: {raised}")
     log.info("the zero division surfaced as %s: %s", type(raised).__name__, raised)
 
 
 @pytest.mark.aot_unsupported("a security child process dies; a compiled run has no child process")
 def __test_a_dead_merged_child_unblocks_every_context_it_served__(runner, log):
-    """A merged child dying stops the chart with an error instead of freezing it.
+    """A merged child dying stops the chart with its error instead of freezing it.
 
     One child now stands behind THREE contexts, so its death strands three
     waiting sids at once while an unrelated child keeps answering normally. The
@@ -116,10 +116,6 @@ def __test_a_dead_merged_child_unblocks_every_context_it_served__(runner, log):
     assert any(len(served) == 3 for served in spawned), \
         f"the three contexts did not share one child: {spawned}"
     assert raised is not None, "the chart finished normally after a child died"
-    assert isinstance(raised, RuntimeError), (
-        f"expected a RuntimeError about the dead child, got "
-        f"{type(raised).__name__}: {raised}")
-    assert "died" in str(raised), f"unexpected error message: {raised}"
     __test_helper_check_report(raised)
     log.info("a dead merged security child surfaced as: %s", raised)
 
@@ -138,27 +134,26 @@ def __test_the_unmerged_run_fails_the_same_way__(runner, log):
     assert len(spawned) == 4, f"unmerged children: {spawned}"
     assert all(len(served) == 1 for served in spawned), \
         f"unmerged child serves several contexts: {spawned}"
-    assert isinstance(raised, RuntimeError), (
-        f"expected a RuntimeError about the dead child, got "
-        f"{type(raised).__name__}: {raised}")
-    assert "died" in str(raised), f"unexpected error message: {raised}"
     __test_helper_check_report(raised)
     log.info("unmerged: %s", raised)
 
 
 def __test_helper_check_report(raised):
-    """The chart's error carries the exception that ended the child, and where.
+    """The chart's error is the child's coded error, located at the script's line.
 
     The child's traceback goes to ITS stderr, which a caller of the run may never
     see; the chart's error is what reaches it.
 
     :param raised: The error the run ended with.
     """
-    from pathlib import Path
+    from pynecore import codes
 
-    text = str(raised)
-    assert "ZeroDivisionError" in text, f"the error lost the child's exception: {text}"
-    assert f"{Path(__file__).name}:" in text, f"the error lost the script line: {text}"
+    assert isinstance(raised, codes.DivisionByZeroError), (
+        f"expected the dead child's R0001, got {type(raised).__name__}: {raised}")
+    assert raised.in_security, raised.report()
+    assert raised.at is not None and raised.at.module == 'main' \
+        and raised.at.path == __file__ and raised.at.line == 23, \
+        f"the error lost the script line: {raised.report()}"
 
 
 # Every timestamp here is Unix MILLISECONDS.

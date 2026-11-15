@@ -1,4 +1,5 @@
 from .. import lib
+from ..codes import ScriptRuntimeError as _ScriptRuntimeError
 
 
 def error(message: str):
@@ -14,4 +15,4 @@ def error(message: str):
     # noinspection PyProtectedMember
     if lib._in_security:
         return
-    raise RuntimeError(message)
+    raise _ScriptRuntimeError(message=message)

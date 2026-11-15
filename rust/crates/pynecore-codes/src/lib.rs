@@ -14,7 +14,7 @@
 
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 mod registry;
@@ -177,4 +177,18 @@ pub fn lookup(code: &str) -> Option<&'static Code> {
 /// The code of `table` (sorted by `code`, as [`ALL`] is) spelled `code`.
 pub fn lookup_in(table: &[&'static Code], code: &str) -> Option<&'static Code> {
     table.binary_search_by(|c| c.code.cmp(code)).ok().map(|i| table[i])
+}
+
+/// A number as an error message shows it, the same way PyneCore's
+/// `format_arg` does: `na`, a whole number without a fraction, any other in
+/// its shortest exact form written out in full (`1e-7` is `0.0000001`). Both
+/// run the vectors of `codes/format_arg.toml`.
+pub fn format_arg(v: f64) -> String {
+    if v.is_nan() {
+        String::from("na")
+    } else if v > -1e18 && v < 1e18 && (v as i64) as f64 == v {
+        (v as i64).to_string()
+    } else {
+        v.to_string()
+    }
 }

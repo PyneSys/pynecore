@@ -92,7 +92,7 @@ def __test_helper_run_with_timeout(fn, seconds=120):
 
 @pytest.mark.aot_unsupported("a security child process dies; a compiled run has no child process")
 def __test_a_dying_consumer_child_stops_the_chart_with_an_error__(runner, log):
-    """A security child dying mid-run stops the chart with an error instead of freezing it.
+    """A security child dying mid-run stops the chart with its error instead of freezing it.
 
     The surviving child is blocked on the dead one's ring, so the chart may well
     be waiting on a child that is alive but will never answer. Watching only the
@@ -132,7 +132,9 @@ def __test_a_dying_consumer_child_stops_the_chart_with_an_error__(runner, log):
         raised = exc
 
     assert raised is not None, "the chart finished normally after a child died"
-    assert isinstance(raised, RuntimeError), \
-        f"expected a RuntimeError about the dead child, got {type(raised).__name__}: {raised}"
-    assert "died" in str(raised), f"unexpected error message: {raised}"
+    # The child's coded error itself, as the code of a security context raised it
+    from pynecore import codes
+    assert isinstance(raised, codes.DivisionByZeroError), \
+        f"expected the dead child's R0001, got {type(raised).__name__}: {raised}"
+    assert raised.in_security and raised.at is not None and raised.at.line == 22, raised.report()
     log.info("a dead security child surfaced as: %s", raised)

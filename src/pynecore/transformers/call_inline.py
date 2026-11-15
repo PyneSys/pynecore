@@ -128,8 +128,8 @@ from . import ast_walk
 from .pine_type_rules import get_ty, stamp_lowering
 from .state_param import DEFAULT_STATE_PARAM
 
-__all__ = ['CallInlineTransformer', 'SUPPORT_MODULE', 'SUPPORT_ALIAS_PREFIX', 'inline_templates',
-           'varargs_expansion_arities']
+__all__ = ['CallInlineTransformer', 'SUPPORT_MODULE', 'SUPPORT_ALIAS_PREFIX', 'INLINE_SITES',
+           'inline_templates', 'varargs_expansion_arities']
 
 #: The module every free name of an inlined body resolves through
 SUPPORT_MODULE = 'pynecore.core.inline_support'
@@ -142,6 +142,16 @@ _SUPPORT_ALIAS = SUPPORT_ALIAS_PREFIX + '{}__'
 _TEMP_NAME = '__inl{}·__'
 #: Stand-in for an actual argument while the emission's shape is decided
 _PLACEHOLDER = '__inlp{}·__'
+
+#: The module-level table of the module's inlined calls, which the run reads to
+#: give an error of an inlined body its code (``core/error_location.py``): one
+#: ``(line, col, function, holders)`` per call, ``line`` and ``col`` the point
+#: the emission is anchored at, ``function`` the Pine name (``array.get``), and
+#: one holder per argument telling where its value is once the body runs:
+#: ``('n', name)`` a name or the pass's temporary, ``('s', state, index)`` a
+#: slot read, ``('c', value)`` a constant, None an expression read once in
+#: place, whose value nothing holds.
+INLINE_SITES = '__pyne_inline_sites__'
 
 #: The generated template registry (``scripts/call_inline_collector.py``)
 _TEMPLATES_PATH = Path(__file__).parent / 'call_inline_templates.json'
@@ -671,6 +681,39 @@ def _arg_class(node: ast.expr) -> str:
     return _ARG_IMPURE
 
 
+#: The prefix of a template key the Pine name of the function is left of
+_LIB_PREFIX = 'pynecore.lib.'
+
+
+def _name_holder(name: str) -> ast.expr:
+    """The :data:`INLINE_SITES` holder of a value a name holds."""
+    return ast.Tuple(elts=[ast.Constant(value='n'), ast.Constant(value=name)], ctx=ast.Load())
+
+
+def _holder(node: ast.expr, kind: str) -> ast.expr:
+    """The :data:`INLINE_SITES` holder of an actual argument that goes in as
+    itself: a name, a slot read or a constant can be read again, anything else
+    cannot (a binding overrides it with its temporary).
+
+    :param node: The argument expression.
+    :param kind: Its ``_ARG_*`` class.
+    :return: The holder.
+    """
+    if kind == _ARG_CONST:
+        return ast.Tuple(elts=[ast.Constant(value='c'),
+                               ast.Constant(value=cast(ast.Constant, node).value)],
+                         ctx=ast.Load())
+    if kind == _ARG_NAME:
+        return _name_holder(cast(ast.Name, node).id)
+    if kind == _ARG_SLOT:
+        slot = cast(ast.Subscript, node)
+        return ast.Tuple(elts=[ast.Constant(value='s'),
+                               ast.Constant(value=cast(ast.Name, slot.value).id),
+                               ast.Constant(value=cast(ast.Constant, slot.slice).value)],
+                         ctx=ast.Load())
+    return ast.Constant(value=None)
+
+
 def _always_nodes(node: ast.expr, out: list[ast.Name]) -> None:
     """Collect the names an expression reads on EVERY path, in order.
 
@@ -915,6 +958,8 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         self._declared: dict[int, frozenset[str]] = {}
         #: Number of sites rewritten -- the pass's own tests assert on it
         self.inlined = 0
+        #: The :data:`INLINE_SITES` rows of the sites rewritten so far
+        self._sites: list[ast.expr] = []
 
     # --- callee proof ------------------------------------------------------
 
@@ -1029,6 +1074,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         # replacements hold no placeholder, so the order they go in is moot
         factories: dict[str, Callable[[], ast.expr]] = {}
         probes: list[ast.expr] = []
+        holders: list[ast.expr] = [_holder(arg, kind) for arg, kind in zip(node.args, classes)]
         for index, kind in enumerate(classes):
             if kind == _ARG_CONST:
                 continue
@@ -1049,6 +1095,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
                     target=ast.Name(id=temp, ctx=ast.Store()),
                     value=_arg_copy(argument)), temp))
                 factories[name] = lambda t=temp: ast.Name(id=t, ctx=ast.Load())
+                holders[index] = _name_holder(temp)
                 continue
             #  - a name is free to re-read, so it always goes in as itself;
             #  - a slot read is free of side effects but costs an index, so it
@@ -1069,6 +1116,7 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
             _replace_node(expression, cast(ast.Name, anchor), ast.NamedExpr(
                 target=ast.Name(id=temp, ctx=ast.Store()), value=_arg_copy(argument)))
             factories[name] = lambda t=temp: ast.Name(id=t, ctx=ast.Load())
+            holders[index] = _name_holder(temp)
         if factories:
             _PlaceholderSubstitutor(factories).visit(expression)
 
@@ -1076,6 +1124,14 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
             expression = _chain(probes, expression)
 
         self.inlined += 1
+        line: int | None = getattr(node, 'lineno', None)
+        if line is not None:
+            # An unlocated call's emission is anchored at its statement later:
+            # no failing position would point at it
+            self._sites.append(ast.Tuple(elts=[
+                ast.Constant(value=line), ast.Constant(value=getattr(node, 'col_offset', 0)),
+                ast.Constant(value=key.removeprefix(_LIB_PREFIX)),
+                ast.Tuple(elts=holders, ctx=ast.Load())], ctx=ast.Load()))
         _stamp_emission(expression, node)
         return ast.copy_location(
             stamp_lowering(expression, get_ty(node)), node)
@@ -1086,23 +1142,28 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
         self.index = _NameIndex()
         self.index.visit(node)
         self._visit_definitions(node)
+        if not self._used and not self._sites:
+            return node
+        insert_pos = 0
+        first = node.body[0] if node.body else None
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            insert_pos = 1
+        for i in range(insert_pos, len(node.body)):
+            if isinstance(node.body[i], (ast.Import, ast.ImportFrom)):
+                insert_pos = i + 1
+            elif not isinstance(node.body[i], ast.Expr):
+                break
+        if self._sites:
+            node.body.insert(insert_pos, ast.Assign(
+                targets=[ast.Name(id=INLINE_SITES, ctx=ast.Store())],
+                value=ast.Tuple(elts=self._sites, ctx=ast.Load())))
         if self._used:
-            import_stmt = ast.ImportFrom(
+            node.body.insert(insert_pos, ast.ImportFrom(
                 module=SUPPORT_MODULE,
                 names=[ast.alias(name=name, asname=_SUPPORT_ALIAS.format(name))
                        for name in sorted(self._used)],
-                level=0)
-            insert_pos = 0
-            first = node.body[0] if node.body else None
-            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-                    and isinstance(first.value.value, str)):
-                insert_pos = 1
-            for i in range(insert_pos, len(node.body)):
-                if isinstance(node.body[i], (ast.Import, ast.ImportFrom)):
-                    insert_pos = i + 1
-                elif not isinstance(node.body[i], ast.Expr):
-                    break
-            node.body.insert(insert_pos, import_stmt)
+                level=0))
         return node
 
     def _visit_definitions(self, node: ast.AST) -> None:

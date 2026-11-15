@@ -5,7 +5,7 @@ title: "Running Scripts"
 description: "Run Pyne code on local OHLCV files or provider data with pyne run. Learn command arguments, script settings and the options for continuing with live data."
 icon: "play_circle"
 date: "2025-03-31"
-lastmod: "2026-10-24"
+lastmod: "2026-11-15"
 draft: false
 toc: true
 categories: ["CLI"]
@@ -298,6 +298,26 @@ pyne run my_strategy.py EURUSD_5 --profile --profile-top 25
 ```
 
 See [Profiling](../profiling.md) for how to read the numbers.
+
+## Errors
+
+When the script stops with an error that has a code (see
+[Diagnostic codes](../reference/codes/index.md)), the run prints one line: the bar it stopped
+on, the code, where in the script, and the message.
+
+```
+Error: bar 5 (2023-06-13 21:00 UTC): R0005 at Pine line 4: stopped at five
+```
+
+The location is the Pine Script line when the script was compiled from Pine and the compile's
+sourcemap (`<script>.py.map`) is beside it, otherwise the Pyne code's `file:line:column`. An
+error raised by the code of a `request.security()` context ends with
+`` (in a `request.security` context) ``.
+
+- `--traceback`: Print the Python traceback of such an error too.
+
+An error without a code (a `KeyError` of the script's own dictionary, for example) is shown
+with its traceback, as Python shows it.
 
 ## Symbol Information
 

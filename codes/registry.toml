@@ -28,6 +28,9 @@
 #                                    # class(es) its exception derives from
 #   python_message = "..."           # PyneCore's message today, when a caller
 #                                    # matches it: the same parameters
+#   exception = "..."                # the exception class's name, where the one
+#                                    # made of `name` (CamelCase, ending in
+#                                    # Error) would be a built-in's
 #
 # `{name}` is a parameter, `{{` and `}}` are literal braces. A code is never
 # reused with another meaning: a code that is no longer reported keeps its
@@ -90,6 +93,7 @@ severity = "error"
 title = "runtime.error()"
 message = "{message}"
 python = "RuntimeError"
+exception = "ScriptRuntimeError"
 explanation = """
 The script called `runtime.error()`. The message is the script's own.
 """

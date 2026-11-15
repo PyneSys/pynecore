@@ -117,11 +117,11 @@
   },
   "CallInline": {
     "module": "call_inline",
-    "digest": "304e9cae3d93312204c00c69434f79abcbe7bf9cdd4fc520a677fe03fedcc3d3"
+    "digest": "b695d69d97e679926f6e8ba98b9234dd96528fc30950ff526d421fe1d23f7efb"
   },
   "FunctionIsolation": {
     "module": "function_isolation",
-    "digest": "6be92f80acb4179b7226c2dcb7180b98627cfa33c5c0ee78fe91a85d847227e0"
+    "digest": "a1464ac50030bb2ad1f342b33962cfc68a79707f65521acc922dfef85dd3b50d"
   },
   "ScriptRequirements": {
     "module": "script_requirements",

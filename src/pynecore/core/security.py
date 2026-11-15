@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import pickle
-import sys
 import threading
 from bisect import bisect_right
 from functools import partial
@@ -31,6 +30,7 @@ from typing import Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from .datetime import parse_timezone
+from .errors import PyneError, RUNTIME_ROOTS
 from .import_hook import security_dev_skip_disabled
 from .lookahead import ALLOW_LOOKAHEAD
 from .security_mp import mp_context
@@ -187,20 +187,10 @@ NO_BATCH = os.environ.get("PYNE_NO_SECURITY_BATCH", "").strip().lower() in (
 # per bar.
 SECURITY_TRACE_ENV = "PYNE_SECURITY_TRACE"
 
-# Frames under these roots are the runtime's own or the interpreter's, never the
-# script's: the trace leaves them out of a read's ``stack``, and a dead child's
-# failure report points past them, at the script line that raised.
-RUNTIME_ROOTS = tuple(sorted({
-    str(Path(__file__).resolve().parent.parent) + os.sep,
-    str(Path(sys.prefix).resolve()) + os.sep,
-    str(Path(sys.base_prefix).resolve()) + os.sep,
-}))
-
-
 def watch_security_child(
     sec_id: str,
     proc: 'BaseProcess',
-    failed_children: dict[str, str],
+    failed_children: 'dict[str, str | PyneError]',
     events: 'tuple[EventType, ...]',
     stop_events: 'tuple[EventType, ...]' = (),
     failure_conn: 'Connection | None' = None,
@@ -224,7 +214,8 @@ def watch_security_child(
     :param sec_id: Security context id the process serves
     :param proc: The started child process
     :param failed_children: Shared registry of abnormally died sec_ids, each
-        with the report of the exception that ended it ('' when it left none)
+        with the report of the exception that ended it: the coded error itself,
+        a text report of any other ('' when it left none)
     :param events: Events a chart wait may block on for this context
     :param stop_events: Every child's shutdown event. One child's death has to
         release them ALL: a sibling blocked on this context's ring would never
@@ -273,14 +264,16 @@ def watch_security_child(
 def _child_death_error(
     sec_id: str,
     sec_processes: 'dict[str, BaseProcess] | None',
-    failed_children: dict[str, str],
-) -> RuntimeError:
+    failed_children: 'dict[str, str | PyneError]',
+) -> 'RuntimeError | PyneError':
     """The error a chart wait raises once ``failed_children`` holds a death.
 
     ANY child's death can freeze a wait, not only the awaited one's: contexts read
     each other, so a dead consumer leaves a producer blocked and the chart waiting
     on that producer. The error names the awaited context when it is the dead one,
-    otherwise the child that actually died, with the exception that ended it.
+    otherwise the child that actually died, with the exception that ended it. A
+    child stopped by a coded error hands the error itself over: the chart raises
+    it as the code of a ``request.security`` context raised, on its own bar.
 
     :param sec_id: The context the chart waited on
     :param sec_processes: The children, by sec_id
@@ -290,6 +283,9 @@ def _child_death_error(
     dead = sec_id if sec_id in failed_children else next(iter(failed_children))
     proc = sec_processes.get(dead) if sec_processes is not None else None
     report = failed_children[dead]
+    if isinstance(report, PyneError):
+        report.in_security = True
+        return report
     return RuntimeError(
         f"Security process for '{dead}' died unexpectedly "
         f"(exit code: {proc.exitcode if proc is not None else '?'})"
@@ -301,7 +297,7 @@ def _wait_with_liveness(
     event: 'EventType',
     sec_id: str,
     sec_processes: 'dict[str, BaseProcess] | None',
-    failed_children: 'dict[str, str] | None' = None,
+    failed_children: 'dict[str, str | PyneError] | None' = None,
 ) -> None:
     """
     Wait for ``event`` without deadlocking on a dead security process.
@@ -1444,7 +1440,7 @@ def create_chart_protocol(
     currency_conversions: dict[str, tuple[str, str]] | None = None,
     sec_processes: 'dict[str, BaseProcess] | None' = None,
     auto_rate_sec_ids: frozenset[str] = frozenset(),
-    failed_children: 'dict[str, str] | None' = None,
+    failed_children: 'dict[str, str | PyneError] | None' = None,
     ring_conditions: 'dict[str, ConditionType] | None' = None,
     consumers_by_sid: 'dict[str, list[str]] | None' = None,
     merge_group_fn: 'Callable[[str], list[str] | None] | None' = None,
