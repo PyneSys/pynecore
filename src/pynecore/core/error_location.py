@@ -4,14 +4,15 @@ and the line of the Pine Script source the script was compiled from.
 The run calls :func:`located` on an exception leaving the script's code. A
 :class:`~pynecore.core.errors.PyneError` gets the bar and its location; a few
 of Python's own exceptions get their code first (a ``ZeroDivisionError`` is
-``R0001``), and so does the error of a built-in's body the transform copied
-into the script (an inlined ``array.get``). Any other exception of the
-script's own code, a ``KeyError`` of its dict, stays a Python error without a
-code.
+``R0001``, a failed ``assert`` of the script's own ``R0004``), and so does the
+error of a built-in's body the transform copied into the script (an inlined
+``array.get``). Any other exception of the script's own code, a ``KeyError``
+of its dict, stays a Python error without a code.
 """
 
 import hashlib
 import json
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -20,14 +21,20 @@ from typing import Any, Callable
 
 from .. import errorcodes
 from ..transformers.call_inline import INLINE_SITES
+from .datetime import TimezoneNotFoundError
 from .errors import MODULE_ID, RUNTIME_ROOTS, PyneError, SiteLoc, user_traceback
 
-__all__ = ['located', 'coded', 'site_of', 'pine_line_for', 'INFINITY_TO_INT', 'NAN_TO_INT']
+__all__ = ['located', 'coded', 'internal', 'INTERNAL_ERROR_REPORT', 'site_of', 'pine_line_for', 'INFINITY_TO_INT', 'NAN_TO_INT']
 
 #: CPython's message of ``int()`` / ``round()`` of an infinite float.
 INFINITY_TO_INT = "cannot convert float infinity to integer"
 #: CPython's message of ``int()`` / ``round()`` of a NaN.
 NAN_TO_INT = "cannot convert float NaN to integer"
+
+#: What a run asks for after an internal error (``I0004``)
+INTERNAL_ERROR_REPORT = ("This is an error of PyneCore, not of the script. Please report it at "
+                         "https://github.com/pynesys/pynecore/issues with the script, the data and "
+                         "the traceback.")
 
 _UNBOUND_RE = re.compile(r"'([^']+)'")
 
@@ -37,6 +44,22 @@ _INLINE_ERRORS: dict[str, tuple[type[BaseException], Callable[..., PyneError]]] 
     'array.get': (IndexError, lambda id_, index: errorcodes.IndexOutOfRangeError(
         function='array.get', index=index, size=len(id_))),
 }
+
+#: The directory of the ``pynecore`` package: the runtime's own code, without
+#: the interpreter's standard library that :data:`RUNTIME_ROOTS` holds too
+_PACKAGE_ROOT = str(Path(__file__).resolve().parent.parent) + os.sep
+
+#: The broker and plugin APIs under the package: their exceptions are the
+#: contract with a plugin, which the run reports as they are
+_API_ROOTS = tuple(_PACKAGE_ROOT + os.path.join('core', d) + os.sep for d in ('broker', 'plugin'))
+
+#: Exceptions the runtime raises for the machine, the environment or the
+#: script's own code, never for a failure of its own: the disk, the network,
+#: the time zone database, the stack, the memory, and a type error, which
+#: inside the library is almost always a wrong argument of hand-written Pyne
+#: code (``math.sqrt('x')``)
+_NOT_INTERNAL: tuple[type[BaseException], ...] = (
+    OSError, RecursionError, MemoryError, TimezoneNotFoundError, TypeError)
 
 #: A holder of :data:`~pynecore.transformers.call_inline.INLINE_SITES` whose value is gone
 _MISSING = object()
@@ -119,7 +142,52 @@ def coded(exc: BaseException) -> PyneError | None:
         return errorcodes.InfinityToIntegerError()
     if isinstance(exc, ValueError) and str(exc) == NAN_TO_INT:
         return errorcodes.NaToIntegerError()
+    if isinstance(exc, AssertionError) and _raised_by_script(exc):
+        return errorcodes.AssertionFailedError(message=str(exc))
     return None
+
+
+def internal(exc: BaseException) -> PyneError | None:
+    """The ``I0004`` error an exception that stopped a run stands for: one
+    without a code that the runtime's own code raised, which is an error of
+    PyneCore, not of the script.
+
+    An ``AttributeError`` of a ``__getattr__`` is the answer to a name the
+    script misspelled (``lib.foo``), a ``TypeError`` is a wrong argument of
+    the script, and the other exceptions of :data:`_NOT_INTERNAL` are the
+    machine's; none of them is internal.
+
+    :param exc: The exception.
+    :return: The internal error, or None when ``exc`` has a code, or the
+        script's code, the standard library or a broker or plugin API raised it.
+    """
+    if not isinstance(exc, Exception) or isinstance(exc, _NOT_INTERNAL) \
+            or coded(exc) is not None:
+        return None
+    tb = exc.__traceback__
+    if tb is None:
+        return None
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    code = tb.tb_frame.f_code
+    path = os.path.abspath(code.co_filename)
+    if not path.startswith(_PACKAGE_ROOT) or path.startswith(_API_ROOTS):
+        return None
+    if isinstance(exc, AttributeError) and code.co_name == '__getattr__':
+        return None
+    text = str(exc)
+    return errorcodes.InternalError(what=type(exc).__name__ + (f": {text}" if text else ''))
+
+
+def _raised_by_script(exc: BaseException) -> bool:
+    """Whether the innermost frame of ``exc``'s traceback is the script's code:
+    its own ``assert`` failed, not one of the runtime's."""
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    return user_traceback(tb) is tb
 
 
 def site_of(tb: TracebackType | None) -> SiteLoc | None:

@@ -313,7 +313,7 @@ def info(formatString: str, *args: Any, **kwargs: Any) -> None:
         of them
     """
     # Checked here, not where the handler formats: logging would swallow the error there
-    _check_format_args(args)
+    _check_format_args('log.info', args)
     # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:
@@ -334,7 +334,7 @@ def warning(formatString: str, *args: Any, **kwargs: Any) -> None:
         of them
     """
     # Checked here, not where the handler formats: logging would swallow the error there
-    _check_format_args(args)
+    _check_format_args('log.warning', args)
     # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:
@@ -355,7 +355,7 @@ def error(formatString: str, *args: Any, **kwargs: Any) -> None:
         of them
     """
     # Checked here, not where the handler formats: logging would swallow the error there
-    _check_format_args(args)
+    _check_format_args('log.error', args)
     # noinspection PyProtectedMember
     if lib._lib_semaphore:
         if _security_logger:

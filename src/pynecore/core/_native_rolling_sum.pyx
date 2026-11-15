@@ -29,7 +29,9 @@ import array as _array
 
 from . import rolling_sum as _rs
 from .safe_convert import native_int as _native_int
-from ..errorcodes import ArgumentNotPositiveError as _ArgumentNotPositiveError
+from ..errorcodes import (ArgumentNotPositiveError as _ArgumentNotPositiveError,
+                          ArgumentOutOfRangeError as _ArgumentOutOfRangeError,
+                          SeriesSubscriptError as _SeriesSubscriptError)
 from .series import SeriesImpl as _SeriesImpl
 from ..types.na import na_float as _na_float
 
@@ -178,7 +180,8 @@ cdef class SumMachine:
     cdef int _check_stop(self, long long stop) except -1:
         # The bound check of a ``SeriesImpl`` slice read
         if stop > self.values_size:
-            raise IndexError("Slice stop index out of range!")
+            raise _SeriesSubscriptError(subscript=f":{stop}",
+                                        why="it reaches past the stored history")
         return 0
 
     cdef int _resize_values(self, long long max_bars_back) except -1:
@@ -189,8 +192,9 @@ cdef class SumMachine:
             raise _ArgumentNotPositiveError(function='max_bars_back', parameter='num',
                                             value=max_bars_back)
         if max_bars_back > _SeriesImpl.MAXIMUM_MAX_BARS_BACK:
-            raise ValueError(
-                f"The max_bars_back cannot exceed {_SeriesImpl.MAXIMUM_MAX_BARS_BACK}!")
+            raise _ArgumentOutOfRangeError(function='max_bars_back', parameter='num', low=1,
+                                           high=_SeriesImpl.MAXIMUM_MAX_BARS_BACK,
+                                           value=max_bars_back)
         new_cap = max_bars_back + 1
         if new_cap == self.values_cap:
             return 0

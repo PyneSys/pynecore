@@ -11,7 +11,7 @@ from ..types import linefill as linefill_types
 from ..types import matrix as matrix_types
 from ..types import polyline as polyline_types
 from ..types import table as table_types
-from ..errorcodes import NaObjectCopyError
+from ..errorcodes import CallArgumentsError, NaObjectCopyError, UnknownMethodAtRunError
 from ..types.na import NA
 
 __all__ = ['udt', 'udt_copy']
@@ -75,19 +75,21 @@ def udt_copy(obj: Any, **changes: Any) -> Any:
     :param obj: The object to copy
     :param changes: Field values to override on the copy; user-defined types only
     :return: An independent copy of ``obj``, or ``obj`` itself when it is na
-    :raises TypeError: If the object's type defines no copy, or if field overrides
-                       are passed for anything but a user-defined type
+    :raises UnknownMethodAtRunError: If the object's type defines no copy
+    :raises CallArgumentsError: If field overrides are passed for anything but a
+        user-defined type
     """
     obj_type = type(obj)
     if obj_type in _UNCOPYABLE:
-        raise TypeError(f"{obj_type.__name__} has no copy method")
+        raise UnknownMethodAtRunError(type_=obj_type.__name__, method='copy')
     builtin = _BUILTIN_COPY.get(obj_type)
     if builtin is not None:
         if changes:
             # Not expressible in Pine: the builtin ``.copy()`` takes no arguments, and
             # only ``@udt``'s own ``copy`` forwards changes, which lands on the fallback
             # below. Refuse rather than poke attributes on a registered chart object.
-            raise TypeError(f"{obj_type.__name__} copy takes no field overrides")
+            raise CallArgumentsError(function=f"{obj_type.__name__}.copy",
+                                     why="it takes no field overrides")
         return builtin(obj)
     if isinstance(obj, NA):
         na_type = obj.__pyne_na_type__
@@ -99,7 +101,7 @@ def udt_copy(obj: Any, **changes: Any) -> Any:
             # An na holds no fields to override. Dropping them silently would answer a
             # typo in hand-written Pyne with a plausible-looking na, so it is refused
             # on the same footing as a builtin receiver.
-            raise TypeError("na copy takes no field overrides")
+            raise CallArgumentsError(function="copy", why="an `na` takes no field overrides")
         # Measured on TradingView: copying an na drawing leaves the registry
         # untouched and returns na. NA is interned per declared type, so this
         # value already IS the na the namespace copy would return.

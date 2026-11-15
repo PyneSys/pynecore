@@ -49,6 +49,7 @@ from collections import defaultdict
 from types import FunctionType, UnionType
 
 from .instance_state import _bind_target, _make_state, register_shared_cache, __dyn_default__  # noqa: internal API
+from ..errorcodes import WrongOperandTypeError
 from ..types.base import StrLiteral
 from ..types.matrix import Matrix
 from ..types.na import NA
@@ -401,6 +402,19 @@ def _takes_pinned(impl: Implementation, argc: int, probes: list[tuple[int, Any]]
     return True
 
 
+def _no_overload_error(qualname: str, args: tuple, kwargs: dict) -> WrongOperandTypeError:
+    """The error for a call no implementation of an overloaded function takes.
+
+    :param qualname: The function's qualified name; a builtin's is written as in Pine.
+    :param args: The positional arguments of the call.
+    :param kwargs: The keyword arguments of the call.
+    :return: The error to raise.
+    """
+    types = [type(v).__name__ for v in args] + [f"{k}={type(v).__name__}" for k, v in kwargs.items()]
+    return WrongOperandTypeError(operation=qualname.removeprefix('pynecore.lib.'),
+                                 operand=f"the arguments ({', '.join(types)})")
+
+
 def _type_token(value: Any) -> Any:
     """Hashable token capturing exactly the properties ``_check_type``
     discriminates on, so that two arguments with equal tokens are
@@ -528,7 +542,7 @@ def _anchored(impls: list[Implementation], qualname: str,
             if impl is None:
                 impl = _select(impls, args, kwargs)
                 if impl is None:
-                    raise TypeError(f"No matching implementation found for {qualname}: {args}, {kwargs}")
+                    raise _no_overload_error(qualname, args, kwargs)
                 _select_cache[key] = impl
             if types is not None:
                 # A token that IS its argument's type carries nothing the type does

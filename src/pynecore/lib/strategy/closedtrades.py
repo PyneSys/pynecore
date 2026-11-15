@@ -45,11 +45,13 @@ def commission(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return 0.0
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].commission
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].commission
+    except IndexError:
         return 0.0
 
 
@@ -64,11 +66,13 @@ def entry_bar_index(trade_num: int) -> PyneInt:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_int
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return na_int
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return pine_int(lib._script.position.closed_trades[trade_num].entry_bar_index)
-    except (IndexError, AssertionError):
+        return pine_int(position.closed_trades[trade_num].entry_bar_index)
+    except IndexError:
         return na_int
 
 
@@ -83,12 +87,14 @@ def entry_comment(trade_num: int) -> PyneStr:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return NA(str)
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        comment = lib._script.position.closed_trades[trade_num].entry_comment
+        comment = position.closed_trades[trade_num].entry_comment
         return comment if comment is not None else NA(str)
-    except (IndexError, AssertionError):
+    except IndexError:
         return NA(str)
 
 
@@ -103,12 +109,14 @@ def entry_id(trade_num: int) -> PyneStr:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return NA(str)
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        entry_id_ = lib._script.position.closed_trades[trade_num].entry_id
+        entry_id_ = position.closed_trades[trade_num].entry_id
         return entry_id_ if entry_id_ is not None else NA(str)
-    except (IndexError, AssertionError):
+    except IndexError:
         return NA(str)
 
 
@@ -123,11 +131,13 @@ def entry_price(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return na_float
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].entry_price
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].entry_price
+    except IndexError:
         return na_float
 
 
@@ -142,11 +152,13 @@ def entry_time(trade_num: int) -> PyneInt:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_int
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return na_int
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return pine_int(lib._script.position.closed_trades[trade_num].entry_time)
-    except (IndexError, AssertionError):
+        return pine_int(position.closed_trades[trade_num].entry_time)
+    except IndexError:
         return na_int
 
 
@@ -161,11 +173,13 @@ def exit_bar_index(trade_num: int) -> PyneInt:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_int
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return na_int
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return pine_int(lib._script.position.closed_trades[trade_num].exit_bar_index)
-    except (IndexError, AssertionError):
+        return pine_int(position.closed_trades[trade_num].exit_bar_index)
+    except IndexError:
         return na_int
 
 
@@ -180,11 +194,13 @@ def exit_comment(trade_num: int) -> PyneStr:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return NA(str)
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].exit_comment
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].exit_comment
+    except IndexError:
         return NA(str)
 
 
@@ -199,12 +215,14 @@ def exit_id(trade_num: int) -> PyneStr:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return NA(str)
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return NA(str)
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        exit_id_ = lib._script.position.closed_trades[trade_num].exit_id
+        exit_id_ = position.closed_trades[trade_num].exit_id
         return exit_id_ if exit_id_ is not None else NA(str)
-    except (IndexError, AssertionError):
+    except IndexError:
         return NA(str)
 
 
@@ -219,11 +237,13 @@ def exit_price(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_float
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return na_float
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].exit_price
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].exit_price
+    except IndexError:
         return na_float
 
 
@@ -237,11 +257,13 @@ def exit_time(trade_num: int) -> PyneInt:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return na_int
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return na_int
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return pine_int(lib._script.position.closed_trades[trade_num].exit_time)
-    except (IndexError, AssertionError):
+        return pine_int(position.closed_trades[trade_num].exit_time)
+    except IndexError:
         return na_int
 
 
@@ -256,11 +278,13 @@ def max_drawdown(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return 0.0
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].max_drawdown
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].max_drawdown
+    except IndexError:
         return 0.0
 
 
@@ -275,11 +299,13 @@ def max_drawdown_percent(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return 0.0
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].max_drawdown_percent
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].max_drawdown_percent
+    except IndexError:
         return 0.0
 
 
@@ -294,11 +320,13 @@ def max_runup(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return 0.0
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].max_runup
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].max_runup
+    except IndexError:
         return 0.0
 
 
@@ -313,11 +341,13 @@ def max_runup_percent(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return 0.0
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].max_runup_percent
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].max_runup_percent
+    except IndexError:
         return 0.0
 
 
@@ -332,11 +362,13 @@ def profit(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return 0.0
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].profit
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].profit
+    except IndexError:
         return 0.0
 
 
@@ -351,11 +383,13 @@ def profit_percent(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return 0.0
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        return lib._script.position.closed_trades[trade_num].profit_percent
-    except (IndexError, AssertionError):
+        return position.closed_trades[trade_num].profit_percent
+    except IndexError:
         return 0.0
 
 
@@ -364,13 +398,15 @@ def size(trade_num: int) -> PyneFloat:
     trade_num = _trade_index(trade_num)
     if trade_num < 0:
         return 0.0
+    script = lib._script
+    position = script.position if script is not None else None
+    if position is None:
+        return 0.0
     try:
-        assert lib._script is not None
-        assert lib._script.position is not None
-        trade = lib._script.position.closed_trades[trade_num]
+        trade = position.closed_trades[trade_num]
         flip = lib.strategy._entry_flip
         return trade.size if flip is None else flip.script_size(trade)
-    except (IndexError, AssertionError):
+    except IndexError:
         return 0.0
 
 

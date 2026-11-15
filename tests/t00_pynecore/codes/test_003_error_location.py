@@ -6,14 +6,16 @@ child sends when a coded error stops it.
 """
 import hashlib
 import json
+import os
 import pickle
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from pynecore import errorcodes
-from pynecore.core.error_location import (INFINITY_TO_INT, NAN_TO_INT, coded, located,
-                                          pine_line_for)
+from pynecore import errorcodes, lib
+from pynecore.core.error_location import (INFINITY_TO_INT, NAN_TO_INT, _PACKAGE_ROOT, coded,
+                                          internal, located, pine_line_for)
 from pynecore.core.errors import SiteLoc
 from pynecore.core.security_process import _failure_report
 from pynecore.pynesys.api import CompileResponse
@@ -68,6 +70,61 @@ def __test_located_fills_in_the_bar_and_the_scripts_line__(tmp_path: Path):
     assert error.__traceback__ is exc.__traceback__
     other = KeyError('k')
     assert located(other, 7, 0) is other
+
+
+def __test_helper_raised_at(source: str, filename: str) -> BaseException:
+    """The exception ``source`` raises when its code claims to be the file
+    ``filename``: a frame of the runtime, of the script or of an API."""
+    try:
+        exec(compile(source, filename, 'exec'), {'__name__': 'probe'})
+    except Exception as e:  # noqa: BLE001 - the test inspects any exception
+        return e
+    raise AssertionError("the source did not raise")
+
+
+def __test_a_failed_assert_of_the_script_is_r0004__(tmp_path: Path):
+    """The script's own ``assert`` is R0004 with its message; a runtime's is not coded"""
+    exc = __test_helper_raised('x = 1\nassert x > 1, "x reached 1"\n', tmp_path / 'script.py')
+    error = coded(exc)
+    assert type(error) is errorcodes.AssertionFailedError
+    assert error.params == {'message': 'x reached 1'}
+    bare = coded(__test_helper_raised('assert False\n', tmp_path / 'bare.py'))
+    assert type(bare) is errorcodes.AssertionFailedError and bare.params == {'message': ''}
+    runtime = os.path.join(_PACKAGE_ROOT, 'core', 'probe.py')
+    assert coded(__test_helper_raised_at('assert False, "an invariant"\n', runtime)) is None
+    assert coded(AssertionError("no traceback")) is None
+
+
+def __test_an_uncoded_error_of_the_runtime_is_i0004__():
+    """An uncoded exception the runtime's own code raised is I0004, with its type and text"""
+    runtime = os.path.join(_PACKAGE_ROOT, 'core', 'probe.py')
+    error = internal(__test_helper_raised_at('raise KeyError("slot")\n', runtime))
+    assert type(error) is errorcodes.InternalError
+    assert error.params == {'what': "KeyError: 'slot'"}
+    bare = internal(__test_helper_raised_at('raise RuntimeError\n', runtime))
+    assert bare is not None and bare.params == {'what': 'RuntimeError'}
+
+
+def __test_what_is_not_an_internal_error__(tmp_path: Path):
+    """The script's own error, the standard library's, the machine's, a misspelled
+    name, a wrong argument, a broker API's and a coded one are no I0004"""
+    runtime = os.path.join(_PACKAGE_ROOT, 'core', 'probe.py')
+    assert internal(__test_helper_raised('raise KeyError("k")\n', tmp_path / 'script.py')) is None
+    with pytest.raises(ValueError) as stdlib:
+        datetime.strptime('x', '%Y')
+    assert internal(stdlib.value) is None
+    assert internal(__test_helper_raised_at('raise OSError("disk full")\n', runtime)) is None
+    misspelled = 'def __getattr__(name):\n    raise AttributeError(name)\n__getattr__("foo")\n'
+    assert internal(__test_helper_raised_at(misspelled, runtime)) is None
+    broker = os.path.join(_PACKAGE_ROOT, 'core', 'broker', 'probe.py')
+    assert internal(__test_helper_raised_at('raise RuntimeError("venue")\n', broker)) is None
+    assert internal(__test_helper_raised_at('1 // 0\n', runtime)) is None
+    assert internal(__test_helper_raised_at('raise TypeError("an argument")\n', runtime)) is None
+    with pytest.raises(TypeError) as argument:
+        lib.math.sqrt('x')  # type: ignore[arg-type]
+    assert internal(argument.value) is None
+    assert internal(errorcodes.DivisionByZeroError()) is None
+    assert internal(RuntimeError("no traceback")) is None
 
 
 def __test_located_keeps_a_location_the_error_already_has__():

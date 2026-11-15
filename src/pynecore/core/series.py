@@ -3,7 +3,7 @@ from typing import Any, TypeVar, Generic, Iterator, Callable, cast, overload
 
 from types import ModuleType
 
-from ..errorcodes import ArgumentNotPositiveError
+from ..errorcodes import ArgumentNotPositiveError, ArgumentOutOfRangeError, SeriesSubscriptError
 from ..types.na import NA, na_float, na_str
 
 __all__ = ['SeriesImpl', 'CollectionSeriesImpl', 'close_collection_bar', 'inline_series']
@@ -18,6 +18,17 @@ T = TypeVar('T')
 # __new__ deliberately types as T (so ``NA(X)`` flows anywhere an ``X`` is
 # expected), which here would be a TypeVar.
 _NA_UNTYPED: NA = cast(NA, NA(T))
+
+
+def slice_text(key: slice) -> str:
+    """The source text of a series slice subscript, as an error message shows it.
+
+    :param key: The slice.
+    :return: ``start:stop``, with ``:step`` when there is one.
+    """
+    text = ('' if key.start is None else str(key.start)) + ':' \
+        + ('' if key.stop is None else str(key.stop))
+    return text if key.step is None else f"{text}:{key.step}"
 
 
 def _na_of(value: Any) -> Any:
@@ -145,13 +156,15 @@ class SeriesImpl(Generic[T]):
 
         :param new_max_bars_back: The new 'max_bars_back' value.
         :raises ArgumentNotPositiveError: If new_value <= 0.
-        :raises ValueError: Above :attr:`MAXIMUM_MAX_BARS_BACK`.
+        :raises ArgumentOutOfRangeError: Above :attr:`MAXIMUM_MAX_BARS_BACK`.
         """
         if new_max_bars_back <= 0:
             raise ArgumentNotPositiveError(function='max_bars_back', parameter='num',
                                            value=new_max_bars_back)
         if new_max_bars_back > SeriesImpl.MAXIMUM_MAX_BARS_BACK:
-            raise ValueError(f"The max_bars_back cannot exceed {self.MAXIMUM_MAX_BARS_BACK}!")
+            raise ArgumentOutOfRangeError(function='max_bars_back', parameter='num', low=1,
+                                          high=SeriesImpl.MAXIMUM_MAX_BARS_BACK,
+                                          value=new_max_bars_back)
 
         if new_max_bars_back == self._max_bars_back:
             return  # No change
@@ -397,7 +410,7 @@ class SeriesImpl(Generic[T]):
 
         :param key: Number offset, NA, or slice
         :return: Single value for a number offset, ReadOnlySeriesView for slice
-        :raises TypeError: If key is not a number, NA, or slice
+        :raises SeriesSubscriptError: If key is not a number, NA, or slice
         """
         # One conversion is the whole hot loop: a Pine int offset is a float as
         # often as a Python int (loop counters, bar_index arithmetic), and
@@ -413,7 +426,7 @@ class SeriesImpl(Generic[T]):
             if isinstance(key, NA) or key != key:
                 offset = 0
             else:
-                raise TypeError("Series indices must be numbers or slices")  # noqa
+                raise SeriesSubscriptError(subscript=key, why="it is neither a number nor a slice")  # noqa
         # Pine: out-of-range subscript -> na (covers both negative and
         # positive past-end indices).
         if offset < 0 or offset >= self._size:
@@ -440,13 +453,14 @@ class SeriesImpl(Generic[T]):
         stop = self._size if key.stop is None else key.stop
 
         if start < 0 or stop < 0:
-            raise IndexError("Negative indices not supported in slice!")
+            raise SeriesSubscriptError(subscript=slice_text(key), why="an offset is negative")
 
         if key.step is not None and key.step != 1:
-            raise ValueError("Step value not supported in slice!")
+            raise SeriesSubscriptError(subscript=slice_text(key), why="a step is not supported")
 
         if stop > self._size:
-            raise IndexError("Slice stop index out of range!")
+            raise SeriesSubscriptError(subscript=slice_text(key),
+                                       why="it reaches past the stored history")
 
         # Ensure start <= stop
         if start > stop:
@@ -564,15 +578,15 @@ class ReadOnlySeriesView(Generic[T]):
     def __getitem__(self, idx: int | float) -> T | NA[T]:
         """Get item using Pine indexing (a fractional offset is truncated)"""
         try:
-            idx = int(idx)
+            offset = int(idx)
         except (TypeError, ValueError):
-            raise TypeError("Only number indexing is supported") from None  # noqa
-        if idx < 0:
-            raise IndexError("Negative indices not supported")
-        if idx >= len(self):
-            raise IndexError("Index out of range")
+            raise SeriesSubscriptError(subscript=idx, why="it is not a number") from None  # noqa
+        if offset < 0:
+            raise SeriesSubscriptError(subscript=idx, why="the offset is negative")
+        if offset >= len(self):
+            raise SeriesSubscriptError(subscript=idx, why="it reaches past the end of the slice")
 
-        actual_idx = idx + self._start
+        actual_idx = offset + self._start
         pos = self._write_pos - 1 - actual_idx
         if pos < 0:
             pos += self._capacity

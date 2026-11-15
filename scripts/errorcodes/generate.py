@@ -450,6 +450,87 @@ def docs(codes: list[Code], intro: str) -> dict[str, str]:
     return pages
 
 
+#: The pages of the website's code reference: file name, the domains it holds,
+#: and its front matter's title, description, icon, weight and tags
+SITE_PAGES: tuple[tuple[str, str, str, str, str, int, tuple[str, ...]], ...] = (
+    ("runtime-errors.md", "RI", "Run-Time Errors",
+     "Look up the error codes a PyneCore run stops with: what each R code means, the "
+     "message it shows and what to change in the script or its data.",
+     "error", 431, ("error-codes", "runtime", "debugging")),
+    ("pyne-code-rules.md", "P", "Pyne Code Rules",
+     "Look up the P codes PyneCore reports when a module breaks a rule of Pyne code, "
+     "before it runs: the message, the place it points at and the fix.",
+     "code", 432, ("error-codes", "pyne-code", "transformations")),
+    ("edge-profile.md", "E", "Pyne Edge Profile",
+     "Look up the E codes of the Pyne Edge profile check: the Python constructs and "
+     "types a script outside the profile uses, and how to stay inside it.",
+     "verified", 433, ("error-codes", "pyne-edge")),
+)
+#: The front matter of the reference's index page
+SITE_INDEX = ("Diagnostic Codes",
+              "Every error code PyneCore reports, with its message and meaning: the run's "
+              "R codes, the Pyne code rules (P) and the Pyne Edge profile (E).",
+              "bug_report", 430, ("error-codes", "debugging"))
+#: The date a page's front matter starts with, when the page is new
+SITE_DATE = "2026-11-15"
+
+
+def _front_matter(path: Path, title: str, description: str, icon: str, weight: int,
+                  tags: tuple[str, ...]) -> str:
+    """The front matter of the docs page ``path``: the one on disk, which may
+    have been curated since, or a new one."""
+    if path.is_file():
+        text = path.read_text(encoding="utf-8")
+        end = text.find("\n---\n-->\n")
+        if text.startswith("<!--\n---\n") and end != -1:
+            return text[:end + len("\n---\n-->\n")]
+    lines = ["<!--", "---", f"weight: {weight}", f'title: "{title}"',
+             f'description: "{description}"', f'icon: "{icon}"', f'date: "{SITE_DATE}"',
+             f'lastmod: "{SITE_DATE}"', "draft: false", "toc: true",
+             'categories: ["Reference"]', "tags: [" + ", ".join(f'"{t}"' for t in tags) + "]",
+             "---", "-->", ""]
+    return "\n".join(lines)
+
+
+def site_docs(codes: list[Code], docs_dir: Path) -> dict[str, str]:
+    """The website's code reference: ``README.md``, the index, and one page per
+    domain group of :data:`SITE_PAGES`, each code a section with its own
+    anchor (``#R0010``), by file name."""
+    pages: dict[str, str] = {}
+    page_of: dict[str, str] = {}
+    for name, domains, title, description, icon, weight, tags in SITE_PAGES:
+        held = sorted((c for c in codes if c.code[0] in domains),
+                      key=lambda c: (domains.index(c.code[0]), c.code))
+        page = [_front_matter(docs_dir / name, title, description, icon, weight, tags),
+                f"# {title}", ""]
+        for c in held:
+            page_of[c.code] = name
+            fields = [("Severity", c.severity), ("Since", c.since), ("Retired", c.retired),
+                      ("PyneCore raises", ", ".join(f"`{p}`" for p in c.python))]
+            fields = [(field, value) for field, value in fields if value]
+            rows = [[field for field, _ in fields], [value for _, value in fields]]
+            page += [f'<a id="{c.code}"></a>', "", f"## {c.code}: {c.title}", "",
+                     *_table(rows), "", "Message:", "", "```text", c.message, "```", ""]
+            if c.fix_title is not None:
+                page += [f"Quick fix: {c.fix_title}", ""]
+            page += [c.explanation.rstrip("\n"), ""]
+        pages[name] = "\n".join(page)
+    title, description, icon, weight, tags = SITE_INDEX
+    index = [_front_matter(docs_dir / "README.md", title, description, icon, weight, tags),
+             f"# {title}", "",
+             "Every code PyneCore reports. A run, the transform and the Pyne Edge profile",
+             "check each name their errors by code, so the code in a message leads here.", ""]
+    for name, domains, page_title, *_ in SITE_PAGES:
+        held = sorted((c for c in codes if page_of.get(c.code) == name),
+                      key=lambda c: (domains.index(c.code[0]), c.code))
+        rows = [["Code", "Severity", "Title"]]
+        rows += [[f"[{c.code}]({name}#{c.code})", c.severity + (" (retired)" if c.retired else ""),
+                  c.title] for c in held]
+        index += [f"## [{page_title}]({name})", "", *_table(rows), ""]
+    pages["README.md"] = "\n".join(index)
+    return pages
+
+
 def rustfmt(code: str, edition: str, workspace: Path) -> str:
     """``code`` as ``cargo fmt`` leaves it, so formatting the workspace keeps it
     current: ``edition`` is the crate's, and ``workspace`` the Cargo workspace
@@ -496,8 +577,7 @@ def outputs() -> dict[Path, str]:
              FORMAT_ARG_RUST: rustfmt(format_arg_rust(vectors, "scripts/errorcodes/format_arg.toml"), "2024",
                                       RUST_ROOT),
              PYTHON: exceptions(codes, "scripts/errorcodes/registry.toml")}
-    pages = docs(codes, "Every code PyneCore reports.")
-    files.update({DOCS / name: text for name, text in pages.items()})
+    files.update({DOCS / name: text for name, text in site_docs(codes, DOCS).items()})
     return files
 
 

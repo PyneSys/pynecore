@@ -4,10 +4,9 @@
 ``str.format`` and ``log.*`` format int, float, bool and string values and arrays of them,
 and reject every other argument type instead of printing a Python object representation.
 """
-import re
-
 import pytest
 
+from pynecore.errorcodes import WrongOperandTypeError
 from pynecore.lib import array, color, log, map, matrix, string
 
 
@@ -32,23 +31,26 @@ def __test_formattable_arguments_pass__():
 ])
 def __test_unformattable_argument_is_rejected__(value, type_name):
     """a matrix, color or map argument raises, even when no placeholder reads it"""
-    with pytest.raises(TypeError, match=re.escape(f"argument {{0}} is a {type_name}")):
+    with pytest.raises(WrongOperandTypeError) as raised:
         string.format("{0}", value)
-    with pytest.raises(TypeError, match=re.escape(f"argument {{1}} is a {type_name}")):
+    assert raised.value.params == {'operation': 'str.format',
+                                   'operand': f"a {type_name} as argument {{0}}"}
+    with pytest.raises(WrongOperandTypeError) as raised:
         string.format("{0}", 1, value)
+    assert raised.value.params['operand'] == f"a {type_name} as argument {{1}}"
 
 
 def __test_array_of_unformattable_elements_is_rejected__():
     """an array of colors is not an array of a formattable type"""
-    with pytest.raises(TypeError, match=re.escape("argument {0} is an array of Color")):
+    with pytest.raises(WrongOperandTypeError) as raised:
         string.format("{0}", array.from_items(color.red))
+    assert raised.value.params['operand'] == "an array of Color as argument {0}"
 
 
 def __test_log_rejects_at_the_call__():
     """log.* raises at the call site, not inside the logging handler that formats lazily"""
-    with pytest.raises(TypeError, match=re.escape("argument {0} is a Matrix")):
-        log.info("{0}", matrix.new(1, 1, -3))
-    with pytest.raises(TypeError, match=re.escape("argument {0} is a Color")):
-        log.warning("{0}", color.red)
-    with pytest.raises(TypeError, match=re.escape("argument {0} is a dict")):
-        log.error("{0}", map.new())
+    for function, args in (('log.info', matrix.new(1, 1, -3)), ('log.warning', color.red),
+                           ('log.error', map.new())):
+        with pytest.raises(WrongOperandTypeError) as raised:
+            getattr(log, function.removeprefix('log.'))("{0}", args)
+        assert raised.value.params['operation'] == function

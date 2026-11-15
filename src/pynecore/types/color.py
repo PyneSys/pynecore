@@ -1,5 +1,7 @@
 import math
 
+from ..errorcodes import ArgumentOutOfRangeError
+
 
 def _channel(value: float) -> int:
     """
@@ -99,9 +101,11 @@ class Color:
         255: fully opaque
 
         :param alpha: Alpha value (0-255)
+        :raises ArgumentOutOfRangeError: If ``alpha`` is outside 0..255
         """
         if not (0 <= alpha <= 255):
-            raise ValueError("Alpha must be between 0 and 255")
+            raise ArgumentOutOfRangeError(function='Color.a', parameter='alpha', low=0, high=255,
+                                          value=alpha)
         self.value = (self.value & 0xFFFFFF00) | alpha
 
     @property

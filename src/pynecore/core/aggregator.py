@@ -10,10 +10,11 @@ source stream, which reproduces TradingView's holiday-aware grid.
 import logging
 import math
 from datetime import date, datetime, timezone as dt_timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from ..errorcodes import DecimalInvalidError
 from .ohlcv import OHLCVWriter
 from .ohlcv import OHLCVReader
 from .ohlcv import restore_f32_volume
@@ -75,8 +76,15 @@ def validate_aggregation(source_tf: str, target_tf: str) -> None:
         )
 
 
-def _merge_candles(candles: list[OHLCV], bar_time: int,
-                   restore_volume: bool = False) -> OHLCV:
+#: The ``function`` and ``why`` of the error of a volume sum that holds both
+#: infinities, per caller, in the AOT's words
+VOLUME_ERROR_AGGREGATE = ('pyne data aggregate', 'the summed volumes hold both +inf and -inf')
+VOLUME_ERROR_SECURITY = ('request.security', 'the summed volumes hold both +inf and -inf')
+VOLUME_ERROR_MAGNIFIER = ('strategy', 'the sub-bar volumes add up to infinity minus infinity')
+
+
+def _merge_candles(candles: list[OHLCV], bar_time: int, restore_volume: bool = False,
+                   volume_error: tuple[str, str] = VOLUME_ERROR_AGGREGATE) -> OHLCV:
     """
     Merge a window of candles into a single aggregated candle.
 
@@ -84,6 +92,8 @@ def _merge_candles(candles: list[OHLCV], bar_time: int,
     :param bar_time: Aligned bar opening timestamp in milliseconds
     :param restore_volume: Whether the source volumes carry float32 storage
                error that has to be undone before summing
+    :param volume_error: The ``function`` and ``why`` of the error raised when the
+               volumes hold both +inf and -inf: the caller's, as the AOT reports it
     :return: Aggregated OHLCV candle
     """
     # The target file stores volume as an absolute f64, so its values are read
@@ -111,13 +121,17 @@ def _merge_candles(candles: list[OHLCV], bar_time: int,
             low=min(a.low for a in asks),
             close=asks[-1].close,
         )
+    try:
+        volume = float(sum(Decimal(repr(v)) for v in volumes))
+    except InvalidOperation:
+        raise DecimalInvalidError(function=volume_error[0], why=volume_error[1]) from None
     return OHLCV(
         timestamp=bar_time,
         open=candles[0].open,
         high=max(c.high for c in candles),
         low=min(c.low for c in candles),
         close=candles[-1].close,
-        volume=float(sum(Decimal(repr(v)) for v in volumes)),
+        volume=volume,
         ask=ask,
     )
 
@@ -179,6 +193,7 @@ def aggregate_ohlcv(
         sym_type: str | None = None,
         source_tf: str | None = None,
         prefix: str | None = None,
+        volume_error: tuple[str, str] = VOLUME_ERROR_AGGREGATE,
 ) -> tuple[int, int]:
     """
     Aggregate OHLCV data from a lower timeframe file to a higher timeframe file.
@@ -211,6 +226,8 @@ def aggregate_ohlcv(
                trading days.
     :param prefix: ``SymInfo.prefix``, the feed the data comes from; a CFD feed
                has no exchange calendar and stays on the weekday grid.
+    :param volume_error: The ``function`` and ``why`` of the error of a volume sum
+               that holds both +inf and -inf (see :func:`_merge_candles`)
     :return: Tuple of (source_candles_read, target_candles_written)
     :raises ValueError: If ``target_path`` is the source file (also via a symlink
                or hard link) — truncating it would destroy the input before it is read
@@ -244,7 +261,7 @@ def aggregate_ohlcv(
                 source_path.name, multiplier, modifier)
         return _aggregate_observed(
             source_path, target_path, modifier, multiplier, tz,
-            session_starts, opening_hours, bar_end, day_step)
+            session_starts, opening_hours, bar_end, day_step, volume_error)
 
     resampler = Resampler.get_resampler(target_tf)
 
@@ -275,7 +292,7 @@ def aggregate_ohlcv(
 
                 if current_bar_time is not None and bar_time != current_bar_time:
                     # New bar boundary — flush the window
-                    writer.write(_merge_candles(window, current_bar_time, restore_volume))
+                    writer.write(_merge_candles(window, current_bar_time, restore_volume, volume_error))
                     target_count += 1
                     window = []
 
@@ -284,7 +301,7 @@ def aggregate_ohlcv(
 
             # Flush last window
             if window and current_bar_time is not None:
-                writer.write(_merge_candles(window, current_bar_time, restore_volume))
+                writer.write(_merge_candles(window, current_bar_time, restore_volume, volume_error))
                 target_count += 1
 
     return source_count, target_count
@@ -300,6 +317,7 @@ def _aggregate_observed(
         opening_hours: list | None,
         bar_end: _SourceBarEnd | None = None,
         day_step: int = 1,
+        volume_error: tuple[str, str] = VOLUME_ERROR_AGGREGATE,
 ) -> tuple[int, int]:
     """
     Multi-period aggregation for 'observed' symbols (exchange-listed).
@@ -328,6 +346,8 @@ def _aggregate_observed(
                the holiday half-day fold (see :class:`ObservedDayCounter`). ``None``
                for a daily or coarser source, which is already folded.
     :param day_step: Trading days one source bar spans (the ``n`` of an nD source)
+    :param volume_error: The ``function`` and ``why`` of the error of a volume sum
+               that holds both +inf and -inf (see :func:`_merge_candles`)
     :return: Tuple of (source_candles_read, target_candles_written)
     """
     on = overnight_opens(opening_hours, session_starts)
@@ -365,7 +385,7 @@ def _aggregate_observed(
                 if group_key is not None and key != group_key:
                     # A non-None group key means at least one bar was windowed.
                     assert window_start is not None
-                    writer.write(_merge_candles(window, window_start, restore_volume))
+                    writer.write(_merge_candles(window, window_start, restore_volume, volume_error))
                     target_count += 1
                     window = []
                     window_start = None
@@ -376,7 +396,7 @@ def _aggregate_observed(
                 window.append(candle)
 
             if window and window_start is not None:
-                writer.write(_merge_candles(window, window_start, restore_volume))
+                writer.write(_merge_candles(window, window_start, restore_volume, volume_error))
                 target_count += 1
 
     return source_count, target_count

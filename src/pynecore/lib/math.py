@@ -3,6 +3,7 @@ import builtins
 import math
 
 from ..core import fdlibm, pine_math
+from ..errorcodes import EmptyCollectionError as _EmptyCollectionError
 from ..types.na import NA, na_float, na_int
 from ..types import PyneFloat, PyneInt
 from ..types.pine_types import pine_int
@@ -104,7 +105,8 @@ def avg(*numbers: TFI | NA[TFI]) -> PyneFloat:
     # flush was confirmed on every bar where it decides the last bit, and a plain
     # sum misses TradingView on up to a quarter of the bars once the terms differ
     # in magnitude.
-    assert numbers, "At least one number is necessary!"
+    if not numbers:
+        raise _EmptyCollectionError(function='math.avg')
 
     count = len(numbers)
     for n in numbers:
@@ -238,7 +240,8 @@ def max(*numbers: TIF | NA[TIF]) -> TIF:
     :param numbers: Numbers.
     :return: The largest number.
     """
-    assert numbers, "At least one number is necessary!"
+    if not numbers:
+        raise _EmptyCollectionError(function='math.max')
 
     # The na scan is a plain loop, not ``any(... for n in numbers)``: the generator
     # object the comprehension allocates on every call is pure overhead here, and
@@ -268,7 +271,8 @@ def min(*numbers: TIF | NA[TIF]) -> TIF:
     :param numbers: Numbers.
     :return: The smallest number.
     """
-    assert numbers, "At least one number is necessary!"
+    if not numbers:
+        raise _EmptyCollectionError(function='math.min')
 
     # Plain loop instead of ``any(... for n in numbers)`` -- see :func:`max`.
     for n in numbers:

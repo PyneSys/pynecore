@@ -10,6 +10,7 @@ NA(Matrix[float])) matched nothing and died with `No matching implementation
 found`. A real matrix was never sampled for its element type the way a list is
 either, so overloads differing only there always went to the first one.
 """
+from pynecore.errorcodes import WrongOperandTypeError
 from pynecore.lib import matrix, na
 from pynecore.types import Matrix
 
@@ -231,8 +232,8 @@ def __test_unrelated_element_type_matches_nothing__():
     """ The sample really discriminates -- a string matrix is not numeric """
     try:
         _kind(matrix.new(2, 2, 'x'))
-    except TypeError as e:
-        assert 'No matching implementation' in str(e)
+    except WrongOperandTypeError:
+        pass
     else:
         raise AssertionError('a string matrix matched a numeric overload')
 

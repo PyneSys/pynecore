@@ -2,6 +2,7 @@ from copy import copy as _copy
 from typing import Any, overload
 
 from ..core.module_property import module_property
+from ..errorcodes import CallArgumentsError as _CallArgumentsError
 from ..types.chart import ChartPoint
 from ..types.base import next_vid
 from ..types.label import LabelStyleEnum, Label
@@ -103,10 +104,12 @@ def new(*args: Any, **kwargs: Any) -> Label:
     if args:
         names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
         if len(args) > len(names):
-            raise TypeError(f"label.new() takes at most {len(names)} positional arguments")
+            raise _CallArgumentsError(function='label.new',
+                                      why=f"it takes at most {len(names)} positional arguments")
         for name, value in zip(names, args):
             if name in kwargs:
-                raise TypeError(f"label.new() got multiple values for argument '{name}'")
+                raise _CallArgumentsError(function='label.new',
+                                          why=f"`{name}` is given both by position and by name")
             kwargs[name] = value
     point = kwargs.get('point')
     text = kwargs.get('text', "")

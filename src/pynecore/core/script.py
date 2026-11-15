@@ -16,7 +16,7 @@ import pynecore.lib.strategy as _strategy
 import pynecore.lib.currency as _currency
 import pynecore.lib.display as _display
 
-from pynecore.errorcodes import InvalidDataError, InvalidOptionError
+from pynecore.errorcodes import CallArgumentsError, InvalidDataError, InvalidOptionError
 from pynecore.core.broker.models import ScriptRequirements
 
 from pynecore.types import script_type as _script_type
@@ -831,24 +831,27 @@ class _Input:
                              'confirm', 'display', 'active')
 
     @classmethod
-    def _bind_numeric_tail(cls, args: tuple, kwargs: dict) -> None:
+    def _bind_numeric_tail(cls, function: str, args: tuple, kwargs: dict) -> None:
         """
         Bind positional arguments after ``title`` into ``kwargs`` following
         Pine's two numeric input overloads.
 
+        :param function: The Pine name of the input, for the error message
         :param args: Positional arguments after ``defval`` and ``title``
         :param kwargs: Keyword arguments; bound names are added in place
-        :raises TypeError: On too many positionals or a positional/keyword clash
+        :raises CallArgumentsError: On too many positionals or a positional/keyword clash
         """
         if not args:
             return
         names = (cls._NUMERIC_OPTIONS_TAIL if isinstance(args[0], (tuple, list))
                  else cls._NUMERIC_RANGE_TAIL)
         if len(args) > len(names):
-            raise TypeError("too many positional arguments for input")
+            raise CallArgumentsError(function=function,
+                                     why=f"it takes at most {len(names) + 2} positional arguments")
         for name, value in zip(names, args):
             if name in kwargs:
-                raise TypeError(f"input got multiple values for argument '{name}'")
+                raise CallArgumentsError(function=function,
+                                         why=f"`{name}` is given both by position and by name")
             kwargs[name] = value
 
     # noinspection PyMethodOverriding
@@ -885,7 +888,7 @@ class _Input:
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
         """
-        cls._bind_numeric_tail(args, kwargs)
+        cls._bind_numeric_tail('input.int', args, kwargs)
         inputs[_id] = InputData(
             id=_id,
             input_type='int',
@@ -976,7 +979,7 @@ class _Input:
         :param _id: The unique identifier of the input, it is filled by the InputTransformer
         :return: The input value from toml file or the default
         """
-        cls._bind_numeric_tail(args, kwargs)
+        cls._bind_numeric_tail('input.float', args, kwargs)
         inputs[_id] = InputData(
             id=_id,
             input_type='float',

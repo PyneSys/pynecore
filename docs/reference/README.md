@@ -38,3 +38,8 @@ and TOML-based configuration.
 
 Reference for all PyneCore library functions, variables, and constants. Organized by namespace
 (ta, math, strategy, etc.) with compatibility status for each entry.
+
+### [Diagnostic Codes](codes/)
+
+Every error code PyneCore reports: the run's errors (`R`), the rules of Pyne code (`P`) and the
+Pyne Edge profile (`E`), each with its message and what to change.

@@ -18,6 +18,7 @@ import ast
 import pytest
 
 from pynecore.core.instance_state import _make_state
+from pynecore.errorcodes import WrongOperandTypeError
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
@@ -141,7 +142,7 @@ def main(v):
 
 
 def __test_overload_no_match__():
-    """ No matching implementation raises TypeError """
+    """ No matching implementation raises R0032 """
     ns, _ = _transform(ACC_SRC + '''
 def main(v):
     return acc(v)
@@ -150,7 +151,7 @@ def main(v):
     # A bare float is no mismatch: Pine's ``int / int`` is int-TYPED while keeping
     # its fraction, so such a value legally reaches an int parameter and the callee
     # truncates it. An array fits neither implementation under any reading.
-    with pytest.raises(TypeError, match='No matching implementation'):
+    with pytest.raises(WrongOperandTypeError):
         ns['main'](state, [1.5])
 
 

@@ -55,7 +55,7 @@ name = "na_to_integer"
 severity = "error"
 title = "An na value converted to an integer"
 message = "An `na` value cannot be converted to an integer."
-python = "ValueError"
+python = ["ValueError", "TypeError"]
 explanation = """
 A value that is `na` reached a place that needs a whole number: an index, a
 size, a count or Python's `int()` / `round()`. Check the value with `na()` or
@@ -156,7 +156,7 @@ name = "empty_collection"
 severity = "error"
 title = "Empty collection"
 message = "`{function}` needs at least one element, but there is none."
-python = ["IndexError", "RuntimeError"]
+python = ["IndexError", "RuntimeError", "AssertionError"]
 explanation = """
 The built-in takes an element out of an array, a list or a matrix, and there
 is no element to take. Check the size first.
@@ -210,7 +210,7 @@ name = "na_object"
 severity = "error"
 title = "An na object"
 message = "`{name}` cannot take an `na` object."
-python = "AttributeError"
+python = ["AttributeError", "TypeError"]
 explanation = """
 A field was written, a method called, a length taken or a loop run on an
 object, array or matrix that is `na`. Create the object before it is used,
@@ -392,7 +392,7 @@ name = "wrong_operand_type"
 severity = "error"
 title = "Invalid operand"
 message = "`{operation}` cannot take {operand}."
-python = "TypeError"
+python = ["TypeError", "AssertionError"]
 explanation = """
 An operation of Pyne code got a value of a type it does not take, such as a
 function where a number is needed.
@@ -471,7 +471,7 @@ name = "unknown_method_at_run"
 severity = "error"
 title = "No such method"
 message = "A `{type}` has no method `{method}`."
-python = "AssertionError"
+python = ["AssertionError", "TypeError"]
 explanation = """
 A method is called on an object whose type has no method of this name: the
 module of the type, the calling module and the libraries it imports export
@@ -506,10 +506,10 @@ name = "invalid_option"
 severity = "error"
 title = "Invalid run option"
 message = "`{option}`: {why}."
-python = ["ValueError", "NotImplementedError"]
+python = ["ValueError", "NotImplementedError", "AssertionError"]
 explanation = """
-An option of the run is not usable as given. This is about how the run was
-started, not about the script.
+An option of the run, or of the script's `strategy()` declaration, is not
+usable as given.
 """
 
 [R0043]
@@ -596,14 +596,81 @@ not come up in time, the plugin cannot deliver live data, or the exchange
 does not meet what the script requires.
 """
 
+[R0050]
+name = "call_arguments"
+severity = "error"
+title = "Invalid call arguments"
+message = "`{function}`: {why}."
+python = "TypeError"
+explanation = """
+A built-in, a constructor or a type's `copy()` was called with arguments it
+does not take: more positional arguments than it has parameters, an argument
+given both by position and by name, or a name that is not one of its
+parameters. Check the call against the built-in's parameter list.
+"""
+
+[R0051]
+name = "series_subscript"
+severity = "error"
+title = "Invalid series subscript"
+message = "`{subscript}` is not a valid series subscript: {why}."
+python = ["TypeError", "IndexError", "ValueError"]
+explanation = """
+A series is read with `x[offset]` or `x[start:stop]`, where the offsets are
+whole numbers of bars back from the current bar. The subscript was not a
+number, was negative, had a step, or asked for more bars than the series
+keeps. Use a non-negative whole number of bars back.
+"""
+
+[R0052]
+name = "argument_out_of_range"
+severity = "error"
+title = "Argument out of range"
+message = "`{function}`: `{parameter}` must be between {low} and {high}, but it is {value}."
+python = "ValueError"
+explanation = """
+An argument is outside the range the built-in accepts, such as a
+`max_bars_back` above 5000 or a color's alpha outside 0..255. Pass a value
+within the range.
+"""
+
+[R0053]
+name = "export_misuse"
+severity = "error"
+title = "Export used wrongly"
+message = "`{name}`: {why}."
+python = "ValueError"
+explanation = """
+A library export is declared or used in a way the export machinery does not
+support: an `Exported()` marker without the function it exports, or an
+`@export` function reached without the proxy the transform builds for it.
+Declare exports in a `@pyne` library module, as its top-level functions.
+"""
+
+[R0054]
+name = "security_not_rewritten"
+severity = "error"
+title = "request.security called outside the transform"
+message = "`{function}` runs only where the transform rewrote it; call it directly in a `@pyne` module."
+python = "RuntimeError"
+explanation = """
+`request.security` and its relatives are rewritten by the transform at their
+call sites in a `@pyne` module, so the security context can be run as its own
+process, one per call site. A call that reaches the function itself, for
+example through a variable that holds it or from a module that is not `@pyne`,
+has no such rewrite; neither has a function holding the call that is called
+through a value (`h = f; h()`), so its one context is written twice on a bar.
+Write the calls directly, by name, in the `@pyne` module.
+"""
+
 [I0004]
 name = "internal_error"
 severity = "error"
 title = "Internal error"
 message = "Internal error: {what}."
 explanation = """
-An error of PyneAOT, not of the script. Please report it with the script and
-the data attached.
+An error of the runtime (PyneCore or PyneAOT), not of the script. Please
+report it with the script, the data and the traceback attached.
 """
 
 # The rules of Pyne code: the transform rejects a module that breaks one,

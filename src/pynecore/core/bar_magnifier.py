@@ -14,7 +14,7 @@ from datetime import timezone as dt_timezone
 from typing import Iterable, Iterator
 from zoneinfo import ZoneInfo
 
-from .aggregator import _merge_candles
+from .aggregator import VOLUME_ERROR_MAGNIFIER, _merge_candles
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
 )
@@ -143,7 +143,7 @@ class BarMagnifier:
                 # New bar boundary — flush current window
                 new_window = MagnifiedWindow(
                     sub_bars=window,
-                    aggregated=_merge_candles(window, window_stamp),
+                    aggregated=_merge_candles(window, window_stamp, volume_error=VOLUME_ERROR_MAGNIFIER),
                     is_last_window=False,
                 )
 
@@ -164,7 +164,7 @@ class BarMagnifier:
         if window and window_stamp is not None:
             last_window = MagnifiedWindow(
                 sub_bars=window,
-                aggregated=_merge_candles(window, window_stamp),
+                aggregated=_merge_candles(window, window_stamp, volume_error=VOLUME_ERROR_MAGNIFIER),
                 is_last_window=True,
             )
 

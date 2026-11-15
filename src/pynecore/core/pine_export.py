@@ -1,6 +1,7 @@
 from typing import Callable, TypeVar, Generic, Optional, Any, Union, overload
 import sys
 
+from ..errorcodes import ExportMisuseError
 from ..types import na as _na
 
 __all__ = ['Exported', 'export', 'in_module_bool_mode']
@@ -44,6 +45,16 @@ def in_module_bool_mode(bound: Callable, na_bool: bool) -> Callable:
 F = TypeVar('F', bound=Callable[..., Any])  # Function type
 
 
+def unset_proxy_error(proxy: 'Exported') -> ExportMisuseError:
+    """The error for calling an :class:`Exported` proxy that holds no function yet.
+
+    :param proxy: The proxy.
+    :return: The error to raise.
+    """
+    return ExportMisuseError(name=getattr(proxy, '__name__', 'Exported'),
+                             why="the `Exported()` proxy has no `@export` function yet")
+
+
 class Exported(Generic[F]):
     """
     Function closure proxy with flexible type annotation support
@@ -75,7 +86,7 @@ class Exported(Generic[F]):
     def __call__(self, *args, **kwargs) -> Any:
         fn = self.__fn__
         if fn is None:
-            raise ValueError("Function has not been set yet")
+            raise unset_proxy_error(self)
         # A library carries its own bool semantics across the export boundary:
         # the three-state bool of a v4/v5 library is a property of ITS source,
         # and a v6 caller must not flatten the na its body builds (nor the
@@ -136,14 +147,10 @@ def export(
                 # Function already exists in global scope, just return it unchanged (decorator as decoration)
                 return f
 
-        # No proxy found, throw error explaining what's needed
-        raise ValueError(
-            f"No Exported proxy found for function '{func_name}' in global scope. "
-            f"You must create an Exported proxy first:\n"
-            f"  {func_name} = Exported()\n"
-            f"  @export\n"
-            f"  def {func_name}(): ..."
-        )
+        raise ExportMisuseError(
+            name=func_name,
+            why=f"`@export` needs an `Exported()` proxy of the same name in the module, "
+                f"declared before it: `{func_name} = Exported()`")
 
     if func is not None:
         # Called without parentheses: @export

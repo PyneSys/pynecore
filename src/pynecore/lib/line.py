@@ -1,7 +1,7 @@
 from copy import copy as _copy
 from typing import Any, overload
 
-from ..errorcodes import LinePriceXlocError as _LinePriceXlocError
+from ..errorcodes import CallArgumentsError as _CallArgumentsError, LinePriceXlocError as _LinePriceXlocError
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
 from ..types.base import next_vid
@@ -85,10 +85,12 @@ def new(*args: Any, **kwargs: Any) -> Line:
     if args:
         names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
         if len(args) > len(names):
-            raise TypeError(f"line.new() takes at most {len(names)} positional arguments")
+            raise _CallArgumentsError(function='line.new',
+                                      why=f"it takes at most {len(names)} positional arguments")
         for name, value in zip(names, args):
             if name in kwargs:
-                raise TypeError(f"line.new() got multiple values for argument '{name}'")
+                raise _CallArgumentsError(function='line.new',
+                                          why=f"`{name}` is given both by position and by name")
             kwargs[name] = value
     first_point = kwargs.get('first_point')
     second_point = kwargs.get('second_point')

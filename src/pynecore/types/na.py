@@ -174,11 +174,16 @@ class NA(Generic[T]):
 
     def __int__(self) -> 'NA[int]':
         # We solve this with an AST Transformer
-        raise TypeError("NA cannot be converted to int")
+        # The codes module imports this one, through core.errors
+        from ..errorcodes import NaToIntegerError
+        raise NaToIntegerError()
 
     def __float__(self) -> 'NA[float]':
-        # We solve this with an AST Transformer
-        raise TypeError("NA cannot be converted to float")
+        # The AST Transformer routes ``float()`` around this; a Python builtin that
+        # converts implicitly (``math.sqrt``) still lands here
+        # The codes module imports this one, through core.errors
+        from ..errorcodes import NaObjectError
+        raise NaObjectError(name='float')
 
     def __bool__(self) -> bool:
         return False
@@ -316,7 +321,9 @@ class NA(Generic[T]):
         if error is not None:
             raise error
         # An na is an interned, shared sentinel: nothing on it may change
-        raise AttributeError(f"'{self.__class__.__name__}' object is read-only")
+        # The codes module imports this one, through core.errors
+        from ..errorcodes import NaObjectError
+        raise NaObjectError(name=name)
 
     def __getitem__(self, _: Any) -> Self:
         return self
@@ -333,7 +340,9 @@ class NA(Generic[T]):
         # the sequence protocol and — since ``__getitem__`` returns self for
         # every index — spins forever while building an unbounded list.
         # Failing loudly is the only safe behavior here.
-        raise TypeError("na is not iterable")
+        # The codes module imports this one, through core.errors
+        from ..errorcodes import NaObjectError
+        raise NaObjectError(name='for')
 
     def __call__(self, *_, **__) -> Self:
         return self

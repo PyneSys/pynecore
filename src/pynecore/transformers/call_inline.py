@@ -407,8 +407,8 @@ def _varargs_template(entry: dict[str, Any]) -> _Template:
         _na_of_operands((a, b)) if not (a == a) or not (b == b)
         else builtins.max((a, b))
 
-    The ``assert numbers`` of the body is dropped: a fixed arity of two or
-    three can never fail it. The na scan keeps the loop's left-to-right order
+    The empty-call guard (``if not numbers: raise``) of the body is dropped: a fixed
+    arity of two or three can never fail it. The na scan keeps the loop's left-to-right order
     and short-circuits exactly where the loop's ``return`` does, and the
     builtin is handed the same single tuple argument the body hands it.
 

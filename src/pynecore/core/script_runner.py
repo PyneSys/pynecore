@@ -750,7 +750,7 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         metadata to drive the grid). Temp files live in a per-run directory whose
         path is stored in ``tmp_dir_holder`` and removed at run teardown.
     """
-    from .aggregator import aggregate_ohlcv
+    from .aggregator import VOLUME_ERROR_SECURITY, aggregate_ohlcv
     from .datetime import parse_timezone
 
     src = Path(data_path)
@@ -797,6 +797,7 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
         session_starts=si.session_starts or None,
         opening_hours=si.opening_hours or None,
         sym_type=si.type, source_tf=si.period, prefix=si.prefix,
+        volume_error=VOLUME_ERROR_SECURITY,
     )
     if target_count == 0:
         # An empty source (no bars) resamples to an empty file; swapping the child

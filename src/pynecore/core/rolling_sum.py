@@ -40,7 +40,7 @@ import os as _os
 from typing import Any
 
 from .safe_convert import native_int
-from ..errorcodes import ArgumentNotPositiveError
+from ..errorcodes import ArgumentNotPositiveError, ArgumentOutOfRangeError, SeriesSubscriptError
 from .series import SeriesImpl
 from ..types.na import na_float
 
@@ -364,13 +364,15 @@ class SumMachine:
 
         :param max_bars_back: The new ``max_bars_back``.
         :raises ArgumentNotPositiveError: When ``max_bars_back`` is not positive.
-        :raises ValueError: Above :attr:`SeriesImpl.MAXIMUM_MAX_BARS_BACK`.
+        :raises ArgumentOutOfRangeError: Above :attr:`SeriesImpl.MAXIMUM_MAX_BARS_BACK`.
         """
         if max_bars_back <= 0:
             raise ArgumentNotPositiveError(function='max_bars_back', parameter='num',
                                            value=max_bars_back)
         if max_bars_back > SeriesImpl.MAXIMUM_MAX_BARS_BACK:
-            raise ValueError(f"The max_bars_back cannot exceed {SeriesImpl.MAXIMUM_MAX_BARS_BACK}!")
+            raise ArgumentOutOfRangeError(function='max_bars_back', parameter='num', low=1,
+                                          high=SeriesImpl.MAXIMUM_MAX_BARS_BACK,
+                                          value=max_bars_back)
         new_cap = max_bars_back + 1
         if new_cap == self.values_cap:
             return
@@ -396,10 +398,10 @@ class SumMachine:
         """The window offsets ``start``..``stop - 1`` as one list, oldest first —
         the ``series[start:stop].oldest`` read of a ``SeriesImpl``.
 
-        :raises IndexError: When ``stop`` is past the stored history.
+        :raises SeriesSubscriptError: When ``stop`` is past the stored history.
         """
         if stop > self.values_size:
-            raise IndexError("Slice stop index out of range!")
+            raise SeriesSubscriptError(subscript=f":{stop}", why="it reaches past the stored history")
         if start > stop:
             start = stop
         cap = self.values_cap

@@ -35,7 +35,7 @@ from ..types.na import NA
 
 from .instance_state import (_configure, _make_state, _StateMethodBinding,  # noqa: internal API
                              register_shared_cache)
-from .pine_export import Exported, in_module_bool_mode
+from .pine_export import Exported, in_module_bool_mode, unset_proxy_error
 
 
 #: Runtime classes of Pine scalar receivers
@@ -129,7 +129,7 @@ def _bound_method(method: Any, cache: dict[str, tuple[Any, list | None, Callable
     :param vector: The call site's instance vector, written into the state of a
         method created here (see ``instance_state._configure``).
     :return: The callable to invoke with the visible arguments.
-    :raises ValueError: If an ``Exported`` proxy is not initialized yet.
+    :raises ExportMisuseError: If an ``Exported`` proxy is not initialized yet.
     """
     target: Callable = method
     na_bool: bool | None = None
@@ -137,7 +137,7 @@ def _bound_method(method: Any, cache: dict[str, tuple[Any, list | None, Callable
         na_bool = method.__na_bool__
         unwrapped: Callable | None = method.__fn__
         if unwrapped is None:
-            raise ValueError("Exported proxy has not been initialized with a function yet")
+            raise unset_proxy_error(method)
         target = unwrapped
     key = f"{getattr(target, '__module__', '?')}.{getattr(target, '__qualname__', '?')}"
     entry = cache.get(key)

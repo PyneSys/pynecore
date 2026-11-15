@@ -30,6 +30,8 @@ def run(script_file: str) -> None:
 
     import shutil
     import tempfile
+    import traceback
+    from pynecore.core.error_location import INTERNAL_ERROR_REPORT, internal
     from pynecore.core.data_converter import DataConverter, DataFormatError, ConversionError
     from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader
     from pynecore.core.syminfo import SymInfo
@@ -111,6 +113,15 @@ def run(script_file: str) -> None:
             except PyneError as e:
                 # The script's own error: one line, as `pyne run` writes it
                 print(f"Error: {e.report()}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                error = internal(e)
+                if error is None:
+                    raise
+                # PyneCore's own failure: the traceback is what a report needs
+                traceback.print_exc()
+                print(f"Error: {error.report()}", file=sys.stderr)
+                print(INTERNAL_ERROR_REPORT, file=sys.stderr)
                 sys.exit(1)
 
         print(f"Done. Output: {plot_path}", file=sys.stderr)

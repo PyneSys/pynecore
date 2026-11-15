@@ -1410,6 +1410,56 @@ pub static PROVIDER_UNAVAILABLE: super::Code = super::Code {
     fix: None,
 };
 
+/// R0050: Invalid call arguments
+pub static CALL_ARGUMENTS: super::Code = super::Code {
+    code: "R0050",
+    severity: super::Severity::Error,
+    title: "Invalid call arguments",
+    message: "`{function}`: {why}.",
+    params: &["function", "why"],
+    fix: None,
+};
+
+/// R0051: Invalid series subscript
+pub static SERIES_SUBSCRIPT: super::Code = super::Code {
+    code: "R0051",
+    severity: super::Severity::Error,
+    title: "Invalid series subscript",
+    message: "`{subscript}` is not a valid series subscript: {why}.",
+    params: &["subscript", "why"],
+    fix: None,
+};
+
+/// R0052: Argument out of range
+pub static ARGUMENT_OUT_OF_RANGE: super::Code = super::Code {
+    code: "R0052",
+    severity: super::Severity::Error,
+    title: "Argument out of range",
+    message: "`{function}`: `{parameter}` must be between {low} and {high}, but it is {value}.",
+    params: &["function", "parameter", "low", "high", "value"],
+    fix: None,
+};
+
+/// R0053: Export used wrongly
+pub static EXPORT_MISUSE: super::Code = super::Code {
+    code: "R0053",
+    severity: super::Severity::Error,
+    title: "Export used wrongly",
+    message: "`{name}`: {why}.",
+    params: &["name", "why"],
+    fix: None,
+};
+
+/// R0054: request.security called outside the transform
+pub static SECURITY_NOT_REWRITTEN: super::Code = super::Code {
+    code: "R0054",
+    severity: super::Severity::Error,
+    title: "request.security called outside the transform",
+    message: "`{function}` runs only where the transform rewrote it; call it directly in a `@pyne` module.",
+    params: &["function"],
+    fix: None,
+};
+
 /// Every reported code, sorted by `code`.
 pub static ALL: &[&super::Code] = &[
     &EDGE_SYNTAX,
@@ -1553,6 +1603,11 @@ pub static ALL: &[&super::Code] = &[
     &SCRIPT_NOT_RUNNABLE,
     &FILE_NOT_FOUND,
     &PROVIDER_UNAVAILABLE,
+    &CALL_ARGUMENTS,
+    &SERIES_SUBSCRIPT,
+    &ARGUMENT_OUT_OF_RANGE,
+    &EXPORT_MISUSE,
+    &SECURITY_NOT_REWRITTEN,
 ];
 
 /// The codes a compiled script's run raises (`R`, `I`), sorted by `code`: a
@@ -1608,4 +1663,9 @@ pub static RUNTIME: &[&super::Code] = &[
     &SCRIPT_NOT_RUNNABLE,
     &FILE_NOT_FOUND,
     &PROVIDER_UNAVAILABLE,
+    &CALL_ARGUMENTS,
+    &SERIES_SUBSCRIPT,
+    &ARGUMENT_OUT_OF_RANGE,
+    &EXPORT_MISUSE,
+    &SECURITY_NOT_REWRITTEN,
 ];

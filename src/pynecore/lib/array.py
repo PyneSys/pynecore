@@ -32,7 +32,8 @@ from ..errorcodes import (ArgumentNegativeError as _ArgumentNegativeError,
                      EmptyCollectionError as _EmptyCollectionError,
                      IndexOutOfRangeError as _IndexOutOfRangeError,
                      PercentageOutOfRangeError as _PercentageOutOfRangeError,
-                     SizeMismatchError as _SizeMismatchError)
+                     SizeMismatchError as _SizeMismatchError,
+                     WrongOperandTypeError as _WrongOperandTypeError)
 
 T = TypeVar('T')
 Number = TypeVar('Number', int, float)
@@ -714,6 +715,17 @@ def mode(id: list[T]) -> T:
 
 
 # noinspection PyShadowingNames
+def _initial_value_error(function: str, initial_value: Any) -> _WrongOperandTypeError:
+    """The error for an ``array.new_*`` initial value of the wrong type.
+
+    :param function: The Pine name of the constructor
+    :param initial_value: The value given
+    :return: The error to raise
+    """
+    return _WrongOperandTypeError(operation=function,
+                                  operand=f"a {type(initial_value).__name__} as its initial value")
+
+
 def _na_size(size: int | NA, function: str) -> int:
     """
     Normalize an array constructor ``size`` argument.
@@ -744,7 +756,8 @@ def new_box(size: int | NA = 0, initial_value: Box = NA(Box)) -> list[Box]:
     :return: New array of box objects
     """
     size = _na_size(size, 'array.new_box')
-    assert isinstance(initial_value, (Box, NA)), "Initial value must be Box!"
+    if not isinstance(initial_value, (Box, NA)):
+        raise _initial_value_error('array.new_box', initial_value)
     return [initial_value] * size
 
 
@@ -759,7 +772,8 @@ def new_line(size: int | NA = 0, initial_value: Line = NA(Line)) -> list[Line]:
     :return: New array of line objects
     """
     size = _na_size(size, 'array.new_line')
-    assert isinstance(initial_value, (Line, NA)), "Initial value must be Line!"
+    if not isinstance(initial_value, (Line, NA)):
+        raise _initial_value_error('array.new_line', initial_value)
     return [initial_value] * size
 
 
@@ -774,7 +788,8 @@ def new_label(size: int | NA = 0, initial_value: Label = NA(Label)) -> list[Labe
     :return: New array of label objects
     """
     size = _na_size(size, 'array.new_label')
-    assert isinstance(initial_value, (Label, NA)), "Initial value must be Label!"
+    if not isinstance(initial_value, (Label, NA)):
+        raise _initial_value_error('array.new_label', initial_value)
     return [initial_value] * size
 
 
@@ -790,7 +805,8 @@ def new_linefill(size: int | NA = 0,
     :return: New array of linefill objects
     """
     size = _na_size(size, 'array.new_linefill')
-    assert isinstance(initial_value, (LineFill, NA)), "Initial value must be LineFill!"
+    if not isinstance(initial_value, (LineFill, NA)):
+        raise _initial_value_error('array.new_linefill', initial_value)
     return [initial_value] * size
 
 
@@ -805,7 +821,8 @@ def new_table(size: int | NA = 0, initial_value: Table = NA(Table)) -> list[Tabl
     :return: New array of table objects
     """
     size = _na_size(size, 'array.new_table')
-    assert isinstance(initial_value, (Table, NA)), "Initial value must be Table!"
+    if not isinstance(initial_value, (Table, NA)):
+        raise _initial_value_error('array.new_table', initial_value)
     return [initial_value] * size
 
 
@@ -836,7 +853,8 @@ def new_bool(size: int | NA = 0, initial_value: bool | None = None) -> list[bool
     # false), decided at call time
     if initial_value is None or isinstance(initial_value, NA):
         initial_value = NA(bool)
-    assert isinstance(initial_value, (bool, NA)), "Initial value must be bool!"
+    if not isinstance(initial_value, (bool, NA)):
+        raise _initial_value_error('array.new_bool', initial_value)
     return [initial_value] * size
 
 
@@ -850,7 +868,8 @@ def new_color(size: int | NA = 0, initial_value: Color = NA(Color)) -> list[Colo
     :return: New array of the specified size
     """
     size = _na_size(size, 'array.new_color')
-    assert isinstance(initial_value, (Color, NA)), "Initial value must be Color!"
+    if not isinstance(initial_value, (Color, NA)):
+        raise _initial_value_error('array.new_color', initial_value)
     return [initial_value] * size
 
 
@@ -864,7 +883,8 @@ def new_float(size: int | NA = 0, initial_value: float | int = na_float) -> list
     :return: New array of the specified size
     """
     size = _na_size(size, 'array.new_float')
-    assert isinstance(initial_value, (float, int, NA)), "Initial value must be float!"
+    if not isinstance(initial_value, (float, int, NA)):
+        raise _initial_value_error('array.new_float', initial_value)
     if isinstance(initial_value, int):
         initial_value = float(initial_value)
     return [initial_value] * size
@@ -900,7 +920,8 @@ def new_string(size: int | NA = 0, initial_value: str = NA(str)) -> list[str]:
     if isinstance(initial_value, NA):
         # A typeless na: the string na is the empty string
         initial_value = ""
-    assert isinstance(initial_value, str), "Initial value must be str!"
+    if not isinstance(initial_value, str):
+        raise _initial_value_error('array.new_string', initial_value)
     return [initial_value] * size
 
 

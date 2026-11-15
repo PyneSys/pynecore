@@ -134,7 +134,7 @@ from copy import copy, deepcopy
 from dataclasses import fields as dataclass_fields, replace as dataclass_replace
 from functools import partial
 
-from .pine_export import Exported, in_module_bool_mode
+from .pine_export import Exported, in_module_bool_mode, unset_proxy_error
 from .series import CollectionSeriesImpl, SeriesImpl
 from ..types.base import Drawing
 from ..types.matrix import Matrix
@@ -740,7 +740,7 @@ def _bind_target(func: Any, prev: tuple | None = None, pin: str | None = None,
     if isinstance(target, Exported):
         unwrapped = target.__fn__
         if unwrapped is None:
-            raise ValueError("Exported proxy has not been initialized with a function yet")
+            raise unset_proxy_error(target)
         # Crossing into another module's code: the callee's bool semantics are
         # its own (see pine_export.in_module_bool_mode)
         na_bool = target.__na_bool__

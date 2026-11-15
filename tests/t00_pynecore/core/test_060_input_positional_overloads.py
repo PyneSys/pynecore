@@ -14,6 +14,7 @@ v6 orders under test:
 import pytest
 
 from pynecore.core.script import input as pyne_input, inputs
+from pynecore.errorcodes import CallArgumentsError
 
 
 @pytest.fixture(autouse=True)
@@ -68,8 +69,8 @@ def __test_float_input_int_default_is_float__():
 
 
 def __test_numeric_positional_keyword_clash_raises__():
-    """A positional minval plus keyword minval is a TypeError, like plain Python"""
-    with pytest.raises(TypeError, match="multiple values"):
+    """A positional minval plus keyword minval is R0050, a TypeError like plain Python's"""
+    with pytest.raises(CallArgumentsError, match="`minval` is given both by position and by name"):
         pyne_input.int(5, 't', 1, minval=2, _id='t')
 
 

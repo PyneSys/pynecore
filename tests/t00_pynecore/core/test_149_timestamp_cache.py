@@ -6,7 +6,7 @@ import importlib
 import pytest
 
 import pynecore.lib as lib
-from pynecore.errorcodes import UnknownTimezoneError
+from pynecore.errorcodes import UnknownTimezoneError, WrongOperandTypeError
 from pynecore.core import datetime as core_datetime
 from pynecore.core.overload import Implementation, _anchored
 from pynecore.core.script_runner import ScriptRunner
@@ -110,7 +110,7 @@ def __test_keyword_and_arity_changes_keep_dispatch_semantics__():
     assert bound(year=2025, month=1, day=1) == result
     assert bound('UTC', 2025, 1, 1) == result
     assert bound(2025, 1, 1, 2) == result + 7200000
-    with pytest.raises(TypeError, match='No matching implementation'):
+    with pytest.raises(WrongOperandTypeError):
         bound(year=2025)
 
 

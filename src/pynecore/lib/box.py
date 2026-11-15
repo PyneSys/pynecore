@@ -2,6 +2,7 @@ from copy import copy as _copy
 from typing import Any, overload
 
 from ..core.module_property import module_property
+from ..errorcodes import CallArgumentsError as _CallArgumentsError
 
 from ..types.base import next_vid
 from ..types.box import Box
@@ -88,10 +89,12 @@ def new(*args: Any, **kwargs: Any) -> Box:
     if args:
         names = _POINT_PARAMS if isinstance(args[0], ChartPoint) else _COORD_PARAMS
         if len(args) > len(names):
-            raise TypeError(f"box.new() takes at most {len(names)} positional arguments")
+            raise _CallArgumentsError(function='box.new',
+                                      why=f"it takes at most {len(names)} positional arguments")
         for name, value in zip(names, args):
             if name in kwargs:
-                raise TypeError(f"box.new() got multiple values for argument '{name}'")
+                raise _CallArgumentsError(function='box.new',
+                                          why=f"`{name}` is given both by position and by name")
             kwargs[name] = value
     top_left = kwargs.get('top_left')
     bottom_right = kwargs.get('bottom_right')

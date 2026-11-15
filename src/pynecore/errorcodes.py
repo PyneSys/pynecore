@@ -1024,6 +1024,41 @@ PROVIDER_UNAVAILABLE = Code(
     '`{provider}`: {why}.',
     ('provider', 'why'),
 )
+CALL_ARGUMENTS = Code(
+    'R0050',
+    'error',
+    'Invalid call arguments',
+    '`{function}`: {why}.',
+    ('function', 'why'),
+)
+SERIES_SUBSCRIPT = Code(
+    'R0051',
+    'error',
+    'Invalid series subscript',
+    '`{subscript}` is not a valid series subscript: {why}.',
+    ('subscript', 'why'),
+)
+ARGUMENT_OUT_OF_RANGE = Code(
+    'R0052',
+    'error',
+    'Argument out of range',
+    '`{function}`: `{parameter}` must be between {low} and {high}, but it is {value}.',
+    ('function', 'parameter', 'low', 'high', 'value'),
+)
+EXPORT_MISUSE = Code(
+    'R0053',
+    'error',
+    'Export used wrongly',
+    '`{name}`: {why}.',
+    ('name', 'why'),
+)
+SECURITY_NOT_REWRITTEN = Code(
+    'R0054',
+    'error',
+    'request.security called outside the transform',
+    '`{function}` runs only where the transform rewrote it; call it directly in a `@pyne` module.',
+    ('function',),
+)
 
 
 class EdgeSyntaxError(PyneSyntaxError):
@@ -1808,7 +1843,7 @@ class DivisionByZeroError(PyneError, ZeroDivisionError):
         super().__init__()
 
 
-class NaToIntegerError(PyneError, ValueError):
+class NaToIntegerError(PyneError, ValueError, TypeError):
     """R0002: An na value converted to an integer"""
     code = NA_TO_INTEGER
 
@@ -1880,7 +1915,7 @@ class IndexOutOfRangeError(PyneError, IndexError, ValueError):
         super().__init__(function=function, index=index, size=size)
 
 
-class EmptyCollectionError(PyneError, IndexError, RuntimeError):
+class EmptyCollectionError(PyneError, IndexError, RuntimeError, AssertionError):
     """R0011: Empty collection"""
     code = EMPTY_COLLECTION
 
@@ -1920,7 +1955,7 @@ class NoConvergenceError(PyneError, ValueError):
         super().__init__(function=function)
 
 
-class NaObjectError(PyneError, AttributeError):
+class NaObjectError(PyneError, AttributeError, TypeError):
     """R0016: An na object"""
     code = NA_OBJECT
 
@@ -2048,7 +2083,7 @@ class LinePriceXlocError(PyneError, RuntimeError):
         super().__init__()
 
 
-class WrongOperandTypeError(PyneError, TypeError):
+class WrongOperandTypeError(PyneError, TypeError, AssertionError):
     """R0032: Invalid operand"""
     code = WRONG_OPERAND_TYPE
 
@@ -2104,7 +2139,7 @@ class InvalidDrawingArgumentError(PyneError, TypeError):
         super().__init__(function=function, parameter=parameter, value=value)
 
 
-class UnknownMethodAtRunError(PyneError, AssertionError):
+class UnknownMethodAtRunError(PyneError, AssertionError, TypeError):
     """R0039: No such method"""
     code = UNKNOWN_METHOD_AT_RUN
 
@@ -2130,7 +2165,7 @@ class MatrixHoldsNaError(PyneError, ValueError):
         super().__init__(function=function)
 
 
-class InvalidOptionError(PyneError, ValueError, NotImplementedError):
+class InvalidOptionError(PyneError, ValueError, NotImplementedError, AssertionError):
     """R0042: Invalid run option"""
     code = INVALID_OPTION
 
@@ -2194,6 +2229,47 @@ class ProviderUnavailableError(PyneError, RuntimeError):
         super().__init__(provider=provider, why=why)
 
 
+class CallArgumentsError(PyneError, TypeError):
+    """R0050: Invalid call arguments"""
+    code = CALL_ARGUMENTS
+
+    def __init__(self, *, function: object, why: object) -> None:
+        super().__init__(function=function, why=why)
+
+
+class SeriesSubscriptError(PyneError, TypeError, IndexError, ValueError):
+    """R0051: Invalid series subscript"""
+    code = SERIES_SUBSCRIPT
+
+    def __init__(self, *, subscript: object, why: object) -> None:
+        super().__init__(subscript=subscript, why=why)
+
+
+class ArgumentOutOfRangeError(PyneError, ValueError):
+    """R0052: Argument out of range"""
+    code = ARGUMENT_OUT_OF_RANGE
+
+    def __init__(self, *, function: object, parameter: object, low: object, high: object,
+                 value: object) -> None:
+        super().__init__(function=function, parameter=parameter, low=low, high=high, value=value)
+
+
+class ExportMisuseError(PyneError, ValueError):
+    """R0053: Export used wrongly"""
+    code = EXPORT_MISUSE
+
+    def __init__(self, *, name: object, why: object) -> None:
+        super().__init__(name=name, why=why)
+
+
+class SecurityNotRewrittenError(PyneError, RuntimeError):
+    """R0054: request.security called outside the transform"""
+    code = SECURITY_NOT_REWRITTEN
+
+    def __init__(self, *, function: object) -> None:
+        super().__init__(function=function)
+
+
 #: Every reported code by its code.
 ALL: dict[str, Code] = {c.code: c for c in (
     EDGE_SYNTAX, EDGE_PYTHON_BUILTIN, EDGE_LAMBDA, EDGE_ASSERT_MESSAGE, EDGE_SUBSCRIPT_ASSIGNMENT,
@@ -2230,7 +2306,8 @@ ALL: dict[str, Code] = {c.code: c for c in (
     NOT_AVAILABLE, SCRIPT_TIMEFRAME, INVALID_DATA, INVALID_DRAWING_ARGUMENT, UNKNOWN_METHOD_AT_RUN,
     ARGUMENT_ORDER, MATRIX_HOLDS_NA, INVALID_OPTION, NA_OBJECT_FIELD, NA_OBJECT_COPY,
     SYMINFO_MEMBER_MISSING, DATA_FILE_UNREADABLE, SCRIPT_NOT_RUNNABLE, FILE_NOT_FOUND,
-    PROVIDER_UNAVAILABLE,
+    PROVIDER_UNAVAILABLE, CALL_ARGUMENTS, SERIES_SUBSCRIPT, ARGUMENT_OUT_OF_RANGE, EXPORT_MISUSE,
+    SECURITY_NOT_REWRITTEN,
 )}
 
 #: The exception class of every reported code, by its code.
@@ -2275,4 +2352,6 @@ EXCEPTIONS: dict[str, type[PyneError]] = {c.code.code: c for c in (
     InvalidDrawingArgumentError, UnknownMethodAtRunError, ArgumentOrderError, MatrixHoldsNaError,
     InvalidOptionError, NaObjectFieldError, NaObjectCopyError, SyminfoMemberMissingError,
     DataFileUnreadableError, ScriptNotRunnableError, MissingFileError, ProviderUnavailableError,
+    CallArgumentsError, SeriesSubscriptError, ArgumentOutOfRangeError, ExportMisuseError,
+    SecurityNotRewrittenError,
 )}

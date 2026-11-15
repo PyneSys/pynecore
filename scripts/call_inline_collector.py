@@ -336,9 +336,10 @@ def _varargs_shape(module_name: str, func_name: str) -> str:
     """Verify that ``math.max``/``math.min`` still have the body the expansion
     reproduces, and report which builtin they end in.
 
-    Expected, exactly: a docstring, an ``assert``, a ``for n in numbers``
-    loop whose only statement returns ``_na_of_operands(numbers)`` when ``n``
-    is na, and a final ``return builtins.<max|min>(cast(..., numbers))``.
+    Expected, exactly: a docstring, an empty-call guard (``if not numbers: raise``),
+    a ``for n in numbers`` loop whose only statement returns
+    ``_na_of_operands(numbers)`` when ``n`` is na, and a final
+    ``return builtins.<max|min>(cast(..., numbers))``.
 
     :param module_name: The defining module.
     :param func_name: The function name.
@@ -356,8 +357,14 @@ def _varargs_shape(module_name: str, func_name: str) -> str:
     first = body[0] if body else None
     if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
         body = body[1:]
-    if len(body) != 3 or not isinstance(body[0], ast.Assert):
-        raise NotDerivable("expected `assert`, the na loop and the final return")
+    guard_empty = body[0] if body else None
+    if not (len(body) == 3 and isinstance(guard_empty, ast.If) and not guard_empty.orelse
+            and isinstance(guard_empty.test, ast.UnaryOp)
+            and isinstance(guard_empty.test.op, ast.Not)
+            and isinstance(guard_empty.test.operand, ast.Name)
+            and guard_empty.test.operand.id == vararg
+            and len(guard_empty.body) == 1 and isinstance(guard_empty.body[0], ast.Raise)):
+        raise NotDerivable("expected `if not <numbers>: raise`, the na loop and the final return")
     loop, final = body[1], body[2]
     if not (isinstance(loop, ast.For) and not loop.orelse
             and isinstance(loop.target, ast.Name)

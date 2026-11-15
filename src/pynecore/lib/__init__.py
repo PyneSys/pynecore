@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, time as dt_time, date, UTC, \
 
 from pynecore.types.source import Source
 
-from ..errorcodes import InvalidSessionError as _InvalidSessionError
+from ..errorcodes import CallArgumentsError as _CallArgumentsError, InvalidSessionError as _InvalidSessionError
 from ..core.module_property import module_property, module_function_property
 from ..core.series import SeriesImpl as _SeriesImpl
 
@@ -948,10 +948,12 @@ def fill(*args: Any, **kwargs: Any) -> None:
             else:
                 names = _FILL_PLOT_PARAMS
         if len(args) > len(names):
-            raise TypeError(f"fill() takes at most {len(names)} positional arguments")
+            raise _CallArgumentsError(function='fill',
+                                      why=f"it takes at most {len(names)} positional arguments")
         for name, value in zip(names, args):
             if name in kwargs:
-                raise TypeError(f"fill() got multiple values for argument '{name}'")
+                raise _CallArgumentsError(function='fill',
+                                          why=f"`{name}` is given both by position and by name")
             kwargs[name] = value
     plot1: Plot | HLine | None = kwargs.get('plot1') if 'plot1' in kwargs else kwargs.get('hline1')
     plot2: Plot | HLine | None = kwargs.get('plot2') if 'plot2' in kwargs else kwargs.get('hline2')

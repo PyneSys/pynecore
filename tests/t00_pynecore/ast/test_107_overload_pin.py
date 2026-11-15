@@ -19,6 +19,7 @@ import pytest
 
 from pynecore.core.instance_state import _make_state
 from pynecore.core.overload import Implementation, _anchored  # noqa: internal API
+from pynecore.errorcodes import WrongOperandTypeError
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.layout_emit import apply_layout
@@ -394,7 +395,7 @@ def __test_the_pinned_route_falls_back_to_the_values__():
     assert bound(1) == 'float'
     # A keyword spelling and a different arity are not that shape
     assert bound(x=1) == 'float'
-    with pytest.raises(TypeError, match='No matching implementation'):
+    with pytest.raises(WrongOperandTypeError):
         bound(1, 2)
 
     def narrow(x: int) -> str:

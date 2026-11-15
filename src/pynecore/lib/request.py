@@ -4,7 +4,8 @@ from math import nan
 from typing import TYPE_CHECKING, Any, TypeVar, overload, overload as _typing_overload
 
 from ..types.footprint import Footprint
-from ..errorcodes import NotAvailableError as _NotAvailableError
+from ..errorcodes import (NotAvailableError as _NotAvailableError,
+                          SecurityNotRewrittenError as _SecurityNotRewrittenError)
 from ..types.na import NA
 from . import syminfo
 
@@ -62,10 +63,7 @@ def security(symbol, timeframe, expression: T, *args, **kwargs) -> T:
     SecurityTransformer rewrites all calls into the signal/write/read
     protocol at AST level — this function is never called at runtime.
     """
-    raise RuntimeError(
-        "request.security() should not be called directly. "
-        "It is rewritten by SecurityTransformer during compilation."
-    )
+    raise _SecurityNotRewrittenError(function='request.security')
 
 
 @overload
@@ -114,10 +112,7 @@ def security_lower_tf(
     :param calc_bars_count: Number of bars to calculate (not yet supported)
     :return: array of expression values per intrabar
     """
-    raise RuntimeError(
-        "request.security_lower_tf() should not be called directly. "
-        "It is rewritten by SecurityTransformer during compilation."
-    )
+    raise _SecurityNotRewrittenError(function='request.security_lower_tf')
 
 
 # A pair without rate data answers na whatever ``ignore_invalid_currency`` says: PyneCore

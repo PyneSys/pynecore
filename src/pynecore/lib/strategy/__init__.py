@@ -10,6 +10,8 @@ import struct
 from abc import ABC, abstractmethod
 from datetime import datetime, UTC
 from decimal import Decimal, Context, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import (DivisionByZero as _DivisionByZero,  # underscore-aliased, as above
+                     InvalidOperation as _InvalidOperation)
 from collections import deque, defaultdict
 from copy import copy
 from bisect import insort, bisect_left
@@ -53,6 +55,8 @@ __all__ = [
 #
 
 from ...types.ohlcv import OHLCV, AskOHLC as _AskOHLC  # underscore-aliased: kept out of the module-property registry
+from ...errorcodes import (DecimalInvalidError as _DecimalInvalidError,  # underscore-aliased, as above
+                           InvalidOptionError as _InvalidOptionError)
 
 if TYPE_CHECKING:
     from ...core import script as _core_script
@@ -2266,8 +2270,10 @@ class SimPosition(PositionBase):
                 elif commission_type == _commission.cash_per_contract:
                     commission = _book_commission(comm_booking, abs(order.size), price,
                                                   commission_value, False)
-                else:  # Should not be here!
-                    assert False, 'Wrong commission type: ' + str(commission_type)
+                else:
+                    raise _InvalidOptionError(
+                        option='commission_type',
+                        why=f"`{commission_type}` is not a `strategy.commission` value")
             else:
                 commission = 0.0
 
@@ -6251,6 +6257,53 @@ _CASH_CTX = Context(prec=10, rounding=ROUND_HALF_UP)
 _SPLIT_CTX = Context(prec=40)
 _DEC_CENT = Decimal('0.01')
 
+# The ``why`` of a decimal error, in the AOT's words (``pyneaot-strategy`` ``decimal.rs``)
+_WHY_SPECIAL = "an infinite or NaN operand"
+_WHY_DIVISION_BY_ZERO = "division by zero"
+_WHY_INFINITY_TIMES_ZERO = "infinity times zero"
+
+#: The entry points a decimal error of the strategy is reported under, by code object,
+#: as the AOT's ``DecError::at`` names them; filled on the first error
+_DEC_ENTRY_POINTS: dict[object, str] = {}
+
+
+def _decimal_error(function: str, why: str) -> _DecimalInvalidError:
+    """
+    The ``R0034`` error of a trapped decimal signal in a strategy kernel.
+
+    The AOT renames the error at every entry point it passes on the way out, so the
+    outermost one names it. Here the kernel cannot see its callers, so the stack is
+    walked once, on the error path: the outermost entry point on it gives the name.
+
+    :param function: The kernel's own name, used when no entry point is on the stack
+    :param why: The reason, as the AOT words it
+    :return: The error to raise
+    """
+    if not _DEC_ENTRY_POINTS:
+        _DEC_ENTRY_POINTS.update({
+            entry.__code__: 'strategy.entry',
+            exit.__code__: 'strategy.exit',
+            order.__code__: 'strategy.order',
+            close.__code__: 'strategy.close',
+            close_all.__code__: 'strategy.close_all',
+            default_entry_qty.__code__: 'strategy.default_entry_qty',
+            # A module property reads as its value to a type checker
+            getattr(margin_liquidation_price, '__code__'): 'strategy.margin_liquidation_price',
+            SimPosition.process_orders.__code__: 'process_orders',
+            SimPosition.process_orders_at_close.__code__: 'process_orders_at_close',
+            SimPosition.settle_immediate_closes.__code__: 'settle_immediate_closes',
+            SimPosition.process_orders_magnified.__code__: 'process_orders_magnified',
+            SimPosition.process_deferred_margin_call.__code__: 'process_deferred_margin_call',
+            SimPosition._mark_to_last_fill.__code__: 'mark_to_last_fill',  # noqa
+        })
+    frame = _sys._getframe(1)  # noqa
+    while frame is not None:
+        name = _DEC_ENTRY_POINTS.get(frame.f_code)
+        if name is not None:
+            function = name
+        frame = frame.f_back
+    return _DecimalInvalidError(function=function, why=why)
+
 
 # noinspection PyProtectedMember
 def _round_cash(amount: float) -> float:
@@ -6342,7 +6395,10 @@ def _book_commission(booking: list, qty: float, price: float,
         # when it holds this script, this run does not convert and fx IS 1.0.
         fx = 1.0 if _conv_identity_script is lib._script else _conv_safe
         base = price * fx if fx != 1.0 else price
-        rate = float(Decimal(repr(base)) * Decimal(repr(commission_value)) * _DEC_CENT)
+        try:
+            rate = float(Decimal(repr(base)) * Decimal(repr(commission_value)) * _DEC_CENT)
+        except _InvalidOperation:
+            raise _decimal_error('_book_commission', _WHY_INFINITY_TIMES_ZERO) from None
         pointvalue = syminfo.pointvalue
         if pointvalue != 1.0:
             rate *= pointvalue
@@ -6430,8 +6486,15 @@ def _apply_booking(booking: list, total: float, qty_total: float) -> float:
         legs_dec, qty_dec = _split_lots(booking[2], qty_total)
         target = 0.0
         for leg_dec in legs_dec:
-            share = _SPLIT_CTX.multiply(total_dec, leg_dec)
-            target += float(_CASH_CTX.divide(share, qty_dec))
+            try:
+                share = _SPLIT_CTX.multiply(total_dec, leg_dec)
+            except _InvalidOperation:
+                raise _decimal_error('_apply_booking', _WHY_INFINITY_TIMES_ZERO) from None
+            try:
+                target += float(_CASH_CTX.divide(share, qty_dec))
+            except (_DivisionByZero, _InvalidOperation):
+                raise _decimal_error('_apply_booking', _WHY_DIVISION_BY_ZERO if qty_dec.is_zero()
+                                     else _WHY_SPECIAL) from None
     amount = target - booking[1]
     booking[1] = target
     return amount
@@ -7093,7 +7156,8 @@ def _default_entry_budget(price: float, pv: float | None = None) -> tuple[float,
     if default_qty_type == cash:
         return script.default_qty_value, price * pv
 
-    raise ValueError("Unknown default qty type: ", default_qty_type)
+    raise _InvalidOptionError(option='default_qty_type',
+                              why=f"`{default_qty_type}` is not a `strategy` quantity type")
 
 
 # noinspection PyProtectedMember
@@ -7173,7 +7237,10 @@ def _sig10_money(money: float) -> float:
     if not (money > 0.0):
         return money
     dec = Decimal(repr(money))
-    return float(dec.quantize(Decimal(1).scaleb(dec.adjusted() - 9), rounding=ROUND_HALF_UP))
+    try:
+        return float(dec.quantize(Decimal(1).scaleb(dec.adjusted() - 9), rounding=ROUND_HALF_UP))
+    except _InvalidOperation:
+        raise _decimal_error('_sig10_money', _WHY_SPECIAL) from None
 
 
 def _money_ticks(money: float, mintick: float) -> float:
@@ -7188,7 +7255,13 @@ def _money_ticks(money: float, mintick: float) -> float:
     # drags the quotient off it: 150435449.7 / 0.01 comes out as
     # 15043544969.999998, a whole tick below the value it stands for, and the
     # gate reads the count through ``math.floor``.
-    return float(Decimal(repr(_sig10_money(money))) / Decimal(repr(mintick)))
+    budget = Decimal(repr(_sig10_money(money)))
+    tick = Decimal(repr(mintick))
+    try:
+        return float(budget / tick)
+    except (_DivisionByZero, _InvalidOperation):
+        raise _decimal_error('_money_ticks', _WHY_DIVISION_BY_ZERO if tick.is_zero()
+                             else _WHY_SPECIAL) from None
 
 
 # Distance threshold (in ticks) of the big-money gate's down-step in the

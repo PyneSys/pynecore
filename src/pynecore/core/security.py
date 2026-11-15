@@ -30,7 +30,7 @@ from typing import Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from .datetime import parse_timezone
-from ..errorcodes import SecurityDataMissingError, SecurityVariesInLoopError
+from ..errorcodes import SecurityDataMissingError, SecurityNotRewrittenError, SecurityVariesInLoopError
 from .errors import PyneError, RUNTIME_ROOTS
 from .import_hook import security_dev_skip_disabled
 from .lookahead import ALLOW_LOOKAHEAD
@@ -2781,12 +2781,11 @@ def create_chart_protocol(
         if sec_id in chart_bar_written:
             # A second write on one chart bar: legitimate only from a loop body,
             # and only with a loop-INVARIANT value (a consumer may already have
-            # read the first one).
+            # read the first one). Outside a loop it is a function holding the call
+            # that ran twice through a value (``h = f``), which the per-call-site
+            # instantiation cannot see
             if not state.in_loop:
-                raise AssertionError(
-                    f"security context '{sec_id}' wrote twice on one bar "
-                    f"outside a loop"
-                )
+                raise SecurityNotRewrittenError(function='request.security')
             if _same_value(chart_bar_value.get(sec_id), value):
                 return
             raise SecurityVariesInLoopError()

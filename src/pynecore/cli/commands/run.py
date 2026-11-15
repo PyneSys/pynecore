@@ -38,6 +38,7 @@ from pynecore.core.script_runner import (ScriptRunner, DataRequirements, Securit
                                          history_trades_option_error, profile_option_error)
 from pynecore.core.profiler import ProfilerUnavailable
 from pynecore.errorcodes import InvalidOptionError, MissingFileError
+from pynecore.core.error_location import INTERNAL_ERROR_REPORT, internal
 from pynecore.core.errors import PyneError
 from pynecore.pynesys.compiler import PyneComp
 from pynecore.core.provider_string import is_provider_string
@@ -1795,6 +1796,15 @@ def run(
             if show_traceback:
                 console.print_exception(show_locals=False)
             secho(f"Error: {e.report()}", err=True, fg=colors.RED)
+            raise Exit(1)
+        except Exception as e:
+            error = internal(e)
+            if error is None:
+                raise
+            # PyneCore's own failure: the traceback is what a report needs
+            console.print_exception(show_locals=False)
+            secho(f"Error: {error.report()}", err=True, fg=colors.RED)
+            secho(INTERNAL_ERROR_REPORT, err=True, fg=colors.RED)
             raise Exit(1)
         finally:
             # A broker run that never reached its completion summary ended

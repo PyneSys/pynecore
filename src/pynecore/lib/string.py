@@ -5,10 +5,12 @@ from functools import lru_cache
 from math import isinf, copysign as _copysign
 
 from datetime import datetime, UTC
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
+from decimal import (Decimal, InvalidOperation as _InvalidOperation, ROUND_DOWN, ROUND_HALF_UP,
+                     ROUND_HALF_EVEN, localcontext)
 
 from ..errorcodes import (ArgumentNegativeError as _ArgumentNegativeError,
                      ArgumentOrderError as _ArgumentOrderError,
+                     DecimalInvalidError as _DecimalInvalidError,
                      InvalidFormatError as _InvalidFormatError,
                      InvalidRegexError as _InvalidRegexError)
 from ..core.format_args import check_format_args as _check_format_args
@@ -664,8 +666,14 @@ def _format_number_general(value: float | int | NA, fmt_type: str = '', precisio
     d = Decimal(str(value))
 
     if fmt_type == 'price' or fmt_type == 'currency':
-        # Format as currency with 2 decimals
-        d = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        # Format as currency with 2 decimals; from 1e26 on the cents need more digits
+        # than the thread context's 28
+        try:
+            d = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        except _InvalidOperation:
+            raise _DecimalInvalidError(
+                function='str.format' if decimal_format else 'str.tostring',
+                why="quantizing to cents needs more than 28 digits") from None
         return f"${d:,.2f}"
 
     # Pine number patterns follow Java DecimalFormat: an optional negative
@@ -1174,7 +1182,7 @@ def format(formatString: str, *args: Any) -> str:
     :raises TypeError: If an argument is not an int, float, bool or string value or an array
         of them
     """
-    _check_format_args(args)
+    _check_format_args('str.format', args)
     # A typeless na pattern is the string na, the empty string (MEASURED: the
     # Technical Ratings idiom ``str.format(str.repeat("\n", 0) + "{0}", 5)`` is "5")
     if isinstance(formatString, NA) or formatString is None:
