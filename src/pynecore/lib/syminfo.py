@@ -1,3 +1,4 @@
+import sys as _sys
 from typing import Literal
 from ..types.session import Session
 from ..types.na import NA, na_float, na_int
@@ -105,7 +106,9 @@ def __getattr__(name: str):
     :raises SyminfoMemberMissingError: For a declared detail the symbol has none of
     :raises AttributeError: For any other name
     """
-    if not name.startswith('_') and name in __annotations__:
+    # Read through the module: from Python 3.14 a module's annotations are built
+    # on first access of the attribute, and are no global name before that
+    if not name.startswith('_') and name in _sys.modules[__name__].__annotations__:
         raise _SyminfoMemberMissingError(name=name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
