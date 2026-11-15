@@ -50,7 +50,7 @@ straddling candle into the period its open falls in.
 """
 from typing import TYPE_CHECKING, Iterable
 
-from ..codes import ScriptTimeframeError
+from ..errorcodes import ResourceLimitError, ScriptTimeframeError
 from ..types.ohlcv import OHLCV
 from ..types.na import na_float
 from ..lib import timeframe as tf_module
@@ -231,7 +231,7 @@ class ScriptTimeframe:
             from the periods actually present; without it the count walks the
             scheduled grid, which over-counts a period the feed has no bar in
             (a market holiday, a data gap).
-        :raises ValueError: If the grid walk exceeds :data:`_MAX_PERIODS`.
+        :raises ResourceLimitError: If the grid walk exceeds :data:`_MAX_PERIODS`.
         """
         if last_time_ms is None:
             return
@@ -282,10 +282,8 @@ class ScriptTimeframe:
                 period = nxt
                 count += 1
                 if count > _MAX_PERIODS:
-                    raise ValueError(
-                        f"Script timeframe '{self.timeframe}' spans more than "
-                        f"{_MAX_PERIODS} bars over the chart's range."
-                    )
+                    raise ResourceLimitError(limit=_MAX_PERIODS,
+                                             resource=f"{self.timeframe} script timeframe bars")
         self.last_bar_index = count
 
     # === Per chart bar ====================================================

@@ -93,37 +93,37 @@ def __test_parse_require_timeframe_present__():
 
 def __test_parse_require_timeframe_missing__():
     """require_timeframe raises ValueError when timeframe is missing"""
-    with pytest.raises(ValueError, match="Timeframe is required"):
+    with pytest.raises(ValueError, match="needs a timeframe after `@`"):
         parse_provider_string("ccxt:BYBIT:BTC/USDT:USDT", require_timeframe=True)
 
 
 def __test_parse_no_colon__():
     """String without colon raises ValueError"""
-    with pytest.raises(ValueError, match="Invalid provider string"):
+    with pytest.raises(ValueError, match="expected the format"):
         parse_provider_string("ccxt")
 
 
 def __test_parse_empty_provider__():
     """Empty provider name raises ValueError"""
-    with pytest.raises(ValueError, match="Provider name is empty"):
+    with pytest.raises(ValueError, match="the provider name is empty"):
         parse_provider_string(":BYBIT:BTC/USDT@1D")
 
 
 def __test_parse_empty_symbol__():
     """Empty symbol raises ValueError"""
-    with pytest.raises(ValueError, match="Symbol is missing"):
+    with pytest.raises(ValueError, match="the symbol after `ccxt:` is missing"):
         parse_provider_string("ccxt:")
 
 
 def __test_parse_empty_timeframe__():
     """Empty timeframe after @ raises ValueError"""
-    with pytest.raises(ValueError, match="Timeframe is empty"):
+    with pytest.raises(ValueError, match="the timeframe after `@` is empty"):
         parse_provider_string("ccxt:BYBIT:BTC/USDT@")
 
 
 def __test_parse_empty_symbol_with_timeframe__():
     """Empty symbol before @ raises ValueError"""
-    with pytest.raises(ValueError, match="Symbol is missing"):
+    with pytest.raises(ValueError, match="the symbol before `@` is missing"):
         parse_provider_string("ccxt:@1D")
 
 
@@ -166,7 +166,7 @@ def __test_parse_multi_broker_broker_only_with_timeframe__():
 
 def __test_parse_multi_broker_empty_broker__():
     """Empty broker segment raises ValueError"""
-    with pytest.raises(ValueError, match="Broker name is empty"):
+    with pytest.raises(ValueError, match="the broker name is empty"):
         parse_provider_string("ccxt::BTC/USDT@1D", multi_broker=True)
 
 

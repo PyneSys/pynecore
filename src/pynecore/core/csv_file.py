@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, UTC
 from math import copysign as _copysign, inf as _INF
 
+from pynecore.errorcodes import InvalidDataError
 from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import NA, na_float
 
@@ -619,7 +620,8 @@ class CSVReader:
                     dt = datetime.fromisoformat(time_field).astimezone(UTC)
                     timestamp = round(dt.timestamp() * 1000)
                 except ValueError:
-                    raise ValueError(f"Invalid time format: {time_field}")
+                    raise InvalidDataError(where=f"{self.path}: row {pos + 1}",
+                                           why=f"invalid time {time_field!r}") from None
 
             # Create OHLCV object
             try:
@@ -645,7 +647,7 @@ class CSVReader:
                     )
 
             except (ValueError, IndexError) as e:
-                raise ValueError(f"Invalid data in row {pos + 1}: {e}")
+                raise InvalidDataError(where=f"{self.path}: row {pos + 1}", why=str(e)) from None
 
             yield pos, candle
 

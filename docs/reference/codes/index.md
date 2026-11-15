@@ -60,3 +60,7 @@ Every code PyneCore reports.
 | [R0043](R0043.md) | error    | Field of an na object                         |
 | [R0044](R0044.md) | error    | Copy of an na object                          |
 | [R0045](R0045.md) | error    | Symbol detail not given                       |
+| [R0046](R0046.md) | error    | Unreadable data file                          |
+| [R0047](R0047.md) | error    | Script cannot run                             |
+| [R0048](R0048.md) | error    | File not found                                |
+| [R0049](R0049.md) | error    | Data provider unavailable                     |

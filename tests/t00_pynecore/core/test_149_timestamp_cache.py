@@ -6,7 +6,7 @@ import importlib
 import pytest
 
 import pynecore.lib as lib
-from pynecore.codes import UnknownTimezoneError
+from pynecore.errorcodes import UnknownTimezoneError
 from pynecore.core import datetime as core_datetime
 from pynecore.core.overload import Implementation, _anchored
 from pynecore.core.script_runner import ScriptRunner

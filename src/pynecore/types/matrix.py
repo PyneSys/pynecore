@@ -4,7 +4,7 @@ import math
 from typing import TypeVar, Generic, Any, Iterator, cast
 from collections import Counter
 from .na import NA, na_float
-from ..codes import (ArgumentNegativeError, EmptyCollectionError, IndexOutOfRangeError,
+from ..errorcodes import (ArgumentNegativeError, EmptyCollectionError, IndexOutOfRangeError,
                      MatrixHoldsNaError, MatrixNotSquareError, MatrixSingularError,
                      NoConvergenceError, SizeMismatchError)
 

@@ -16,7 +16,7 @@ import pytest
 
 import pynecore.lib as lib
 from pynecore.core import datetime as pcd
-from pynecore.codes import UnknownTimezoneError
+from pynecore.errorcodes import UnknownTimezoneError
 from pynecore.core.datetime import parse_timezone, TimezoneNotFoundError
 from pynecore.types.na import NA
 

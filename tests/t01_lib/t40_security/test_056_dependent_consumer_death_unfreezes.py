@@ -133,8 +133,8 @@ def __test_a_dying_consumer_child_stops_the_chart_with_an_error__(runner, log):
 
     assert raised is not None, "the chart finished normally after a child died"
     # The child's coded error itself, as the code of a security context raised it
-    from pynecore import codes
-    assert isinstance(raised, codes.DivisionByZeroError), \
+    from pynecore import errorcodes
+    assert isinstance(raised, errorcodes.DivisionByZeroError), \
         f"expected the dead child's R0001, got {type(raised).__name__}: {raised}"
     assert raised.in_security and raised.at is not None and raised.at.line == 22, raised.report()
     log.info("a dead security child surfaced as: %s", raised)

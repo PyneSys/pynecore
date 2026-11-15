@@ -1,4 +1,4 @@
-//! The generator's Rust output for `codes/sample.toml`, compiled against the
+//! The generator's Rust output for `scripts/errorcodes/sample.toml`, compiled against the
 //! crate's types, and the lookups over PyneCore's own codes.
 
 use pynecore_codes::{Code, Fix, Severity};

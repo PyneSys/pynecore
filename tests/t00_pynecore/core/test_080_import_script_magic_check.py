@@ -47,7 +47,7 @@ def __test_a_docstring_longer_than_the_old_1kb_window_imports__(tmp_path: Path) 
 def __test_a_script_without_the_magic_comment_is_rejected__(tmp_path: Path) -> None:
     script = tmp_path / "not_pyne.py"
     script.write_text('"""ordinary module"""\n\n\ndef main():\n    pass\n')
-    with pytest.raises(ImportError, match="magic doc comment"):
+    with pytest.raises(ImportError, match="its docstring does not start with `@pyne`"):
         import_script(script)
 
 

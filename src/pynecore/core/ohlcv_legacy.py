@@ -23,6 +23,7 @@ import struct
 from datetime import UTC, datetime
 from pathlib import Path
 
+from pynecore.errorcodes import DataFileUnreadableError
 from pynecore.types.ohlcv import OHLCV
 
 RECORD_SIZE = 24
@@ -129,12 +130,10 @@ class OHLCVReader:
                 except UnicodeDecodeError:
                     pass
                 else:
-                    raise ValueError(
-                        "Text file detected with .ohlcv extension!\n"
-                        "To convert CSV to binary OHLCV format:\n"
-                        f"  pyne data convert-from {Path(self.path).with_suffix('.csv')} "
-                        "--symbol YOUR_SYMBOL --provider custom"
-                    )
+                    raise DataFileUnreadableError(
+                        path=str(self.path),
+                        why=f"it is a text file; convert it with `pyne data convert-from "
+                            f"{Path(self.path).with_suffix('.csv')}`")
 
             self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
             self._size = size // RECORD_SIZE

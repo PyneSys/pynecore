@@ -20,7 +20,7 @@ def main():
 def __test_timeframe_in_seconds__(csv_reader, runner, dict_comparator):
     """ timeframe.in_seconds() """
     import pytest
-    from pynecore.codes import InvalidTimeframeError, TickTimeframeError
+    from pynecore.errorcodes import InvalidTimeframeError, TickTimeframeError
 
     with csv_reader('timeframe_is.csv', subdir="data") as cr:
         for candle, _plot in runner(cr).run_iter():

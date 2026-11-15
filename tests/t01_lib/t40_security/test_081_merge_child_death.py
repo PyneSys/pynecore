@@ -146,9 +146,9 @@ def __test_helper_check_report(raised):
 
     :param raised: The error the run ended with.
     """
-    from pynecore import codes
+    from pynecore import errorcodes
 
-    assert isinstance(raised, codes.DivisionByZeroError), (
+    assert isinstance(raised, errorcodes.DivisionByZeroError), (
         f"expected the dead child's R0001, got {type(raised).__name__}: {raised}")
     assert raised.in_security, raised.report()
     assert raised.at is not None and raised.at.module == 'main' \

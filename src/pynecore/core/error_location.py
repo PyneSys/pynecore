@@ -18,7 +18,7 @@ from pathlib import Path
 from types import FrameType, TracebackType
 from typing import Any, Callable
 
-from .. import codes
+from .. import errorcodes
 from ..transformers.call_inline import INLINE_SITES
 from .errors import MODULE_ID, RUNTIME_ROOTS, PyneError, SiteLoc, user_traceback
 
@@ -34,7 +34,7 @@ _UNBOUND_RE = re.compile(r"'([^']+)'")
 #: The coded error of an inlined built-in's body, by its Pine name: the Python
 #: exception its body raises, and the error made of its argument values.
 _INLINE_ERRORS: dict[str, tuple[type[BaseException], Callable[..., PyneError]]] = {
-    'array.get': (IndexError, lambda id_, index: codes.IndexOutOfRangeError(
+    'array.get': (IndexError, lambda id_, index: errorcodes.IndexOutOfRangeError(
         function='array.get', index=index, size=len(id_))),
 }
 
@@ -108,17 +108,17 @@ def coded(exc: BaseException) -> PyneError | None:
     if inlined is not None:
         return inlined
     if isinstance(exc, ZeroDivisionError):
-        return codes.DivisionByZeroError()
+        return errorcodes.DivisionByZeroError()
     if isinstance(exc, UnboundLocalError):
         name = getattr(exc, 'name', None)
         if name is None:
             found = _UNBOUND_RE.search(str(exc))
             name = found.group(1) if found else '?'
-        return codes.UnboundVariableError(name=name)
+        return errorcodes.UnboundVariableError(name=name)
     if isinstance(exc, OverflowError) and str(exc) == INFINITY_TO_INT:
-        return codes.InfinityToIntegerError()
+        return errorcodes.InfinityToIntegerError()
     if isinstance(exc, ValueError) and str(exc) == NAN_TO_INT:
-        return codes.NaToIntegerError()
+        return errorcodes.NaToIntegerError()
     return None
 
 

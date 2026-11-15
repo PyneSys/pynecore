@@ -99,7 +99,7 @@ def main():
 def __test_timeframe_basic__(runner, dummy_ohlcv_iter, monkeypatch):
     """ Basic """
     import pytest
-    from pynecore.codes import InvalidTimeframeError
+    from pynecore.errorcodes import InvalidTimeframeError
 
     next(runner(dummy_ohlcv_iter).run_iter())
 

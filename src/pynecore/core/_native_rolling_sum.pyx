@@ -29,7 +29,7 @@ import array as _array
 
 from . import rolling_sum as _rs
 from .safe_convert import native_int as _native_int
-from ..codes import ArgumentNotPositiveError as _ArgumentNotPositiveError
+from ..errorcodes import ArgumentNotPositiveError as _ArgumentNotPositiveError
 from .series import SeriesImpl as _SeriesImpl
 from ..types.na import na_float as _na_float
 

@@ -8,7 +8,7 @@ TV-measured double; a value under 1e-3 was printed rounded to 20 decimals.
 """
 import pytest
 
-from pynecore.codes import EmptyCollectionError, MatrixHoldsNaError, MatrixNotSquareError
+from pynecore.errorcodes import EmptyCollectionError, MatrixHoldsNaError, MatrixNotSquareError
 from pynecore.lib import matrix
 from pynecore.types.matrix import Matrix
 

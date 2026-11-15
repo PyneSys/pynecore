@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from pynecore import codes
+from pynecore import errorcodes
 from pynecore.core.error_location import (INFINITY_TO_INT, NAN_TO_INT, coded, located,
                                           pine_line_for)
 from pynecore.core.errors import SiteLoc
@@ -33,13 +33,13 @@ def __test_helper_raised(source: str, path: Path) -> BaseException:
 
 def __test_python_exceptions_get_their_codes__():
     """The four Python exceptions with a code, by type and CPython's message"""
-    assert type(coded(ZeroDivisionError("float division by zero"))) is codes.DivisionByZeroError
+    assert type(coded(ZeroDivisionError("float division by zero"))) is errorcodes.DivisionByZeroError
     unbound = UnboundLocalError("cannot access local variable 'x' where it is not associated "
                                 "with a value")
     error = coded(unbound)
-    assert type(error) is codes.UnboundVariableError and error.params == {'name': 'x'}
-    assert type(coded(OverflowError(INFINITY_TO_INT))) is codes.InfinityToIntegerError
-    assert type(coded(ValueError(NAN_TO_INT))) is codes.NaToIntegerError
+    assert type(error) is errorcodes.UnboundVariableError and error.params == {'name': 'x'}
+    assert type(coded(OverflowError(INFINITY_TO_INT))) is errorcodes.InfinityToIntegerError
+    assert type(coded(ValueError(NAN_TO_INT))) is errorcodes.NaToIntegerError
     assert coded(OverflowError("math range error")) is None
     assert coded(ValueError("bad")) is None
     assert coded(KeyError("k")) is None
@@ -62,7 +62,7 @@ def __test_located_fills_in_the_bar_and_the_scripts_line__(tmp_path: Path):
     script = tmp_path / 'script.py'
     exc = __test_helper_raised('x = 1\ny = 2 // 0\n', script)
     error = located(exc, 7, 1704164640000)
-    assert type(error) is codes.DivisionByZeroError
+    assert type(error) is errorcodes.DivisionByZeroError
     assert (error.bar_index, error.bar_time) == (7, 1704164640000)
     assert error.at == SiteLoc('signals', str(script), 2, 5, None)
     assert error.__traceback__ is exc.__traceback__
@@ -72,7 +72,7 @@ def __test_located_fills_in_the_bar_and_the_scripts_line__(tmp_path: Path):
 
 def __test_located_keeps_a_location_the_error_already_has__():
     """An error a security context located keeps the context's line"""
-    error = codes.DivisionByZeroError()
+    error = errorcodes.DivisionByZeroError()
     error.at = SiteLoc('main', 'child.py', 4, 1)
     assert located(error, 3, 0) is error and error.at == SiteLoc('main', 'child.py', 4, 1)
     assert error.bar_index == 3
@@ -133,7 +133,7 @@ def __test_a_child_stopped_by_a_coded_error_reports_the_error__(tmp_path: Path):
     script = tmp_path / 'script.py'
     exc = __test_helper_raised('x = 1 // 0\n', script)
     report = _failure_report(exc)
-    assert type(report) is codes.DivisionByZeroError
+    assert type(report) is errorcodes.DivisionByZeroError
     assert report.at == SiteLoc('signals', str(script), 1, 5, None) and report.bar_index is None
     assert pickle.loads(pickle.dumps(report)).report() == report.report()
     text = _failure_report(__test_helper_raised('{}["k"]\n', script))

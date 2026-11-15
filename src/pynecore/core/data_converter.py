@@ -11,7 +11,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
+from pynecore.errorcodes import MissingFileError
 from pynecore.core._file_io import replace_file
+from pynecore.core.errors import PyneError
 from pynecore.core.data_path import with_data_extension
 from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
 from pynecore.lib.timeframe import _in_seconds
@@ -166,12 +168,13 @@ class DataConverter:
         :param provider: Data provider name for OHLCV file naming
         :param symbol: Symbol for OHLCV file naming
         :param timezone: Timezone for timestamp conversion
-        :raises FileNotFoundError: If source file doesn't exist
+        :raises MissingFileError: If source file doesn't exist
         :raises DataFormatError: If file format is unsupported
         :raises ConversionError: If conversion fails
+        :raises PyneError: If the source data is invalid (its coded error)
         """
         if not file_path.exists():
-            raise FileNotFoundError(f"Source file not found: {file_path}")
+            raise MissingFileError(path=str(file_path))
 
         # Detect file format
         detected_format = self.detect_format(file_path)
@@ -399,6 +402,8 @@ class DataConverter:
                     cleanup_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+            if isinstance(e, PyneError):
+                raise
             raise ConversionError(f"Failed to convert {file_path}: {e}") from e
 
     @staticmethod
@@ -408,11 +413,11 @@ class DataConverter:
 
         :param file_path: Path to the file to analyze
         :return: Detected format
-        :raises FileNotFoundError: If file doesn't exist
+        :raises MissingFileError: If file doesn't exist
         :raises DataFormatError: If file cannot be read
         """
         if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+            raise MissingFileError(path=str(file_path))
 
         if file_path.suffix.lower() == '.ohlcv':
             try:

@@ -7,6 +7,7 @@ hit resolving to a synthetic ``.ohlcv`` file, the missing-file error message,
 and an explicit ``security_data`` mapping overriding the global map.
 """
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import pytest
 
 from pynecore.core.symbol_map import MappedSymbol, SymbolMap, SYMBOL_MAP_FILENAME
 from pynecore.core.script_runner import ScriptRunner
+from pynecore.errorcodes import SECURITY_DATA_MISSING
 
 
 # --- MappedSymbol.parse ---
@@ -143,20 +145,21 @@ def __test_resolve_security_data_map_hit__(tmp_path: Path):
     assert result["sid1"] == str(expected)
 
 
-def __test_resolve_security_data_map_missing_file__(tmp_path: Path):
-    """A mapped-but-missing file raises an actionable ValueError"""
+def __test_resolve_security_data_map_missing_file__(tmp_path: Path, caplog):
+    """A mapped-but-missing file raises the missing-data error and logs how to download it"""
     _write_map(tmp_path / "config", """
 [symbol_map]
 "BINANCE:BTCUSDT" = "ccxt:BYBIT:BTC/USDT:USDT"
 """)
     runner = _make_runner(tmp_path)
-    with pytest.raises(ValueError) as ei:
+    with caplog.at_level(logging.WARNING), pytest.raises(ValueError) as ei:
         runner._resolve_security_data(
             {"sid1": {"symbol": "BINANCE:BTCUSDT", "timeframe": "1D"}})
-    msg = str(ei.value)
-    assert "ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv" in msg
-    assert "pyne data download" in msg
-    assert "ccxt:BYBIT:BTC/USDT:USDT@1D" in msg
+    assert getattr(ei.value, 'code', None) is SECURITY_DATA_MISSING
+    hint = caplog.text
+    assert "ccxt_BYBIT_BTC_USDT_USDT_1D.ohlcv" in hint
+    assert "pyne data download" in hint
+    assert "ccxt:BYBIT:BTC/USDT:USDT@1D" in hint
 
 
 def __test_resolve_security_data_explicit_overrides_map__(tmp_path: Path):

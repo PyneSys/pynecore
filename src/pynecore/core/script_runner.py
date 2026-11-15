@@ -37,7 +37,10 @@ from pynecore.types.session import Session
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.data_path import with_data_extension
 from pynecore.core.drawing_snapshot import DrawingSnapshot
-from pynecore.codes import (InvalidTimeframeError, ResourceLimitError, SecurityDataMissingError,
+from pynecore.errorcodes import (InvalidDataError, InvalidOptionError, InvalidTimeframeError,
+                            MissingFileError, NotAvailableError, ProviderUnavailableError,
+                            ResourceLimitError,
+                            ScriptNotRunnableError, SecurityDataMissingError,
                             SecurityTimeframeHigherError)
 from pynecore.core.error_location import located
 from pynecore.core.errors import MAIN_MODULE, MODULE_ID, PyneError
@@ -200,10 +203,11 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
     :param resolved_configs: Per-module chart configuration for a security replica;
                             matching modules do not read or write their TOML
     :return: The executed module
-    :raises ImportError: If the file cannot be read, is not Pyne code or has no
+    :raises MissingFileError: If the file does not exist
+    :raises ScriptNotRunnableError: If the file cannot be read, is not Pyne code or has no
                          ``main`` function
-    :raises ValueError: If an ``inputs`` key is not an input of the script, or a ``settings``
-                       key is not a settable script field
+    :raises InvalidOptionError: If an ``inputs`` key is not an input of the script, or a
+                       ``settings`` key is not a settable script field
     """
     # Check for @pyne magic doc comment before importing (prevents import errors)
     # Without this user may get strange errors which are very hard to debug.
@@ -215,13 +219,14 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
     try:
         with open(script_path, 'rb') as f:
             head = f.read(4096)
-        if not import_hook.source_starts_with_pyne(head):
-            raise ImportError(
-                f"Script '{script_path}' must have a magic doc comment containing "
-                f"'@pyne' at the beginning of the file!"
-            )
-    except (OSError, IOError) as e:
-        raise ImportError(f"Could not read script file '{script_path}': {e}")
+    except FileNotFoundError:
+        raise MissingFileError(path=str(script_path)) from None
+    except OSError as e:
+        raise ScriptNotRunnableError(path=str(script_path),
+                                     why=f"it cannot be read ({e.strerror})") from None
+    if not import_hook.source_starts_with_pyne(head):
+        raise ScriptNotRunnableError(path=str(script_path),
+                                     why="its docstring does not start with `@pyne`")
 
     # The file itself, never what its stem resolves to: a cached module of another
     # script with the same file name, or any other module of that name
@@ -263,7 +268,7 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
         script_mod._resolved_configs = previous_configs
 
     if not hasattr(module, 'main'):
-        raise ImportError(f"Script '{script_path}' must have a 'main' function to run!")
+        raise ScriptNotRunnableError(path=str(script_path), why="it has no `main` function")
 
     return module
 
@@ -668,6 +673,20 @@ def _ltf_timeframe_too_high(timeframe: str, script_tf: str) -> bool:
     return req_sec is not None and script_sec is not None and req_sec > script_sec
 
 
+def profile_option_error() -> InvalidOptionError:
+    """The error of profiling asked for outside a backtest."""
+    return InvalidOptionError(option='--profile',
+                              why="it is available for backtests only, not with --live or "
+                                  "--broker")
+
+
+def history_trades_option_error() -> InvalidOptionError:
+    """The error of trading on the warmup bars asked for outside live paper trading."""
+    return InvalidOptionError(option='--history-trades',
+                              why="it is available with --live paper trading only, not with "
+                                  "--broker or in a backtest")
+
+
 def _ltf_timeframe_error(timeframe: str, script_tf: str) -> SecurityTimeframeHigherError:
     """The error of a ``request.security_lower_tf()`` above the script's timeframe.
 
@@ -690,7 +709,7 @@ def _measure_feed_period_sec(path: Path, declared: str | None = None) -> int | N
     :param path: Path to the ``.ohlcv`` feed.
     :param declared: ``period`` from the sibling ``.toml``, when it has one.
     :return: The feed's period in seconds, or ``None`` when it cannot be told.
-    :raises ValueError: If ``declared`` disagrees with the file header.
+    :raises InvalidDataError: If ``declared`` disagrees with the file header.
     """
     from .ohlcv import OHLCVReader
 
@@ -699,10 +718,9 @@ def _measure_feed_period_sec(path: Path, declared: str | None = None) -> int | N
         header_sec = _try_in_seconds(reader.period)
         if header_sec is not None:
             if declared_sec is not None and declared_sec != header_sec:
-                raise ValueError(
-                    f"Stale syminfo for {path.name}: TOML period {declared!r} does not "
-                    f"match the period {reader.period!r} declared by the data file"
-                )
+                raise InvalidDataError(
+                    where=str(path), why=f"its symbol description declares the period "
+                                         f"{declared}, the file holds {reader.period} bars")
             return header_sec
         if declared_sec is not None:
             return declared_sec
@@ -758,10 +776,7 @@ def _resample_finer_security_feed(data_path: str, target_tf: str,
 
     # Same resolution as the runner's own ``syminfo.timezone`` (empty -> UTC), so the
     # resampled grid and the security child agree on the exchange day.
-    try:
-        tz = parse_timezone(si.timezone or 'UTC')
-    except ValueError as e:
-        raise ValueError(f"{toml_path}: {e}") from e
+    tz = parse_timezone(si.timezone or 'UTC')
 
     if not tmp_dir_holder:
         tmp_dir_holder.append(tempfile.mkdtemp(prefix='pyne_sec_resample_'))
@@ -1469,19 +1484,19 @@ class ScriptRunner:
                                 the clean-up on (see :func:`_round_price`)
         :param profile_path: Profile the run and write the per-line profile here (see
                              :mod:`pynecore.core.profiler`). Backtests only.
-        :raises ImportError: If the script does not have a 'main' function
-        :raises ImportError: If the 'main' function is not decorated with @script.[indicator|strategy|library]
+        :raises MissingFileError: If the script file does not exist
+        :raises ScriptNotRunnableError: If the script is not Pyne code, has no ``main``
+            function, or its ``main`` is not decorated with
+            ``@script.[indicator|strategy|library]``
         :raises OSError: If the plot file could not be opened
-        :raises ValueError: If a live or broker run is to be profiled
-        :raises ValueError: If ``live_history_trades`` is set outside live paper trading
+        :raises InvalidOptionError: If ``live_history_trades`` is set outside live paper trading,
+            or ``profile_path`` outside a backtest
         :raises ProfilerUnavailable: If profiling is asked for but not possible here
         """
         if profile_path is not None and (live or broker_plugin is not None):
-            raise ValueError("Profiling is available for backtests only, not for live or "
-                             "broker runs.")
+            raise profile_option_error()
         if live_history_trades and (not live or broker_plugin is not None):
-            raise ValueError("Trading on the warmup bars is available for live paper trading "
-                             "only, not for backtests or broker runs.")
+            raise history_trades_option_error()
         self._script_path = script_path
         self._profiler: 'RunProfiler | None' = None
         self._security_data = security_data or {}
@@ -1570,8 +1585,10 @@ class ScriptRunner:
                                            settings=self._settings)
 
         if not hasattr(self.script_module.main, 'script'):
-            raise ImportError(f"The 'main' function must be decorated with "
-                              f"@script.[indicator|strategy|library] to run!")
+            raise ScriptNotRunnableError(
+                path=str(script_path),
+                why="its `main` is not decorated with `@script.indicator`, "
+                    "`@script.strategy` or `@script.library`")
 
         self.script: script = self.script_module.main.script
 
@@ -2299,6 +2316,16 @@ class ScriptRunner:
             # Closing this iterator early (break, close()) must run the runner's cleanup now
             results.close()
 
+    def _main_result_error(self) -> ScriptNotRunnableError:
+        """The error of a ``main`` that returned something else than a dict."""
+        return ScriptNotRunnableError(path=str(self._script_path),
+                                      why="its `main` returns a value that is not a dict")
+
+    def _broker_name(self) -> str:
+        """The broker plugin's name as an error shows it."""
+        plugin = self._broker_plugin
+        return getattr(plugin, 'plugin_name', '') or type(plugin).__name__
+
     # noinspection PyProtectedMember
     def _run_iter(self, on_progress: Callable[[datetime], None] | None = None,
                   on_tick: Callable[[OHLCV], None] | None = None,
@@ -2333,11 +2360,9 @@ class ScriptRunner:
         run_tf = stf.timeframe if stf is not None else str(self.syminfo.period)
         if stf is not None:
             if lib._is_live:
-                raise NotImplementedError(
-                    f"Script timeframe '{stf.timeframe}' is not supported in live mode: "
-                    f"the current higher-timeframe bar is still developing and the "
-                    f"historical path only executes completed ones."
-                )
+                raise InvalidOptionError(
+                    option='--live', why=f"the script timeframe {stf.timeframe} does not run "
+                                         f"live: its developing bar is not executed")
 
         # Reset bar_index — pre-increment scheme starts at -1.
         self.bar_index = -1
@@ -2357,20 +2382,17 @@ class ScriptRunner:
         # exchange doesn't offer. Fail fast — never on the first bar.
         if self._broker_plugin is not None:
             from pynecore.core.broker.validation import validate_at_startup
-            from pynecore.core.broker.exceptions import (
-                AuthenticationError,
-                ExchangeCapabilityError,
-            )
+            from pynecore.core.broker.exceptions import AuthenticationError
             caps = self._broker_plugin.get_capabilities()
             reqs = getattr(self.script, '_broker_requirements', None)
             if reqs is not None:
                 pyramiding = int(getattr(self.script, 'pyramiding', 1) or 1)
                 errors = validate_at_startup(cast('ScriptRequirements', reqs), caps, pyramiding=pyramiding)
                 if errors:
-                    raise ExchangeCapabilityError(
-                        "Script requirements not met by exchange:\n"
-                        + "\n".join(f"  - {e}" for e in errors)
-                    )
+                    raise ProviderUnavailableError(
+                        provider=self._broker_name(),
+                        why="the exchange does not meet the script's requirements: "
+                            + "; ".join(error.rstrip('.') for error in errors))
 
             # Auth check: fail fast on bad credentials rather than on the
             # first order attempt. A single get_balance() call is cheap and
@@ -2385,11 +2407,9 @@ class ScriptRunner:
                         coro, self._broker_event_loop,
                     ).result(timeout=30.0)
             except AuthenticationError as exc:
-                raise AuthenticationError(
-                    "Broker authentication failed at startup — cannot begin "
-                    f"trading: {exc.reason}",
-                    reason=exc.reason,
-                ) from exc
+                raise ProviderUnavailableError(
+                    provider=self._broker_name(),
+                    why=f"the authentication failed at startup ({exc.reason})") from exc
 
             # Confirm demo/live authentication and account identity at INFO
             # without dumping every asset balance into the durable transcript.
@@ -2921,9 +2941,9 @@ class ScriptRunner:
                     # type would need per-intrabar transformation that the
                     # child-side per-period step does not do — reject it clearly.
                     if sec_state.chart_type is not None and sec_state.is_ltf:
-                        raise NotImplementedError(
-                            f"request.security_lower_tf() with "
-                            f"ticker.{sec_state.chart_type}() is not supported.")
+                        raise NotAvailableError(
+                            function=f"request.security_lower_tf with "
+                                     f"ticker.{sec_state.chart_type}")
                     # D/W/M HTF contexts confirm boundaries by walking the
                     # child's actual bar opens (correct for sparse series).
                     # Backtest only: a file-backed child realizes the real
@@ -3510,7 +3530,8 @@ class ScriptRunner:
                     located(e, int(lib.bar_index), lib._time)
                     raise
                 if r is not None:
-                    assert isinstance(r, dict), "The 'main' function must return a dictionary!"
+                    if not isinstance(r, dict):
+                        raise self._main_result_error()
                     lib._plot_data.update(r)
 
             # noinspection PyProtectedMember
@@ -4929,7 +4950,8 @@ class ScriptRunner:
 
             # Update plot data with the results
             if res is not None:
-                assert isinstance(res, dict), "The 'main' function must return a dictionary!"
+                if not isinstance(res, dict):
+                    raise self._main_result_error()
                 lib._plot_data.update(res)
 
             # Write plot data to CSV if we have a writer
@@ -5495,10 +5517,10 @@ class ScriptRunner:
                 continue
             provider_cls = load_plugin(entry.provider_name)
             if not issubclass(provider_cls, LiveProviderPlugin):
-                raise RuntimeError(
-                    f"Plugin '{entry.provider_name}' is not a live provider; "
-                    f"cannot drive cross-symbol live request.security."
-                )
+                raise ProviderUnavailableError(
+                    provider=entry.provider_name,
+                    why="it is not a live provider, so it cannot serve a live "
+                        "`request.security`")
             ignore_invalid = bool(
                 sec_contexts and sec_contexts.get(sec_id, {}).get('ignore_invalid_symbol')
             )

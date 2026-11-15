@@ -8,7 +8,7 @@ takes its first dimension from the array; omitting the array inserts na cells.
 """
 import pytest
 
-from pynecore.codes import SizeMismatchError
+from pynecore.errorcodes import SizeMismatchError
 from pynecore.lib import matrix
 from pynecore.types.line import Line
 from pynecore.types.na import NA

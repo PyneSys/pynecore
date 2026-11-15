@@ -77,7 +77,7 @@ def __test_out_of_order_append_still_rejected__(tmp_path: Path, log):
     with OHLCVReader(str(path)) as reader:
         first_on_disk = reader.start_timestamp
 
-    with pytest.raises(ValueError, match="strictly increasing"):
+    with pytest.raises(ValueError, match="follows"):
         with OHLCVWriter(path, "1M") as writer:
             writer.write(OHLCV(first_on_disk, 1.0, 2.0, 0.5, 1.5, 100.0))
 

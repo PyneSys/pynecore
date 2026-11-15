@@ -336,7 +336,7 @@ def __test_missing_feed_still_raises_with_slicing__(runner, log):
     ``ValueError`` whether the child runs a slice or the whole ``main()`` — a
     dropped read would turn the failure into a quiet ``na``.
     """
-    from pynecore.codes import SECURITY_DATA_MISSING
+    from pynecore.errorcodes import SECURITY_DATA_MISSING
     sliced_done, sliced_error = __test_helper_run_with_timeout(
         lambda: __test_helper_run_missing_feed(runner, False))
     plain_done, plain_error = __test_helper_run_with_timeout(

@@ -203,7 +203,7 @@ def _parse_timezone_cached(timezone: str) -> ZoneInfo:
         if not _timezone_db_available():
             raise TimezoneNotFoundError(_missing_timezone_message(timezone))
         # The codes module builds its error on this module's TimezoneNotFoundError
-        from ..codes import UnknownTimezoneError
+        from ..errorcodes import UnknownTimezoneError
         raise UnknownTimezoneError(timezone=timezone)
 
     prefix, sign, hours, minutes = match.groups()
@@ -295,7 +295,7 @@ def parse_timezone(timezone: str | None) -> ZoneInfo:
 def _invalid_date(text: str) -> ValueError:
     """The error of a date string no format takes."""
     # The codes module imports this one
-    from ..codes import InvalidDateError
+    from ..errorcodes import InvalidDateError
     return InvalidDateError(text=text)
 
 

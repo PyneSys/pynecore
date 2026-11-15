@@ -4,7 +4,7 @@ from math import nan
 from typing import TYPE_CHECKING, Any, TypeVar, overload, overload as _typing_overload
 
 from ..types.footprint import Footprint
-from ..codes import NotAvailableError as _NotAvailableError
+from ..errorcodes import NotAvailableError as _NotAvailableError
 from ..types.na import NA
 from . import syminfo
 

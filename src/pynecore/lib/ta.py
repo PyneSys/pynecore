@@ -15,7 +15,7 @@ from collections import deque
 from ..types import (Series, Persistent, IBPersistent, NA, PyneFloat, PyneInt, PyneBool,
                      na_float)
 from ..types.na import na_int
-from ..codes import (ArgumentNegativeError as _ArgumentNegativeError,
+from ..errorcodes import (ArgumentNegativeError as _ArgumentNegativeError,
                      ArgumentNotPositiveError as _ArgumentNotPositiveError,
                      PercentageOutOfRangeError as _PercentageOutOfRangeError)
 from ..core.module_property import module_property, module_function_property

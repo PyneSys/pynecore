@@ -164,6 +164,6 @@ def __test_legacy_reader_rejects_text_disguised_as_ohlcv__(tmp_path):
         "1609459200,100,110,90,105,1000\n"
     )
 
-    with pytest.raises(ValueError, match="Text file detected with .ohlcv extension"):
+    with pytest.raises(ValueError, match="it is a text file"):
         with OHLCVReader(file_path):
             pass

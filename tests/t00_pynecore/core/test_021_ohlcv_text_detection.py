@@ -48,7 +48,7 @@ def __test_csv_under_ohlcv_name_still_rejected__(tmp_path: Path, log):
                     "2025-01-01T00:00:00Z,1,2,0.5,1.5,100\n", encoding="utf-8")
     assert path.stat().st_size % RECORD_SIZE != 0
 
-    with pytest.raises(ValueError, match="Text file detected"):
+    with pytest.raises(ValueError, match="it is a text file; convert it with `pyne data convert-from"):
         with OHLCVReader(str(path)):
             pass
 

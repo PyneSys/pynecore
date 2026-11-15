@@ -30,7 +30,7 @@ from typing import Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from .datetime import parse_timezone
-from ..codes import SecurityDataMissingError, SecurityVariesInLoopError
+from ..errorcodes import SecurityDataMissingError, SecurityVariesInLoopError
 from .errors import PyneError, RUNTIME_ROOTS
 from .import_hook import security_dev_skip_disabled
 from .lookahead import ALLOW_LOOKAHEAD

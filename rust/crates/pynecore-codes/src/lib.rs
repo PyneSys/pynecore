@@ -2,7 +2,7 @@
 //! of Pyne code and of the Pyne Edge profile, and PyneCore's internal error.
 //!
 //! The constants, [`ALL`] and [`RUNTIME`] are generated from
-//! `codes/registry.toml` by `codes/generate.py`. A code carries what a
+//! `scripts/errorcodes/registry.toml` by `scripts/errorcodes/generate.py`. A code carries what a
 //! reported diagnostic needs; the long explanation and the introducing release
 //! are in the generated docs. PyneComp's code crate re-exports these codes next
 //! to the compiler's own, with this crate's types.
@@ -182,7 +182,7 @@ pub fn lookup_in(table: &[&'static Code], code: &str) -> Option<&'static Code> {
 /// A number as an error message shows it, the same way PyneCore's
 /// `format_arg` does: `na`, a whole number without a fraction, any other in
 /// its shortest exact form written out in full (`1e-7` is `0.0000001`). Both
-/// run the vectors of `codes/format_arg.toml`.
+/// run the vectors of `scripts/errorcodes/format_arg.toml`.
 pub fn format_arg(v: f64) -> String {
     if v.is_nan() {
         String::from("na")

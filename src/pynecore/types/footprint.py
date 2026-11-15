@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 from .volume_row import VolumeRow
-from ..codes import NotAvailableError
+from ..errorcodes import NotAvailableError
 
 
 @dataclass(slots=True, eq=False)

@@ -446,11 +446,12 @@ aligned with the data's bars.
 name = "invalid_data"
 severity = "error"
 title = "Invalid data"
-message = "The data handed to the run is invalid: {why}."
+message = "`{where}`: the data is invalid: {why}."
 python = "ValueError"
 explanation = """
-A data file or its symbol description is inconsistent: two sources under one
-key, a symbol description of another symbol, or prices that are not finite.
+A data file, an imported row or a symbol description is inconsistent: two
+sources under one key, a symbol description of another symbol, a timestamp
+that does not follow the previous one, or prices that are not finite.
 """
 
 [R0038]
@@ -504,6 +505,7 @@ name = "invalid_option"
 severity = "error"
 title = "Invalid run option"
 message = "`{option}`: {why}."
+python = ["ValueError", "NotImplementedError"]
 explanation = """
 An option of the run is not usable as given. This is about how the run was
 started, not about the script.
@@ -544,6 +546,53 @@ explanation = """
 Some symbol details exist only when the data provider supplies them, such as
 `syminfo.avg_spread`. The symbol of this run has none, so reading it stops the
 run. Add the value to the symbol's description, or do not read it.
+"""
+
+[R0046]
+name = "data_file_unreadable"
+severity = "error"
+title = "Unreadable data file"
+message = "`{path}` is not a usable OHLCV file: {why}."
+python = "ValueError"
+explanation = """
+The file is not an OHLCV file, it is damaged, or it was written in a format
+version this PyneCore cannot read. Download or convert the data again.
+"""
+
+[R0047]
+name = "script_not_runnable"
+severity = "error"
+title = "Script cannot run"
+message = "`{path}` cannot run: {why}."
+python = ["ImportError", "AssertionError"]
+explanation = """
+A Pyne code file starts with a docstring holding `@pyne`, has a `main`
+function decorated with `@script.indicator`, `@script.strategy` or
+`@script.library`, and its `main` returns a dict when it returns anything.
+"""
+
+[R0048]
+name = "file_not_found"
+severity = "error"
+title = "File not found"
+message = "`{path}` does not exist."
+python = "FileNotFoundError"
+exception = "MissingFileError"
+explanation = """
+A file the run needs, such as the script, its data or the data's symbol
+description, is not where the run looks for it.
+"""
+
+[R0049]
+name = "provider_unavailable"
+severity = "error"
+title = "Data provider unavailable"
+message = "`{provider}`: {why}."
+python = "RuntimeError"
+explanation = """
+The data provider or broker of a live run cannot serve it: the connection did
+not come up in time, the plugin cannot deliver live data, or the exchange
+does not meet what the script requires.
 """
 
 [I0004]

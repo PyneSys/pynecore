@@ -40,7 +40,7 @@ import os as _os
 from typing import Any
 
 from .safe_convert import native_int
-from ..codes import ArgumentNotPositiveError
+from ..errorcodes import ArgumentNotPositiveError
 from .series import SeriesImpl
 from ..types.na import na_float
 

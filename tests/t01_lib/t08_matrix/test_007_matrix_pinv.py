@@ -9,7 +9,7 @@ decimals.
 """
 import pytest
 
-from pynecore.codes import MatrixSingularError
+from pynecore.errorcodes import MatrixSingularError
 from pynecore.lib import matrix
 from pynecore.types.matrix import Matrix
 

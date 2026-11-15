@@ -1,6 +1,6 @@
 from typing import Iterable
 
-from pynecore.codes import ArgumentNotPositiveError, ArgumentZeroError
+from pynecore.errorcodes import ArgumentNotPositiveError, ArgumentZeroError
 from pynecore.core.errors import PyneError
 from pynecore.core.pine_compare import EPSILON
 from pynecore.types.pine_types import PyneFloat, PyneInt

@@ -25,9 +25,9 @@ def __test_helper_bars():
 def __test_an_inlined_array_get_out_of_range_is_r0010__(runner):
     """The index and the size come from the failing frame, the call's own line"""
     import pytest
-    from pynecore import codes
+    from pynecore import errorcodes
 
-    with pytest.raises(codes.IndexOutOfRangeError) as raised:
+    with pytest.raises(errorcodes.IndexOutOfRangeError) as raised:
         for _ in runner(__test_helper_bars(), {"period": "1D"}).run_iter():
             pass
     error = raised.value

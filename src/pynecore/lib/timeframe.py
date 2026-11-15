@@ -6,7 +6,7 @@ if TYPE_CHECKING:
 from functools import lru_cache
 from datetime import datetime, timedelta
 
-from ..codes import (InvalidTimeframeError as _InvalidTimeframeError,
+from ..errorcodes import (InvalidTimeframeError as _InvalidTimeframeError,
                      TickTimeframeError as _TickTimeframeError)
 from ..core.module_property import module_property
 from ..types.pine_types import PyneInt, pine_int

@@ -34,8 +34,10 @@ from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.core.broker.interrupt_guard import request_interrupt
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.syminfo import SymInfo, mintick_decimals
-from pynecore.core.script_runner import ScriptRunner, DataRequirements, SecurityRequirement
+from pynecore.core.script_runner import (ScriptRunner, DataRequirements, SecurityRequirement,
+                                         history_trades_option_error, profile_option_error)
 from pynecore.core.profiler import ProfilerUnavailable
+from pynecore.errorcodes import InvalidOptionError, MissingFileError
 from pynecore.core.errors import PyneError
 from pynecore.pynesys.compiler import PyneComp
 from pynecore.core.provider_string import is_provider_string
@@ -689,7 +691,7 @@ def resolve_script(script: Path, api_key: str | None) -> Path:
 
     # Check if script exists
     if not script.exists():
-        secho(f"Script file '{script}' not found!", fg="red", err=True)
+        secho(f"Error: {MissingFileError(path=str(script)).report()}", fg="red", err=True)
         raise Exit(1)
 
     # Handle .pine files - compile them first
@@ -744,7 +746,8 @@ def resolve_script(script: Path, api_key: str | None) -> Path:
             script = script.with_suffix(".py")
             # Check if script exists
             if not script.exists():
-                secho(f"Script file '{script}' not found!", fg="red", err=True)
+                secho(f"Error: {MissingFileError(path=str(script)).report()}", fg="red",
+                      err=True)
                 raise Exit(1)
 
     return script
@@ -816,6 +819,9 @@ def resolve_data(data: str, time_from: str | None, *,
                         progress.update(task, completed=1)
                 else:
                     data_path = with_data_extension(data_path, ".ohlcv")
+            except PyneError as e:
+                secho(f"Error: {e.report()}", fg="red", err=True)
+                raise Exit(1)
             except (DataFormatError, ConversionError) as e:
                 secho(f"Conversion failed: {e}", fg="red", err=True)
                 secho("Please convert the file manually:", fg="red")
@@ -823,13 +829,17 @@ def resolve_data(data: str, time_from: str | None, *,
                 raise Exit(1)
 
         if not data_path.exists():
-            secho(f"Data file not found: {data_path.name}", fg="red", err=True)
+            secho(f"Error: {MissingFileError(path=str(data_path)).report()}", fg="red", err=True)
             raise Exit(1)
 
+        toml_path = data_path.with_suffix(".toml")
         try:
-            syminfo = SymInfo.load_toml(data_path.with_suffix(".toml"))
+            syminfo = SymInfo.load_toml(toml_path)
         except FileNotFoundError:
-            secho(f"Symbol info file '{data_path.with_suffix('.toml')}' not found!", fg="red", err=True)
+            secho(f"Error: {MissingFileError(path=str(toml_path)).report()}", fg="red", err=True)
+            raise Exit(1)
+        except PyneError as e:
+            secho(f"Error: {e.report()}", fg="red", err=True)
             raise Exit(1)
 
     return data_path, syminfo, provider_data
@@ -940,7 +950,7 @@ def backtest_security_path(value: str) -> str:
         sec_path = app_state.data_dir / sec_path
     ohlcv_check = with_data_extension(sec_path, '.ohlcv')
     if not ohlcv_check.exists():
-        secho(f"Security data not found: {ohlcv_check}", fg="red", err=True)
+        secho(f"Error: {MissingFileError(path=str(ohlcv_check)).report()}", fg="red", err=True)
         raise Exit(1)
     return str(with_data_extension(sec_path, ''))
 
@@ -1147,18 +1157,16 @@ def run(
     # --- Data resolution: provider string or file path ---
     provider_mode = is_provider_string(data)
 
+    option_error: InvalidOptionError | None = None
     if live and not provider_mode:
-        secho("Error: --live is only available in provider mode.", err=True, fg=colors.RED)
-        raise Exit(1)
-
-    if history_trades and (broker or not live):
-        secho("Error: --history-trades is available with --live paper trading only, "
-              "not with --broker or in a backtest.", err=True, fg=colors.RED)
-        raise Exit(1)
-
-    if profile and (live or broker):
-        secho("Error: --profile is available for backtests only, not with --live or --broker.",
-              err=True, fg=colors.RED)
+        option_error = InvalidOptionError(option='--live', why="it needs a provider string as "
+                                                              "the data")
+    elif history_trades and (broker or not live):
+        option_error = history_trades_option_error()
+    elif profile and (live or broker):
+        option_error = profile_option_error()
+    if option_error is not None:
+        secho(f"Error: {option_error.report()}", err=True, fg=colors.RED)
         raise Exit(1)
 
     data_path, syminfo, provider_data = resolve_data(

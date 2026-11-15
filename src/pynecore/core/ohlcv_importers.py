@@ -1,6 +1,8 @@
 """Import CSV, TXT, and JSON market data into an open OHLCV v2 writer."""
 
 import csv
+import functools
+import inspect
 import json
 import re
 import tempfile
@@ -10,11 +12,13 @@ from math import gcd
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from types import TracebackType
-from typing import IO, Protocol, cast
+from typing import IO, Any, Callable, Protocol, TypeVar, cast
 
+from pynecore.errorcodes import InvalidDataError
 from pynecore.core._file_io import replace_file
+from pynecore.core.errors import PyneError
 from pynecore.core.ohlcv import OHLCVWriter, parse_timezone_name
-from pynecore.types.ohlcv import OHLCV
+from pynecore.types.ohlcv import OHLCV, AskOHLC
 
 __all__ = [
     "infer_csv_period",
@@ -26,12 +30,50 @@ __all__ = [
 ]
 
 _TIMESTAMP_NAMES = ("timestamp", "time", "date", "datetime", "ts_event", "ts_recv")
-_STANDARD_COLUMNS = frozenset((*_TIMESTAMP_NAMES, "open", "high", "low", "close", "volume"))
+# The ask side of a feed quoting both sides, as the OHLCV exporters name it
+_ASK_NAMES = ("ask_open", "ask_high", "ask_low", "ask_close")
+_STANDARD_COLUMNS = frozenset(
+    (*_TIMESTAMP_NAMES, "open", "high", "low", "close", "volume", *_ASK_NAMES)
+)
 _JSON_WRAPPER_NAMES = ("data", "candles", "ohlcv", "results")
 _SUB_MICROSECONDS = re.compile(r"(\.\d{6})\d+")
 
 _Timezone = tzinfo
 _JsonNumberInput = str | int | float
+_F = TypeVar('_F', bound=Callable[..., Any])
+
+
+def _why(error: ValueError) -> str:
+    """What is wrong, from ``error``: the reason of an invalid-data error, or the
+    exception's own text."""
+    if isinstance(error, InvalidDataError):
+        return str(error.params['why'])
+    text = str(error)
+    if len(text) > 1 and text[1].islower():
+        return text[0].lower() + text[1:]
+    return text
+
+
+def _invalid_data(function: _F) -> _F:
+    """Report a source ``function``'s plain ``ValueError`` as the invalid data of its
+    ``path`` argument; a coded error already names its place.
+
+    :param function: An import entry point with a ``path`` parameter
+    :return: The wrapped function
+    """
+    signature = inspect.signature(function)
+
+    @functools.wraps(function)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return function(*args, **kwargs)
+        except PyneError:
+            raise
+        except ValueError as error:
+            path = signature.bind(*args, **kwargs).arguments['path']
+            raise InvalidDataError(where=str(path), why=_why(error)) from None
+
+    return cast(_F, wrapper)
 
 
 class _RowWriter(Protocol):
@@ -180,6 +222,39 @@ def _find_ohlcv_columns(headers: list[str]) -> tuple[int, int, int, int, int]:
     return indices[0], indices[1], indices[2], indices[3], indices[4]
 
 
+def _find_ask_columns(headers: list[str]) -> tuple[int, int, int, int] | None:
+    """Find the four ask-side price column indices.
+
+    :param headers: Normalized lowercase headers.
+    :return: ``(ask_open, ask_high, ask_low, ask_close)`` indices, or ``None`` without
+             ask columns.
+    :raises ValueError: If only some of the ask columns are present.
+    """
+    present = [name for name in _ASK_NAMES if name in headers]
+    if not present:
+        return None
+    if len(present) != len(_ASK_NAMES):
+        missing = ", ".join(name for name in _ASK_NAMES if name not in present)
+        raise ValueError(f"Incomplete ask columns, missing: {missing}")
+    indices = [headers.index(name) for name in _ASK_NAMES]
+    return indices[0], indices[1], indices[2], indices[3]
+
+
+def _ask_from_cells(cells: list[str]) -> AskOHLC | None:
+    """Build the ask side of a bar from its four source cells.
+
+    :param cells: ``ask_open``, ``ask_high``, ``ask_low`` and ``ask_close`` texts.
+    :return: The ask prices, or ``None`` when every cell is empty.
+    :raises ValueError: If only some cells are empty or a cell is not a number.
+    """
+    empty = [not cell.strip() for cell in cells]
+    if all(empty):
+        return None
+    if any(empty):
+        raise ValueError("incomplete ask prices")
+    return AskOHLC(float(cells[0]), float(cells[1]), float(cells[2]), float(cells[3]))
+
+
 def _parse_timestamp(
     timestamp_text: str,
     timestamp_format: str | None = None,
@@ -306,6 +381,7 @@ def _parse_and_write_ohlcv_row(
     timestamp_text: str,
     row: list[str],
     ohlcv_indices: tuple[int, int, int, int, int],
+    ask_indices: tuple[int, int, int, int] | None,
     timestamp_format: str | None,
     timezone: _Timezone | None,
 ) -> None:
@@ -317,17 +393,16 @@ def _parse_and_write_ohlcv_row(
     :param timestamp_text: Combined or direct timestamp text.
     :param row: Full source row.
     :param ohlcv_indices: Price and volume column indices.
+    :param ask_indices: Ask-side price column indices, or ``None`` without ask columns.
     :param timestamp_format: Explicit timestamp format, if any.
     :param timezone: Timezone for naive timestamps.
-    :raises ValueError: If the row cannot produce a valid v2 record.
+    :raises InvalidDataError: If the row cannot produce a valid v2 record.
     """
     try:
         timestamp = _parse_timestamp(timestamp_text, timestamp_format, timezone)
     except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError(
-            f"{source_path}: row {row_number}: failed to parse timestamp "
-            f"{timestamp_text!r}: {error}"
-        ) from error
+        raise InvalidDataError(where=f"{source_path}: row {row_number}",
+                               why=f"invalid timestamp {timestamp_text!r}: {_why(error)}") from None
 
     try:
         open_index, high_index, low_index, close_index, volume_index = ohlcv_indices
@@ -338,14 +413,19 @@ def _parse_and_write_ohlcv_row(
             float(row[low_index]),
             float(row[close_index]),
             float(row[volume_index]),
+            ask=None if ask_indices is None else _ask_from_cells(
+                [row[index] if index < len(row) else "" for index in ask_indices]
+            ),
         )
     except (IndexError, TypeError, ValueError) as error:
-        raise ValueError(f"{source_path}: row {row_number}: invalid OHLCV values: {error}") from error
+        raise InvalidDataError(where=f"{source_path}: row {row_number}",
+                               why=f"invalid OHLCV values: {error}") from None
 
     try:
         writer.write(candle)
     except ValueError as error:
-        raise ValueError(f"{source_path}: row {row_number}: {error}") from error
+        raise InvalidDataError(where=f"{source_path}: row {row_number}",
+                               why=_why(error)) from None
 
 
 def _calendar_month_step(previous_wall_clock: int, wall_clock: int) -> int | None:
@@ -408,12 +488,11 @@ def _infer_period(timestamps: Iterator[tuple[str, int, int]]) -> str:
         if previous is not None and previous_wall_clock is not None:
             elapsed_interval = timestamp - previous
             if elapsed_interval == 0:
-                raise ValueError(f"{location}: duplicate timestamp {timestamp}")
+                raise InvalidDataError(where=location,
+                                       why=f"the timestamp {timestamp} is there twice")
             if elapsed_interval < 0:
-                raise ValueError(
-                    f"{location}: timestamps must be strictly increasing; "
-                    f"{timestamp} follows {previous}"
-                )
+                raise InvalidDataError(where=location,
+                                       why=f"the timestamp {timestamp} follows {previous}")
             wall_interval = wall_clock - previous_wall_clock
             interval = wall_interval if wall_interval > 0 else elapsed_interval
             if smallest_interval is None or interval < smallest_interval:
@@ -465,7 +544,7 @@ def _csv_timestamps(
         reader = csv.reader(source)
         raw_headers = next(reader, None)
         if not raw_headers:
-            raise ValueError(f"{path}: CSV header row is missing")
+            raise InvalidDataError(where=str(path), why="the CSV header row is missing")
         headers = [header.strip().lower() for header in raw_headers]
         timestamp_indices = _find_timestamp_columns(
             headers, timestamp_column, date_column, time_column
@@ -479,10 +558,12 @@ def _csv_timestamps(
                     text, timestamp_format, timezone, wall_clock=True
                 )
             except (IndexError, TypeError, ValueError, OverflowError) as error:
-                raise ValueError(f"{path}: row {row_number}: invalid timestamp: {error}") from error
+                raise InvalidDataError(where=f"{path}: row {row_number}",
+                                       why=f"invalid timestamp: {_why(error)}") from None
             yield f"{path}: row {row_number}", timestamp, wall_clock
 
 
+@_invalid_data
 def infer_csv_period(
     path: str | Path,
     timestamp_format: str | None = None,
@@ -500,7 +581,7 @@ def infer_csv_period(
     :param time_column: Explicit time column for split timestamps.
     :param tz: Timezone for naive timestamps.
     :return: Canonical TradingView period for the v2 header.
-    :raises ValueError: If timestamps are malformed, unordered, or insufficient.
+    :raises InvalidDataError: If timestamps are malformed, unordered, or insufficient.
     """
     source_path = Path(path)
     timezone = _parse_timezone_param(tz)
@@ -516,6 +597,7 @@ def infer_csv_period(
     )
 
 
+@_invalid_data
 def load_from_csv(
     writer: OHLCVWriter,
     path: str | Path,
@@ -540,7 +622,7 @@ def load_from_csv(
     :param time_column: Explicit time column for split timestamps.
     :param tz: Timezone for naive timestamps.
     :param extra_csv_path: Optional destination for user extra columns.
-    :raises ValueError: If headers or any source row are malformed.
+    :raises InvalidDataError: If headers or any source row are malformed.
     """
     source_path = Path(path)
     timezone = _parse_timezone_param(tz)
@@ -549,12 +631,13 @@ def load_from_csv(
         reader = csv.reader(source)
         raw_headers = next(reader, None)
         if not raw_headers:
-            raise ValueError(f"{source_path}: CSV header row is missing")
+            raise InvalidDataError(where=str(source_path), why="the CSV header row is missing")
         headers = [header.strip().lower() for header in raw_headers]
         timestamp_indices = _find_timestamp_columns(
             headers, timestamp_column, date_column, time_column
         )
         ohlcv_indices = _find_ohlcv_columns(headers)
+        ask_indices = _find_ask_columns(headers)
         extra_indices, extra_headers = _extra_columns(raw_headers, headers)
 
         with _ExtraSidecar(extra_csv_path, extra_headers) as sidecar:
@@ -563,9 +646,8 @@ def load_from_csv(
                 try:
                     timestamp_text = _timestamp_text(row, *timestamp_indices)
                 except IndexError as error:
-                    raise ValueError(
-                        f"{source_path}: row {row_number}: timestamp column is missing"
-                    ) from error
+                    raise InvalidDataError(where=f"{source_path}: row {row_number}",
+                                           why="the timestamp column is missing") from None
                 _parse_and_write_ohlcv_row(
                     writer,
                     source_path,
@@ -573,6 +655,7 @@ def load_from_csv(
                     timestamp_text,
                     row,
                     ohlcv_indices,
+                    ask_indices,
                     timestamp_format,
                     timezone,
                 )
@@ -583,12 +666,13 @@ def _detect_txt_delimiter(path: Path) -> str:
     with open(path, "r", encoding="utf-8-sig") as source:
         first_line = source.readline().strip()
     if not first_line:
-        raise ValueError(f"{path}: file is empty or its first line is blank")
+        raise InvalidDataError(where=str(path), why="the file is empty or its first line is blank")
 
     counts = {delimiter: first_line.count(delimiter) for delimiter in ("\t", ";", "|")}
     counts = {delimiter: count for delimiter, count in counts.items() if count > 0}
     if not counts:
-        raise ValueError(f"{path}: no supported delimiter found (tab, semicolon, or pipe)")
+        raise InvalidDataError(where=str(path),
+                               why="no supported delimiter found (tab, semicolon, or pipe)")
     return max(counts, key=counts.__getitem__)
 
 
@@ -664,9 +748,8 @@ def _txt_timestamps(
                 continue
             row = [field.strip() for field in _parse_txt_line(stripped, delimiter)]
             if len(row) != len(headers):
-                raise ValueError(
-                    f"{path}: row {row_number}: has {len(row)} columns, expected {len(headers)}"
-                )
+                raise InvalidDataError(where=f"{path}: row {row_number}",
+                                       why=f"it has {len(row)} columns, not {len(headers)}")
             try:
                 text = _timestamp_text(row, *timestamp_indices)
                 timestamp = _parse_timestamp(text, timestamp_format, timezone)
@@ -674,10 +757,12 @@ def _txt_timestamps(
                     text, timestamp_format, timezone, wall_clock=True
                 )
             except (IndexError, TypeError, ValueError, OverflowError) as error:
-                raise ValueError(f"{path}: row {row_number}: invalid timestamp: {error}") from error
+                raise InvalidDataError(where=f"{path}: row {row_number}",
+                                       why=f"invalid timestamp: {_why(error)}") from None
             yield f"{path}: row {row_number}", timestamp, wall_clock
 
 
+@_invalid_data
 def infer_txt_period(
     path: str | Path,
     timestamp_format: str | None = None,
@@ -695,7 +780,7 @@ def infer_txt_period(
     :param time_column: Explicit time column for split timestamps.
     :param tz: Timezone for naive timestamps.
     :return: Canonical TradingView period for the v2 header.
-    :raises ValueError: If timestamps are malformed, unordered, or insufficient.
+    :raises InvalidDataError: If timestamps are malformed, unordered, or insufficient.
     """
     source_path = Path(path)
     delimiter = _detect_txt_delimiter(source_path)
@@ -713,6 +798,7 @@ def infer_txt_period(
     )
 
 
+@_invalid_data
 def load_from_txt(
     writer: OHLCVWriter,
     path: str | Path,
@@ -736,7 +822,7 @@ def load_from_txt(
     :param time_column: Explicit time column for split timestamps.
     :param tz: Timezone for naive timestamps.
     :param extra_csv_path: Optional destination for user extra columns.
-    :raises ValueError: If headers, quoting, or any source row are malformed.
+    :raises InvalidDataError: If headers, quoting, or any source row are malformed.
     """
     source_path = Path(path)
     delimiter = _detect_txt_delimiter(source_path)
@@ -750,6 +836,7 @@ def load_from_txt(
             headers, timestamp_column, date_column, time_column
         )
         ohlcv_indices = _find_ohlcv_columns(headers)
+        ask_indices = _find_ask_columns(headers)
         extra_indices, extra_headers = _extra_columns(raw_headers, headers)
 
         with _ExtraSidecar(extra_csv_path, extra_headers) as sidecar:
@@ -759,10 +846,8 @@ def load_from_txt(
                     continue
                 row = [field.strip() for field in _parse_txt_line(stripped, delimiter)]
                 if len(row) != len(headers):
-                    raise ValueError(
-                        f"{source_path}: row {row_number}: has {len(row)} columns, "
-                        f"expected {len(headers)}"
-                    )
+                    raise InvalidDataError(where=f"{source_path}: row {row_number}",
+                                           why=f"it has {len(row)} columns, not {len(headers)}")
                 timestamp_text = _timestamp_text(row, *timestamp_indices)
                 _parse_and_write_ohlcv_row(
                     writer,
@@ -771,6 +856,7 @@ def load_from_txt(
                     timestamp_text,
                     row,
                     ohlcv_indices,
+                    ask_indices,
                     timestamp_format,
                     timezone,
                 )
@@ -788,14 +874,14 @@ def _json_records(path: Path) -> list[Mapping[str, object]]:
                 data = candidate
                 break
         else:
-            raise ValueError(f"{path}: could not find an OHLCV data array in JSON")
+            raise InvalidDataError(where=str(path), why="it holds no OHLCV data array")
     if not isinstance(data, list):
-        raise ValueError(f"{path}: JSON must contain an array of OHLCV records")
+        raise InvalidDataError(where=str(path), why="it is not an array of OHLCV records")
 
     records: list[Mapping[str, object]] = []
     for index, record in enumerate(data, start=1):
         if not isinstance(record, Mapping):
-            raise ValueError(f"{path}: record {index}: expected an object")
+            raise InvalidDataError(where=f"{path}: record {index}", why="it is not an object")
         records.append(record)
     return records
 
@@ -832,6 +918,27 @@ def _json_field_map(
     return field_map
 
 
+def _json_ask(record: Mapping[str, object], ask_names: tuple[str, ...]) -> AskOHLC | None:
+    """Build the ask side of a bar from its JSON record.
+
+    :param record: Source JSON record.
+    :param ask_names: Source field names of ``ask_open``, ``ask_high``, ``ask_low`` and
+                      ``ask_close``.
+    :return: The ask prices, or ``None`` when the record has no ask field.
+    :raises ValueError: If only some ask fields are present.
+    """
+    present = [name in record for name in ask_names]
+    if not any(present):
+        return None
+    if not all(present):
+        missing = ", ".join(name for name, found in zip(ask_names, present) if not found)
+        raise ValueError(f"incomplete ask prices, missing: {missing}")
+    open_value, high_value, low_value, close_value = (
+        float(cast(_JsonNumberInput, record[name])) for name in ask_names
+    )
+    return AskOHLC(open_value, high_value, low_value, close_value)
+
+
 def _json_text(value: object, field_name: str) -> str:
     if value is None:
         raise ValueError(f"JSON field {field_name!r} cannot be null")
@@ -853,6 +960,7 @@ def _json_timestamp_text(
     return _json_text(record[timestamp_name], timestamp_name)
 
 
+@_invalid_data
 def infer_json_period(
     path: str | Path,
     timestamp_format: str | None = None,
@@ -872,7 +980,7 @@ def infer_json_period(
     :param tz: Timezone for naive timestamps.
     :param mapping: Optional logical-to-source field mapping.
     :return: Canonical TradingView period for the v2 header.
-    :raises ValueError: If timestamps are malformed, unordered, or insufficient.
+    :raises InvalidDataError: If timestamps are malformed, unordered, or insufficient.
     """
     source_path = Path(path)
     records = _json_records(source_path)
@@ -891,12 +999,14 @@ def infer_json_period(
                     text, timestamp_format, timezone, wall_clock=True
                 )
             except (KeyError, TypeError, ValueError, OverflowError) as error:
-                raise ValueError(f"{location}: invalid timestamp: {error}") from error
+                raise InvalidDataError(where=location,
+                                       why=f"invalid timestamp: {_why(error)}") from None
             yield location, timestamp, wall_clock
 
     return _infer_period(timestamps())
 
 
+@_invalid_data
 def load_from_json(
     writer: OHLCVWriter,
     path: str | Path,
@@ -917,7 +1027,7 @@ def load_from_json(
     :param time_field: Explicit time field for split timestamps.
     :param tz: Timezone for naive timestamps.
     :param mapping: Optional logical-to-source field mapping.
-    :raises ValueError: If the JSON structure or any record is malformed.
+    :raises InvalidDataError: If the JSON structure or any record is malformed.
     """
     source_path = Path(path)
     records = _json_records(source_path)
@@ -925,6 +1035,8 @@ def load_from_json(
         records, timestamp_field, date_field, time_field, mapping
     )
     timezone = _parse_timezone_param(tz)
+    supplied = mapping or {}
+    ask_names = tuple(supplied.get(name, name) for name in _ASK_NAMES)
 
     for index, record in enumerate(records, start=1):
         location = f"{source_path}: record {index}"
@@ -948,13 +1060,15 @@ def load_from_json(
                 float(cast(_JsonNumberInput, record[low_name])),
                 float(cast(_JsonNumberInput, record[close_name])),
                 float(cast(_JsonNumberInput, record[volume_name])),
+                ask=_json_ask(record, ask_names),
             )
         except KeyError as error:
-            raise ValueError(f"{location}: missing field {error.args[0]!r}") from error
+            raise InvalidDataError(where=location,
+                                   why=f"the field {error.args[0]!r} is missing") from None
         except (TypeError, ValueError, OverflowError) as error:
-            raise ValueError(f"{location}: invalid OHLCV data: {error}") from error
+            raise InvalidDataError(where=location, why=f"invalid OHLCV data: {error}") from None
 
         try:
             writer.write(candle)
         except ValueError as error:
-            raise ValueError(f"{location}: {error}") from error
+            raise InvalidDataError(where=location, why=_why(error)) from None

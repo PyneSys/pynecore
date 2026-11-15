@@ -2,7 +2,7 @@ from copy import copy as _copy
 
 from ..types.color import Color
 from ..types.chart import ChartPoint
-from ..codes import NaObjectCopyError as _NaObjectCopyError
+from ..errorcodes import NaObjectCopyError as _NaObjectCopyError
 from ..types.na import NA, na_int
 from ..types.pine_types import PyneInt
 from ..core.module_property import module_property

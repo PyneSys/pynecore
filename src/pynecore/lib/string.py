@@ -7,7 +7,7 @@ from math import isinf, copysign as _copysign
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
 
-from ..codes import (ArgumentNegativeError as _ArgumentNegativeError,
+from ..errorcodes import (ArgumentNegativeError as _ArgumentNegativeError,
                      ArgumentOrderError as _ArgumentOrderError,
                      InvalidFormatError as _InvalidFormatError,
                      InvalidRegexError as _InvalidRegexError)

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from ..codes import NotAvailableError
+from ..errorcodes import NotAvailableError
 
 
 @dataclass(slots=True, eq=False)

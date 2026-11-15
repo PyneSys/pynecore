@@ -11,7 +11,7 @@ from ..types import linefill as linefill_types
 from ..types import matrix as matrix_types
 from ..types import polyline as polyline_types
 from ..types import table as table_types
-from ..codes import NaObjectCopyError
+from ..errorcodes import NaObjectCopyError
 from ..types.na import NA
 
 __all__ = ['udt', 'udt_copy']

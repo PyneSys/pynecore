@@ -3,7 +3,7 @@ from typing import Any, TypeVar, Generic, Iterator, Callable, cast, overload
 
 from types import ModuleType
 
-from ..codes import ArgumentNotPositiveError
+from ..errorcodes import ArgumentNotPositiveError
 from ..types.na import NA, na_float, na_str
 
 __all__ = ['SeriesImpl', 'CollectionSeriesImpl', 'close_collection_bar', 'inline_series']

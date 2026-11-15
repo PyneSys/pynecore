@@ -10,7 +10,7 @@ drawing keeps answering na through its getters.
 """
 import pytest
 
-from pynecore.codes import NaObjectCopyError, NaObjectFieldError
+from pynecore.errorcodes import NaObjectCopyError, NaObjectFieldError
 from pynecore.core.pine_udt import udt, udt_copy
 from pynecore.lib import chart
 from pynecore.types.chart import ChartPoint

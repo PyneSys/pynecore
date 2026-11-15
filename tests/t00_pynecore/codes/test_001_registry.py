@@ -1,7 +1,7 @@
 """
-The diagnostic code generator (``codes/generate.py``): its Python and docs output
-for ``codes/sample.toml``, its validation, the merge of two registries, and that
-the committed outputs (``pynecore.codes`` among them) match ``codes/registry.toml``.
+The diagnostic code generator (``scripts/errorcodes/generate.py``): its Python and docs output
+for ``scripts/errorcodes/sample.toml``, its validation, the merge of two registries, and that
+the committed outputs (``pynecore.errorcodes`` among them) match ``scripts/errorcodes/registry.toml``.
 """
 import importlib.util
 from pathlib import Path
@@ -19,13 +19,13 @@ def _load(name: str, path: Path):
     return module
 
 
-generate = _load('codes_generate', _REPO_ROOT / 'codes' / 'generate.py')
+generate = _load('codes_generate', _REPO_ROOT / 'scripts' / 'errorcodes' / 'generate.py')
 
 
 def __test_committed_outputs_match_the_registry__():
     """The generated Python and Rust sides and docs pages are what the registry gives today"""
     assert generate.stale(generate.outputs(), generate.DOCS) == [], \
-        "regenerate with `python codes/generate.py` from the pynecore checkout root"
+        "regenerate with `python scripts/errorcodes/generate.py` from the pynecore checkout root"
 
 
 def __test_the_registry_holds_only_pynecore_domains__():
@@ -38,7 +38,7 @@ def __test_sample_python_side_renders_messages__(tmp_path: Path):
     """The self-contained Python module renders a message from its parameters"""
     module_path = tmp_path / "sample_codes.py"
     sample = generate.load(generate.SAMPLE, generate.ALL_DOMAINS)
-    module_path.write_text(generate.python(sample, "codes/sample.toml"), encoding="utf-8")
+    module_path.write_text(generate.python(sample, "scripts/errorcodes/sample.toml"), encoding="utf-8")
     module = _load("sample_codes", module_path)
     assert sorted(module.ALL) == ["L0001", "S0001"]
     code = module.UNEXPECTED_TOKEN
@@ -64,7 +64,7 @@ def __test_rust_side_reexports_and_lists_another_crates_codes__():
     """With ``reexport``, the other crate's codes are re-exported and sorted into ALL and RUNTIME"""
     ours = generate.load(generate.SAMPLE, generate.ALL_DOMAINS)
     theirs = generate.load(generate.REGISTRY)
-    text = generate.rust(ours, "codes/sample.toml", ("pynecore_codes", theirs))
+    text = generate.rust(ours, "scripts/errorcodes/sample.toml", ("pynecore_codes", theirs))
     assert "pub use pynecore_codes::{EDGE_SYNTAX, " in text
     all_line = next(line for line in text.splitlines() if line.startswith("pub static ALL"))
     assert all_line.index("&EDGE_SYNTAX") < all_line.index("&NBSP_IN_VERSION_PRAGMA") \

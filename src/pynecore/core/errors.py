@@ -1,5 +1,5 @@
 """The errors PyneCore reports by code: :class:`PyneError`, the base of every
-exception class :mod:`~pynecore.codes` generates from ``codes/registry.toml``.
+exception class :mod:`~pynecore.errorcodes` generates from ``scripts/errorcodes/registry.toml``.
 
 An error carries its code, the values of the code's parameters, and, once the
 run has located it, the bar it stopped on and the line of the script that
@@ -98,7 +98,7 @@ def format_arg(value: Any) -> str:
     is ``0.0000001``). A Pine ``int`` is a float while the script runs, so it
     shows as ``3``, never ``3.0``.
 
-    The number cases are tested against the vectors of ``codes/format_arg.toml``,
+    The number cases are tested against the vectors of ``scripts/errorcodes/format_arg.toml``,
     which the Rust ``pynecore_codes::format_arg`` runs too.
 
     :param value: The value.
@@ -172,7 +172,7 @@ def _rebuild(cls: type['PyneError'], params: dict[str, Any],
 
 class PyneError(Exception):
     """An error with a registry code. Each code has a generated subclass in
-    :mod:`~pynecore.codes`, which also derives from the built-in exception the
+    :mod:`~pynecore.errorcodes`, which also derives from the built-in exception the
     registry names (``IndexOutOfRangeError`` is an :class:`IndexError`), and
     takes the code's parameters as keyword arguments::
 

@@ -17,6 +17,7 @@ from types import TracebackType
 from typing import IO, Any, BinaryIO, Iterator, NamedTuple, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pynecore.errorcodes import DataFileUnreadableError, InvalidDataError, InvalidTimeframeError
 from pynecore.core._file_io import open_shared_binary, replace_file
 from pynecore.core.ohlcv_legacy import OHLCVReader as _LegacyOHLCVReader
 from pynecore.core.syminfo import SymInfoInterval, tick_grid
@@ -432,7 +433,30 @@ def _validate_columns(columns: tuple[_Column, ...], record_size: int) -> None:
         raise ValueError("OHLCV column ranges do not match record_size")
 
 
+def _unreadable(path: str | Path, error: ValueError) -> DataFileUnreadableError:
+    """The coded error of a file ``error`` says is not a usable OHLCV file."""
+    why = str(error)
+    if len(why) > 1 and why[1].islower():
+        why = why[0].lower() + why[1:]
+    return DataFileUnreadableError(path=str(path), why=why)
+
+
 def _read_layout(file: BinaryIO, file_size: int, magic: bytes | None = None) -> _Layout:
+    """The validated layout of an OHLCV v2 file.
+
+    :param file: The file, open for binary reading
+    :param file_size: Its size in bytes
+    :param magic: Its first bytes, when the caller already read them
+    :return: The layout
+    :raises DataFileUnreadableError: If the header, schema or committed extent is invalid
+    """
+    try:
+        return _parse_layout(file, file_size, magic)
+    except ValueError as error:
+        raise _unreadable(getattr(file, 'name', '?'), error) from None
+
+
+def _parse_layout(file: BinaryIO, file_size: int, magic: bytes | None = None) -> _Layout:
     if file_size < _FIXED_HEADER_SIZE:
         raise ValueError("File is too short to contain an OHLCV v2 header")
     if magic is None:
@@ -551,21 +575,31 @@ def _ohlc_slack(*values: float) -> float:
     return math.ulp(scale) * _OHLC_RELATION_ULPS
 
 
-def _validate_candle(candle: OHLCV) -> None:
+def _validate_candle(candle: OHLCV, where: str) -> None:
+    """Refuse a bar no OHLCV file can hold.
+
+    :param candle: The bar
+    :param where: The file it goes to
+    :raises InvalidDataError: If a value is infinite or the high/low is not the extreme
+    """
     values = (candle.open, candle.high, candle.low, candle.close, candle.volume)
     if any(math.isinf(value) for value in values):
-        raise ValueError("OHLCV values cannot contain positive or negative infinity")
+        raise InvalidDataError(where=where, why=f"the bar at {candle.timestamp} has an "
+                                                f"infinite value")
     if candle.ask is not None and any(math.isinf(value) for value in candle.ask):
-        raise ValueError("OHLCV ask values cannot contain positive or negative infinity")
+        raise InvalidDataError(where=where, why=f"the bar at {candle.timestamp} has an "
+                                                f"infinite ask value")
 
     if not (math.isnan(candle.open) or math.isnan(candle.close) or math.isnan(candle.high)):
         bound = max(candle.open, candle.close)
         if candle.high < bound - _ohlc_slack(candle.high, bound):
-            raise ValueError("Invalid OHLC relation: high is below open or close")
+            raise InvalidDataError(where=where, why=f"the high of the bar at {candle.timestamp} "
+                                                    f"is below its open or close")
     if not (math.isnan(candle.open) or math.isnan(candle.close) or math.isnan(candle.low)):
         bound = min(candle.open, candle.close)
         if candle.low > bound + _ohlc_slack(candle.low, bound):
-            raise ValueError("Invalid OHLC relation: low is above open or close")
+            raise InvalidDataError(where=where, why=f"the low of the bar at {candle.timestamp} "
+                                                    f"is above its open or close")
 
 
 def _f32_resolution(value: float) -> float | None:
@@ -922,9 +956,13 @@ class OHLCVWriter:
         :param truncate: Replace any existing file with a new empty v2 file.
         :param timezone: IANA name of the symbol timezone the opening-hours analysis
             reports its weekday and hour intervals in. Unknown names fall back to UTC.
-        :raises ValueError: If ``period`` or the tick-grid pair is invalid.
+        :raises InvalidTimeframeError: If ``period`` is invalid.
+        :raises ValueError: If the tick-grid pair is invalid.
         """
-        canonical, interval_value, interval_unit = _parse_period(period)
+        try:
+            canonical, interval_value, interval_unit = _parse_period(period)
+        except ValueError:
+            raise InvalidTimeframeError(timeframe=period) from None
         minmove, pricescale = _validate_tick_grid(minmove, pricescale)
         self.path = str(path)
         self._period = canonical
@@ -1248,7 +1286,8 @@ class OHLCVWriter:
         append. The method never dispatches to the v1 format.
 
         :return: This writer.
-        :raises ValueError: If an existing file has an incompatible header, period, or schema.
+        :raises DataFileUnreadableError: If an existing file has an incompatible header or schema.
+        :raises InvalidDataError: If an existing file holds bars of another period.
         """
         if self._file is not None:
             return self
@@ -1260,10 +1299,8 @@ class OHLCVWriter:
             with open_shared_binary(path, "rb") as existing_file:
                 existing_magic = existing_file.read(len(_MAGIC))
             if existing_magic != _MAGIC and not self._truncate_requested:
-                raise ValueError(
-                    "Cannot write to a legacy v1 OHLCV file; re-download the data to replace it "
-                    "with v2"
-                )
+                raise DataFileUnreadableError(
+                    path=self.path, why="it is a legacy v1 file, which cannot be appended to")
 
         if self._truncate_requested or not path_exists:
             file = open_shared_binary(path, "w+b")
@@ -1292,10 +1329,12 @@ class OHLCVWriter:
             layout = _read_layout(file, file_size, existing_magic)
             file_period = _period_from_interval(layout.interval_value, layout.interval_unit)
             if file_period != self._period:
-                raise ValueError(
-                    f"OHLCV period mismatch: file declares {file_period!r}, writer uses {self._period!r}"
-                )
-            self._validate_writer_schema(layout.columns)
+                raise InvalidDataError(where=self.path, why=f"the file holds {file_period} "
+                                                            f"bars, not {self._period}")
+            try:
+                self._validate_writer_schema(layout.columns)
+            except ValueError as error:
+                raise _unreadable(self.path, error) from None
             committed_end = layout.header_size + layout.record_count * layout.record_size
             if file_size > committed_end:
                 file.truncate(committed_end)
@@ -1367,7 +1406,7 @@ class OHLCVWriter:
         :param candle: Logical OHLCV bar with a millisecond timestamp.
         :raises RuntimeError: If the writer is closed, or a failed publication left a header
             that could not be restored.
-        :raises ValueError: If the bar is malformed or its timestamp is not strictly increasing.
+        :raises InvalidDataError: If the bar is malformed or its timestamp is not strictly increasing.
         """
         if self._file is None:
             raise RuntimeError("OHLCV writer is not open")
@@ -1375,16 +1414,16 @@ class OHLCVWriter:
             raise RuntimeError(
                 "OHLCV writer cannot publish: the previous header could not be restored"
             )
-        _validate_candle(candle)
+        _validate_candle(candle, self.path)
         if not -(1 << 63) <= candle.timestamp < (1 << 63):
-            raise ValueError("OHLCV timestamp is outside the signed i64 range")
+            raise InvalidDataError(where=self.path, why=f"the timestamp {candle.timestamp} is "
+                                                        f"outside the signed 64-bit range")
         if self._last_timestamp is not None and candle.timestamp <= self._last_timestamp:
             if candle.timestamp == self._last_timestamp:
-                raise ValueError(f"Duplicate OHLCV timestamp: {candle.timestamp}")
-            raise ValueError(
-                "OHLCV timestamps must be strictly increasing: "
-                f"{candle.timestamp} follows {self._last_timestamp}"
-            )
+                raise InvalidDataError(where=self.path, why=f"the timestamp {candle.timestamp} "
+                                                            f"is there twice")
+            raise InvalidDataError(where=self.path, why=f"the timestamp {candle.timestamp} "
+                                                        f"follows {self._last_timestamp}")
 
         old_count = self._size
         new_columns = self._columns_for(candle)
@@ -2589,7 +2628,7 @@ class _V2OHLCVReader:
         uncommitted tail. The reader never follows later file growth implicitly.
 
         :return: This reader.
-        :raises ValueError: If the v2 header, schema, or committed extent is invalid.
+        :raises DataFileUnreadableError: If the v2 header, schema, or committed extent is invalid.
         """
         if self._file is not None:
             return self
@@ -2602,7 +2641,7 @@ class _V2OHLCVReader:
         :param file: Open binary file positioned arbitrarily.
         :param magic: Already-read eight-byte magic, or ``None`` to read the full header.
         :return: This reader.
-        :raises ValueError: If the v2 header, schema, or committed extent is invalid.
+        :raises DataFileUnreadableError: If the v2 header, schema, or committed extent is invalid.
         """
         self._file = file
         try:
@@ -2610,7 +2649,8 @@ class _V2OHLCVReader:
             layout = _read_layout(file, file_size, magic)
             roles = {column.role for column in layout.columns}
             if not _REQUIRED_OHLCV_ROLES.issubset(roles):
-                raise ValueError("OHLCV schema lacks one or more required OHLCV columns")
+                raise DataFileUnreadableError(path=self.path,
+                                              why="the schema lacks a required OHLCV column")
 
             ordered = tuple(sorted(layout.columns, key=lambda column: column.byte_offset))
             self._record_struct = _record_struct(layout.columns)

@@ -56,7 +56,7 @@ def __test_the_unsliced_child_reaches_the_chart_side_statement__(runner, log):
     chart's row was never added, and dies with the index error of ``matrix.get``
     (converter corpus 1a04048648, Volume Analysis - Heatmap and Volume Profile).
     """
-    from pynecore.codes import INDEX_OUT_OF_RANGE
+    from pynecore.errorcodes import INDEX_OUT_OF_RANGE
     try:
         __test_helper_run(runner, no_slice=True)
     except IndexError as exc:

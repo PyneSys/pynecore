@@ -4,7 +4,7 @@ from ..types.na import NA, na_float, na_int
 from ..types.pine_types import PyneFloat, PyneInt
 from .session import regular
 
-from ..codes import SyminfoMemberMissingError as _SyminfoMemberMissingError
+from ..errorcodes import SyminfoMemberMissingError as _SyminfoMemberMissingError
 from ..core.module_property import module_function_property
 from ..core.syminfo import SymInfoSession, SymInfoInterval
 

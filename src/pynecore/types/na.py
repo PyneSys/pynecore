@@ -81,7 +81,7 @@ def _field_error(na_type: Any, name: str) -> RuntimeError | None:
             or name not in getattr(na_type, '__dataclass_fields__', ()):
         return None
     # The codes module imports this one, through core.errors
-    from ..codes import NaObjectFieldError
+    from ..errorcodes import NaObjectFieldError
     return NaObjectFieldError(name=name)
 
 

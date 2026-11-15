@@ -16,6 +16,7 @@ import pynecore.lib.strategy as _strategy
 import pynecore.lib.currency as _currency
 import pynecore.lib.display as _display
 
+from pynecore.errorcodes import InvalidDataError, InvalidOptionError
 from pynecore.core.broker.models import ScriptRequirements
 
 from pynecore.types import script_type as _script_type
@@ -258,7 +259,7 @@ class Script:
         :param value: The new value
         """
         if key not in self.settable_fields():
-            raise ValueError(f"Not a settable script field: {key}")
+            raise InvalidOptionError(option=key, why="it is not a settable script field")
         if key == 'commission_type':
             value = _COMMISSION_TYPE_ALIASES.get(value, value)
         elif key == 'pyramiding':
@@ -357,7 +358,7 @@ class Script:
             data = tomllib.load(f)
 
         if 'script' not in data:
-            raise ValueError("Invalid TOML: missing [script] section!")
+            raise InvalidDataError(where=str(path), why="the [script] section is missing")
 
         script_data = data['script']
 
@@ -433,9 +434,10 @@ class Script:
                 input_names = {key.removesuffix('__global__') for key in self.inputs}
                 unknown = input_overrides - input_names - self.inputs.keys()
                 if unknown:
-                    raise ValueError(
-                        f"Unknown input(s): {', '.join(sorted(unknown))}. Inputs are keyed by "
-                        f"the main() parameter name: {', '.join(sorted(input_names)) or 'none'}")
+                    raise InvalidOptionError(
+                        option=', '.join(sorted(unknown)),
+                        why=f"the script has no such input; inputs are keyed by the main() "
+                            f"parameter name: {', '.join(sorted(input_names)) or 'none'}")
 
                 # Save toml file if not in pytest and not disabled by env var PYNE_SAVE_SCRIPT_TOML = 0
                 save = (config is None and os.environ.get('PYNE_SAVE_SCRIPT_TOML', '1') == '1'

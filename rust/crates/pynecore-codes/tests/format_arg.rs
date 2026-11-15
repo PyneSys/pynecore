@@ -1,4 +1,4 @@
-//! `format_arg` over the vectors of `codes/format_arg.toml`, which PyneCore's
+//! `format_arg` over the vectors of `scripts/errorcodes/format_arg.toml`, which PyneCore's
 //! Python `format_arg` runs too.
 
 use pynecore_codes::format_arg;

@@ -27,7 +27,7 @@ from ..types.label import Label
 from ..types.linefill import LineFill
 from ..types.table import Table
 from . import order as _order
-from ..codes import (ArgumentNegativeError as _ArgumentNegativeError,
+from ..errorcodes import (ArgumentNegativeError as _ArgumentNegativeError,
                      ArgumentOrderError as _ArgumentOrderError,
                      EmptyCollectionError as _EmptyCollectionError,
                      IndexOutOfRangeError as _IndexOutOfRangeError,

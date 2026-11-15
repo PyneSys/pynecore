@@ -145,7 +145,7 @@ def __test_taken_branch_raises_at_the_reading_bar__(runner, log):
     whose condition holds reads the context, and that read has no value to
     return, so it raises there — not at startup.
     """
-    from pynecore.codes import SECURITY_DATA_MISSING
+    from pynecore.errorcodes import SECURITY_DATA_MISSING
     import sys
     from pathlib import Path
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pynecore.errorcodes import InvalidOptionError
+
 
 @dataclass(frozen=True)
 class ProviderString:
@@ -83,7 +85,7 @@ def parse_provider_string(value: str, *, require_timeframe: bool = False,
     Parse a provider string into its components.
 
     :param value: The provider string (e.g. ``"ccxt:BYBIT:BTC/USDT:USDT@1D"``).
-    :param require_timeframe: If True, raise ValueError when ``@timeframe`` is missing.
+    :param require_timeframe: If True, raise InvalidOptionError when ``@timeframe`` is missing.
     :param multi_broker: If True, treat the first segment after the provider name
         as the broker/exchange selector (e.g. ``"BYBIT"``) and split it into
         :attr:`ProviderString.broker`; the remainder is the symbol (which may be
@@ -91,41 +93,28 @@ def parse_provider_string(value: str, *, require_timeframe: bool = False,
         whether a provider is multi-broker from its ``multi_broker`` class
         attribute.
     :return: A :class:`ProviderString` with the parsed components.
-    :raises ValueError: If the string is malformed or timeframe is required but missing.
+    :raises InvalidOptionError: If the string is malformed or timeframe is required but missing.
     """
     if ':' not in value:
-        raise ValueError(
-            f"Invalid provider string: '{value}'. "
-            f"Expected format: provider:symbol[@timeframe]"
-        )
+        raise InvalidOptionError(option=value,
+                                 why="expected the format provider:symbol[@timeframe]")
 
     provider, rest = value.split(':', 1)
 
     if not provider:
-        raise ValueError(
-            f"Invalid provider string: '{value}'. "
-            f"Provider name is empty."
-        )
+        raise InvalidOptionError(option=value, why="the provider name is empty")
 
     if not rest:
-        raise ValueError(
-            f"Invalid provider string: '{value}'. "
-            f"Symbol is missing after '{provider}:'."
-        )
+        raise InvalidOptionError(
+            option=value, why=f"the symbol after `{provider}:` is missing")
 
     timeframe = None
     if '@' in rest:
         symbol_part, timeframe = rest.rsplit('@', 1)
         if not timeframe:
-            raise ValueError(
-                f"Invalid provider string: '{value}'. "
-                f"Timeframe is empty after '@'."
-            )
+            raise InvalidOptionError(option=value, why="the timeframe after `@` is empty")
         if not symbol_part:
-            raise ValueError(
-                f"Invalid provider string: '{value}'. "
-                f"Symbol is missing before '@'."
-            )
+            raise InvalidOptionError(option=value, why="the symbol before `@` is missing")
         rest = symbol_part
 
     broker: str | None = None
@@ -133,16 +122,11 @@ def parse_provider_string(value: str, *, require_timeframe: bool = False,
     if multi_broker:
         broker, _, symbol = rest.partition(':')
         if not broker:
-            raise ValueError(
-                f"Invalid provider string: '{value}'. "
-                f"Broker name is empty."
-            )
+            raise InvalidOptionError(option=value, why="the broker name is empty")
 
     if require_timeframe and timeframe is None:
-        raise ValueError(
-            f"Timeframe is required. Use '@' to specify it: "
-            f"'{value}@<timeframe>' (e.g. '{value}@1D')"
-        )
+        raise InvalidOptionError(option=value, why=f"it needs a timeframe after `@`, "
+                                                   f"such as `{value}@1D`")
 
     return ProviderString(provider=provider, symbol=symbol,
                           timeframe=timeframe, broker=broker)

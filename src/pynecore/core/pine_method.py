@@ -22,7 +22,7 @@ from functools import partial
 
 from ..lib import array, matrix, box, line, label, table, linefill, polyline
 from ..lib import map as map_lib
-from ..codes import UnknownMethodAtRunError
+from ..errorcodes import UnknownMethodAtRunError
 from ..utils.sequence_view import SequenceView
 from ..types import matrix as matrix_types
 from ..types import line as line_types

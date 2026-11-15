@@ -1,7 +1,7 @@
 from copy import copy as _copy
 from typing import Any, overload
 
-from ..codes import LinePriceXlocError as _LinePriceXlocError
+from ..errorcodes import LinePriceXlocError as _LinePriceXlocError
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
 from ..types.base import next_vid

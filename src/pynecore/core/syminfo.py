@@ -5,6 +5,9 @@ from datetime import time, date, datetime
 from decimal import Decimal
 from math import gcd
 
+from pynecore.errorcodes import InvalidDataError
+from pynecore.core.errors import PyneError
+
 SymInfoInterval = NamedTuple("SymInfoInterval", [('day', int), ('start', time), ('end', time)])
 SymInfoSession = NamedTuple("SymInfoSession", [('day', int), ('time', time)])
 SymInfoScheduleVariant = NamedTuple("SymInfoScheduleVariant", [
@@ -206,7 +209,26 @@ class SymInfo:
 
         :param path: Path to the TOML file
         :return: SymInfo instance
-        :raises ValueError: If required fields are missing or invalid
+        :raises InvalidDataError: If the file is not TOML, or required fields are missing
+            or invalid
+        """
+        try:
+            return cls._parse_toml(path)
+        except PyneError:
+            raise
+        except KeyError as error:
+            raise InvalidDataError(where=str(path),
+                                   why=f"the field {error.args[0]!r} is missing") from None
+        except (ValueError, TypeError) as error:
+            raise InvalidDataError(where=str(path), why=str(error)) from None
+
+    @classmethod
+    def _parse_toml(cls, path: Path) -> Self:
+        """
+        The SymInfo of a TOML file, its faults raised as Python's exceptions.
+
+        :param path: Path to the TOML file
+        :return: SymInfo instance
         """
         import tomllib
 
@@ -214,7 +236,7 @@ class SymInfo:
             data = tomllib.load(f)
 
         if 'symbol' not in data:
-            raise ValueError("Missing [symbol] section in TOML")
+            raise ValueError("the [symbol] section is missing")
 
         symbol = data['symbol']
 

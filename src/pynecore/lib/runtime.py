@@ -1,5 +1,5 @@
 from .. import lib
-from ..codes import ScriptRuntimeError as _ScriptRuntimeError
+from ..errorcodes import ScriptRuntimeError as _ScriptRuntimeError
 
 
 def error(message: str):

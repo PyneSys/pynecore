@@ -5,6 +5,8 @@ import pytest
 from pynecore.core import data_converter as data_converter_module
 from pynecore.core.data_converter import ConversionError, DataConverter
 from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter, _LEGACY_RECORD_SIZE
+from pynecore.errorcodes import InvalidDataError
+from pynecore.types.ohlcv import OHLCV, AskOHLC
 from pynecore.core.ohlcv_importers import (
     infer_csv_period,
     infer_json_period,
@@ -115,6 +117,62 @@ def __test_json_import_supports_wrappers_and_field_mapping__(tmp_path):
     assert [candle.volume for candle in candles] == pytest.approx([10.0, 11.0])
 
 
+def __test_helper_write_quoted_bars(path):
+    with OHLCVWriter(path, "1", truncate=True) as writer:
+        writer.write(OHLCV(1_704_067_200_000, 100.0, 102.0, 99.0, 101.0, 10.0,
+                           ask=AskOHLC(101.0, 104.0, 100.0, 103.0)))
+        writer.write(OHLCV(1_704_067_260_000, 101.0, 103.0, 100.0, 102.0, 11.0,
+                           ask=AskOHLC(102.0, 105.0, 101.0, 104.0)))
+
+
+@pytest.mark.parametrize("export_format", ["csv", "json"])
+def __test_export_import_round_trip_keeps_ask_prices__(tmp_path, export_format):
+    source_path = tmp_path / "quoted.ohlcv"
+    export_path = tmp_path / f"quoted.{export_format}"
+    output_path = tmp_path / "imported.ohlcv"
+    extra_path = tmp_path / "imported.extra.csv"
+    __test_helper_write_quoted_bars(source_path)
+    with OHLCVReader(source_path) as reader:
+        if export_format == "csv":
+            reader.save_to_csv(export_path)
+        else:
+            reader.save_to_json(export_path)
+
+    with OHLCVWriter(output_path, "1", truncate=True) as writer:
+        if export_format == "csv":
+            load_from_csv(writer, export_path, tz="UTC", extra_csv_path=extra_path)
+        else:
+            load_from_json(writer, export_path, tz="UTC")
+
+    with OHLCVReader(output_path) as reader:
+        candles = list(reader)
+
+    assert [candle.ask for candle in candles] == [
+        AskOHLC(101.0, 104.0, 100.0, 103.0),
+        AskOHLC(102.0, 105.0, 101.0, 104.0),
+    ]
+    assert not extra_path.exists()
+
+
+def __test_import_rejects_an_incomplete_ask_group__(tmp_path):
+    csv_path = tmp_path / "partial.csv"
+    csv_path.write_text(
+        "timestamp,open,high,low,close,volume,ask_open,ask_close\n"
+        "1704067200,100,102,99,101,10,101,103\n"
+    )
+    json_path = tmp_path / "partial.json"
+    json_path.write_text(json.dumps([
+        {"timestamp": 1_704_067_200_000, "open": 100, "high": 102, "low": 99, "close": 101,
+         "volume": 10, "ask_open": 101, "ask_high": 104},
+    ]))
+
+    with OHLCVWriter(tmp_path / "out.ohlcv", "1", truncate=True) as writer:
+        with pytest.raises(InvalidDataError, match="ask"):
+            load_from_csv(writer, csv_path, tz="UTC")
+        with pytest.raises(InvalidDataError, match="ask"):
+            load_from_json(writer, json_path, tz="UTC")
+
+
 def __test_format_detection_does_not_treat_csv_as_legacy_binary__(tmp_path):
     source_path = tmp_path / "aligned.csv"
     content = (
@@ -138,7 +196,7 @@ def __test_data_converter_removes_output_after_invalid_ohlc_row__(tmp_path):
         "1704067260,101,100,99,102,11\n"
     )
 
-    with pytest.raises(ConversionError, match=r"row 3: Invalid OHLC relation"):
+    with pytest.raises(InvalidDataError, match=r"row 3`: the data is invalid: the high of the bar"):
         DataConverter().convert_to_ohlcv(
             source_path,
             force=True,
@@ -225,7 +283,7 @@ def __test_data_converter_rejects_duplicate_timestamps_before_writing__(tmp_path
         "1704067200,101,103,100,102,11\n"
     )
 
-    with pytest.raises(ConversionError, match=r"row 3: duplicate timestamp"):
+    with pytest.raises(InvalidDataError, match=r"row 3`: the data is invalid: the timestamp \d+ is there twice"):
         DataConverter().convert_to_ohlcv(
             source_path,
             force=True,

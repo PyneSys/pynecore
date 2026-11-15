@@ -430,10 +430,10 @@ def __test_append_updates_authoritative_header__(tmp_path: Path):
 @pytest.mark.parametrize(
     ("candle", "message"),
     [
-        (OHLCV(999, 1.0, 2.0, 0.0, 1.5, 1.0), "strictly increasing"),
-        (OHLCV(1_000, 1.0, 2.0, 0.0, 1.5, 1.0), "Duplicate OHLCV timestamp"),
-        (OHLCV(2_000, 10.0, 9.0, 8.0, 10.0, 1.0), "high is below"),
-        (OHLCV(2_000, 10.0, 11.0, 10.5, 10.0, 1.0), "low is above"),
+        (OHLCV(999, 1.0, 2.0, 0.0, 1.5, 1.0), "the timestamp 999 follows 1000"),
+        (OHLCV(1_000, 1.0, 2.0, 0.0, 1.5, 1.0), "the timestamp 1000 is there twice"),
+        (OHLCV(2_000, 10.0, 9.0, 8.0, 10.0, 1.0), "is below its open or close"),
+        (OHLCV(2_000, 10.0, 11.0, 10.5, 10.0, 1.0), "is above its open or close"),
     ],
 )
 def __test_invalid_append_is_rejected__(tmp_path: Path, candle: OHLCV, message: str):
@@ -920,7 +920,7 @@ def __test_timestamp_i64_boundaries__(tmp_path: Path):
     for timestamp in (-(1 << 63) - 1, 1 << 63):
         path = tmp_path / f"outside_{timestamp}.ohlcv"
         with OHLCVWriter(path, "1S", truncate=True) as writer:
-            with pytest.raises(ValueError, match="signed i64"):
+            with pytest.raises(ValueError, match="outside the signed 64-bit range"):
                 writer.write(OHLCV(timestamp, 1.0, 2.0, 0.0, 1.5, 1.0))
 
 
@@ -945,7 +945,7 @@ def __test_nan_encoding_and_infinity_rejection__(tmp_path: Path):
         values[index] = math.inf if index % 2 == 0 else -math.inf
         invalid = OHLCV(2_000, *values)
         with OHLCVWriter(tmp_path / f"inf_{index}.ohlcv", "1", truncate=True) as writer:
-            with pytest.raises(ValueError, match="infinity"):
+            with pytest.raises(ValueError, match="infinite"):
                 writer.write(invalid)
 
 
@@ -1163,7 +1163,7 @@ def __test_column_name_and_descriptor_validation__():
 @pytest.mark.parametrize(
     ("offset", "replacement", "message"),
     [
-        (0, b"BADMAGIC", "Invalid OHLCV v2 magic"),
+        (0, b"BADMAGIC", "invalid OHLCV v2 magic"),
         (8, struct.pack("<H", 3), "major version"),
         (10, struct.pack("<H", 2), "minor version"),
         (56, struct.pack("<I", 1), "zero or positive together"),
@@ -1207,7 +1207,7 @@ def __test_header_length_and_dense_edge_corruption__(tmp_path: Path):
     empty_dense = tmp_path / "empty_dense.ohlcv"
     _write_candles(empty_dense, [])
     _mutate(empty_dense, 22, struct.pack("<H", 1))
-    with pytest.raises(ValueError, match="Empty OHLCV files cannot be marked DENSE"):
+    with pytest.raises(ValueError, match="empty OHLCV files cannot be marked DENSE"):
         OHLCVReader(empty_dense).open()
 
     empty_timestamp = tmp_path / "empty_timestamp.ohlcv"
@@ -1284,7 +1284,7 @@ def __test_period_mismatch_rejects_append_without_modifying_file__(tmp_path: Pat
     before = path.read_bytes()
 
     writer = OHLCVWriter(path, "5")
-    with pytest.raises(ValueError, match="period mismatch"):
+    with pytest.raises(ValueError, match="the file holds 1 bars, not 5"):
         writer.open()
     writer.close()
     assert path.read_bytes() == before
@@ -1556,7 +1556,7 @@ def __test_writer_rejects_appending_to_legacy_v1_file__(tmp_path: Path):
     legacy_data = struct.pack("Ifffff", 1_700_000_000, 1.0, 2.0, 0.5, 1.5, 10.0)
     path.write_bytes(legacy_data)
 
-    with pytest.raises(ValueError, match="legacy v1.*re-download"):
+    with pytest.raises(ValueError, match="legacy v1 file, which cannot be appended to"):
         OHLCVWriter(path, "1").open()
     assert path.read_bytes() == legacy_data
 

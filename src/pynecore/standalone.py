@@ -21,8 +21,11 @@ def run(script_file: str) -> None:
     data_path = Path(data_arg).resolve()
     script_path = Path(script_file).resolve()
 
+    from pynecore.errorcodes import MissingFileError
+    from pynecore.core.errors import PyneError
+
     if not data_path.exists():
-        print(f"Error: Data file '{data_arg}' not found", file=sys.stderr)
+        print(f"Error: {MissingFileError(path=data_arg).report()}", file=sys.stderr)
         sys.exit(1)
 
     import shutil
@@ -57,6 +60,9 @@ def run(script_file: str) -> None:
                     symbol=detected_symbol, force=True
                 )
                 ohlcv_path = temp_copy.with_suffix('.ohlcv')
+            except PyneError as e:
+                print(f"Error: {e.report()}", file=sys.stderr)
+                sys.exit(1)
             except (DataFormatError, ConversionError) as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
@@ -66,7 +72,10 @@ def run(script_file: str) -> None:
         try:
             syminfo = SymInfo.load_toml(toml_path)
         except FileNotFoundError:
-            print(f"Error: Symbol info '{toml_path.name}' not found", file=sys.stderr)
+            print(f"Error: {MissingFileError(path=str(toml_path)).report()}", file=sys.stderr)
+            sys.exit(1)
+        except PyneError as e:
+            print(f"Error: {e.report()}", file=sys.stderr)
             sys.exit(1)
 
         # Output paths next to script
@@ -89,15 +98,20 @@ def run(script_file: str) -> None:
                 file=sys.stderr
             )
 
-            runner = ScriptRunner(
-                script_path, ohlcv_iter, syminfo, last_bar_index=size - 1,
-                last_bar_time=reader.get_last_bar_time(start_ts, end_ts),
-                plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
-                lossless_volume=reader.lossless_volume,
-                lossless_prices=reader.lossless_prices,
-                chart_bar_window=chart_bar_window,
-            )
-            runner.run()
+            try:
+                runner = ScriptRunner(
+                    script_path, ohlcv_iter, syminfo, last_bar_index=size - 1,
+                    last_bar_time=reader.get_last_bar_time(start_ts, end_ts),
+                    plot_path=plot_path, strat_path=strat_path, trade_path=trade_path,
+                    lossless_volume=reader.lossless_volume,
+                    lossless_prices=reader.lossless_prices,
+                    chart_bar_window=chart_bar_window,
+                )
+                runner.run()
+            except PyneError as e:
+                # The script's own error: one line, as `pyne run` writes it
+                print(f"Error: {e.report()}", file=sys.stderr)
+                sys.exit(1)
 
         print(f"Done. Output: {plot_path}", file=sys.stderr)
 

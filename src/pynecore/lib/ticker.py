@@ -2,7 +2,7 @@
 Pine Script ``ticker.*`` namespace - ticker identifier construction.
 """
 from . import syminfo
-from ..codes import NotAvailableError as _NotAvailableError
+from ..errorcodes import NotAvailableError as _NotAvailableError
 
 __all__ = [
     'heikinashi',

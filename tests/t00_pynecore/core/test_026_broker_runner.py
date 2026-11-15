@@ -42,7 +42,6 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
     BrokerManualInterventionError,
-    ExchangeCapabilityError,
     ExchangeConnectionError,
 )
 from pynecore.core.broker.position import BrokerPosition
@@ -50,6 +49,7 @@ from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core import script_runner as script_runner_mod
 from pynecore.core.script_runner import LIVE_TRANSITION, ScriptRunner
 from pynecore.core.syminfo import SymInfo
+from pynecore.errorcodes import ProviderUnavailableError
 from pynecore.types.ohlcv import OHLCV
 
 
@@ -376,7 +376,7 @@ def __test_startup_validation_rejects_incompatible_script__(tmp_path):
         syminfo=_make_syminfo(),
         broker_plugin=plugin,  # type: ignore[arg-type]
     )
-    with pytest.raises(ExchangeCapabilityError) as excinfo:
+    with pytest.raises(ProviderUnavailableError) as excinfo:
         list(runner.run_iter())
     assert "TP+SL" in str(excinfo.value)
 
@@ -795,10 +795,11 @@ def __test_live_broker_marks_open_trade_before_each_tick__(tmp_path):
 
 
 def __test_startup_rejects_script_on_authentication_failure__(tmp_path):
-    """Bad credentials on get_balance() abort startup with AuthenticationError, sending no order.
+    """Bad credentials on get_balance() abort startup with the coded provider error, sending
+    no order.
 
-    Bad credentials on get_balance() must abort startup with
-    AuthenticationError — before any order is sent."""
+    The plugin's AuthenticationError is the cause of the R0049 the runner raises, before any
+    order is sent."""
     plugin = MockBrokerPlugin(
         capabilities=ExchangeCapabilities(),
         auth_error=AuthenticationError("Invalid API key", reason="invalid key"),
@@ -811,12 +812,12 @@ def __test_startup_rejects_script_on_authentication_failure__(tmp_path):
         syminfo=_make_syminfo(),
         broker_plugin=plugin,  # type: ignore[arg-type]
     )
-    with pytest.raises(AuthenticationError) as excinfo:
+    with pytest.raises(ProviderUnavailableError) as excinfo:
         list(runner.run_iter())
-    # The runner wraps with its own descriptive message but preserves the
-    # original reason.
-    assert excinfo.value.reason == "invalid key"
-    assert "authentication failed at startup" in str(excinfo.value).lower()
+    # The runner reports it with its code, the plugin's own error as the cause
+    assert isinstance(excinfo.value.__cause__, AuthenticationError)
+    assert excinfo.value.__cause__.reason == "invalid key"
+    assert "authentication failed at startup (invalid key)" in str(excinfo.value)
     # No orders should have been dispatched.
     assert plugin.entry_calls == []
 

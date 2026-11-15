@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, time as dt_time, date, UTC, \
 
 from pynecore.types.source import Source
 
-from ..codes import InvalidSessionError as _InvalidSessionError
+from ..errorcodes import InvalidSessionError as _InvalidSessionError
 from ..core.module_property import module_property, module_function_property
 from ..core.series import SeriesImpl as _SeriesImpl
 

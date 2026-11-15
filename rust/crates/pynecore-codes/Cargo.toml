@@ -1,6 +1,6 @@
 [package]
 name = "pynecore-codes"
-description = "PyneCore's diagnostic codes, generated from codes/registry.toml"
+description = "PyneCore's diagnostic codes, generated from scripts/errorcodes/registry.toml"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
