@@ -124,6 +124,7 @@ import hashlib
 import types
 
 from ..core.pine_export import Exported
+from ..errorcodes import StatefulCallAtModuleLevelError
 from . import ast_walk
 from . import module_interface
 from .call_inline import SUPPORT_ALIAS_PREFIX
@@ -670,6 +671,8 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         #: The module files a route was already tracked through, as spelled
         self._tracked_files: set[str] = set()
         self._close_module = ''
+        #: The source path of the module, for a rejection's location
+        self._module_file = '<script>'
         # scope -> its instance-vector slot, and the index every varying site
         # of that scope reads out of it (by node identity)
         self._pin_slots: dict[str, int] = {}
@@ -1149,6 +1152,7 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         # A source stamp survives bytecode caching and cannot collide with a
         # statement in another imported library. Standalone AST users may not
         # have the loader's source path, so their module gets a content stamp.
+        self._module_file = getattr(node, '_module_file_path', '<script>')
         self._close_module = getattr(node, '_module_file_path', None) or hashlib.sha256(
             ast.dump(node, include_attributes=True).encode()).hexdigest()
         self._table = module_table(node)
@@ -1316,7 +1320,8 @@ class FunctionIsolationTransformer(ast_walk.NodeTransformer):
         if not self._scope_stack:
             if route in (_FAST, _FAST_SHARED) \
                     or (isinstance(route, tuple) and self._is_carrier(route[1])):
-                raise SyntaxError("Stateful function calls are not supported at module level")
+                raise StatefulCallAtModuleLevelError(
+                    location=(self._module_file, node.lineno, node.col_offset + 1, None))
             pin = get_pin(node)
             if pin is not None and route == _UNIFORM:
                 # An overload site up here has no anchor to resolve its pin in,

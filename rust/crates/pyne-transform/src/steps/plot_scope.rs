@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use pyne_ast::walk::{child_statements, children, walk};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 const PLOT_NAMES: [&str; 11] = [
     "plot",
@@ -267,10 +267,8 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
     let root = collector.new_scope(None);
     collector.collect(ast, module, root, false);
 
-    let reject = |name: &str| {
-        Err(Error::Rejected(format!(
-            "{name}() must be called unconditionally in the direct body of module-level main"
-        )))
+    let reject = |code: &'static pynecore_codes::Code, name: &str| {
+        Err(Error::Rejected(Raised::new(code, [name])))
     };
     for &call in &collector.calls {
         let Kind::Call { func, .. } = ast.kind(call) else { unreachable!() };
@@ -278,7 +276,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
         if let Some(name) = plot_name(&path)
             && !collector.allowed.contains(&call)
         {
-            return reject(name);
+            return reject(&pynecore_codes::PLOT_CALL_CONDITIONAL, name);
         }
     }
     for &reference in &collector.references {
@@ -306,7 +304,7 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
                 continue;
             }
         }
-        return reject(name);
+        return reject(&pynecore_codes::PLOT_AS_VALUE, name);
     }
     Ok(module)
 }

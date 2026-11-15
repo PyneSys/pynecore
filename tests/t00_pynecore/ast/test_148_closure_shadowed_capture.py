@@ -12,6 +12,7 @@ import ast
 
 import pytest
 
+from pynecore.errorcodes import UnpackedReceiverError
 from pynecore.transformers.closure_arguments_transformer import ClosureArgumentsTransformer
 
 
@@ -269,7 +270,7 @@ def main():
 def __test_method_unpacked_receiver_is_rejected__():
     """ A direct method call whose receiver comes from an unpacked argument has no
     position for the capture to follow, so the transform rejects it """
-    with pytest.raises(SyntaxError, match=r'pass the receiver explicitly: m\(receiver, \*args\)'):
+    with pytest.raises(UnpackedReceiverError, match=r'`m\(receiver, \*args\)`'):
         __test_helper_run(__test_helper_PRELUDE + '''
 @script.indicator('t')
 def main():

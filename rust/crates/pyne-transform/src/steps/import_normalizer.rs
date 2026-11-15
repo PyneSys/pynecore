@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit, walk};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
-use crate::{Context, Error, Host};
+use crate::{Context, Error, Host, Raised};
 
 /// Attributes of `lib` that are classes, not submodules
 const NON_MODULE_ATTRS: [&str; 2] = ["input", "script"];
@@ -128,8 +128,9 @@ impl ImportNormalizer<'_> {
         let exposed: HashSet<String> =
             self.host.star_exports(module)?.unwrap_or_default().into_iter().collect();
         if exposed.is_empty() {
-            return Err(Error::Rejected(format!(
-                "Cannot use wildcard import: module {module} has no __all__ defined"
+            return Err(Error::Rejected(Raised::new(
+                &pynecore_codes::WILDCARD_IMPORT_WITHOUT_ALL,
+                [module.to_string()],
             )));
         }
         let mut path: Vec<String> = vec!["lib".into()];
@@ -364,9 +365,10 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
                         alias == "lib" && asname.is_some()
                     })
                 {
-                    return Err(Error::Rejected(
-                        "'lib' must be imported as itself, not as an alias".into(),
-                    ));
+                    return Err(Error::Rejected(Raised::new(
+                        &pynecore_codes::LIB_IMPORT_ALIAS,
+                        [] as [String; 0],
+                    )));
                 }
                 normalizer.handle_import_from(ast, stmt)?;
             }

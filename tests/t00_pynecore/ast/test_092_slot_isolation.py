@@ -13,6 +13,7 @@ import types
 
 import pytest
 
+from pynecore.errorcodes import StatefulCallAtModuleLevelError
 from pynecore.core.instance_state import _make_state
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.layout_emit import apply_layout
@@ -290,7 +291,7 @@ def main(xs):
 
 def __test_module_level_stateful_call_rejected__():
     """ A module-level call to a stateful function raises a transform error """
-    with pytest.raises(SyntaxError):
+    with pytest.raises(StatefulCallAtModuleLevelError):
         _transform(COUNTER_FUNC + '''
 x = t1()
 ''')
@@ -521,7 +522,7 @@ def main():
 
 def __test_module_level_impure_stateful_callee_rejected__():
     """ Module level rejects a stateful call inside an attribute callee too """
-    with pytest.raises(SyntaxError):
+    with pytest.raises(StatefulCallAtModuleLevelError):
         _transform(COUNTER_FUNC + '''
 Z = t1().bit_length()
 ''')

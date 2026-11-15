@@ -30,6 +30,7 @@ shadows the parent's series.
 from typing import cast
 import ast
 
+from ..errorcodes import SeriesOutsideFunctionError
 from . import ast_walk
 from .dynamic_default_guard import is_dynamic_default_guard
 from .pine_type_rules import (OBJECT, get_ty, get_varying, is_array, is_map, is_matrix, set_ty,
@@ -52,6 +53,8 @@ class SeriesTransformer(ast_walk.NodeTransformer):
 
     def __init__(self, layout: ModuleLayout):
         self.layout = layout
+        #: The source path of the module, for a rejection's location
+        self._module_file = '<script>'
         self.scope_stack: list[str] = []
         self.current_scope: str = ''
         # scope -> var name -> series slot
@@ -164,6 +167,7 @@ class SeriesTransformer(ast_walk.NodeTransformer):
     # --- visitors --------------------------------------------------------
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
+        self._module_file = getattr(node, '_module_file_path', '<script>')
         self.layout.assign_scope_ids(node)
         return cast(ast.Module, self.generic_visit(node))
 
@@ -237,7 +241,8 @@ class SeriesTransformer(ast_walk.NodeTransformer):
             return node
 
         if not self.current_scope:
-            raise SyntaxError("Series variables must be declared inside a function")
+            raise SeriesOutsideFunctionError(
+                location=(self._module_file, node.lineno, node.col_offset + 1, None))
 
         varying = self._varying[-1] if self._varying else ()
         pin = next((j for j, site in enumerate(varying) if site is node.target), None)

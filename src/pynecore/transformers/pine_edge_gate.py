@@ -33,6 +33,11 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, Final
 
+from ..core.errors import Code
+from ..errorcodes import (
+    EDGE_ASSERT_MESSAGE, EDGE_ATTRIBUTE_ASSIGNMENT, EDGE_CALL, EDGE_CLASS, EDGE_DECORATOR, EDGE_IMPORT,
+    EDGE_LAMBDA, EDGE_PYTHON_BUILTIN, EDGE_RESERVED_NAME, EDGE_SUBSCRIPT_ASSIGNMENT, EDGE_SYNTAX,
+)
 from . import ast_walk
 from .factory_fields import FactoryFields
 from .pine_type_table import Diag, Unknown
@@ -61,20 +66,20 @@ _LIB_MODULES: Final = ('pynecore.lib', 'pynecore')
 #: The symbol table name of a lambda: 'lambda' up to Python 3.14, '<lambda>' from 3.15.
 _LAMBDA_TABLE_NAMES: Final = ('lambda', '<lambda>')
 
-#: How a rejected node is named in a message.
+#: How a rejected node is named in a message, as the subject of its sentence.
 _NODE_LABELS: Final[dict[str, str]] = {
-    'AsyncFunctionDef': "'async def'", 'AsyncFor': "'async for'",
-    'AsyncWith': "'async with'", 'Await': "'await'",
-    'Try': "'try'", 'TryStar': "'try'", 'Raise': "'raise'",
-    'With': "'with'", 'Delete': "'del'",
-    'Global': "'global'", 'Nonlocal': "'nonlocal'", 'Match': "'match'",
-    'Yield': "'yield'", 'YieldFrom': "'yield from'",
-    'List': 'a list literal', 'Dict': 'a dict literal',
-    'Set': 'a set literal', 'ListComp': 'a list comprehension',
-    'SetComp': 'a set comprehension', 'DictComp': 'a dict comprehension',
-    'GeneratorExp': 'a generator expression', 'JoinedStr': 'an f-string',
-    'NamedExpr': "a ':=' assignment", 'Starred': 'a starred expression',
-    'Slice': 'a slice',
+    'AsyncFunctionDef': '`async def`', 'AsyncFor': '`async for`',
+    'AsyncWith': '`async with`', 'Await': '`await`',
+    'Try': '`try`', 'TryStar': '`try`', 'Raise': '`raise`',
+    'With': '`with`', 'Delete': '`del`',
+    'Global': '`global`', 'Nonlocal': '`nonlocal`', 'Match': '`match`',
+    'Yield': '`yield`', 'YieldFrom': '`yield from`',
+    'List': 'A list literal', 'Dict': 'A dict literal',
+    'Set': 'A set literal', 'ListComp': 'A list comprehension',
+    'SetComp': 'A set comprehension', 'DictComp': 'A dict comprehension',
+    'GeneratorExp': 'A generator expression', 'JoinedStr': 'An f-string',
+    'NamedExpr': 'A `:=` assignment', 'Starred': 'A starred expression',
+    'Slice': 'A slice',
 }
 
 #: How a rejected operator is spelled in a message.
@@ -83,8 +88,6 @@ _OP_SYMBOLS: Final[dict[str, str]] = {
     'RShift': '>>', 'MatMult': '@', 'Invert': '~', 'Is': 'is',
     'IsNot': 'is not', 'In': 'in', 'NotIn': 'not in',
 }
-
-_SUFFIX: Final = 'is not Pine'
 
 #: Nodes the walk has nothing to check in: contexts and operators, which the
 #: node that holds them is judged by
@@ -336,8 +339,8 @@ class _Gate:
         if kind == 'List' and id(node) in self.allowed_lists:
             return
         if kind not in self.nodes and hasattr(node, 'lineno'):
-            label = _NODE_LABELS.get(kind, f"'{kind}'")
-            self._report(node, 'edge-syntax', f'{label} {_SUFFIX}',
+            label = _NODE_LABELS.get(kind, f'`{kind}`')
+            self._report(node, 'edge-syntax', EDGE_SYNTAX, (label,),
                          'write it with Pine constructs only')
             return
         if isinstance(node, ast.Module):
@@ -385,9 +388,7 @@ class _Gate:
                 self._check_call(node)
         elif isinstance(node, ast.Lambda):
             if id(node) not in self.allowed_lambdas:
-                self._report(node, 'edge-lambda',
-                             f"'lambda' outside a field(default_factory=...) UDT field "
-                             f'default {_SUFFIX}', 'define a function instead')
+                self._report(node, 'edge-lambda', EDGE_LAMBDA, (), 'define a function instead')
                 return
             self._visit_scope(node, [node.body])
             return
@@ -396,13 +397,11 @@ class _Gate:
             # script carries its message verbatim: only a string literal can be
             if node.msg is not None and not (isinstance(node.msg, ast.Constant)
                                              and isinstance(node.msg.value, str)):
-                self._report(node.msg, 'edge-assert',
-                             f'an assert message other than a string literal {_SUFFIX}',
+                self._report(node.msg, 'edge-assert', EDGE_ASSERT_MESSAGE, (),
                              'write the message as a string literal')
                 return
         elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
-            self._report(node, 'edge-subscript', f'subscript assignment {_SUFFIX}',
-                         'use array.set()')
+            self._report(node, 'edge-subscript', EDGE_SUBSCRIPT_ASSIGNMENT, (), 'use array.set()')
         elif isinstance(node, ast.Attribute):
             self._check_ident(node, node.attr)
             if isinstance(node.ctx, ast.Store):
@@ -411,8 +410,8 @@ class _Gate:
             self._check_ident(node, node.id)
             name = self._builtin_read(node)
             if name is not None:
-                self._report(node, 'edge-builtin', f"Python's builtin '{name}' {_SUFFIX}",
-                             f'for {self.lib_builtins[name]}, import it: '
+                self._report(node, 'edge-builtin', EDGE_PYTHON_BUILTIN,
+                             (name, self.lib_builtins[name]),
                              f'from pynecore.lib import {name}')
         elif isinstance(node, ast.arg):
             self._check_ident(node, node.arg)
@@ -424,16 +423,16 @@ class _Gate:
             self._check_op(node, node.op, self.bool_ops)
         elif isinstance(node, ast.Compare):
             if len(node.ops) > 1:
-                self._report(node, 'edge-syntax', f'a chained comparison {_SUFFIX}',
+                self._report(node, 'edge-syntax', EDGE_SYNTAX, ('A chained comparison',),
                              'compare pairwise, joined with and')
             for op in node.ops:
                 self._check_op(node, op, self.cmp_ops)
         elif isinstance(node, (ast.For, ast.While)) and node.orelse:
-            self._report(node.orelse[0], 'edge-syntax', f"a loop's else clause {_SUFFIX}",
-                         'put the code after the loop')
+            self._report(node.orelse[0], 'edge-syntax', EDGE_SYNTAX,
+                         ("A loop's `else` clause",), 'put the code after the loop')
         elif isinstance(node, ast.keyword):
             if node.arg is None:
-                self._report(node.value, 'edge-syntax', f'keyword unpacking {_SUFFIX}',
+                self._report(node.value, 'edge-syntax', EDGE_SYNTAX, ('Keyword unpacking (`**`)',),
                              'pass the arguments one by one')
             else:
                 self._check_ident(node, node.arg)
@@ -448,11 +447,11 @@ class _Gate:
             self._check_ident(node, alias.asname or alias.name.rpartition('.')[2])
         if isinstance(node, ast.ImportFrom):
             if node.level:
-                self._report(node, 'edge-import', f'a relative import {_SUFFIX}',
+                self._report(node, 'edge-import', EDGE_IMPORT, ('A relative import',),
                              'import from pynecore or lib.*')
                 return
             if any(alias.name == '*' for alias in node.names):
-                self._report(node, 'edge-import', f'a star import {_SUFFIX}',
+                self._report(node, 'edge-import', EDGE_IMPORT, ('A star import',),
                              'import the names one by one')
                 return
             module = node.module or ''
@@ -460,18 +459,18 @@ class _Gate:
                 return
             allowed = self.from_modules.get(module)
             if allowed is None:
-                self._report(node, 'edge-import', f"importing from '{module}' {_SUFFIX}",
-                             'only the PyneCore API and lib.* libraries are available')
+                self._report(node, 'edge-import', EDGE_IMPORT, (f'The module `{module}`',),
+                             'import from pynecore or lib.*')
                 return
             for alias in node.names:
                 if alias.name not in allowed:
-                    self._report(node, 'edge-import', f"'{module}.{alias.name}' {_SUFFIX}",
-                                 'only the PyneCore API and lib.* libraries are available')
+                    self._report(node, 'edge-import', EDGE_IMPORT, (f'`{module}.{alias.name}`',),
+                                 'import from pynecore or lib.*')
             return
         for alias in node.names:
             if not self._has_allowed_prefix(alias.name):
-                self._report(node, 'edge-import', f"importing '{alias.name}' {_SUFFIX}",
-                             'only the PyneCore API and lib.* libraries are available')
+                self._report(node, 'edge-import', EDGE_IMPORT, (f'The module `{alias.name}`',),
+                             'import from pynecore or lib.*')
 
     def _has_allowed_prefix(self, module: str) -> bool:
         return any(module == prefix or module.startswith(prefix + '.')
@@ -480,23 +479,23 @@ class _Gate:
     def _check_function(self, node: ast.FunctionDef) -> None:
         self._check_ident(node, node.name)
         if _has_special_parameters(node.args):
-            self._report(node, 'edge-syntax',
-                         f'*args, **kwargs, keyword-only and positional-only parameters '
-                         f'{_SUFFIX}', 'declare plain positional parameters')
+            self._report(node, 'edge-syntax', EDGE_SYNTAX,
+                         ('A `*args`, `**kwargs`, keyword-only or positional-only parameter',),
+                         'declare plain positional parameters')
         for decorator in node.decorator_list:
             if not self._decorator_ok(decorator, self.func_decorators, allow_script=True):
-                self._report(decorator, 'edge-decorator', f'this decorator {_SUFFIX}',
-                             'only @script.indicator/strategy/library(...), @method, '
-                             '@overload and @export exist')
+                self._report(decorator, 'edge-decorator', EDGE_DECORATOR, (),
+                             'remove the decorator')
 
     def _check_class(self, node: ast.ClassDef) -> None:
         if node.bases or node.keywords:
-            self._report(node, 'edge-class', f'class inheritance {_SUFFIX}',
-                         'a class is a plain @udt/@dataclass field list')
+            self._report(node, 'edge-class', EDGE_CLASS,
+                         ('A class cannot have base classes or keywords.',),
+                         'remove the base classes')
         decorators = node.decorator_list
         if len(decorators) != 1 or not self._decorator_ok(decorators[0], self.class_decorators):
-            self._report(node, 'edge-class',
-                         f'a class without exactly one @udt or @dataclass decorator {_SUFFIX}',
+            self._report(node, 'edge-class', EDGE_CLASS,
+                         ('A class needs exactly one `@udt` or `@dataclass` decorator.',),
                          'decorate it with @udt')
         body = node.body
         if body and _is_docstring(body[0]):
@@ -505,8 +504,8 @@ class _Gate:
             if isinstance(stmt, ast.FunctionDef):
                 self._check_member(stmt)
             elif not isinstance(stmt, (ast.AnnAssign, ast.Pass)):
-                self._report(stmt, 'edge-class',
-                             f'a class body beyond annotated fields and methods {_SUFFIX}',
+                self._report(stmt, 'edge-class', EDGE_CLASS,
+                             ('A class body can hold only annotated fields and methods.',),
                              'declare fields and methods only')
 
     def _check_member(self, node: ast.FunctionDef) -> None:
@@ -515,11 +514,12 @@ class _Gate:
         class, so it takes no decorator and its receiver first.
         """
         if node.decorator_list:
-            self._report(node, 'edge-class', f'a decorated method in a class body {_SUFFIX}',
+            self._report(node, 'edge-class', EDGE_CLASS,
+                         ('A method in a class body takes no decorator.',),
                          'drop the decorator: a method takes its receiver first')
         elif not (node.args.posonlyargs or node.args.args):
-            self._report(node, 'edge-class',
-                         f'a method without its receiver as the first parameter {_SUFFIX}',
+            self._report(node, 'edge-class', EDGE_CLASS,
+                         ('A method takes its receiver as its first parameter.',),
                          'take the receiver as the first parameter')
 
     def _is_protocol_shim(self, node: ast.ClassDef) -> bool:
@@ -547,26 +547,24 @@ class _Gate:
                 or any(pattern.match(name) for pattern in self.dunder_patterns) \
                 or id(node) in self._reported:
             return
-        self._report(node, 'edge-name', f"the name '{name}' {_SUFFIX}",
-                     'double-underscore names belong to the pipeline')
+        self._report(node, 'edge-name', EDGE_RESERVED_NAME, (name,), 'rename the identifier')
 
     def _check_call(self, node: ast.Call) -> None:
         func = node.func
         if isinstance(func, ast.Attribute):
             if _attribute_chain(func) is None:
-                self._report(func, 'edge-call', f'calling a computed expression {_SUFFIX}',
+                self._report(func, 'edge-call', EDGE_SYNTAX, ('Calling a computed expression',),
                              'call a defined function or a lib name')
             return
         if not isinstance(func, ast.Name):
-            self._report(func, 'edge-call', f'calling a computed expression {_SUFFIX}',
+            self._report(func, 'edge-call', EDGE_SYNTAX, ('Calling a computed expression',),
                          'call a defined function or a lib name')
             return
         name = func.id
         if name in self.def_names or name in self.import_bound or name in self.builtin_calls:
             return
-        self._report(func, 'edge-call', f"calling '{name}' {_SUFFIX}",
-                     f'only defined functions, imported names and '
-                     f'{", ".join(sorted(self.builtin_calls))} can be called')
+        self._report(func, 'edge-call', EDGE_CALL, (name, ', '.join(sorted(self.builtin_calls))),
+                     'call a defined function, an imported name or a lib name')
 
     def _visit_scope(self, node: ast.ClassDef | ast.Lambda, body: Sequence[ast.AST]) -> None:
         """
@@ -666,8 +664,8 @@ class _Gate:
                 return
         if self.module_bound_at.get(root, len(self.tree.body)) < self._stmt_index:
             return
-        self._report(node, 'edge-attr-store', f"assigning an attribute on '{root}' {_SUFFIX}",
-                     'functions and modules are not objects')
+        self._report(node, 'edge-attr-store', EDGE_ATTRIBUTE_ASSIGNMENT, (root,),
+                     'set fields of @udt objects only')
 
     def _decorator_ok(self, decorator: ast.expr, allowed: frozenset[tuple[str, str]],
                       allow_script: bool = False) -> bool:
@@ -716,22 +714,33 @@ class _Gate:
         kind = type(op).__name__
         if kind not in allowed:
             symbol = _OP_SYMBOLS.get(kind, kind)
-            self._report(node, 'edge-syntax', f"the '{symbol}' operator {_SUFFIX}",
+            self._report(node, 'edge-syntax', EDGE_SYNTAX, (f'The `{symbol}` operator',),
                          'write it with Pine operators only')
 
-    def _report(self, node: ast.AST, reason: str, message: str, fix: str) -> None:
+    def _report(self, node: ast.AST, reason: str, code: Code, args: tuple[str, ...],
+                fix: str) -> None:
+        """
+        Record that a node breaks the profile.
+
+        :param node: The offending node; the walk does not descend into it
+        :param reason: The machine-readable cause, the diagnostic's origin
+        :param code: The registry code of the rule
+        :param args: The code's parameters, as the message shows them
+        :param fix: The concrete remedy
+        """
         self._reported.add(id(node))
         line = getattr(node, 'lineno', 0)
         col = getattr(node, 'col_offset', 0)
         # A rejected EXPRESSION covers everything written inside it: the
         # typed half has nothing to add about its parts
         spans = isinstance(node, ast.expr)
-        self.diags.append(Diag(message=message, line=line, col=col,
+        self.diags.append(Diag(message=code.render(*args), line=line, col=col,
                                origin=Unknown(reason=reason, line=line, col=col,
                                               detail=type(node).__name__),
                                fix=fix,
                                end_line=getattr(node, 'end_lineno', 0) or 0 if spans else 0,
-                               end_col=getattr(node, 'end_col_offset', 0) or 0 if spans else 0))
+                               end_col=getattr(node, 'end_col_offset', 0) or 0 if spans else 0,
+                               code=code.code, args=args))
 
 
 def _stored_names(stmt: ast.stmt) -> set[str]:

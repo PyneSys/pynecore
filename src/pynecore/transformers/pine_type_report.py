@@ -22,6 +22,11 @@ the script the fast path can see -- and never stop anything. In an
 import ast
 import re
 
+from ..errorcodes import (
+    TYPE_FUNCTION_VALUE, TYPE_NOT_LIB_NAME, TYPE_NOT_PINE_EXPRESSION, TYPE_UNKNOWN_CALL,
+    TYPE_UNKNOWN_CALLEE_CALL, TYPE_UNKNOWN_FIELD, TYPE_UNKNOWN_INDEX, TYPE_UNKNOWN_LIB_CALL,
+    TYPE_UNKNOWN_METHOD_CALL, TYPE_UNKNOWN_NAME, TYPE_UNKNOWN_OPERATION,
+)
 from . import ast_walk
 from .factory_fields import FactoryFields
 from .pine_type_rules import TY_ATTR, UNKNOWN, get_ty, render_ty
@@ -385,14 +390,14 @@ class _Report:
                 # function values, and the walk cannot follow what the alias
                 # is then called as
                 origin = Unknown(reason='function-value', line=line, col=col, detail=node.id)
-                message = f"'{node.id}' is a function, not a value"
+                code, args = TYPE_FUNCTION_VALUE, (node.id,)
             else:
-                message = f"'{node.id}' has no known type"
+                code, args = TYPE_UNKNOWN_NAME, (node.id,)
         elif isinstance(node, ast.Call):
             callee = _dotted(node.func)
             if callee is None:
                 origin = Unknown(reason='unknown-call', line=line, col=col, detail='')
-                message = 'this call has no known type'
+                code, args = TYPE_UNKNOWN_CALLEE_CALL, ()
             elif callee == 'method_call' and len(node.args) >= 2:
                 # The plumbing of a method call: the METHOD is what has no
                 # type, and the message names it, not the plumbing
@@ -402,39 +407,39 @@ class _Report:
                 else:
                     method = _dotted(selector) or ast.unparse(selector)
                 origin = Unknown(reason='unknown-return', line=line, col=col, detail=method)
-                message = f"the call to method '{method}' has no known type"
+                code, args = TYPE_UNKNOWN_METHOD_CALL, (method,)
             elif callee.startswith('lib.'):
                 origin = Unknown(reason='unknown-lib', line=line, col=col, detail=callee)
-                message = f"'{callee[4:]}' has no known type here"
+                code, args = TYPE_UNKNOWN_LIB_CALL, (callee[4:],)
             elif self._is_user_function(callee, node):
                 origin = Unknown(reason='unknown-return', line=line, col=col, detail=callee)
-                message = f"the call to '{callee}' has no known type"
+                code, args = TYPE_UNKNOWN_CALL, (callee,)
             else:
                 origin = Unknown(reason='unknown-call', line=line, col=col, detail=callee)
-                message = f"the call to '{callee}' has no known type"
+                code, args = TYPE_UNKNOWN_CALL, (callee,)
         elif isinstance(node, ast.Attribute):
             dotted = _dotted(node)
             if dotted is not None and dotted.startswith('lib.'):
                 origin = Unknown(reason='unknown-lib-name', line=line, col=col, detail=dotted)
-                message = f"'{dotted[4:]}' is not a known lib name"
+                code, args = TYPE_NOT_LIB_NAME, (dotted[4:],)
             else:
                 origin = Unknown(reason='unknown-field', line=line, col=col, detail=node.attr)
-                message = f"'.{node.attr}' has no known type on {render_ty(get_ty(node.value))}"
+                code, args = TYPE_UNKNOWN_FIELD, (node.attr, render_ty(get_ty(node.value)))
         elif isinstance(node, ast.Subscript):
             origin = Unknown(reason='unknown-index', line=line, col=col, detail='')
-            message = f'indexing {render_ty(get_ty(node.value))} has no known type'
+            code, args = TYPE_UNKNOWN_INDEX, (render_ty(get_ty(node.value)),)
         elif isinstance(node, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp)):
             # A Pine operation over KNOWN operands that has no result type:
             # the operands are what the operation does not accept together
             operands = [node.body, node.orelse] if isinstance(node, ast.IfExp) \
                 else self._value_children(node)
-            over = ', '.join(render_ty(get_ty(operand)) for operand in operands)
+            over = ', '.join(f'`{render_ty(get_ty(operand))}`' for operand in operands)
             origin = Unknown(reason='unknown-op', line=line, col=col, detail=type(node).__name__)
-            message = f"'{ast.unparse(node)[:40]}' has no known type over {over}"
+            code, args = TYPE_UNKNOWN_OPERATION, (ast.unparse(node)[:40], over)
         else:
             kind = type(node).__name__
             origin = Unknown(reason='not-pine', line=line, col=col, detail=kind)
-            message = f"'{ast.unparse(node)[:40]}' is not a Pine expression"
+            code, args = TYPE_NOT_PINE_EXPRESSION, (ast.unparse(node)[:40],)
         key = (origin.reason, origin.line, origin.col, origin.detail)
         if key in self.seen:
             return
@@ -444,7 +449,8 @@ class _Report:
             fix = f"annotate '{origin.detail}'"
         elif origin.reason == 'unknown-return' and origin.detail:
             fix = f"annotate the return of '{origin.detail}'"
-        self.diags.append(Diag(message=message, line=line, col=col, origin=origin, fix=fix))
+        self.diags.append(Diag(message=code.render(*args), line=line, col=col, origin=origin,
+                               fix=fix, code=code.code, args=args))
 
 
 def _is_plumbing(node: ast.AST) -> bool:

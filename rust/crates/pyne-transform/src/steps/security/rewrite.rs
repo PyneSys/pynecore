@@ -21,7 +21,7 @@ use super::collection::{
 use super::lift::reached_ids;
 use super::predicates::{is_security_call, is_security_lower_tf_call};
 use super::{Entries, Security};
-use crate::Error;
+use crate::{Error, Raised};
 
 /// Compound statements whose statement lists [`Security::recurse_subbodies`]
 /// transforms on their own.
@@ -364,10 +364,9 @@ impl Security {
                 let Kind::Attribute { attr, .. } = ast.kind(bad) else { unreachable!() };
                 let function =
                     if is_ltf { "request.security_lower_tf" } else { "request.security" };
-                return Err(Error::Rejected(format!(
-                    "'strategy.{attr}' cannot be used as the expression argument of \
-                     {function}() \u{2014} strategy state is only available in the chart \
-                     context, not in a security context."
+                return Err(Error::Rejected(Raised::new(
+                    &pynecore_codes::STRATEGY_STATE_IN_SECURITY,
+                    [attr.to_string(), function.to_string()],
                 )));
             }
 

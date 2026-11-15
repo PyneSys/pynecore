@@ -1,6 +1,7 @@
 import ast
 import linecache
 
+from ..errorcodes import InputNotMainDefaultError
 from . import ast_walk
 from .pipeline_names import is_pipeline_name
 from .price_series import BUILTIN_PRICE_SERIES
@@ -139,9 +140,8 @@ class InputTransformer(ast_walk.NodeVisitor):
         filename = getattr(self._module, '_module_file_path', '<script>')
         line = getattr(node, 'lineno', 0)
         text = (linecache.getline(filename, line) or None) if line > 0 else None
-        raise SyntaxError(f'{name}() is not a main() parameter default; inputs must be declared '
-                          f'as main() parameter defaults: def main(length=input.int(14, ...))',
-                          (filename, line, getattr(node, 'col_offset', 0) + 1, text))
+        raise InputNotMainDefaultError(
+            function=name, location=(filename, line, getattr(node, 'col_offset', 0) + 1, text))
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         """Insert getattr calls at the start of functions for source inputs"""

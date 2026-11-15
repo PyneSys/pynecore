@@ -40,8 +40,9 @@ class Holder:
 '''
 
 
-def __test_helper_widen(body: str, prelude: str = __test_helper_PRELUDE) -> tuple[str, list[str]]:
-    """Infer and widen ``main``'s body; return the emitted body and the diagnostics."""
+def __test_helper_widen(body: str, prelude: str = __test_helper_PRELUDE
+                        ) -> tuple[str, list[tuple[str, tuple[str, ...]]]]:
+    """Infer and widen ``main``'s body; return the emitted body and the diagnostics' codes."""
     source = prelude + 'def main():\n' + ''.join(
         f'    {line}\n' for line in body.strip().splitlines())
     tree = ast.parse(source)
@@ -51,7 +52,7 @@ def __test_helper_widen(body: str, prelude: str = __test_helper_PRELUDE) -> tupl
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == 'main':
             emitted = [ast.unparse(stmt) for stmt in node.body]
-    return '\n'.join(emitted), [d.message for d in table.diags]
+    return '\n'.join(emitted), [(d.code, d.args) for d in table.diags]
 
 
 @pytest.mark.parametrize("body,expected", [
@@ -938,18 +939,16 @@ def __test_a_typeless_na_a_name_starts_as_follows_the_context_it_is_assigned_in_
     assert '    out = safe_convert.implicit_convert(lib._na_none, None)' in emitted.splitlines()
 
 
-@pytest.mark.parametrize("body,message", [
-    ('x = 1.0\nif lib.bar_index > 0:\n    x = "s"',
-     "'x' gets both float and string, which are different types"),
+@pytest.mark.parametrize("body,args", [
+    ('x = 1.0\nif lib.bar_index > 0:\n    x = "s"', ('`x`', 'float', 'string')),
     ('result = lib._na_none\nif lib.bar_index > 0:\n    result = "s"\nelse:\n    result = 2',
-     "'result' gets both string and int, which are different types"),
-    ('x = True\nif lib.bar_index > 0:\n    x = Pivot(1.0)',
-     "'x' gets both bool and Pivot, which are different types"),
+     ('`result`', 'string', 'int')),
+    ('x = True\nif lib.bar_index > 0:\n    x = Pivot(1.0)', ('`x`', 'bool', 'Pivot')),
 ])
-def __test_branches_assigning_different_types_are_reported__(body, message):
+def __test_branches_assigning_different_types_are_reported__(body, args):
     """Pine rejects a variable whose assignments disagree; the walk names the pair"""
     emitted, diags = __test_helper_widen(body, __test_helper_UDT_PRELUDE)
-    assert message in diags
+    assert ('E0023', args) in diags
 
 
 @pytest.mark.parametrize("body,expected", [
@@ -975,8 +974,8 @@ def __test_tuple_positions_assigned_different_types_are_reported_one_by_one__():
     body = ('bad = (lib._na_none, lib._na_none)\nif lib.bar_index > 0:\n    bad = (1, "a")\n'
             'else:\n    bad = ("x", 2)')
     _, diags = __test_helper_widen(body)
-    assert "element 1 of 'bad' gets both int and string, which are different types" in diags
-    assert "element 2 of 'bad' gets both string and int, which are different types" in diags
+    assert ('E0023', ('element 1 of `bad`', 'int', 'string')) in diags
+    assert ('E0023', ('element 2 of `bad`', 'string', 'int')) in diags
 
 
 @pytest.mark.parametrize("body,expected", [

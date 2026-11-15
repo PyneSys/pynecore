@@ -227,8 +227,8 @@ impl Engine<'_, '_> {
             }
             let origin = self.unknown("context-dependent-widen", node, "");
             self.diag(
-                "the implicit conversion of a value differs per call context, and not every \
-                 instance can be given its own",
+                &pynecore_codes::TYPE_WIDEN_PER_CONTEXT,
+                &[],
                 node,
                 Some(origin),
                 "annotate the parameters so every call site passes the same types",

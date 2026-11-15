@@ -3,12 +3,15 @@
 and an exception class per code. The class derives from
 :class:`~pynecore.core.errors.PyneError` and the built-in exceptions the
 registry names, and takes the code's parameters as keyword arguments (a
-parameter named as a Python keyword or built-in with a trailing underscore)."""
+parameter named as a Python keyword or built-in with a trailing underscore). A
+code whose built-in is :class:`SyntaxError` derives from
+:class:`~pynecore.core.errors.PyneSyntaxError` and also takes the ``location``
+its rule was broken at."""
 
 import decimal
 import re
 
-from .core.errors import Code, PyneError
+from .core.errors import Code, PyneError, PyneSyntaxError, SyntaxLocation
 from .core.datetime import TimezoneNotFoundError
 
 EDGE_SYNTAX = Code(
@@ -87,12 +90,594 @@ EDGE_ATTRIBUTE_ASSIGNMENT = Code(
     'modules are not objects.',
     ('root',),
 )
+EDGE_RESERVED_NAME = Code(
+    'E0011',
+    'error',
+    'Double-underscore name',
+    'The name `{name}` is not allowed in the Pyne Edge profile: double-underscore names belong to '
+    "PyneCore's transform.",
+    ('name',),
+)
+TYPE_UNKNOWN_NAME = Code(
+    'E0012',
+    'error',
+    'Name without a known type',
+    '`{name}` has no known type.',
+    ('name',),
+)
+TYPE_FUNCTION_VALUE = Code(
+    'E0013',
+    'error',
+    'Function used as a value',
+    '`{name}` is a function, not a value.',
+    ('name',),
+)
+TYPE_UNKNOWN_CALL = Code(
+    'E0014',
+    'error',
+    'Call without a known type',
+    'The call to `{callee}` has no known type.',
+    ('callee',),
+)
+TYPE_UNKNOWN_CALLEE_CALL = Code(
+    'E0015',
+    'error',
+    'Call of an unknown callee',
+    'This call has no known type.',
+    (),
+)
+TYPE_UNKNOWN_METHOD_CALL = Code(
+    'E0016',
+    'error',
+    'Method call without a known type',
+    'The call to the method `{method}` has no known type.',
+    ('method',),
+)
+TYPE_UNKNOWN_LIB_CALL = Code(
+    'E0017',
+    'error',
+    'Lib call without a known type here',
+    '`{name}` has no known type here.',
+    ('name',),
+)
+TYPE_NOT_LIB_NAME = Code(
+    'E0018',
+    'error',
+    'Unknown lib name',
+    '`{name}` is not a lib name.',
+    ('name',),
+)
+TYPE_UNKNOWN_FIELD = Code(
+    'E0019',
+    'error',
+    'Field without a known type',
+    '`.{field}` has no known type on `{type}`.',
+    ('field', 'type'),
+)
+TYPE_UNKNOWN_INDEX = Code(
+    'E0020',
+    'error',
+    'Index without a known type',
+    'Indexing `{type}` has no known type.',
+    ('type',),
+)
+TYPE_UNKNOWN_OPERATION = Code(
+    'E0021',
+    'error',
+    'Operation without a known type',
+    '`{expression}` has no known type over {operands}.',
+    ('expression', 'operands'),
+)
+TYPE_NOT_PINE_EXPRESSION = Code(
+    'E0022',
+    'error',
+    'Expression outside Pine',
+    '`{expression}` is not a Pine expression.',
+    ('expression',),
+)
+TYPE_CONFLICT = Code(
+    'E0023',
+    'error',
+    'Two types for one value',
+    '{what} gets both `{first}` and `{second}`, which are different types.',
+    ('what', 'first', 'second'),
+)
+TYPE_STARRED_TARGET = Code(
+    'E0024',
+    'error',
+    'Starred unpacking target',
+    'A starred target takes an unknown number of elements, which Pine has no form for.',
+    (),
+)
+TYPE_UNPACK_COUNT = Code(
+    'E0025',
+    'error',
+    'Unpacking count mismatch',
+    '`{type}` has {count} elements, and this unpacks {names}.',
+    ('type', 'count', 'names'),
+)
+TYPE_PIN_PER_CONTEXT = Code(
+    'E0026',
+    'error',
+    'Overload differs per call context',
+    'The overload chosen for this call differs per call context: {pins}.',
+    ('pins',),
+)
+TYPE_WIDEN_PER_CONTEXT = Code(
+    'E0027',
+    'error',
+    'Conversion differs per call context',
+    'The implicit conversion of a value differs per call context, and not every instance can be '
+    'given its own.',
+    (),
+)
+TYPE_OPERAND_UNKNOWN = Code(
+    'E0028',
+    'error',
+    'Collection operand without a known type',
+    '`{type}` takes an operand whose type is not known here, so what it holds afterwards is not '
+    'known either.',
+    ('type',),
+)
+TYPE_OPERAND_MISMATCH = Code(
+    'E0029',
+    'error',
+    'Collection operand of another element type',
+    '`{type}` cannot take `{other}`: the elements are different types.',
+    ('type', 'other'),
+)
+TYPE_REBOUND_DEFINED = Code(
+    'E0030',
+    'error',
+    'Function name assigned',
+    '`{name}` is assigned as well as defined, so what it calls is unknown.',
+    ('name',),
+)
+TYPE_IMPORTED_TWICE = Code(
+    'E0031',
+    'error',
+    'Name imported twice',
+    '`{name}` is imported more than once, so what it calls is unknown.',
+    ('name',),
+)
+TYPE_REBOUND_IMPORTED = Code(
+    'E0032',
+    'error',
+    'Imported name assigned',
+    '`{name}` is assigned as well as imported, so what it calls is unknown.',
+    ('name',),
+)
+TYPE_RECURSION = Code(
+    'E0033',
+    'error',
+    'Re-entrant call',
+    '`{function}` is re-entrant, so its result type is unknown.',
+    ('function',),
+)
+TYPE_CONTEXT_LIMIT = Code(
+    'E0034',
+    'error',
+    'Too many call contexts',
+    '`{function}` hit the per-module context limit.',
+    ('function',),
+)
+TYPE_UNANNOTATED_IMPORT = Code(
+    'E0035',
+    'error',
+    'Import without annotations',
+    '`{name}` is imported from `{source}`, where its parameters carry no annotations, so what it '
+    'returns is unknown.',
+    ('name', 'source'),
+)
+TYPE_SUPPRESSED_IMPORT = Code(
+    'E0036',
+    'error',
+    'Import of a reported module',
+    '`{module}` is reported, and no type it publishes may drive a dispatch here: {reason}.',
+    ('module', 'reason'),
+)
+TYPE_IMPORT_CYCLE = Code(
+    'E0037',
+    'error',
+    'Import cycle',
+    '`{module}` imports this module back, so its signatures are not available yet.',
+    ('module',),
+)
+TYPE_NOT_ITERABLE = Code(
+    'E0038',
+    'error',
+    'For loop over a non-iterable',
+    '`{expression}` is a `{type}`; a for loop iterates a range or an array.',
+    ('expression', 'type'),
+)
+TYPE_INDEX_NOT_PINE = Code(
+    'E0039',
+    'error',
+    'Indexing outside Pine',
+    'Indexing `{type}` is not Pine.',
+    ('type',),
+)
+TYPE_NOT_SERIES = Code(
+    'E0040',
+    'error',
+    'History of a plain value',
+    '`{expression}` is a plain `{type}`, not a series.',
+    ('expression', 'type'),
+)
+TYPE_DECLARED_MISMATCH = Code(
+    'E0041',
+    'error',
+    'Assignment of another type',
+    '`{name}` is declared `{declared}` and assigned `{assigned}`.',
+    ('name', 'declared', 'assigned'),
+)
+TYPE_FIELD_ASSIGN_MISMATCH = Code(
+    'E0042',
+    'error',
+    'Field assigned another type',
+    '`{field}` holds `{declared}` and is assigned `{assigned}`.',
+    ('field', 'declared', 'assigned'),
+)
+TYPE_UNKNOWN_CALLEE = Code(
+    'E0043',
+    'error',
+    'Unknown function',
+    '`{name}` is not a function this module defines or imports, nor a lib name.',
+    ('name',),
+)
+TYPE_CALLEE_NOT_NAME = Code(
+    'E0044',
+    'error',
+    'Callee is not a name',
+    'The callee is not a name.',
+    (),
+)
+TYPE_UNKNOWN_CLASS_FIELD = Code(
+    'E0045',
+    'error',
+    'Field of a value of unknown class',
+    'The class of `{value}` is not known here, so its field `{field}` has no type.',
+    ('value', 'field'),
+)
+TYPE_UNKNOWN_CLASS_METHOD = Code(
+    'E0046',
+    'error',
+    'Method of a value of unknown class',
+    'The class of `{value}` is not known here, so its method `{method}` has no type.',
+    ('value', 'method'),
+)
+TYPE_UNKNOWN_CLASS_STORE = Code(
+    'E0047',
+    'error',
+    'Field set on a value of unknown class',
+    'The class of `{value}` is not known here, so its field `{field}` cannot be checked.',
+    ('value', 'field'),
+)
+TYPE_NO_FIELD = Code(
+    'E0048',
+    'error',
+    'Unknown field',
+    '`{owner}` has no field `{field}`.',
+    ('owner', 'field'),
+)
+TYPE_NO_FIELD_TO_ASSIGN = Code(
+    'E0049',
+    'error',
+    'Field set on a value without fields',
+    'A `{type}` has no field `{field}` to assign.',
+    ('type', 'field'),
+)
+TYPE_LOOP_COUNTER_FIELD = Code(
+    'E0050',
+    'error',
+    'Unknown loop counter field',
+    'The loop counter has no field `{field}`.',
+    ('field',),
+)
+TYPE_LIB_NAMESPACE_CALL = Code(
+    'E0051',
+    'error',
+    'Lib namespace called',
+    '`{name}` is a lib namespace, not a function.',
+    ('name',),
+)
+TYPE_LIB_VALUE_CALL = Code(
+    'E0052',
+    'error',
+    'Lib value called',
+    '`{name}` is a lib value, not a function.',
+    ('name',),
+)
+TYPE_METHOD_NOT_FOUND = Code(
+    'E0053',
+    'error',
+    'Unknown method',
+    '`{method}` is not a method of `{type}` here.',
+    ('method', 'type'),
+)
+TYPE_METHOD_NOT_EXPORTED = Code(
+    'E0054',
+    'error',
+    'Method not reachable by name',
+    '`{method}` is declared on `{type}`, but no export the runtime searches by name holds it.',
+    ('method', 'type'),
+)
+TYPE_LOOP_BOUNDS_UNKNOWN = Code(
+    'E0055',
+    'error',
+    'Loop bounds without a known type',
+    'The bounds of `{expression}` are not known here, so its counter has no type.',
+    ('expression',),
+)
+CALL_BOUND_NOT_NUMBER = Code(
+    'E0056',
+    'error',
+    'Bound is not a number',
+    '`{function}` takes a number for a bound, `{type}` passed.',
+    ('function', 'type'),
+)
+LOOP_STEP_ARITY = Code(
+    'E0057',
+    'error',
+    'step() arity',
+    '`step` takes 1 argument, {count} passed.',
+    ('count',),
+)
+LOOP_ENTER_ARITY = Code(
+    'E0058',
+    'error',
+    'enter() arity',
+    '`enter` takes 0 or 1 argument(s), {count} passed.',
+    ('count',),
+)
+METHOD_CALL_SHAPE = Code(
+    'E0059',
+    'error',
+    'method_call() arguments',
+    '`method_call` takes a method and a receiver.',
+    (),
+)
+CALL_ARGUMENT_COUNT = Code(
+    'E0060',
+    'error',
+    'Wrong number of arguments',
+    '`{function}` does not take {count} argument(s).',
+    ('function', 'count'),
+)
+CALL_TOO_FEW_ARGUMENTS = Code(
+    'E0061',
+    'error',
+    'Too few arguments',
+    '`{function}` does not take {count} argument(s) (at least {least} needed).',
+    ('function', 'count', 'least'),
+)
+CALL_POSITIONAL_COUNT = Code(
+    'E0062',
+    'error',
+    'Wrong number of positional arguments',
+    '`{function}` takes {positional} positional argument(s), {count} passed.',
+    ('function', 'positional', 'count'),
+)
+CALL_UNKNOWN_PARAMETER = Code(
+    'E0063',
+    'error',
+    'Unknown parameter',
+    '`{function}` has no parameter `{parameter}`.',
+    ('function', 'parameter'),
+)
+CALL_ARGUMENT_TYPE = Code(
+    'E0064',
+    'error',
+    'Argument of another type',
+    '`{function}` takes `{declared}` for `{parameter}`, `{passed}` passed.',
+    ('function', 'declared', 'parameter', 'passed'),
+)
+CALL_NO_OVERLOAD = Code(
+    'E0065',
+    'error',
+    'No matching overload',
+    'No overload of `{function}` takes these arguments.',
+    ('function',),
+)
+CALL_ARGUMENT_TWICE = Code(
+    'E0066',
+    'error',
+    'Argument passed twice',
+    '`{parameter}` is passed to `{function}` twice.',
+    ('parameter', 'function'),
+)
+CALL_MISSING_ARGUMENT = Code(
+    'E0067',
+    'error',
+    'Missing argument',
+    '`{function}` needs an argument for `{parameter}`.',
+    ('function', 'parameter'),
+)
+CONSTRUCTOR_FIELD_COUNT = Code(
+    'E0068',
+    'error',
+    'Wrong number of constructor arguments',
+    '`{type}` has {fields} field(s), {count} argument(s) passed.',
+    ('type', 'fields', 'count'),
+)
+CONSTRUCTOR_MISSING_FIELD = Code(
+    'E0069',
+    'error',
+    'Missing field value',
+    '`{type}` needs a value for `{field}`.',
+    ('type', 'field'),
+)
+CONSTRUCTOR_FIELD_TYPE = Code(
+    'E0070',
+    'error',
+    'Field value of another type',
+    '`{field}` holds `{declared}`, `{passed}` passed.',
+    ('field', 'declared', 'passed'),
+)
 INTERNAL_ERROR = Code(
     'I0004',
     'error',
     'Internal error',
     'Internal error: {what}.',
     ('what',),
+)
+RESERVED_NAME_CHAR = Code(
+    'P0001',
+    'error',
+    "Identifier with PyneCore's reserved character",
+    "`{name}` contains `·`, which is reserved for PyneCore's internal names in Pyne code; rename "
+    'the identifier.',
+    ('name',),
+)
+PIPELINE_NAME = Code(
+    'P0002',
+    'error',
+    'Identifier reserved by the transform',
+    "`{name}` is a name PyneCore's transform generates, reserved in Pyne code; rename the "
+    'identifier.',
+    ('name',),
+)
+SCRIPT_DECORATOR_NOT_ON_MAIN = Code(
+    'P0003',
+    'error',
+    'Script decorator not on main',
+    'The script decorator belongs on `main`, not on `{function}`.',
+    ('function',),
+)
+DUPLICATE_SCRIPT_DECORATOR = Code(
+    'P0004',
+    'error',
+    'Second script decorator',
+    'A module has one script decorator, and `main` is defined twice.',
+    (),
+)
+NA_BOOL_NOT_LITERAL = Code(
+    'P0005',
+    'error',
+    'na_bool is not a literal',
+    "`na_bool` must be a literal `True` or `False`: the script's bool semantics are fixed before "
+    'its module body runs.',
+    (),
+)
+SERIES_OUTSIDE_FUNCTION = Code(
+    'P0006',
+    'error',
+    'Series variable outside a function',
+    'A `Series` variable must be declared inside a function.',
+    (),
+)
+PERSISTENT_OUTSIDE_FUNCTION = Code(
+    'P0007',
+    'error',
+    'Persistent variable outside a function',
+    'A `Persistent` variable must be declared inside a function.',
+    (),
+)
+STATEFUL_CALL_AT_MODULE_LEVEL = Code(
+    'P0008',
+    'error',
+    'Stateful call at module level',
+    'A function that keeps state from bar to bar cannot be called at module level.',
+    (),
+)
+INPUT_NOT_MAIN_DEFAULT = Code(
+    'P0009',
+    'error',
+    "Input outside main's parameters",
+    '`{function}()` is not a `main()` parameter default; inputs must be declared as `main()` '
+    'parameter defaults: `def main(length=input.int(14, ...))`.',
+    ('function',),
+)
+LIB_IMPORT_ALIAS = Code(
+    'P0010',
+    'error',
+    'lib imported under an alias',
+    '`lib` must be imported as itself, not as an alias.',
+    (),
+)
+WILDCARD_IMPORT_WITHOUT_ALL = Code(
+    'P0011',
+    'error',
+    'Wildcard import of a module without __all__',
+    'Cannot use a wildcard import: the module `{module}` has no `__all__` defined.',
+    ('module',),
+)
+UNKNOWN_LIB_ATTRIBUTE = Code(
+    'P0012',
+    'error',
+    'Unknown lib attribute',
+    '`{module}` has no attribute `{name}`.',
+    ('module', 'name'),
+)
+MODULE_STATE_MODIFIED = Code(
+    'P0013',
+    'error',
+    'Module-level object modified inside a function',
+    '`{name}` {how} inside a function: an object created outside a function cannot be modified '
+    'inside one.',
+    ('name', 'how'),
+)
+PLOT_CALL_CONDITIONAL = Code(
+    'P0014',
+    'error',
+    'Plot called conditionally',
+    '`{function}()` must be called unconditionally in the direct body of module-level `main`, '
+    'before any possible early return.',
+    ('function',),
+)
+PLOT_AS_VALUE = Code(
+    'P0015',
+    'error',
+    'Plot used as a value',
+    '`{function}()` cannot be passed or stored as a function value; use a direct call or a single '
+    'static alias so its scope can be checked.',
+    ('function',),
+)
+STATEFUL_METHOD_KIND = Code(
+    'P0016',
+    'error',
+    'Stateful method of the wrong kind',
+    'The method `{method}` keeps state (a `ta` call, a series or a persistent), which only a '
+    'plain or a `@staticmethod` method can do.',
+    ('method',),
+)
+UNPACKED_RECEIVER = Code(
+    'P0017',
+    'error',
+    'Method receiver from an unpacked argument',
+    '`{function}()` uses variables of `main()`, so its receiver cannot come from an unpacked '
+    'argument; pass the receiver explicitly: `{function}(receiver, *args)`.',
+    ('function',),
+)
+EXPORT_CAPTURES_GLOBAL = Code(
+    'P0018',
+    'error',
+    'Export captures a library global',
+    'The exported function `{function}` cannot capture the non-constant library global `{name}`.',
+    ('function', 'name'),
+)
+STRATEGY_STATE_IN_SECURITY = Code(
+    'P0019',
+    'error',
+    'Strategy state in a security expression',
+    '`strategy.{name}` cannot be used as the expression argument of `{function}()`: strategy '
+    'state is only available in the chart context, not in a security context.',
+    ('name', 'function'),
+)
+DRAWING_IN_SECURITY = Code(
+    'P0020',
+    'error',
+    'Drawing in a security expression',
+    '`{name}()` cannot be used in the expression of `{function}()`.',
+    ('name', 'function'),
+)
+TOO_MANY_FUNCTION_REQUESTS = Code(
+    'P0021',
+    'error',
+    'Too many requests in one function',
+    'The function `{function}` reaches {count} `request.security` calls through the functions it '
+    'calls; a function can use at most {limit} request values.',
+    ('function', 'count', 'limit'),
 )
 DIVISION_BY_ZERO = Code(
     'R0001',
@@ -441,84 +1026,596 @@ PROVIDER_UNAVAILABLE = Code(
 )
 
 
-class EdgeSyntaxError(PyneError):
+class EdgeSyntaxError(PyneSyntaxError):
     """E0001: Syntax outside the Edge profile"""
     code = EDGE_SYNTAX
 
-    def __init__(self, *, construct: object) -> None:
-        super().__init__(construct=construct)
+    def __init__(self, *, construct: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(construct=construct, location=location)
 
 
-class EdgePythonBuiltinError(PyneError):
+class EdgePythonBuiltinError(PyneSyntaxError):
     """E0002: Python built-in instead of the Pine one"""
     code = EDGE_PYTHON_BUILTIN
 
-    def __init__(self, *, name: object, meaning: object) -> None:
-        super().__init__(name=name, meaning=meaning)
+    def __init__(self, *, name: object, meaning: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, meaning=meaning, location=location)
 
 
-class EdgeLambdaError(PyneError):
+class EdgeLambdaError(PyneSyntaxError):
     """E0003: lambda outside a field default"""
     code = EDGE_LAMBDA
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
 
 
-class EdgeAssertMessageError(PyneError):
+class EdgeAssertMessageError(PyneSyntaxError):
     """E0004: assert message that is not a string literal"""
     code = EDGE_ASSERT_MESSAGE
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
 
 
-class EdgeSubscriptAssignmentError(PyneError):
+class EdgeSubscriptAssignmentError(PyneSyntaxError):
     """E0005: Assignment to a subscript"""
     code = EDGE_SUBSCRIPT_ASSIGNMENT
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
 
 
-class EdgeImportError(PyneError):
+class EdgeImportError(PyneSyntaxError):
     """E0006: Import outside the Edge profile"""
     code = EDGE_IMPORT
 
-    def __init__(self, *, import_: object) -> None:
-        super().__init__(**{'import': import_})
+    def __init__(self, *, import_: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'import': import_}, location=location)
 
 
-class EdgeDecoratorError(PyneError):
+class EdgeDecoratorError(PyneSyntaxError):
     """E0007: Decorator outside the Edge profile"""
     code = EDGE_DECORATOR
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
 
 
-class EdgeClassError(PyneError):
+class EdgeClassError(PyneSyntaxError):
     """E0008: Class outside the Edge profile"""
     code = EDGE_CLASS
 
-    def __init__(self, *, detail: object) -> None:
-        super().__init__(detail=detail)
+    def __init__(self, *, detail: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(detail=detail, location=location)
 
 
-class EdgeCallError(PyneError):
+class EdgeCallError(PyneSyntaxError):
     """E0009: Call outside the Edge profile"""
     code = EDGE_CALL
 
-    def __init__(self, *, name: object, builtins: object) -> None:
-        super().__init__(name=name, builtins=builtins)
+    def __init__(self, *, name: object, builtins: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, builtins=builtins, location=location)
 
 
-class EdgeAttributeAssignmentError(PyneError):
+class EdgeAttributeAssignmentError(PyneSyntaxError):
     """E0010: Attribute set on a function or module"""
     code = EDGE_ATTRIBUTE_ASSIGNMENT
 
-    def __init__(self, *, root: object) -> None:
-        super().__init__(root=root)
+    def __init__(self, *, root: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(root=root, location=location)
+
+
+class EdgeReservedNameError(PyneSyntaxError):
+    """E0011: Double-underscore name"""
+    code = EDGE_RESERVED_NAME
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeUnknownNameError(PyneSyntaxError):
+    """E0012: Name without a known type"""
+    code = TYPE_UNKNOWN_NAME
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeFunctionValueError(PyneSyntaxError):
+    """E0013: Function used as a value"""
+    code = TYPE_FUNCTION_VALUE
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeUnknownCallError(PyneSyntaxError):
+    """E0014: Call without a known type"""
+    code = TYPE_UNKNOWN_CALL
+
+    def __init__(self, *, callee: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(callee=callee, location=location)
+
+
+class TypeUnknownCalleeCallError(PyneSyntaxError):
+    """E0015: Call of an unknown callee"""
+    code = TYPE_UNKNOWN_CALLEE_CALL
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class TypeUnknownMethodCallError(PyneSyntaxError):
+    """E0016: Method call without a known type"""
+    code = TYPE_UNKNOWN_METHOD_CALL
+
+    def __init__(self, *, method: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(method=method, location=location)
+
+
+class TypeUnknownLibCallError(PyneSyntaxError):
+    """E0017: Lib call without a known type here"""
+    code = TYPE_UNKNOWN_LIB_CALL
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeNotLibNameError(PyneSyntaxError):
+    """E0018: Unknown lib name"""
+    code = TYPE_NOT_LIB_NAME
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeUnknownFieldError(PyneSyntaxError):
+    """E0019: Field without a known type"""
+    code = TYPE_UNKNOWN_FIELD
+
+    def __init__(self, *, field: object, type_: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'field': field, 'type': type_}, location=location)
+
+
+class TypeUnknownIndexError(PyneSyntaxError):
+    """E0020: Index without a known type"""
+    code = TYPE_UNKNOWN_INDEX
+
+    def __init__(self, *, type_: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'type': type_}, location=location)
+
+
+class TypeUnknownOperationError(PyneSyntaxError):
+    """E0021: Operation without a known type"""
+    code = TYPE_UNKNOWN_OPERATION
+
+    def __init__(self, *, expression: object, operands: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(expression=expression, operands=operands, location=location)
+
+
+class TypeNotPineExpressionError(PyneSyntaxError):
+    """E0022: Expression outside Pine"""
+    code = TYPE_NOT_PINE_EXPRESSION
+
+    def __init__(self, *, expression: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(expression=expression, location=location)
+
+
+class TypeConflictError(PyneSyntaxError):
+    """E0023: Two types for one value"""
+    code = TYPE_CONFLICT
+
+    def __init__(self, *, what: object, first: object, second: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(what=what, first=first, second=second, location=location)
+
+
+class TypeStarredTargetError(PyneSyntaxError):
+    """E0024: Starred unpacking target"""
+    code = TYPE_STARRED_TARGET
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class TypeUnpackCountError(PyneSyntaxError):
+    """E0025: Unpacking count mismatch"""
+    code = TYPE_UNPACK_COUNT
+
+    def __init__(self, *, type_: object, count: object, names: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'type': type_, 'count': count, 'names': names}, location=location)
+
+
+class TypePinPerContextError(PyneSyntaxError):
+    """E0026: Overload differs per call context"""
+    code = TYPE_PIN_PER_CONTEXT
+
+    def __init__(self, *, pins: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(pins=pins, location=location)
+
+
+class TypeWidenPerContextError(PyneSyntaxError):
+    """E0027: Conversion differs per call context"""
+    code = TYPE_WIDEN_PER_CONTEXT
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class TypeOperandUnknownError(PyneSyntaxError):
+    """E0028: Collection operand without a known type"""
+    code = TYPE_OPERAND_UNKNOWN
+
+    def __init__(self, *, type_: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'type': type_}, location=location)
+
+
+class TypeOperandMismatchError(PyneSyntaxError):
+    """E0029: Collection operand of another element type"""
+    code = TYPE_OPERAND_MISMATCH
+
+    def __init__(self, *, type_: object, other: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'type': type_, 'other': other}, location=location)
+
+
+class TypeReboundDefinedError(PyneSyntaxError):
+    """E0030: Function name assigned"""
+    code = TYPE_REBOUND_DEFINED
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeImportedTwiceError(PyneSyntaxError):
+    """E0031: Name imported twice"""
+    code = TYPE_IMPORTED_TWICE
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeReboundImportedError(PyneSyntaxError):
+    """E0032: Imported name assigned"""
+    code = TYPE_REBOUND_IMPORTED
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeRecursionError(PyneSyntaxError):
+    """E0033: Re-entrant call"""
+    code = TYPE_RECURSION
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
+class TypeContextLimitError(PyneSyntaxError):
+    """E0034: Too many call contexts"""
+    code = TYPE_CONTEXT_LIMIT
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
+class TypeUnannotatedImportError(PyneSyntaxError):
+    """E0035: Import without annotations"""
+    code = TYPE_UNANNOTATED_IMPORT
+
+    def __init__(self, *, name: object, source: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, source=source, location=location)
+
+
+class TypeSuppressedImportError(PyneSyntaxError):
+    """E0036: Import of a reported module"""
+    code = TYPE_SUPPRESSED_IMPORT
+
+    def __init__(self, *, module: object, reason: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(module=module, reason=reason, location=location)
+
+
+class TypeImportCycleError(PyneSyntaxError):
+    """E0037: Import cycle"""
+    code = TYPE_IMPORT_CYCLE
+
+    def __init__(self, *, module: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(module=module, location=location)
+
+
+class TypeNotIterableError(PyneSyntaxError):
+    """E0038: For loop over a non-iterable"""
+    code = TYPE_NOT_ITERABLE
+
+    def __init__(self, *, expression: object, type_: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'expression': expression, 'type': type_}, location=location)
+
+
+class TypeIndexNotPineError(PyneSyntaxError):
+    """E0039: Indexing outside Pine"""
+    code = TYPE_INDEX_NOT_PINE
+
+    def __init__(self, *, type_: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'type': type_}, location=location)
+
+
+class TypeNotSeriesError(PyneSyntaxError):
+    """E0040: History of a plain value"""
+    code = TYPE_NOT_SERIES
+
+    def __init__(self, *, expression: object, type_: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'expression': expression, 'type': type_}, location=location)
+
+
+class TypeDeclaredMismatchError(PyneSyntaxError):
+    """E0041: Assignment of another type"""
+    code = TYPE_DECLARED_MISMATCH
+
+    def __init__(self, *, name: object, declared: object, assigned: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, declared=declared, assigned=assigned, location=location)
+
+
+class TypeFieldAssignMismatchError(PyneSyntaxError):
+    """E0042: Field assigned another type"""
+    code = TYPE_FIELD_ASSIGN_MISMATCH
+
+    def __init__(self, *, field: object, declared: object, assigned: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(field=field, declared=declared, assigned=assigned, location=location)
+
+
+class TypeUnknownCalleeError(PyneSyntaxError):
+    """E0043: Unknown function"""
+    code = TYPE_UNKNOWN_CALLEE
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeCalleeNotNameError(PyneSyntaxError):
+    """E0044: Callee is not a name"""
+    code = TYPE_CALLEE_NOT_NAME
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class TypeUnknownClassFieldError(PyneSyntaxError):
+    """E0045: Field of a value of unknown class"""
+    code = TYPE_UNKNOWN_CLASS_FIELD
+
+    def __init__(self, *, value: object, field: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(value=value, field=field, location=location)
+
+
+class TypeUnknownClassMethodError(PyneSyntaxError):
+    """E0046: Method of a value of unknown class"""
+    code = TYPE_UNKNOWN_CLASS_METHOD
+
+    def __init__(self, *, value: object, method: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(value=value, method=method, location=location)
+
+
+class TypeUnknownClassStoreError(PyneSyntaxError):
+    """E0047: Field set on a value of unknown class"""
+    code = TYPE_UNKNOWN_CLASS_STORE
+
+    def __init__(self, *, value: object, field: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(value=value, field=field, location=location)
+
+
+class TypeNoFieldError(PyneSyntaxError):
+    """E0048: Unknown field"""
+    code = TYPE_NO_FIELD
+
+    def __init__(self, *, owner: object, field: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(owner=owner, field=field, location=location)
+
+
+class TypeNoFieldToAssignError(PyneSyntaxError):
+    """E0049: Field set on a value without fields"""
+    code = TYPE_NO_FIELD_TO_ASSIGN
+
+    def __init__(self, *, type_: object, field: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'type': type_, 'field': field}, location=location)
+
+
+class TypeLoopCounterFieldError(PyneSyntaxError):
+    """E0050: Unknown loop counter field"""
+    code = TYPE_LOOP_COUNTER_FIELD
+
+    def __init__(self, *, field: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(field=field, location=location)
+
+
+class TypeLibNamespaceCallError(PyneSyntaxError):
+    """E0051: Lib namespace called"""
+    code = TYPE_LIB_NAMESPACE_CALL
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeLibValueCallError(PyneSyntaxError):
+    """E0052: Lib value called"""
+    code = TYPE_LIB_VALUE_CALL
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class TypeMethodNotFoundError(PyneSyntaxError):
+    """E0053: Unknown method"""
+    code = TYPE_METHOD_NOT_FOUND
+
+    def __init__(self, *, method: object, type_: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'method': method, 'type': type_}, location=location)
+
+
+class TypeMethodNotExportedError(PyneSyntaxError):
+    """E0054: Method not reachable by name"""
+    code = TYPE_METHOD_NOT_EXPORTED
+
+    def __init__(self, *, method: object, type_: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'method': method, 'type': type_}, location=location)
+
+
+class TypeLoopBoundsUnknownError(PyneSyntaxError):
+    """E0055: Loop bounds without a known type"""
+    code = TYPE_LOOP_BOUNDS_UNKNOWN
+
+    def __init__(self, *, expression: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(expression=expression, location=location)
+
+
+class CallBoundNotNumberError(PyneSyntaxError):
+    """E0056: Bound is not a number"""
+    code = CALL_BOUND_NOT_NUMBER
+
+    def __init__(self, *, function: object, type_: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'function': function, 'type': type_}, location=location)
+
+
+class LoopStepArityError(PyneSyntaxError):
+    """E0057: step() arity"""
+    code = LOOP_STEP_ARITY
+
+    def __init__(self, *, count: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(count=count, location=location)
+
+
+class LoopEnterArityError(PyneSyntaxError):
+    """E0058: enter() arity"""
+    code = LOOP_ENTER_ARITY
+
+    def __init__(self, *, count: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(count=count, location=location)
+
+
+class MethodCallShapeError(PyneSyntaxError):
+    """E0059: method_call() arguments"""
+    code = METHOD_CALL_SHAPE
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class CallArgumentCountError(PyneSyntaxError):
+    """E0060: Wrong number of arguments"""
+    code = CALL_ARGUMENT_COUNT
+
+    def __init__(self, *, function: object, count: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, count=count, location=location)
+
+
+class CallTooFewArgumentsError(PyneSyntaxError):
+    """E0061: Too few arguments"""
+    code = CALL_TOO_FEW_ARGUMENTS
+
+    def __init__(self, *, function: object, count: object, least: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, count=count, least=least, location=location)
+
+
+class CallPositionalCountError(PyneSyntaxError):
+    """E0062: Wrong number of positional arguments"""
+    code = CALL_POSITIONAL_COUNT
+
+    def __init__(self, *, function: object, positional: object, count: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, positional=positional, count=count, location=location)
+
+
+class CallUnknownParameterError(PyneSyntaxError):
+    """E0063: Unknown parameter"""
+    code = CALL_UNKNOWN_PARAMETER
+
+    def __init__(self, *, function: object, parameter: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, parameter=parameter, location=location)
+
+
+class CallArgumentTypeError(PyneSyntaxError):
+    """E0064: Argument of another type"""
+    code = CALL_ARGUMENT_TYPE
+
+    def __init__(self, *, function: object, declared: object, parameter: object, passed: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, declared=declared, parameter=parameter, passed=passed,
+                         location=location)
+
+
+class CallNoOverloadError(PyneSyntaxError):
+    """E0065: No matching overload"""
+    code = CALL_NO_OVERLOAD
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
+class CallArgumentTwiceError(PyneSyntaxError):
+    """E0066: Argument passed twice"""
+    code = CALL_ARGUMENT_TWICE
+
+    def __init__(self, *, parameter: object, function: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(parameter=parameter, function=function, location=location)
+
+
+class CallMissingArgumentError(PyneSyntaxError):
+    """E0067: Missing argument"""
+    code = CALL_MISSING_ARGUMENT
+
+    def __init__(self, *, function: object, parameter: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, parameter=parameter, location=location)
+
+
+class ConstructorFieldCountError(PyneSyntaxError):
+    """E0068: Wrong number of constructor arguments"""
+    code = CONSTRUCTOR_FIELD_COUNT
+
+    def __init__(self, *, type_: object, fields: object, count: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'type': type_, 'fields': fields, 'count': count}, location=location)
+
+
+class ConstructorMissingFieldError(PyneSyntaxError):
+    """E0069: Missing field value"""
+    code = CONSTRUCTOR_MISSING_FIELD
+
+    def __init__(self, *, type_: object, field: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(**{'type': type_, 'field': field}, location=location)
+
+
+class ConstructorFieldTypeError(PyneSyntaxError):
+    """E0070: Field value of another type"""
+    code = CONSTRUCTOR_FIELD_TYPE
+
+    def __init__(self, *, field: object, declared: object, passed: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(field=field, declared=declared, passed=passed, location=location)
 
 
 class InternalError(PyneError):
@@ -527,6 +1624,180 @@ class InternalError(PyneError):
 
     def __init__(self, *, what: object) -> None:
         super().__init__(what=what)
+
+
+class ReservedNameCharError(PyneSyntaxError):
+    """P0001: Identifier with PyneCore's reserved character"""
+    code = RESERVED_NAME_CHAR
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class PipelineNameError(PyneSyntaxError):
+    """P0002: Identifier reserved by the transform"""
+    code = PIPELINE_NAME
+
+    def __init__(self, *, name: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, location=location)
+
+
+class ScriptDecoratorNotOnMainError(PyneSyntaxError):
+    """P0003: Script decorator not on main"""
+    code = SCRIPT_DECORATOR_NOT_ON_MAIN
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
+class DuplicateScriptDecoratorError(PyneSyntaxError):
+    """P0004: Second script decorator"""
+    code = DUPLICATE_SCRIPT_DECORATOR
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class NaBoolNotLiteralError(PyneSyntaxError):
+    """P0005: na_bool is not a literal"""
+    code = NA_BOOL_NOT_LITERAL
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class SeriesOutsideFunctionError(PyneSyntaxError):
+    """P0006: Series variable outside a function"""
+    code = SERIES_OUTSIDE_FUNCTION
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class PersistentOutsideFunctionError(PyneSyntaxError):
+    """P0007: Persistent variable outside a function"""
+    code = PERSISTENT_OUTSIDE_FUNCTION
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class StatefulCallAtModuleLevelError(PyneSyntaxError):
+    """P0008: Stateful call at module level"""
+    code = STATEFUL_CALL_AT_MODULE_LEVEL
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class InputNotMainDefaultError(PyneSyntaxError):
+    """P0009: Input outside main's parameters"""
+    code = INPUT_NOT_MAIN_DEFAULT
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
+class LibImportAliasError(PyneSyntaxError):
+    """P0010: lib imported under an alias"""
+    code = LIB_IMPORT_ALIAS
+
+    def __init__(self, *, location: SyntaxLocation | None = None) -> None:
+        super().__init__(location=location)
+
+
+class WildcardImportWithoutAllError(PyneSyntaxError):
+    """P0011: Wildcard import of a module without __all__"""
+    code = WILDCARD_IMPORT_WITHOUT_ALL
+
+    def __init__(self, *, module: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(module=module, location=location)
+
+
+class UnknownLibAttributeError(PyneSyntaxError):
+    """P0012: Unknown lib attribute"""
+    code = UNKNOWN_LIB_ATTRIBUTE
+
+    def __init__(self, *, module: object, name: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(module=module, name=name, location=location)
+
+
+class ModuleStateModifiedError(PyneSyntaxError):
+    """P0013: Module-level object modified inside a function"""
+    code = MODULE_STATE_MODIFIED
+
+    def __init__(self, *, name: object, how: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, how=how, location=location)
+
+
+class PlotCallConditionalError(PyneSyntaxError):
+    """P0014: Plot called conditionally"""
+    code = PLOT_CALL_CONDITIONAL
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
+class PlotAsValueError(PyneSyntaxError):
+    """P0015: Plot used as a value"""
+    code = PLOT_AS_VALUE
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
+class StatefulMethodKindError(PyneSyntaxError):
+    """P0016: Stateful method of the wrong kind"""
+    code = STATEFUL_METHOD_KIND
+
+    def __init__(self, *, method: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(method=method, location=location)
+
+
+class UnpackedReceiverError(PyneSyntaxError):
+    """P0017: Method receiver from an unpacked argument"""
+    code = UNPACKED_RECEIVER
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
+class ExportCapturesGlobalError(PyneSyntaxError):
+    """P0018: Export captures a library global"""
+    code = EXPORT_CAPTURES_GLOBAL
+
+    def __init__(self, *, function: object, name: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, name=name, location=location)
+
+
+class StrategyStateInSecurityError(PyneSyntaxError):
+    """P0019: Strategy state in a security expression"""
+    code = STRATEGY_STATE_IN_SECURITY
+
+    def __init__(self, *, name: object, function: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, function=function, location=location)
+
+
+class DrawingInSecurityError(PyneSyntaxError):
+    """P0020: Drawing in a security expression"""
+    code = DRAWING_IN_SECURITY
+
+    def __init__(self, *, name: object, function: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(name=name, function=function, location=location)
+
+
+class TooManyFunctionRequestsError(PyneSyntaxError):
+    """P0021: Too many requests in one function"""
+    code = TOO_MANY_FUNCTION_REQUESTS
+
+    def __init__(self, *, function: object, count: object, limit: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, count=count, limit=limit, location=location)
 
 
 class DivisionByZeroError(PyneError, ZeroDivisionError):
@@ -926,36 +2197,82 @@ class ProviderUnavailableError(PyneError, RuntimeError):
 #: Every reported code by its code.
 ALL: dict[str, Code] = {c.code: c for c in (
     EDGE_SYNTAX, EDGE_PYTHON_BUILTIN, EDGE_LAMBDA, EDGE_ASSERT_MESSAGE, EDGE_SUBSCRIPT_ASSIGNMENT,
-    EDGE_IMPORT, EDGE_DECORATOR, EDGE_CLASS, EDGE_CALL, EDGE_ATTRIBUTE_ASSIGNMENT, INTERNAL_ERROR,
-    DIVISION_BY_ZERO, NA_TO_INTEGER, INFINITY_TO_INTEGER, ASSERTION_FAILED, RUNTIME_ERROR,
-    ARGUMENT_NOT_POSITIVE, ARGUMENT_NEGATIVE, ARGUMENT_ZERO, PERCENTAGE_OUT_OF_RANGE,
-    INDEX_OUT_OF_RANGE, EMPTY_COLLECTION, SIZE_MISMATCH, MATRIX_NOT_SQUARE, MATRIX_SINGULAR,
-    NO_CONVERGENCE, NA_OBJECT, UNBOUND_VARIABLE, RESOURCE_LIMIT, INVALID_TIMEFRAME, TICK_TIMEFRAME,
-    INVALID_SESSION, INVALID_DATE, INVALID_FORMAT, INVALID_REGEX, UNKNOWN_TIMEZONE,
-    SECURITY_DATA_MISSING, SECURITY_TIMEFRAME_HIGHER, SECURITY_VARIES_IN_LOOP,
-    STRATEGY_VALUE_NOT_FINITE, STRATEGY_IN_SECURITY, LINE_PRICE_XLOC, WRONG_OPERAND_TYPE,
-    FLOAT_RANGE, DECIMAL_INVALID, NOT_AVAILABLE, SCRIPT_TIMEFRAME, INVALID_DATA,
-    INVALID_DRAWING_ARGUMENT, UNKNOWN_METHOD_AT_RUN, ARGUMENT_ORDER, MATRIX_HOLDS_NA,
-    INVALID_OPTION, NA_OBJECT_FIELD, NA_OBJECT_COPY, SYMINFO_MEMBER_MISSING, DATA_FILE_UNREADABLE,
-    SCRIPT_NOT_RUNNABLE, FILE_NOT_FOUND, PROVIDER_UNAVAILABLE,
+    EDGE_IMPORT, EDGE_DECORATOR, EDGE_CLASS, EDGE_CALL, EDGE_ATTRIBUTE_ASSIGNMENT,
+    EDGE_RESERVED_NAME, TYPE_UNKNOWN_NAME, TYPE_FUNCTION_VALUE, TYPE_UNKNOWN_CALL,
+    TYPE_UNKNOWN_CALLEE_CALL, TYPE_UNKNOWN_METHOD_CALL, TYPE_UNKNOWN_LIB_CALL, TYPE_NOT_LIB_NAME,
+    TYPE_UNKNOWN_FIELD, TYPE_UNKNOWN_INDEX, TYPE_UNKNOWN_OPERATION, TYPE_NOT_PINE_EXPRESSION,
+    TYPE_CONFLICT, TYPE_STARRED_TARGET, TYPE_UNPACK_COUNT, TYPE_PIN_PER_CONTEXT,
+    TYPE_WIDEN_PER_CONTEXT, TYPE_OPERAND_UNKNOWN, TYPE_OPERAND_MISMATCH, TYPE_REBOUND_DEFINED,
+    TYPE_IMPORTED_TWICE, TYPE_REBOUND_IMPORTED, TYPE_RECURSION, TYPE_CONTEXT_LIMIT,
+    TYPE_UNANNOTATED_IMPORT, TYPE_SUPPRESSED_IMPORT, TYPE_IMPORT_CYCLE, TYPE_NOT_ITERABLE,
+    TYPE_INDEX_NOT_PINE, TYPE_NOT_SERIES, TYPE_DECLARED_MISMATCH, TYPE_FIELD_ASSIGN_MISMATCH,
+    TYPE_UNKNOWN_CALLEE, TYPE_CALLEE_NOT_NAME, TYPE_UNKNOWN_CLASS_FIELD, TYPE_UNKNOWN_CLASS_METHOD,
+    TYPE_UNKNOWN_CLASS_STORE, TYPE_NO_FIELD, TYPE_NO_FIELD_TO_ASSIGN, TYPE_LOOP_COUNTER_FIELD,
+    TYPE_LIB_NAMESPACE_CALL, TYPE_LIB_VALUE_CALL, TYPE_METHOD_NOT_FOUND, TYPE_METHOD_NOT_EXPORTED,
+    TYPE_LOOP_BOUNDS_UNKNOWN, CALL_BOUND_NOT_NUMBER, LOOP_STEP_ARITY, LOOP_ENTER_ARITY,
+    METHOD_CALL_SHAPE, CALL_ARGUMENT_COUNT, CALL_TOO_FEW_ARGUMENTS, CALL_POSITIONAL_COUNT,
+    CALL_UNKNOWN_PARAMETER, CALL_ARGUMENT_TYPE, CALL_NO_OVERLOAD, CALL_ARGUMENT_TWICE,
+    CALL_MISSING_ARGUMENT, CONSTRUCTOR_FIELD_COUNT, CONSTRUCTOR_MISSING_FIELD,
+    CONSTRUCTOR_FIELD_TYPE, INTERNAL_ERROR, RESERVED_NAME_CHAR, PIPELINE_NAME,
+    SCRIPT_DECORATOR_NOT_ON_MAIN, DUPLICATE_SCRIPT_DECORATOR, NA_BOOL_NOT_LITERAL,
+    SERIES_OUTSIDE_FUNCTION, PERSISTENT_OUTSIDE_FUNCTION, STATEFUL_CALL_AT_MODULE_LEVEL,
+    INPUT_NOT_MAIN_DEFAULT, LIB_IMPORT_ALIAS, WILDCARD_IMPORT_WITHOUT_ALL, UNKNOWN_LIB_ATTRIBUTE,
+    MODULE_STATE_MODIFIED, PLOT_CALL_CONDITIONAL, PLOT_AS_VALUE, STATEFUL_METHOD_KIND,
+    UNPACKED_RECEIVER, EXPORT_CAPTURES_GLOBAL, STRATEGY_STATE_IN_SECURITY, DRAWING_IN_SECURITY,
+    TOO_MANY_FUNCTION_REQUESTS, DIVISION_BY_ZERO, NA_TO_INTEGER, INFINITY_TO_INTEGER,
+    ASSERTION_FAILED, RUNTIME_ERROR, ARGUMENT_NOT_POSITIVE, ARGUMENT_NEGATIVE, ARGUMENT_ZERO,
+    PERCENTAGE_OUT_OF_RANGE, INDEX_OUT_OF_RANGE, EMPTY_COLLECTION, SIZE_MISMATCH,
+    MATRIX_NOT_SQUARE, MATRIX_SINGULAR, NO_CONVERGENCE, NA_OBJECT, UNBOUND_VARIABLE,
+    RESOURCE_LIMIT, INVALID_TIMEFRAME, TICK_TIMEFRAME, INVALID_SESSION, INVALID_DATE,
+    INVALID_FORMAT, INVALID_REGEX, UNKNOWN_TIMEZONE, SECURITY_DATA_MISSING,
+    SECURITY_TIMEFRAME_HIGHER, SECURITY_VARIES_IN_LOOP, STRATEGY_VALUE_NOT_FINITE,
+    STRATEGY_IN_SECURITY, LINE_PRICE_XLOC, WRONG_OPERAND_TYPE, FLOAT_RANGE, DECIMAL_INVALID,
+    NOT_AVAILABLE, SCRIPT_TIMEFRAME, INVALID_DATA, INVALID_DRAWING_ARGUMENT, UNKNOWN_METHOD_AT_RUN,
+    ARGUMENT_ORDER, MATRIX_HOLDS_NA, INVALID_OPTION, NA_OBJECT_FIELD, NA_OBJECT_COPY,
+    SYMINFO_MEMBER_MISSING, DATA_FILE_UNREADABLE, SCRIPT_NOT_RUNNABLE, FILE_NOT_FOUND,
+    PROVIDER_UNAVAILABLE,
 )}
 
 #: The exception class of every reported code, by its code.
 EXCEPTIONS: dict[str, type[PyneError]] = {c.code.code: c for c in (
     EdgeSyntaxError, EdgePythonBuiltinError, EdgeLambdaError, EdgeAssertMessageError,
     EdgeSubscriptAssignmentError, EdgeImportError, EdgeDecoratorError, EdgeClassError,
-    EdgeCallError, EdgeAttributeAssignmentError, InternalError, DivisionByZeroError,
-    NaToIntegerError, InfinityToIntegerError, AssertionFailedError, ScriptRuntimeError,
-    ArgumentNotPositiveError, ArgumentNegativeError, ArgumentZeroError, PercentageOutOfRangeError,
-    IndexOutOfRangeError, EmptyCollectionError, SizeMismatchError, MatrixNotSquareError,
-    MatrixSingularError, NoConvergenceError, NaObjectError, UnboundVariableError,
-    ResourceLimitError, InvalidTimeframeError, TickTimeframeError, InvalidSessionError,
-    InvalidDateError, InvalidFormatError, InvalidRegexError, UnknownTimezoneError,
-    SecurityDataMissingError, SecurityTimeframeHigherError, SecurityVariesInLoopError,
-    StrategyValueNotFiniteError, StrategyInSecurityError, LinePriceXlocError,
-    WrongOperandTypeError, FloatRangeError, DecimalInvalidError, NotAvailableError,
-    ScriptTimeframeError, InvalidDataError, InvalidDrawingArgumentError, UnknownMethodAtRunError,
-    ArgumentOrderError, MatrixHoldsNaError, InvalidOptionError, NaObjectFieldError,
-    NaObjectCopyError, SyminfoMemberMissingError, DataFileUnreadableError, ScriptNotRunnableError,
-    MissingFileError, ProviderUnavailableError,
+    EdgeCallError, EdgeAttributeAssignmentError, EdgeReservedNameError, TypeUnknownNameError,
+    TypeFunctionValueError, TypeUnknownCallError, TypeUnknownCalleeCallError,
+    TypeUnknownMethodCallError, TypeUnknownLibCallError, TypeNotLibNameError,
+    TypeUnknownFieldError, TypeUnknownIndexError, TypeUnknownOperationError,
+    TypeNotPineExpressionError, TypeConflictError, TypeStarredTargetError, TypeUnpackCountError,
+    TypePinPerContextError, TypeWidenPerContextError, TypeOperandUnknownError,
+    TypeOperandMismatchError, TypeReboundDefinedError, TypeImportedTwiceError,
+    TypeReboundImportedError, TypeRecursionError, TypeContextLimitError,
+    TypeUnannotatedImportError, TypeSuppressedImportError, TypeImportCycleError,
+    TypeNotIterableError, TypeIndexNotPineError, TypeNotSeriesError, TypeDeclaredMismatchError,
+    TypeFieldAssignMismatchError, TypeUnknownCalleeError, TypeCalleeNotNameError,
+    TypeUnknownClassFieldError, TypeUnknownClassMethodError, TypeUnknownClassStoreError,
+    TypeNoFieldError, TypeNoFieldToAssignError, TypeLoopCounterFieldError,
+    TypeLibNamespaceCallError, TypeLibValueCallError, TypeMethodNotFoundError,
+    TypeMethodNotExportedError, TypeLoopBoundsUnknownError, CallBoundNotNumberError,
+    LoopStepArityError, LoopEnterArityError, MethodCallShapeError, CallArgumentCountError,
+    CallTooFewArgumentsError, CallPositionalCountError, CallUnknownParameterError,
+    CallArgumentTypeError, CallNoOverloadError, CallArgumentTwiceError, CallMissingArgumentError,
+    ConstructorFieldCountError, ConstructorMissingFieldError, ConstructorFieldTypeError,
+    InternalError, ReservedNameCharError, PipelineNameError, ScriptDecoratorNotOnMainError,
+    DuplicateScriptDecoratorError, NaBoolNotLiteralError, SeriesOutsideFunctionError,
+    PersistentOutsideFunctionError, StatefulCallAtModuleLevelError, InputNotMainDefaultError,
+    LibImportAliasError, WildcardImportWithoutAllError, UnknownLibAttributeError,
+    ModuleStateModifiedError, PlotCallConditionalError, PlotAsValueError, StatefulMethodKindError,
+    UnpackedReceiverError, ExportCapturesGlobalError, StrategyStateInSecurityError,
+    DrawingInSecurityError, TooManyFunctionRequestsError, DivisionByZeroError, NaToIntegerError,
+    InfinityToIntegerError, AssertionFailedError, ScriptRuntimeError, ArgumentNotPositiveError,
+    ArgumentNegativeError, ArgumentZeroError, PercentageOutOfRangeError, IndexOutOfRangeError,
+    EmptyCollectionError, SizeMismatchError, MatrixNotSquareError, MatrixSingularError,
+    NoConvergenceError, NaObjectError, UnboundVariableError, ResourceLimitError,
+    InvalidTimeframeError, TickTimeframeError, InvalidSessionError, InvalidDateError,
+    InvalidFormatError, InvalidRegexError, UnknownTimezoneError, SecurityDataMissingError,
+    SecurityTimeframeHigherError, SecurityVariesInLoopError, StrategyValueNotFiniteError,
+    StrategyInSecurityError, LinePriceXlocError, WrongOperandTypeError, FloatRangeError,
+    DecimalInvalidError, NotAvailableError, ScriptTimeframeError, InvalidDataError,
+    InvalidDrawingArgumentError, UnknownMethodAtRunError, ArgumentOrderError, MatrixHoldsNaError,
+    InvalidOptionError, NaObjectFieldError, NaObjectCopyError, SyminfoMemberMissingError,
+    DataFileUnreadableError, ScriptNotRunnableError, MissingFileError, ProviderUnavailableError,
 )}

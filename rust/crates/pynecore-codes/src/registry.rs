@@ -100,6 +100,606 @@ pub static EDGE_ATTRIBUTE_ASSIGNMENT: super::Code = super::Code {
     fix: None,
 };
 
+/// E0011: Double-underscore name
+pub static EDGE_RESERVED_NAME: super::Code = super::Code {
+    code: "E0011",
+    severity: super::Severity::Error,
+    title: "Double-underscore name",
+    message: "The name `{name}` is not allowed in the Pyne Edge profile: double-underscore names belong to PyneCore's transform.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0012: Name without a known type
+pub static TYPE_UNKNOWN_NAME: super::Code = super::Code {
+    code: "E0012",
+    severity: super::Severity::Error,
+    title: "Name without a known type",
+    message: "`{name}` has no known type.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0013: Function used as a value
+pub static TYPE_FUNCTION_VALUE: super::Code = super::Code {
+    code: "E0013",
+    severity: super::Severity::Error,
+    title: "Function used as a value",
+    message: "`{name}` is a function, not a value.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0014: Call without a known type
+pub static TYPE_UNKNOWN_CALL: super::Code = super::Code {
+    code: "E0014",
+    severity: super::Severity::Error,
+    title: "Call without a known type",
+    message: "The call to `{callee}` has no known type.",
+    params: &["callee"],
+    fix: None,
+};
+
+/// E0015: Call of an unknown callee
+pub static TYPE_UNKNOWN_CALLEE_CALL: super::Code = super::Code {
+    code: "E0015",
+    severity: super::Severity::Error,
+    title: "Call of an unknown callee",
+    message: "This call has no known type.",
+    params: &[],
+    fix: None,
+};
+
+/// E0016: Method call without a known type
+pub static TYPE_UNKNOWN_METHOD_CALL: super::Code = super::Code {
+    code: "E0016",
+    severity: super::Severity::Error,
+    title: "Method call without a known type",
+    message: "The call to the method `{method}` has no known type.",
+    params: &["method"],
+    fix: None,
+};
+
+/// E0017: Lib call without a known type here
+pub static TYPE_UNKNOWN_LIB_CALL: super::Code = super::Code {
+    code: "E0017",
+    severity: super::Severity::Error,
+    title: "Lib call without a known type here",
+    message: "`{name}` has no known type here.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0018: Unknown lib name
+pub static TYPE_NOT_LIB_NAME: super::Code = super::Code {
+    code: "E0018",
+    severity: super::Severity::Error,
+    title: "Unknown lib name",
+    message: "`{name}` is not a lib name.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0019: Field without a known type
+pub static TYPE_UNKNOWN_FIELD: super::Code = super::Code {
+    code: "E0019",
+    severity: super::Severity::Error,
+    title: "Field without a known type",
+    message: "`.{field}` has no known type on `{type}`.",
+    params: &["field", "type"],
+    fix: None,
+};
+
+/// E0020: Index without a known type
+pub static TYPE_UNKNOWN_INDEX: super::Code = super::Code {
+    code: "E0020",
+    severity: super::Severity::Error,
+    title: "Index without a known type",
+    message: "Indexing `{type}` has no known type.",
+    params: &["type"],
+    fix: None,
+};
+
+/// E0021: Operation without a known type
+pub static TYPE_UNKNOWN_OPERATION: super::Code = super::Code {
+    code: "E0021",
+    severity: super::Severity::Error,
+    title: "Operation without a known type",
+    message: "`{expression}` has no known type over {operands}.",
+    params: &["expression", "operands"],
+    fix: None,
+};
+
+/// E0022: Expression outside Pine
+pub static TYPE_NOT_PINE_EXPRESSION: super::Code = super::Code {
+    code: "E0022",
+    severity: super::Severity::Error,
+    title: "Expression outside Pine",
+    message: "`{expression}` is not a Pine expression.",
+    params: &["expression"],
+    fix: None,
+};
+
+/// E0023: Two types for one value
+pub static TYPE_CONFLICT: super::Code = super::Code {
+    code: "E0023",
+    severity: super::Severity::Error,
+    title: "Two types for one value",
+    message: "{what} gets both `{first}` and `{second}`, which are different types.",
+    params: &["what", "first", "second"],
+    fix: None,
+};
+
+/// E0024: Starred unpacking target
+pub static TYPE_STARRED_TARGET: super::Code = super::Code {
+    code: "E0024",
+    severity: super::Severity::Error,
+    title: "Starred unpacking target",
+    message: "A starred target takes an unknown number of elements, which Pine has no form for.",
+    params: &[],
+    fix: None,
+};
+
+/// E0025: Unpacking count mismatch
+pub static TYPE_UNPACK_COUNT: super::Code = super::Code {
+    code: "E0025",
+    severity: super::Severity::Error,
+    title: "Unpacking count mismatch",
+    message: "`{type}` has {count} elements, and this unpacks {names}.",
+    params: &["type", "count", "names"],
+    fix: None,
+};
+
+/// E0026: Overload differs per call context
+pub static TYPE_PIN_PER_CONTEXT: super::Code = super::Code {
+    code: "E0026",
+    severity: super::Severity::Error,
+    title: "Overload differs per call context",
+    message: "The overload chosen for this call differs per call context: {pins}.",
+    params: &["pins"],
+    fix: None,
+};
+
+/// E0027: Conversion differs per call context
+pub static TYPE_WIDEN_PER_CONTEXT: super::Code = super::Code {
+    code: "E0027",
+    severity: super::Severity::Error,
+    title: "Conversion differs per call context",
+    message: "The implicit conversion of a value differs per call context, and not every instance can be given its own.",
+    params: &[],
+    fix: None,
+};
+
+/// E0028: Collection operand without a known type
+pub static TYPE_OPERAND_UNKNOWN: super::Code = super::Code {
+    code: "E0028",
+    severity: super::Severity::Error,
+    title: "Collection operand without a known type",
+    message: "`{type}` takes an operand whose type is not known here, so what it holds afterwards is not known either.",
+    params: &["type"],
+    fix: None,
+};
+
+/// E0029: Collection operand of another element type
+pub static TYPE_OPERAND_MISMATCH: super::Code = super::Code {
+    code: "E0029",
+    severity: super::Severity::Error,
+    title: "Collection operand of another element type",
+    message: "`{type}` cannot take `{other}`: the elements are different types.",
+    params: &["type", "other"],
+    fix: None,
+};
+
+/// E0030: Function name assigned
+pub static TYPE_REBOUND_DEFINED: super::Code = super::Code {
+    code: "E0030",
+    severity: super::Severity::Error,
+    title: "Function name assigned",
+    message: "`{name}` is assigned as well as defined, so what it calls is unknown.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0031: Name imported twice
+pub static TYPE_IMPORTED_TWICE: super::Code = super::Code {
+    code: "E0031",
+    severity: super::Severity::Error,
+    title: "Name imported twice",
+    message: "`{name}` is imported more than once, so what it calls is unknown.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0032: Imported name assigned
+pub static TYPE_REBOUND_IMPORTED: super::Code = super::Code {
+    code: "E0032",
+    severity: super::Severity::Error,
+    title: "Imported name assigned",
+    message: "`{name}` is assigned as well as imported, so what it calls is unknown.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0033: Re-entrant call
+pub static TYPE_RECURSION: super::Code = super::Code {
+    code: "E0033",
+    severity: super::Severity::Error,
+    title: "Re-entrant call",
+    message: "`{function}` is re-entrant, so its result type is unknown.",
+    params: &["function"],
+    fix: None,
+};
+
+/// E0034: Too many call contexts
+pub static TYPE_CONTEXT_LIMIT: super::Code = super::Code {
+    code: "E0034",
+    severity: super::Severity::Error,
+    title: "Too many call contexts",
+    message: "`{function}` hit the per-module context limit.",
+    params: &["function"],
+    fix: None,
+};
+
+/// E0035: Import without annotations
+pub static TYPE_UNANNOTATED_IMPORT: super::Code = super::Code {
+    code: "E0035",
+    severity: super::Severity::Error,
+    title: "Import without annotations",
+    message: "`{name}` is imported from `{source}`, where its parameters carry no annotations, so what it returns is unknown.",
+    params: &["name", "source"],
+    fix: None,
+};
+
+/// E0036: Import of a reported module
+pub static TYPE_SUPPRESSED_IMPORT: super::Code = super::Code {
+    code: "E0036",
+    severity: super::Severity::Error,
+    title: "Import of a reported module",
+    message: "`{module}` is reported, and no type it publishes may drive a dispatch here: {reason}.",
+    params: &["module", "reason"],
+    fix: None,
+};
+
+/// E0037: Import cycle
+pub static TYPE_IMPORT_CYCLE: super::Code = super::Code {
+    code: "E0037",
+    severity: super::Severity::Error,
+    title: "Import cycle",
+    message: "`{module}` imports this module back, so its signatures are not available yet.",
+    params: &["module"],
+    fix: None,
+};
+
+/// E0038: For loop over a non-iterable
+pub static TYPE_NOT_ITERABLE: super::Code = super::Code {
+    code: "E0038",
+    severity: super::Severity::Error,
+    title: "For loop over a non-iterable",
+    message: "`{expression}` is a `{type}`; a for loop iterates a range or an array.",
+    params: &["expression", "type"],
+    fix: None,
+};
+
+/// E0039: Indexing outside Pine
+pub static TYPE_INDEX_NOT_PINE: super::Code = super::Code {
+    code: "E0039",
+    severity: super::Severity::Error,
+    title: "Indexing outside Pine",
+    message: "Indexing `{type}` is not Pine.",
+    params: &["type"],
+    fix: None,
+};
+
+/// E0040: History of a plain value
+pub static TYPE_NOT_SERIES: super::Code = super::Code {
+    code: "E0040",
+    severity: super::Severity::Error,
+    title: "History of a plain value",
+    message: "`{expression}` is a plain `{type}`, not a series.",
+    params: &["expression", "type"],
+    fix: None,
+};
+
+/// E0041: Assignment of another type
+pub static TYPE_DECLARED_MISMATCH: super::Code = super::Code {
+    code: "E0041",
+    severity: super::Severity::Error,
+    title: "Assignment of another type",
+    message: "`{name}` is declared `{declared}` and assigned `{assigned}`.",
+    params: &["name", "declared", "assigned"],
+    fix: None,
+};
+
+/// E0042: Field assigned another type
+pub static TYPE_FIELD_ASSIGN_MISMATCH: super::Code = super::Code {
+    code: "E0042",
+    severity: super::Severity::Error,
+    title: "Field assigned another type",
+    message: "`{field}` holds `{declared}` and is assigned `{assigned}`.",
+    params: &["field", "declared", "assigned"],
+    fix: None,
+};
+
+/// E0043: Unknown function
+pub static TYPE_UNKNOWN_CALLEE: super::Code = super::Code {
+    code: "E0043",
+    severity: super::Severity::Error,
+    title: "Unknown function",
+    message: "`{name}` is not a function this module defines or imports, nor a lib name.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0044: Callee is not a name
+pub static TYPE_CALLEE_NOT_NAME: super::Code = super::Code {
+    code: "E0044",
+    severity: super::Severity::Error,
+    title: "Callee is not a name",
+    message: "The callee is not a name.",
+    params: &[],
+    fix: None,
+};
+
+/// E0045: Field of a value of unknown class
+pub static TYPE_UNKNOWN_CLASS_FIELD: super::Code = super::Code {
+    code: "E0045",
+    severity: super::Severity::Error,
+    title: "Field of a value of unknown class",
+    message: "The class of `{value}` is not known here, so its field `{field}` has no type.",
+    params: &["value", "field"],
+    fix: None,
+};
+
+/// E0046: Method of a value of unknown class
+pub static TYPE_UNKNOWN_CLASS_METHOD: super::Code = super::Code {
+    code: "E0046",
+    severity: super::Severity::Error,
+    title: "Method of a value of unknown class",
+    message: "The class of `{value}` is not known here, so its method `{method}` has no type.",
+    params: &["value", "method"],
+    fix: None,
+};
+
+/// E0047: Field set on a value of unknown class
+pub static TYPE_UNKNOWN_CLASS_STORE: super::Code = super::Code {
+    code: "E0047",
+    severity: super::Severity::Error,
+    title: "Field set on a value of unknown class",
+    message: "The class of `{value}` is not known here, so its field `{field}` cannot be checked.",
+    params: &["value", "field"],
+    fix: None,
+};
+
+/// E0048: Unknown field
+pub static TYPE_NO_FIELD: super::Code = super::Code {
+    code: "E0048",
+    severity: super::Severity::Error,
+    title: "Unknown field",
+    message: "`{owner}` has no field `{field}`.",
+    params: &["owner", "field"],
+    fix: None,
+};
+
+/// E0049: Field set on a value without fields
+pub static TYPE_NO_FIELD_TO_ASSIGN: super::Code = super::Code {
+    code: "E0049",
+    severity: super::Severity::Error,
+    title: "Field set on a value without fields",
+    message: "A `{type}` has no field `{field}` to assign.",
+    params: &["type", "field"],
+    fix: None,
+};
+
+/// E0050: Unknown loop counter field
+pub static TYPE_LOOP_COUNTER_FIELD: super::Code = super::Code {
+    code: "E0050",
+    severity: super::Severity::Error,
+    title: "Unknown loop counter field",
+    message: "The loop counter has no field `{field}`.",
+    params: &["field"],
+    fix: None,
+};
+
+/// E0051: Lib namespace called
+pub static TYPE_LIB_NAMESPACE_CALL: super::Code = super::Code {
+    code: "E0051",
+    severity: super::Severity::Error,
+    title: "Lib namespace called",
+    message: "`{name}` is a lib namespace, not a function.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0052: Lib value called
+pub static TYPE_LIB_VALUE_CALL: super::Code = super::Code {
+    code: "E0052",
+    severity: super::Severity::Error,
+    title: "Lib value called",
+    message: "`{name}` is a lib value, not a function.",
+    params: &["name"],
+    fix: None,
+};
+
+/// E0053: Unknown method
+pub static TYPE_METHOD_NOT_FOUND: super::Code = super::Code {
+    code: "E0053",
+    severity: super::Severity::Error,
+    title: "Unknown method",
+    message: "`{method}` is not a method of `{type}` here.",
+    params: &["method", "type"],
+    fix: None,
+};
+
+/// E0054: Method not reachable by name
+pub static TYPE_METHOD_NOT_EXPORTED: super::Code = super::Code {
+    code: "E0054",
+    severity: super::Severity::Error,
+    title: "Method not reachable by name",
+    message: "`{method}` is declared on `{type}`, but no export the runtime searches by name holds it.",
+    params: &["method", "type"],
+    fix: None,
+};
+
+/// E0055: Loop bounds without a known type
+pub static TYPE_LOOP_BOUNDS_UNKNOWN: super::Code = super::Code {
+    code: "E0055",
+    severity: super::Severity::Error,
+    title: "Loop bounds without a known type",
+    message: "The bounds of `{expression}` are not known here, so its counter has no type.",
+    params: &["expression"],
+    fix: None,
+};
+
+/// E0056: Bound is not a number
+pub static CALL_BOUND_NOT_NUMBER: super::Code = super::Code {
+    code: "E0056",
+    severity: super::Severity::Error,
+    title: "Bound is not a number",
+    message: "`{function}` takes a number for a bound, `{type}` passed.",
+    params: &["function", "type"],
+    fix: None,
+};
+
+/// E0057: step() arity
+pub static LOOP_STEP_ARITY: super::Code = super::Code {
+    code: "E0057",
+    severity: super::Severity::Error,
+    title: "step() arity",
+    message: "`step` takes 1 argument, {count} passed.",
+    params: &["count"],
+    fix: None,
+};
+
+/// E0058: enter() arity
+pub static LOOP_ENTER_ARITY: super::Code = super::Code {
+    code: "E0058",
+    severity: super::Severity::Error,
+    title: "enter() arity",
+    message: "`enter` takes 0 or 1 argument(s), {count} passed.",
+    params: &["count"],
+    fix: None,
+};
+
+/// E0059: method_call() arguments
+pub static METHOD_CALL_SHAPE: super::Code = super::Code {
+    code: "E0059",
+    severity: super::Severity::Error,
+    title: "method_call() arguments",
+    message: "`method_call` takes a method and a receiver.",
+    params: &[],
+    fix: None,
+};
+
+/// E0060: Wrong number of arguments
+pub static CALL_ARGUMENT_COUNT: super::Code = super::Code {
+    code: "E0060",
+    severity: super::Severity::Error,
+    title: "Wrong number of arguments",
+    message: "`{function}` does not take {count} argument(s).",
+    params: &["function", "count"],
+    fix: None,
+};
+
+/// E0061: Too few arguments
+pub static CALL_TOO_FEW_ARGUMENTS: super::Code = super::Code {
+    code: "E0061",
+    severity: super::Severity::Error,
+    title: "Too few arguments",
+    message: "`{function}` does not take {count} argument(s) (at least {least} needed).",
+    params: &["function", "count", "least"],
+    fix: None,
+};
+
+/// E0062: Wrong number of positional arguments
+pub static CALL_POSITIONAL_COUNT: super::Code = super::Code {
+    code: "E0062",
+    severity: super::Severity::Error,
+    title: "Wrong number of positional arguments",
+    message: "`{function}` takes {positional} positional argument(s), {count} passed.",
+    params: &["function", "positional", "count"],
+    fix: None,
+};
+
+/// E0063: Unknown parameter
+pub static CALL_UNKNOWN_PARAMETER: super::Code = super::Code {
+    code: "E0063",
+    severity: super::Severity::Error,
+    title: "Unknown parameter",
+    message: "`{function}` has no parameter `{parameter}`.",
+    params: &["function", "parameter"],
+    fix: None,
+};
+
+/// E0064: Argument of another type
+pub static CALL_ARGUMENT_TYPE: super::Code = super::Code {
+    code: "E0064",
+    severity: super::Severity::Error,
+    title: "Argument of another type",
+    message: "`{function}` takes `{declared}` for `{parameter}`, `{passed}` passed.",
+    params: &["function", "declared", "parameter", "passed"],
+    fix: None,
+};
+
+/// E0065: No matching overload
+pub static CALL_NO_OVERLOAD: super::Code = super::Code {
+    code: "E0065",
+    severity: super::Severity::Error,
+    title: "No matching overload",
+    message: "No overload of `{function}` takes these arguments.",
+    params: &["function"],
+    fix: None,
+};
+
+/// E0066: Argument passed twice
+pub static CALL_ARGUMENT_TWICE: super::Code = super::Code {
+    code: "E0066",
+    severity: super::Severity::Error,
+    title: "Argument passed twice",
+    message: "`{parameter}` is passed to `{function}` twice.",
+    params: &["parameter", "function"],
+    fix: None,
+};
+
+/// E0067: Missing argument
+pub static CALL_MISSING_ARGUMENT: super::Code = super::Code {
+    code: "E0067",
+    severity: super::Severity::Error,
+    title: "Missing argument",
+    message: "`{function}` needs an argument for `{parameter}`.",
+    params: &["function", "parameter"],
+    fix: None,
+};
+
+/// E0068: Wrong number of constructor arguments
+pub static CONSTRUCTOR_FIELD_COUNT: super::Code = super::Code {
+    code: "E0068",
+    severity: super::Severity::Error,
+    title: "Wrong number of constructor arguments",
+    message: "`{type}` has {fields} field(s), {count} argument(s) passed.",
+    params: &["type", "fields", "count"],
+    fix: None,
+};
+
+/// E0069: Missing field value
+pub static CONSTRUCTOR_MISSING_FIELD: super::Code = super::Code {
+    code: "E0069",
+    severity: super::Severity::Error,
+    title: "Missing field value",
+    message: "`{type}` needs a value for `{field}`.",
+    params: &["type", "field"],
+    fix: None,
+};
+
+/// E0070: Field value of another type
+pub static CONSTRUCTOR_FIELD_TYPE: super::Code = super::Code {
+    code: "E0070",
+    severity: super::Severity::Error,
+    title: "Field value of another type",
+    message: "`{field}` holds `{declared}`, `{passed}` passed.",
+    params: &["field", "declared", "passed"],
+    fix: None,
+};
+
 /// I0004: Internal error
 pub static INTERNAL_ERROR: super::Code = super::Code {
     code: "I0004",
@@ -107,6 +707,216 @@ pub static INTERNAL_ERROR: super::Code = super::Code {
     title: "Internal error",
     message: "Internal error: {what}.",
     params: &["what"],
+    fix: None,
+};
+
+/// P0001: Identifier with PyneCore's reserved character
+pub static RESERVED_NAME_CHAR: super::Code = super::Code {
+    code: "P0001",
+    severity: super::Severity::Error,
+    title: "Identifier with PyneCore's reserved character",
+    message: "`{name}` contains `·`, which is reserved for PyneCore's internal names in Pyne code; rename the identifier.",
+    params: &["name"],
+    fix: None,
+};
+
+/// P0002: Identifier reserved by the transform
+pub static PIPELINE_NAME: super::Code = super::Code {
+    code: "P0002",
+    severity: super::Severity::Error,
+    title: "Identifier reserved by the transform",
+    message: "`{name}` is a name PyneCore's transform generates, reserved in Pyne code; rename the identifier.",
+    params: &["name"],
+    fix: None,
+};
+
+/// P0003: Script decorator not on main
+pub static SCRIPT_DECORATOR_NOT_ON_MAIN: super::Code = super::Code {
+    code: "P0003",
+    severity: super::Severity::Error,
+    title: "Script decorator not on main",
+    message: "The script decorator belongs on `main`, not on `{function}`.",
+    params: &["function"],
+    fix: None,
+};
+
+/// P0004: Second script decorator
+pub static DUPLICATE_SCRIPT_DECORATOR: super::Code = super::Code {
+    code: "P0004",
+    severity: super::Severity::Error,
+    title: "Second script decorator",
+    message: "A module has one script decorator, and `main` is defined twice.",
+    params: &[],
+    fix: None,
+};
+
+/// P0005: na_bool is not a literal
+pub static NA_BOOL_NOT_LITERAL: super::Code = super::Code {
+    code: "P0005",
+    severity: super::Severity::Error,
+    title: "na_bool is not a literal",
+    message: "`na_bool` must be a literal `True` or `False`: the script's bool semantics are fixed before its module body runs.",
+    params: &[],
+    fix: None,
+};
+
+/// P0006: Series variable outside a function
+pub static SERIES_OUTSIDE_FUNCTION: super::Code = super::Code {
+    code: "P0006",
+    severity: super::Severity::Error,
+    title: "Series variable outside a function",
+    message: "A `Series` variable must be declared inside a function.",
+    params: &[],
+    fix: None,
+};
+
+/// P0007: Persistent variable outside a function
+pub static PERSISTENT_OUTSIDE_FUNCTION: super::Code = super::Code {
+    code: "P0007",
+    severity: super::Severity::Error,
+    title: "Persistent variable outside a function",
+    message: "A `Persistent` variable must be declared inside a function.",
+    params: &[],
+    fix: None,
+};
+
+/// P0008: Stateful call at module level
+pub static STATEFUL_CALL_AT_MODULE_LEVEL: super::Code = super::Code {
+    code: "P0008",
+    severity: super::Severity::Error,
+    title: "Stateful call at module level",
+    message: "A function that keeps state from bar to bar cannot be called at module level.",
+    params: &[],
+    fix: None,
+};
+
+/// P0009: Input outside main's parameters
+pub static INPUT_NOT_MAIN_DEFAULT: super::Code = super::Code {
+    code: "P0009",
+    severity: super::Severity::Error,
+    title: "Input outside main's parameters",
+    message: "`{function}()` is not a `main()` parameter default; inputs must be declared as `main()` parameter defaults: `def main(length=input.int(14, ...))`.",
+    params: &["function"],
+    fix: None,
+};
+
+/// P0010: lib imported under an alias
+pub static LIB_IMPORT_ALIAS: super::Code = super::Code {
+    code: "P0010",
+    severity: super::Severity::Error,
+    title: "lib imported under an alias",
+    message: "`lib` must be imported as itself, not as an alias.",
+    params: &[],
+    fix: None,
+};
+
+/// P0011: Wildcard import of a module without __all__
+pub static WILDCARD_IMPORT_WITHOUT_ALL: super::Code = super::Code {
+    code: "P0011",
+    severity: super::Severity::Error,
+    title: "Wildcard import of a module without __all__",
+    message: "Cannot use a wildcard import: the module `{module}` has no `__all__` defined.",
+    params: &["module"],
+    fix: None,
+};
+
+/// P0012: Unknown lib attribute
+pub static UNKNOWN_LIB_ATTRIBUTE: super::Code = super::Code {
+    code: "P0012",
+    severity: super::Severity::Error,
+    title: "Unknown lib attribute",
+    message: "`{module}` has no attribute `{name}`.",
+    params: &["module", "name"],
+    fix: None,
+};
+
+/// P0013: Module-level object modified inside a function
+pub static MODULE_STATE_MODIFIED: super::Code = super::Code {
+    code: "P0013",
+    severity: super::Severity::Error,
+    title: "Module-level object modified inside a function",
+    message: "`{name}` {how} inside a function: an object created outside a function cannot be modified inside one.",
+    params: &["name", "how"],
+    fix: None,
+};
+
+/// P0014: Plot called conditionally
+pub static PLOT_CALL_CONDITIONAL: super::Code = super::Code {
+    code: "P0014",
+    severity: super::Severity::Error,
+    title: "Plot called conditionally",
+    message: "`{function}()` must be called unconditionally in the direct body of module-level `main`, before any possible early return.",
+    params: &["function"],
+    fix: None,
+};
+
+/// P0015: Plot used as a value
+pub static PLOT_AS_VALUE: super::Code = super::Code {
+    code: "P0015",
+    severity: super::Severity::Error,
+    title: "Plot used as a value",
+    message: "`{function}()` cannot be passed or stored as a function value; use a direct call or a single static alias so its scope can be checked.",
+    params: &["function"],
+    fix: None,
+};
+
+/// P0016: Stateful method of the wrong kind
+pub static STATEFUL_METHOD_KIND: super::Code = super::Code {
+    code: "P0016",
+    severity: super::Severity::Error,
+    title: "Stateful method of the wrong kind",
+    message: "The method `{method}` keeps state (a `ta` call, a series or a persistent), which only a plain or a `@staticmethod` method can do.",
+    params: &["method"],
+    fix: None,
+};
+
+/// P0017: Method receiver from an unpacked argument
+pub static UNPACKED_RECEIVER: super::Code = super::Code {
+    code: "P0017",
+    severity: super::Severity::Error,
+    title: "Method receiver from an unpacked argument",
+    message: "`{function}()` uses variables of `main()`, so its receiver cannot come from an unpacked argument; pass the receiver explicitly: `{function}(receiver, *args)`.",
+    params: &["function"],
+    fix: None,
+};
+
+/// P0018: Export captures a library global
+pub static EXPORT_CAPTURES_GLOBAL: super::Code = super::Code {
+    code: "P0018",
+    severity: super::Severity::Error,
+    title: "Export captures a library global",
+    message: "The exported function `{function}` cannot capture the non-constant library global `{name}`.",
+    params: &["function", "name"],
+    fix: None,
+};
+
+/// P0019: Strategy state in a security expression
+pub static STRATEGY_STATE_IN_SECURITY: super::Code = super::Code {
+    code: "P0019",
+    severity: super::Severity::Error,
+    title: "Strategy state in a security expression",
+    message: "`strategy.{name}` cannot be used as the expression argument of `{function}()`: strategy state is only available in the chart context, not in a security context.",
+    params: &["name", "function"],
+    fix: None,
+};
+
+/// P0020: Drawing in a security expression
+pub static DRAWING_IN_SECURITY: super::Code = super::Code {
+    code: "P0020",
+    severity: super::Severity::Error,
+    title: "Drawing in a security expression",
+    message: "`{name}()` cannot be used in the expression of `{function}()`.",
+    params: &["name", "function"],
+    fix: None,
+};
+
+/// P0021: Too many requests in one function
+pub static TOO_MANY_FUNCTION_REQUESTS: super::Code = super::Code {
+    code: "P0021",
+    severity: super::Severity::Error,
+    title: "Too many requests in one function",
+    message: "The function `{function}` reaches {count} `request.security` calls through the functions it calls; a function can use at most {limit} request values.",
+    params: &["function", "count", "limit"],
     fix: None,
 };
 
@@ -612,7 +1422,88 @@ pub static ALL: &[&super::Code] = &[
     &EDGE_CLASS,
     &EDGE_CALL,
     &EDGE_ATTRIBUTE_ASSIGNMENT,
+    &EDGE_RESERVED_NAME,
+    &TYPE_UNKNOWN_NAME,
+    &TYPE_FUNCTION_VALUE,
+    &TYPE_UNKNOWN_CALL,
+    &TYPE_UNKNOWN_CALLEE_CALL,
+    &TYPE_UNKNOWN_METHOD_CALL,
+    &TYPE_UNKNOWN_LIB_CALL,
+    &TYPE_NOT_LIB_NAME,
+    &TYPE_UNKNOWN_FIELD,
+    &TYPE_UNKNOWN_INDEX,
+    &TYPE_UNKNOWN_OPERATION,
+    &TYPE_NOT_PINE_EXPRESSION,
+    &TYPE_CONFLICT,
+    &TYPE_STARRED_TARGET,
+    &TYPE_UNPACK_COUNT,
+    &TYPE_PIN_PER_CONTEXT,
+    &TYPE_WIDEN_PER_CONTEXT,
+    &TYPE_OPERAND_UNKNOWN,
+    &TYPE_OPERAND_MISMATCH,
+    &TYPE_REBOUND_DEFINED,
+    &TYPE_IMPORTED_TWICE,
+    &TYPE_REBOUND_IMPORTED,
+    &TYPE_RECURSION,
+    &TYPE_CONTEXT_LIMIT,
+    &TYPE_UNANNOTATED_IMPORT,
+    &TYPE_SUPPRESSED_IMPORT,
+    &TYPE_IMPORT_CYCLE,
+    &TYPE_NOT_ITERABLE,
+    &TYPE_INDEX_NOT_PINE,
+    &TYPE_NOT_SERIES,
+    &TYPE_DECLARED_MISMATCH,
+    &TYPE_FIELD_ASSIGN_MISMATCH,
+    &TYPE_UNKNOWN_CALLEE,
+    &TYPE_CALLEE_NOT_NAME,
+    &TYPE_UNKNOWN_CLASS_FIELD,
+    &TYPE_UNKNOWN_CLASS_METHOD,
+    &TYPE_UNKNOWN_CLASS_STORE,
+    &TYPE_NO_FIELD,
+    &TYPE_NO_FIELD_TO_ASSIGN,
+    &TYPE_LOOP_COUNTER_FIELD,
+    &TYPE_LIB_NAMESPACE_CALL,
+    &TYPE_LIB_VALUE_CALL,
+    &TYPE_METHOD_NOT_FOUND,
+    &TYPE_METHOD_NOT_EXPORTED,
+    &TYPE_LOOP_BOUNDS_UNKNOWN,
+    &CALL_BOUND_NOT_NUMBER,
+    &LOOP_STEP_ARITY,
+    &LOOP_ENTER_ARITY,
+    &METHOD_CALL_SHAPE,
+    &CALL_ARGUMENT_COUNT,
+    &CALL_TOO_FEW_ARGUMENTS,
+    &CALL_POSITIONAL_COUNT,
+    &CALL_UNKNOWN_PARAMETER,
+    &CALL_ARGUMENT_TYPE,
+    &CALL_NO_OVERLOAD,
+    &CALL_ARGUMENT_TWICE,
+    &CALL_MISSING_ARGUMENT,
+    &CONSTRUCTOR_FIELD_COUNT,
+    &CONSTRUCTOR_MISSING_FIELD,
+    &CONSTRUCTOR_FIELD_TYPE,
     &INTERNAL_ERROR,
+    &RESERVED_NAME_CHAR,
+    &PIPELINE_NAME,
+    &SCRIPT_DECORATOR_NOT_ON_MAIN,
+    &DUPLICATE_SCRIPT_DECORATOR,
+    &NA_BOOL_NOT_LITERAL,
+    &SERIES_OUTSIDE_FUNCTION,
+    &PERSISTENT_OUTSIDE_FUNCTION,
+    &STATEFUL_CALL_AT_MODULE_LEVEL,
+    &INPUT_NOT_MAIN_DEFAULT,
+    &LIB_IMPORT_ALIAS,
+    &WILDCARD_IMPORT_WITHOUT_ALL,
+    &UNKNOWN_LIB_ATTRIBUTE,
+    &MODULE_STATE_MODIFIED,
+    &PLOT_CALL_CONDITIONAL,
+    &PLOT_AS_VALUE,
+    &STATEFUL_METHOD_KIND,
+    &UNPACKED_RECEIVER,
+    &EXPORT_CAPTURES_GLOBAL,
+    &STRATEGY_STATE_IN_SECURITY,
+    &DRAWING_IN_SECURITY,
+    &TOO_MANY_FUNCTION_REQUESTS,
     &DIVISION_BY_ZERO,
     &NA_TO_INTEGER,
     &INFINITY_TO_INTEGER,

@@ -15,12 +15,12 @@ from datetime import datetime, UTC
 from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple, TypeVar
 
 from ..types.na import NA
 
-__all__ = ['Code', 'SiteLoc', 'PyneError', 'RUNTIME_ROOTS', 'MAIN_MODULE', 'MODULE_ID',
-           'format_arg', 'bar_time_text', 'user_traceback']
+__all__ = ['Code', 'SiteLoc', 'SyntaxLocation', 'PyneError', 'PyneSyntaxError', 'RUNTIME_ROOTS',
+           'MAIN_MODULE', 'MODULE_ID', 'format_arg', 'bar_time_text', 'user_traceback']
 
 # Frames under these roots are the runtime's own or the interpreter's, never the
 # script's: an error is located at the innermost frame outside them, and the
@@ -36,6 +36,10 @@ RUNTIME_ROOTS = tuple(sorted({
 MAIN_MODULE = 'main'
 #: The module global the script's module carries its id in.
 MODULE_ID = '__pyne_module_id__'
+
+#: Where in a source a syntax rule was broken, as :class:`SyntaxError` takes it:
+#: the file, the one-based line and column, and the text of that line.
+SyntaxLocation = tuple[str, int, int, str | None]
 
 #: Whole numbers below this magnitude are written without a fraction.
 _WHOLE_LIMIT = 1e18
@@ -159,8 +163,11 @@ def user_traceback(tb: TracebackType | None) -> TracebackType | None:
     return found
 
 
-def _rebuild(cls: type['PyneError'], params: dict[str, Any],
-             state: dict[str, Any]) -> 'PyneError':
+#: A :class:`PyneError` subclass, for the rebuild helpers that keep it
+_Error = TypeVar('_Error', bound='PyneError')
+
+
+def _rebuild(cls: type[_Error], params: dict[str, Any], state: dict[str, Any]) -> _Error:
     """The error :meth:`PyneError.__reduce__` pickled. The base's constructor
     takes the parameters by their registry names, which a class's own does not
     when one is a Python keyword."""
@@ -223,3 +230,55 @@ class PyneError(Exception):
             return text
         when = '' if self.bar_time is None else f" ({bar_time_text(self.bar_time)})"
         return f"bar {self.bar_index}{when}: {text}"
+
+
+def _rebuild_syntax(cls: type['PyneSyntaxError'], params: dict[str, Any],
+                    state: dict[str, Any], location: SyntaxLocation | None) -> 'PyneSyntaxError':
+    """The error :meth:`PyneSyntaxError.__reduce__` pickled: :class:`SyntaxError`
+    keeps its location in slots, which the instance dictionary does not hold."""
+    error = _rebuild(cls, params, state)
+    error.locate(location)
+    return error
+
+
+class PyneSyntaxError(PyneError, SyntaxError):
+    """A coded rule of Pyne code or of the Pyne Edge profile, broken in the
+    source before it runs. It is a :class:`SyntaxError`, so Python's traceback
+    puts a caret under the column, and the generated class of every ``P`` and
+    ``E`` code derives from it::
+
+        raise SeriesOutsideFunctionError(location=(path, line, col, text))
+    """
+
+    def __init__(self, *, location: SyntaxLocation | None = None, **params: Any) -> None:
+        super().__init__(**params)
+        self.locate(location)
+
+    def locate(self, location: SyntaxLocation | None) -> None:
+        """Set where in the source the rule was broken.
+
+        :param location: The file, line, column and line text, or None to leave it unset
+        """
+        if location is not None:
+            self.filename, self.lineno, self.offset, self.text = location
+
+    @property
+    def location(self) -> SyntaxLocation | None:
+        """The file, line, column and line text, when the error has a file."""
+        if self.filename is None:
+            return None
+        return self.filename, self.lineno or 0, self.offset or 0, self.text
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        state = {k: v for k, v in self.__dict__.items() if k != 'params'}
+        return _rebuild_syntax, (type(self), self.params, state, self.location)
+
+    def report(self) -> str:
+        """The line a run prints for the error: the code, the place in the
+        source, when it is known, and the message."""
+        text = self.code.code
+        if self.filename is not None:
+            text += f" at {self.filename}:{self.lineno}"
+            if self.offset:
+                text += f":{self.offset}"
+        return f"{text}: {self.message}"

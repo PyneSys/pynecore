@@ -20,7 +20,7 @@ use pyne_ast::walk::{
 };
 use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Value};
 
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 /// The decorators that make an inner function a Pine method
 const METHOD_DECORATORS: [&str; 2] = ["method", "pine_method.method"];
@@ -506,10 +506,9 @@ impl ClosureArguments {
                     .first()
                     .is_some_and(|&first| matches!(ast.kind(first), Kind::Starred { .. }))
                 {
-                    self.error.get_or_insert(Error::Rejected(format!(
-                        "{func_name}() uses variables of main(), so its receiver cannot come \
-                         from an unpacked argument; pass the receiver explicitly: \
-                         {func_name}(receiver, *args)"
+                    self.error.get_or_insert(Error::Rejected(Raised::new(
+                        &pynecore_codes::UNPACKED_RECEIVER,
+                        [func_name.to_string()],
                     )));
                     return;
                 }

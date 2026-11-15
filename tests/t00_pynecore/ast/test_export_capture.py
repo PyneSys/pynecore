@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core.import_hook import PyneLoader
+from pynecore.errorcodes import ExportCapturesGlobalError
 from pynecore.core import script as script_mod
 from pynecore.core.script_runner import ScriptRunner
 from pynecore.transformers import native
@@ -63,7 +64,7 @@ def main():
     if value.startswith('color.') or value == 'close':
         check(source)
     else:
-        with pytest.raises(SyntaxError, match='cannot capture non-constant library global "obj"'):
+        with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
             check(source)
 
 
@@ -106,7 +107,7 @@ def main():
 ])
 def __test_scalar_capture_rejects_mutation_and_inputs__(declaration):
     result = 'alias' if 'alias =' in declaration else 'obj'
-    with pytest.raises(SyntaxError, match='cannot capture non-constant library global'):
+    with pytest.raises(ExportCapturesGlobalError):
         check(f'''from pynecore.lib import input
 @script.library("Probe")
 def main():
@@ -204,7 +205,7 @@ def __test_valid_closures__(source):
 
 
 def __test_module_capture__():
-    with pytest.raises(SyntaxError, match='global "obj"'):
+    with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
         check('''obj = label.new(0, 1)
 @export
 def getObject():
@@ -227,7 +228,7 @@ def main():
 '''
     path = tmp_path / 'capture.py'
     path.write_text(source)
-    with pytest.raises(SyntaxError, match='global "obj"'):
+    with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
         PyneLoader('capture', str(path)).get_code('capture')
 
 
@@ -237,12 +238,12 @@ def main():
     '    capture = lambda: obj\n    @export\n    def getObject():\n        return capture()\n',
 ])
 def __test_capture_paths__(body):
-    with pytest.raises(SyntaxError, match='cannot capture non-constant library global'):
+    with pytest.raises(ExportCapturesGlobalError):
         check('@script.library("Probe")\ndef main():\n    obj = label.new(0, 1)\n' + body)
 
 
 def __test_nonlocal_write_invalidates_literal__():
-    with pytest.raises(SyntaxError, match='global "obj"'):
+    with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
         check('''@script.library("Probe")
 def main():
     obj = 1
@@ -327,7 +328,7 @@ def __test_imported_enum_capture__(__test_helper_enum_package, import_line, valu
     'sd.close',
 ])
 def __test_imported_non_enum_capture_rejected__(__test_helper_enum_package, value):
-    with pytest.raises(SyntaxError, match='global "obj"'):
+    with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
         check(f'''import capture_enums.definitions as sd
 obj = {value}
 @script.library("Probe")
@@ -343,7 +344,7 @@ def main():
     'sd = 1\n',
 ])
 def __test_import_alias_rebinding_rejected__(__test_helper_enum_package, extra):
-    with pytest.raises(SyntaxError, match='global "obj"'):
+    with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
         check('import capture_enums.definitions as sd\n' + extra + '''
 obj = sd.NumericSystem.decimal
 @script.library("Probe")
@@ -361,7 +362,7 @@ def main():
 ])
 def __test_unproven_imported_enum_rejected__(__test_helper_enum_package, definition):
     (__test_helper_enum_package / 'definitions.py').write_text(definition)
-    with pytest.raises(SyntaxError, match='global "obj"'):
+    with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
         check('''import capture_enums.definitions as sd
 obj = sd.NumericSystem.decimal
 @script.library("Probe")
@@ -374,7 +375,7 @@ def main():
 
 def __test_import_cycle_cannot_prove_enum__(__test_helper_enum_package):
     (__test_helper_enum_package / 'definitions.py').write_text('from .bridge import NumberBase as NumericSystem\n')
-    with pytest.raises(SyntaxError, match='global "obj"'):
+    with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
         check('''from capture_enums.bridge import NumberBase
 obj = NumberBase.decimal
 @script.library("Probe")
@@ -423,7 +424,7 @@ def main():
     before = enum_path.stat()
     enum_path.write_text("class Mode:\n    fixed = 'FIXED'\n")
     os.utime(enum_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
-    with pytest.raises(SyntaxError, match='global "obj"'):
+    with pytest.raises(ExportCapturesGlobalError, match='global `obj`'):
         loader.get_code('capture')
 
 

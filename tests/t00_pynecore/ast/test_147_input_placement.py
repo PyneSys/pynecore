@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core import import_hook
+from pynecore.errorcodes import InputNotMainDefaultError
 
 #: The header every case module starts with, ``{mode}`` being the ``@pyne`` mode word
 __test_helper_HEADER = ('"""\n@pyne{mode}\n"""\n'
@@ -99,11 +100,9 @@ def __test_input_outside_main_defaults_is_rejected__(case, mode, backend, tmp_pa
     located at the call and naming the correct form."""
     monkeypatch.setenv('PYNE_AST_BACKEND', backend)
     body, line = __test_helper_REJECTED[case]
-    with pytest.raises(SyntaxError) as info:
+    with pytest.raises(InputNotMainDefaultError) as info:
         __test_helper_lower(tmp_path, body, mode)
     error = info.value
-    assert 'inputs must be declared as main() parameter defaults: ' \
-           'def main(length=input.int(14, ...))' in error.msg
     assert error.lineno == __test_helper_HEADER.count('\n') + line
     assert error.text is not None and 'input' in error.text
     assert error.filename == str((tmp_path / 'case.py').resolve())

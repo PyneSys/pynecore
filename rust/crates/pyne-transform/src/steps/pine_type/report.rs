@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use pyne_ast::walk::{children, walk};
 use pyne_ast::{Constant, ExprContext, Kind, NodeId};
+use pynecore_codes::Code;
 
 use super::{Engine, R};
 use crate::pine_type_rules::{TY_ATTR, UNKNOWN, dotted, get_ty, render_ty};
@@ -419,7 +420,7 @@ impl<'e> Report<'e, '_, '_> {
             col,
             detail: detail.to_string(),
         };
-        let (origin, message) = match ast.kind(node) {
+        let (origin, code, args): (Unknown, &'static Code, Vec<String>) = match ast.kind(node) {
             Kind::Name { id, .. } => {
                 let id = id.clone();
                 let origin = self
@@ -435,13 +436,13 @@ impl<'e> Report<'e, '_, '_> {
                     return Ok(());
                 }
                 if origin.reason == "unknown-name" && self.is_user_function(&id, node) {
-                    (at("function-value", &id), format!("'{id}' is a function, not a value"))
+                    (at("function-value", &id), &pynecore_codes::TYPE_FUNCTION_VALUE, vec![id])
                 } else {
-                    (origin, format!("'{id}' has no known type"))
+                    (origin, &pynecore_codes::TYPE_UNKNOWN_NAME, vec![id])
                 }
             }
             Kind::Call { func, args, .. } => match dotted(ast, *func) {
-                None => (at("unknown-call", ""), "this call has no known type".to_string()),
+                None => (at("unknown-call", ""), &pynecore_codes::TYPE_UNKNOWN_CALLEE_CALL, vec![]),
                 Some(callee) if callee == "method_call" && args.len() >= 2 => {
                     let selector = args[0];
                     let method = match ast.kind(selector) {
@@ -453,35 +454,40 @@ impl<'e> Report<'e, '_, '_> {
                     };
                     (
                         at("unknown-return", &method),
-                        format!("the call to method '{method}' has no known type"),
+                        &pynecore_codes::TYPE_UNKNOWN_METHOD_CALL,
+                        vec![method],
                     )
                 }
                 Some(callee) if callee.starts_with("lib.") => (
                     at("unknown-lib", &callee),
-                    format!("'{}' has no known type here", &callee[4..]),
+                    &pynecore_codes::TYPE_UNKNOWN_LIB_CALL,
+                    vec![callee[4..].to_string()],
                 ),
                 Some(callee) if self.is_user_function(&callee, node) => (
                     at("unknown-return", &callee),
-                    format!("the call to '{callee}' has no known type"),
+                    &pynecore_codes::TYPE_UNKNOWN_CALL,
+                    vec![callee],
                 ),
-                Some(callee) => (
-                    at("unknown-call", &callee),
-                    format!("the call to '{callee}' has no known type"),
-                ),
+                Some(callee) => {
+                    (at("unknown-call", &callee), &pynecore_codes::TYPE_UNKNOWN_CALL, vec![callee])
+                }
             },
             Kind::Attribute { value, attr, .. } => match dotted(ast, node) {
                 Some(spelled) if spelled.starts_with("lib.") => (
                     at("unknown-lib-name", &spelled),
-                    format!("'{}' is not a known lib name", &spelled[4..]),
+                    &pynecore_codes::TYPE_NOT_LIB_NAME,
+                    vec![spelled[4..].to_string()],
                 ),
                 _ => (
                     at("unknown-field", attr),
-                    format!("'.{attr}' has no known type on {}", render_ty(get_ty(ast, *value))),
+                    &pynecore_codes::TYPE_UNKNOWN_FIELD,
+                    vec![attr.clone(), render_ty(get_ty(ast, *value))],
                 ),
             },
             Kind::Subscript { value, .. } => (
                 at("unknown-index", ""),
-                format!("indexing {} has no known type", render_ty(get_ty(ast, *value))),
+                &pynecore_codes::TYPE_UNKNOWN_INDEX,
+                vec![render_ty(get_ty(ast, *value))],
             ),
             Kind::BinOp { .. }
             | Kind::UnaryOp { .. }
@@ -492,19 +498,26 @@ impl<'e> Report<'e, '_, '_> {
                     Kind::IfExp { body, orelse, .. } => vec![*body, *orelse],
                     _ => self.value_children(node),
                 };
-                let over: Vec<String> =
-                    operands.iter().map(|&operand| render_ty(get_ty(ast, operand))).collect();
+                let over: Vec<String> = operands
+                    .iter()
+                    .map(|&operand| format!("`{}`", render_ty(get_ty(ast, operand))))
+                    .collect();
                 let spelled =
                     crate::unparse::unparse_prefix(ast, node, 40, self.engine.host.python())?;
                 (
                     at("unknown-op", ast.name(node)),
-                    format!("'{spelled}' has no known type over {}", over.join(", ")),
+                    &pynecore_codes::TYPE_UNKNOWN_OPERATION,
+                    vec![spelled, over.join(", ")],
                 )
             }
             _ => {
                 let spelled =
                     crate::unparse::unparse_prefix(ast, node, 40, self.engine.host.python())?;
-                (at("not-pine", ast.name(node)), format!("'{spelled}' is not a Pine expression"))
+                (
+                    at("not-pine", ast.name(node)),
+                    &pynecore_codes::TYPE_NOT_PINE_EXPRESSION,
+                    vec![spelled],
+                )
             }
         };
         let key = (origin.reason.clone(), origin.line, origin.col, origin.detail.clone());
@@ -518,14 +531,17 @@ impl<'e> Report<'e, '_, '_> {
         } else {
             fix_for(&origin.reason).to_string()
         };
+        let rendered: Vec<&str> = args.iter().map(String::as_str).collect();
         self.diags.push(Diag {
-            message,
+            message: code.render(&rendered),
             line,
             col,
             origin: Some(origin),
             fix,
             end_line: 0,
             end_col: 0,
+            code: code.code.to_string(),
+            args,
         });
         Ok(())
     }

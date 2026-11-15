@@ -194,7 +194,7 @@ value = loose(3)
     assert get_pin(node) is None
     diag = _diag(table, 'unannotated-import')
     where = f'{lib.resolve()}:10'
-    assert "'loose'" in diag.message and where in diag.message
+    assert (diag.code, diag.args) == ('E0035', ('loose', where))
     assert diag.fix == f"annotate the parameters of 'loose' in {where}"
 
 
@@ -496,7 +496,7 @@ helper = loose
 
     assert get_ty(_call(tree, 'helper')) == UNKNOWN
     diag = _diag(table, 'rebound-name')
-    assert "'helper'" in diag.message
+    assert (diag.code, diag.args) == ('E0032', ('helper',))
     assert diag.fix == "call 'helper' under a name nothing assigns to"
 
 
@@ -521,8 +521,7 @@ value = helper(3)
 
     assert get_ty(_call(tree, 'helper')) == UNKNOWN
     diag = _diag(table, 'rebound-name')
-    assert diag.message == ("'helper' is imported more than once, so what it calls is "
-                            "unknown")
+    assert (diag.code, diag.args) == ('E0031', ('helper',))
     assert diag.fix == "import 'helper' once, under a name nothing else binds"
     # Neither module's signatures decided anything here, but both are
     # imported: the lowering routes a call on whatever the import binds, so
@@ -754,11 +753,11 @@ def __test_a_call_into_another_module_is_held_to_its_signature__(tmp_path, monke
     assert all(types[name] == UNKNOWN for name in ('y', 'z', 'w', 'u'))
     reasons = [diag.origin.reason for diag in table.diags if diag.origin is not None]
     assert reasons == ['bad-call'] * 4
-    messages = [diag.message for diag in table.diags]
-    assert "'add' does not take 3 argument(s)" in messages[0]
-    assert "'add' has no parameter 'nosuch'" in messages[1]
-    assert "'add' takes int for 'b', float passed" in messages[2]
-    assert "'a' is passed to 'add' twice" in messages[3]
+    found = [(diag.code, diag.args) for diag in table.diags]
+    assert found[0] == ('E0060', ('add', '3'))
+    assert found[1] == ('E0063', ('add', 'nosuch'))
+    assert found[2] == ('E0064', ('add', 'int', 'b', 'float'))
+    assert found[3] == ('E0066', ('a', 'add'))
 
 
 METHOD_LIB = '''"""
@@ -815,11 +814,11 @@ def __test_a_method_of_an_imported_class_is_held_to_its_signature__(tmp_path, mo
     assert all(types[name] == UNKNOWN for name in ('a', 'b', 'd', 'f'))
     reasons = [diag.origin.reason for diag in table.diags if diag.origin is not None]
     assert reasons == ['bad-call'] * 4
-    messages = [diag.message for diag in table.diags]
-    assert "'bump' does not take 1 argument(s)" in messages[0]
-    assert "'bump' does not take 3 argument(s)" in messages[1]
-    assert "'bump' takes int for 'by', string passed" in messages[2]
-    assert "takes int for 'by', float passed" in messages[3]
+    found = [(diag.code, diag.args) for diag in table.diags]
+    assert found[0] == ('E0060', ('bump', '1'))
+    assert found[1] == ('E0060', ('bump', '3'))
+    assert found[2] == ('E0064', ('bump', 'int', 'by', 'string'))
+    assert found[3][0] == 'E0064' and found[3][1][1:] == ('int', 'by', 'float')
 
 
 BARE_CLASS_APP = '''"""
@@ -848,4 +847,4 @@ def __test_a_class_imported_by_name_is_a_type__(tmp_path, monkeypatch):
     assert types['t'] == UNKNOWN
     reasons = [diag.origin.reason for diag in table.diags if diag.origin is not None]
     assert reasons == ['bad-call']
-    assert "'Cfg' has 2 field(s), 3 argument(s) passed" in table.diags[0].message
+    assert (table.diags[0].code, table.diags[0].args) == ('E0068', ('Cfg', '2', '3'))

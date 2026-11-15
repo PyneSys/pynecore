@@ -3,6 +3,7 @@ import ast
 import json
 from pathlib import Path
 
+from ..errorcodes import UnknownLibAttributeError
 from . import ast_walk
 
 __all__ = ['ModulePropertyTransformer', 'module_properties']
@@ -48,6 +49,8 @@ class ModulePropertyTransformer(ast_walk.NodeTransformer):
     """
 
     def __init__(self):
+        #: The source path of the module, for a rejection's location
+        self._module_file = '<script>'
         # Structure: module -> name -> {"type": "property"|"variable"}
         self.module_info: dict[str, dict[str, dict[str, Any]]] = module_properties()
 
@@ -56,6 +59,10 @@ class ModulePropertyTransformer(ast_walk.NodeTransformer):
         # know about the place it stands in, without a parent link per node
         self._callees: set[ast.AST] = set()
         self._annotation_nodes: set[ast.AST] = set()
+
+    def visit_Module(self, node: ast.Module) -> ast.AST:
+        self._module_file = getattr(node, '_module_file_path', '<script>')
+        return self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
         self._callees.add(node.func)
@@ -154,11 +161,9 @@ class ModulePropertyTransformer(ast_walk.NodeTransformer):
             result = node
 
         else:
-            raise SyntaxError(
-                f"unknown attribute '{name}' on module '{module_path}' (line {node.lineno}); "
-                f"if this is a new pynecore.lib name, regenerate module_properties.json "
-                f"with scripts/module_property_collector.py"
-            )
+            raise UnknownLibAttributeError(
+                module=module_path, name=name,
+                location=(self._module_file, node.lineno, node.col_offset + 1, None))
 
         setattr(result, "_processed", True)
         return result

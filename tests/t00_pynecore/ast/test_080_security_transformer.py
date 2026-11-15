@@ -5,6 +5,7 @@ import ast
 
 import pytest
 
+from pynecore.errorcodes import StrategyStateInSecurityError
 from pynecore.transformers.security import SecurityTransformer
 from pynecore.transformers.security_instantiation import SecurityInstantiationTransformer
 
@@ -677,7 +678,7 @@ def main():
     daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.position_size)
     lib.plot(daily)
 """
-    with pytest.raises(SyntaxError, match="strategy.position_size"):
+    with pytest.raises(StrategyStateInSecurityError, match="strategy.position_size"):
         _transform(source)
 
 
@@ -688,7 +689,7 @@ def main():
     daily = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.equity + 100)
     lib.plot(daily)
 """
-    with pytest.raises(SyntaxError, match="strategy.equity"):
+    with pytest.raises(StrategyStateInSecurityError, match="strategy.equity"):
         _transform(source)
 
 
@@ -699,7 +700,7 @@ def main():
     arr = lib.request.security_lower_tf(lib.syminfo.tickerid, "1", lib.strategy.netprofit)
     lib.plot(arr)
 """
-    with pytest.raises(SyntaxError, match="strategy.netprofit.*security_lower_tf"):
+    with pytest.raises(StrategyStateInSecurityError, match="strategy.netprofit.*security_lower_tf"):
         _transform(source)
 
 
@@ -741,7 +742,7 @@ def __test_all_thirteen_strategy_state_attrs_rejected__(log):
 def main():
     x = lib.request.security(lib.syminfo.tickerid, "1D", lib.strategy.{attr})
 """
-        with pytest.raises(SyntaxError, match=f"strategy.{attr}"):
+        with pytest.raises(StrategyStateInSecurityError, match=f"strategy.{attr}"):
             _transform(source)
 
 

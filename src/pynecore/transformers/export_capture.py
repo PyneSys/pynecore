@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from ..errorcodes import ExportCapturesGlobalError
 from . import ast_walk
 from .lib_registry import lib_types
 from .source_read import stable_source
@@ -434,11 +435,9 @@ class ExportCaptureTransformer(ast_walk.NodeTransformer):
                         captures[owner, read.id] = bindings[0]
                         continue
                     path = getattr(node, '_module_file_path', '<pyne>')
-                    raise SyntaxError(
-                        f'Exported function "{function.name}" cannot capture '
-                        f'non-constant library global "{read.id}".',
-                        (path, read.lineno, read.col_offset + 1, None),
-                    )
+                    raise ExportCapturesGlobalError(
+                        function=function.name, name=read.id,
+                        location=(path, read.lineno, read.col_offset + 1, None))
         # Export definitions survive across bars. A scalar held only in a Python
         # closure would freeze at its first-bar value, so read its library slot.
         declarations: dict[int, ast.AnnAssign] = {}

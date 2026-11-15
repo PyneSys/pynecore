@@ -324,7 +324,9 @@ fn run<'py>(
     }
     let root = steps.map_err(|err| match err {
         pyne_transform::Error::Unsupported(message) => Unsupported::new_err(message),
-        pyne_transform::Error::Rejected(message) => Rejected::new_err(message),
+        pyne_transform::Error::Rejected(raised) => {
+            Rejected::new_err(format!("{}: {}", raised.code.code, raised.message()))
+        }
     })?;
     let mut to = ToPython::new(py)?.with_objects(from.objects);
     let module = to.node(&ast, root)?;

@@ -19,7 +19,7 @@ use pyne_ast::{Ast, Category, Constant, ExprContext, FieldMut, FieldRef, Int, Ki
 
 use crate::pine_type_rules::{OBJECT, stamp_lowering};
 use crate::slot_layout::{ModuleLayout, ScopeLayout, SlotKind};
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 fn constant(ast: &mut Ast, value: Constant) -> NodeId {
     ast.add(Kind::Constant { value, kind: None })
@@ -191,10 +191,9 @@ fn process_method(
     let static_method = decorators.len() == 1
         && matches!(ast.kind(decorators[0]), Kind::Name { id, .. } if id == "staticmethod");
     if !decorators.is_empty() && !static_method {
-        let line = ast[stmt].loc.lineno.map_or_else(|| "None".to_string(), |l| l.to_string());
-        return Err(Error::Rejected(format!(
-            "method '{func_name}' keeps state (a 'ta' call, a series or a persistent), \
-             which only a plain or a @staticmethod method can do (line {line})"
+        return Err(Error::Rejected(Raised::new(
+            &pynecore_codes::STATEFUL_METHOD_KIND,
+            [func_name.to_string()],
         )));
     }
     let mut added = Vec::with_capacity(2);

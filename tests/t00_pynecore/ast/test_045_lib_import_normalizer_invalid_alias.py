@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core.import_hook import PyneLoader
+from pynecore.errorcodes import LibImportAliasError
 
 __test_helper_script = '''"""
 @pyne
@@ -28,5 +29,5 @@ def __test_import_normalizer_invalid_alias__(tmp_path: Path):
     """
     path = tmp_path / 'invalid_alias_script.py'
     path.write_text(__test_helper_script, encoding='utf-8')
-    with pytest.raises(SyntaxError, match="'lib' must be imported as itself, not as an alias"):
+    with pytest.raises(LibImportAliasError):
         PyneLoader(path.stem, str(path)).source_to_code(__test_helper_script, str(path))

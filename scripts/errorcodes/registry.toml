@@ -4,9 +4,10 @@
 # one from its pinned PyneCore, so every code of the Pyne chain is in exactly
 # one of the two.
 #
-# `python codes/generate.py` writes the Rust side (rust/crates/pynecore-codes)
-# and one English docs page per code (docs/reference/codes). `--check` fails
-# when a generated file is stale.
+# `python3.14 scripts/errorcodes/generate.py` writes the Python module
+# (src/pynecore/errorcodes.py), the Rust side (rust/crates/pynecore-codes) and
+# one English docs page per code (docs/reference/codes). `--check` fails when a
+# generated file is stale.
 #
 # One table per code. The code is a domain letter and four digits:
 #   R runtime, P Pyne code rules, E Pyne Edge profile,
@@ -605,6 +606,257 @@ An error of PyneAOT, not of the script. Please report it with the script and
 the data attached.
 """
 
+# The rules of Pyne code: the transform rejects a module that breaks one,
+# before the module runs. Each of these is a SyntaxError that points at the
+# place in the source.
+
+[P0001]
+name = "reserved_name_char"
+severity = "error"
+title = "Identifier with PyneCore's reserved character"
+message = "`{name}` contains `·`, which is reserved for PyneCore's internal names in Pyne code; rename the identifier."
+python = "SyntaxError"
+explanation = """
+PyneCore names the state it adds to a script with a `·` in the name, so no
+identifier of Pyne code may hold one. Python folds a few other characters
+into `·` (NFKC normalization), so an identifier spelled with them is rejected
+too.
+"""
+
+[P0002]
+name = "pipeline_name"
+severity = "error"
+title = "Identifier reserved by the transform"
+message = "`{name}` is a name PyneCore's transform generates, reserved in Pyne code; rename the identifier."
+python = "SyntaxError"
+explanation = """
+The transform adds functions and variables of its own to every script. An
+identifier of the script spelled like one of them would be overwritten by
+it, so the name is reserved.
+"""
+
+[P0003]
+name = "script_decorator_not_on_main"
+severity = "error"
+title = "Script decorator not on main"
+message = "The script decorator belongs on `main`, not on `{function}`."
+python = "SyntaxError"
+explanation = """
+A script has one entry point, the function the runner calls: `main`. The
+`@script.indicator`, `@script.strategy` or `@script.library` decorator marks
+it, so it stands on `main` and on no other function.
+"""
+
+[P0004]
+name = "duplicate_script_decorator"
+severity = "error"
+title = "Second script decorator"
+message = "A module has one script decorator, and `main` is defined twice."
+python = "SyntaxError"
+explanation = """
+A module has one entry point. Keep one decorated `main` and remove the other.
+"""
+
+[P0005]
+name = "na_bool_not_literal"
+severity = "error"
+title = "na_bool is not a literal"
+message = "`na_bool` must be a literal `True` or `False`: the script's bool semantics are fixed before its module body runs."
+python = "SyntaxError"
+explanation = """
+`na_bool` decides how the script's bools are compiled, so PyneCore reads it
+from the source before the module runs. Write it as `True` or `False`, not as
+a name or an expression.
+"""
+
+[P0006]
+name = "series_outside_function"
+severity = "error"
+title = "Series variable outside a function"
+message = "A `Series` variable must be declared inside a function."
+python = "SyntaxError"
+explanation = """
+A series keeps its history per call of the function that declares it. At
+module level there is no such call, so declare the series inside `main` or
+another function.
+"""
+
+[P0007]
+name = "persistent_outside_function"
+severity = "error"
+title = "Persistent variable outside a function"
+message = "A `Persistent` variable must be declared inside a function."
+python = "SyntaxError"
+explanation = """
+A persistent variable keeps its value from bar to bar per call of the
+function that declares it, as Pine's `var` does. Declare it inside `main` or
+another function.
+"""
+
+[P0008]
+name = "stateful_call_at_module_level"
+severity = "error"
+title = "Stateful call at module level"
+message = "A function that keeps state from bar to bar cannot be called at module level."
+python = "SyntaxError"
+explanation = """
+A `ta.*` call, or any function that keeps a series or a persistent, stores
+its state per call site and per bar. The module body runs once, not on every
+bar, so call it from `main` or a function `main` calls.
+"""
+
+[P0009]
+name = "input_not_main_default"
+severity = "error"
+title = "Input outside main's parameters"
+message = "`{function}()` is not a `main()` parameter default; inputs must be declared as `main()` parameter defaults: `def main(length=input.int(14, ...))`."
+python = "SyntaxError"
+explanation = """
+PyneCore reads a script's inputs from the defaults of `main`'s parameters, so
+that a run can set them before the script starts. An input called anywhere
+else cannot be set.
+"""
+
+[P0010]
+name = "lib_import_alias"
+severity = "error"
+title = "lib imported under an alias"
+message = "`lib` must be imported as itself, not as an alias."
+python = "SyntaxError"
+explanation = """
+The transform recognizes the Pine builtins by the `lib.` prefix. Write
+`from pynecore import lib`.
+"""
+
+[P0011]
+name = "wildcard_import_without_all"
+severity = "error"
+title = "Wildcard import of a module without __all__"
+message = "Cannot use a wildcard import: the module `{module}` has no `__all__` defined."
+python = "SyntaxError"
+explanation = """
+A wildcard import brings in exactly the names of the module's `__all__`.
+Without one, import the names you use one by one.
+"""
+
+[P0012]
+name = "unknown_lib_attribute"
+severity = "error"
+title = "Unknown lib attribute"
+message = "`{module}` has no attribute `{name}`."
+python = "SyntaxError"
+explanation = """
+The name is not part of this module of `pynecore.lib`. Check its spelling.
+If it is a new `pynecore.lib` name, the module property registry is stale:
+regenerate `module_properties.json` with `scripts/module_property_collector.py`.
+"""
+
+[P0013]
+name = "module_state_modified"
+severity = "error"
+title = "Module-level object modified inside a function"
+message = "`{name}` {how} inside a function: an object created outside a function cannot be modified inside one."
+python = "SyntaxError"
+explanation = """
+Module-level state is not restored when a bar is re-executed, so a change
+made to it on one execution of a bar would stay when the bar runs again.
+Declare the value as `Persistent` or `IBPersistent` inside the function
+instead.
+"""
+
+[P0014]
+name = "plot_call_conditional"
+severity = "error"
+title = "Plot called conditionally"
+message = "`{function}()` must be called unconditionally in the direct body of module-level `main`, before any possible early return."
+python = "SyntaxError"
+explanation = """
+A plot is one series of the script's output, and its place in the output is
+fixed by its call. A call inside a branch, a loop, another function or after
+an early return would leave the series without a value on some bars. Plot
+`na` instead where nothing should be drawn.
+"""
+
+[P0015]
+name = "plot_as_value"
+severity = "error"
+title = "Plot used as a value"
+message = "`{function}()` cannot be passed or stored as a function value; use a direct call or a single static alias so its scope can be checked."
+python = "SyntaxError"
+explanation = """
+PyneCore checks where each plot is called. A plot function passed around as
+a value could be called from anywhere, so call it directly.
+"""
+
+[P0016]
+name = "stateful_method_kind"
+severity = "error"
+title = "Stateful method of the wrong kind"
+message = "The method `{method}` keeps state (a `ta` call, a series or a persistent), which only a plain or a `@staticmethod` method can do."
+python = "SyntaxError"
+explanation = """
+A method's state lives with the call site of the method, which PyneCore can
+tie only to a plain method or a static method. Remove the other decorator,
+or move the stateful code into a function.
+"""
+
+[P0017]
+name = "unpacked_receiver"
+severity = "error"
+title = "Method receiver from an unpacked argument"
+message = "`{function}()` uses variables of `main()`, so its receiver cannot come from an unpacked argument; pass the receiver explicitly: `{function}(receiver, *args)`."
+python = "SyntaxError"
+explanation = """
+A method that reads variables of `main()` gets them passed in after its
+receiver, so PyneCore has to see which argument the receiver is.
+"""
+
+[P0018]
+name = "export_captures_global"
+severity = "error"
+title = "Export captures a library global"
+message = "The exported function `{function}` cannot capture the non-constant library global `{name}`."
+python = "SyntaxError"
+explanation = """
+An exported function runs in the importing script, where the library's
+module-level variables do not change with the library's bars. Pass the value
+in as a parameter, or make the global a constant.
+"""
+
+[P0019]
+name = "strategy_state_in_security"
+severity = "error"
+title = "Strategy state in a security expression"
+message = "`strategy.{name}` cannot be used as the expression argument of `{function}()`: strategy state is only available in the chart context, not in a security context."
+python = "SyntaxError"
+explanation = """
+A `request.security` expression runs on another symbol or timeframe, where
+the chart's strategy has no position, orders or trades.
+"""
+
+[P0020]
+name = "drawing_in_security"
+severity = "error"
+title = "Drawing in a security expression"
+message = "`{name}()` cannot be used in the expression of `{function}()`."
+python = "SyntaxError"
+explanation = """
+A drawing belongs to the chart. A `request.security` expression runs in
+another context, so it cannot create or change one.
+"""
+
+[P0021]
+name = "too_many_function_requests"
+severity = "error"
+title = "Too many requests in one function"
+message = "The function `{function}` reaches {count} `request.security` calls through the functions it calls; a function can use at most {limit} request values."
+python = "SyntaxError"
+explanation = """
+Each `request.security` call a function reaches, directly or through the
+functions it calls, takes one request value of that function. Split the
+work across functions, or request a tuple of values in one call.
+"""
+
 # The Pyne Edge profile: what a Pyne Edge script may not contain.
 
 [E0001]
@@ -612,6 +864,7 @@ name = "edge_syntax"
 severity = "error"
 title = "Syntax outside the Edge profile"
 message = "{construct} is not allowed in the Pyne Edge profile."
+python = "SyntaxError"
 explanation = """
 The Pyne Edge profile is the subset of Python that is enough for everything a
 Pine Script program needs: every Pine script can be written in it. This
@@ -623,6 +876,7 @@ name = "edge_python_builtin"
 severity = "error"
 title = "Python built-in instead of the Pine one"
 message = "`{name}` is Python's built-in here, which is not allowed in the Pyne Edge profile. For {meaning}, import it: `from pynecore.lib import {name}`."
+python = "SyntaxError"
 explanation = """
 Without the import, the name means Python's own built-in, not the Pine
 function of the same name.
@@ -633,6 +887,7 @@ name = "edge_lambda"
 severity = "error"
 title = "lambda outside a field default"
 message = "`lambda` is allowed only as a `field(default_factory=...)` default of a field."
+python = "SyntaxError"
 explanation = """
 The Pyne Edge profile has no function values. The one `lambda` it takes
 builds a field's default value.
@@ -643,6 +898,7 @@ name = "edge_assert_message"
 severity = "error"
 title = "assert message that is not a string literal"
 message = "An `assert` message must be a string literal in the Pyne Edge profile."
+python = "SyntaxError"
 explanation = """
 The message is fixed text, as Pine's own messages are: the profile has no use
 for one built while the script runs.
@@ -653,6 +909,7 @@ name = "edge_subscript_assignment"
 severity = "error"
 title = "Assignment to a subscript"
 message = "Assigning to a subscript is not allowed in the Pyne Edge profile; use `array.set()`."
+python = "SyntaxError"
 explanation = """
 An array element is set with `array.set(id, index, value)`.
 """
@@ -662,6 +919,7 @@ name = "edge_import"
 severity = "error"
 title = "Import outside the Edge profile"
 message = "{import} is not allowed in the Pyne Edge profile: only the PyneCore API and `lib.*` libraries can be imported."
+python = "SyntaxError"
 explanation = """
 Relative imports, star imports and modules other than the PyneCore API and
 the user's `lib.*` libraries are outside the profile.
@@ -672,6 +930,7 @@ name = "edge_decorator"
 severity = "error"
 title = "Decorator outside the Edge profile"
 message = "Only `@script.indicator/strategy/library(...)`, `@method` and `@export` can decorate a function in the Pyne Edge profile."
+python = "SyntaxError"
 explanation = """
 Other decorators change a function while the script runs, which nothing in
 Pine needs.
@@ -682,6 +941,7 @@ name = "edge_class"
 severity = "error"
 title = "Class outside the Edge profile"
 message = "{detail} A class in the Pyne Edge profile is a plain `@udt` or `@dataclass` field list with methods."
+python = "SyntaxError"
 explanation = """
 A class has exactly one `@udt` or `@dataclass` decorator, no base classes or
 keywords, and a body of annotated fields and undecorated methods that take
@@ -693,6 +953,7 @@ name = "edge_call"
 severity = "error"
 title = "Call outside the Edge profile"
 message = "`{name}` cannot be called in the Pyne Edge profile: only defined functions, imported names and {builtins} can."
+python = "SyntaxError"
 explanation = """
 A call goes to a function of the script, an imported name, or one of the few
 Python built-ins the profile keeps.
@@ -703,6 +964,628 @@ name = "edge_attribute_assignment"
 severity = "error"
 title = "Attribute set on a function or module"
 message = "Assigning an attribute on `{root}` is not allowed in the Pyne Edge profile: functions and modules are not objects."
+python = "SyntaxError"
 explanation = """
 Only objects of user-defined types have fields to set.
+"""
+
+[E0011]
+name = "edge_reserved_name"
+severity = "error"
+title = "Double-underscore name"
+message = "The name `{name}` is not allowed in the Pyne Edge profile: double-underscore names belong to PyneCore's transform."
+python = "SyntaxError"
+explanation = """
+PyneCore's transform names its own functions and variables with double
+underscores, and a Pine script has no such names. Rename the identifier.
+"""
+
+# The Pyne Edge profile's typing: a value of an Edge script the type
+# analysis cannot type the way Pine does.
+
+[E0012]
+name = "type_unknown_name"
+severity = "error"
+title = "Name without a known type"
+message = "`{name}` has no known type."
+python = "SyntaxError"
+explanation = """
+The Pyne Edge profile types every value the way Pine does. The value this name
+holds could not be typed; give it a value of a known type, or annotate it.
+"""
+
+[E0013]
+name = "type_function_value"
+severity = "error"
+title = "Function used as a value"
+message = "`{name}` is a function, not a value."
+python = "SyntaxError"
+explanation = """
+Pine has no function values: a function is called where it is used, never
+stored or passed.
+"""
+
+[E0014]
+name = "type_unknown_call"
+severity = "error"
+title = "Call without a known type"
+message = "The call to `{callee}` has no known type."
+python = "SyntaxError"
+explanation = """
+What the called function returns could not be typed. Annotate its return, or
+the parameters its result depends on.
+"""
+
+[E0015]
+name = "type_unknown_callee_call"
+severity = "error"
+title = "Call of an unknown callee"
+message = "This call has no known type."
+python = "SyntaxError"
+explanation = """
+The called expression is not a name, so what it returns cannot be typed. Call
+a defined function or a lib name.
+"""
+
+[E0016]
+name = "type_unknown_method_call"
+severity = "error"
+title = "Method call without a known type"
+message = "The call to the method `{method}` has no known type."
+python = "SyntaxError"
+explanation = """
+What the method returns could not be typed. Annotate its return, or its
+receiver's type.
+"""
+
+[E0017]
+name = "type_unknown_lib_call"
+severity = "error"
+title = "Lib call without a known type here"
+message = "`{name}` has no known type here."
+python = "SyntaxError"
+explanation = """
+The lib function has no overload for the argument types it gets here. Give its
+arguments known types.
+"""
+
+[E0018]
+name = "type_not_lib_name"
+severity = "error"
+title = "Unknown lib name"
+message = "`{name}` is not a lib name."
+python = "SyntaxError"
+explanation = """
+The name is not part of `pynecore.lib`. Check its spelling.
+"""
+
+[E0019]
+name = "type_unknown_field"
+severity = "error"
+title = "Field without a known type"
+message = "`.{field}` has no known type on `{type}`."
+python = "SyntaxError"
+explanation = """
+The field could not be typed on this value. Declare the field on a `@udt`
+class.
+"""
+
+[E0020]
+name = "type_unknown_index"
+severity = "error"
+title = "Index without a known type"
+message = "Indexing `{type}` has no known type."
+python = "SyntaxError"
+explanation = """
+Only a series, a tuple, or an array read through `array.get()` can be indexed
+with a known result type.
+"""
+
+[E0021]
+name = "type_unknown_operation"
+severity = "error"
+title = "Operation without a known type"
+message = "`{expression}` has no known type over {operands}."
+python = "SyntaxError"
+explanation = """
+The operation does not take these operand types together. Give the operands
+types the operation accepts.
+"""
+
+[E0022]
+name = "type_not_pine_expression"
+severity = "error"
+title = "Expression outside Pine"
+message = "`{expression}` is not a Pine expression."
+python = "SyntaxError"
+explanation = """
+The expression has no Pine counterpart. Write it with Pine constructs only.
+"""
+
+[E0023]
+name = "type_conflict"
+severity = "error"
+title = "Two types for one value"
+message = "{what} gets both `{first}` and `{second}`, which are different types."
+python = "SyntaxError"
+explanation = """
+A Pine variable has one type. Make every branch, or every assignment, give it
+the same type.
+"""
+
+[E0024]
+name = "type_starred_target"
+severity = "error"
+title = "Starred unpacking target"
+message = "A starred target takes an unknown number of elements, which Pine has no form for."
+python = "SyntaxError"
+explanation = """
+Unpack exactly as many names as the tuple has elements.
+"""
+
+[E0025]
+name = "type_unpack_count"
+severity = "error"
+title = "Unpacking count mismatch"
+message = "`{type}` has {count} elements, and this unpacks {names}."
+python = "SyntaxError"
+explanation = """
+Unpack as many names as the tuple has elements.
+"""
+
+[E0026]
+name = "type_pin_per_context"
+severity = "error"
+title = "Overload differs per call context"
+message = "The overload chosen for this call differs per call context: {pins}."
+python = "SyntaxError"
+explanation = """
+The same call site would take a different overload depending on where its
+function is called from. Annotate the parameters so every call site agrees.
+"""
+
+[E0027]
+name = "type_widen_per_context"
+severity = "error"
+title = "Conversion differs per call context"
+message = "The implicit conversion of a value differs per call context, and not every instance can be given its own."
+python = "SyntaxError"
+explanation = """
+Annotate the parameters so every call site passes the same types.
+"""
+
+[E0028]
+name = "type_operand_unknown"
+severity = "error"
+title = "Collection operand without a known type"
+message = "`{type}` takes an operand whose type is not known here, so what it holds afterwards is not known either."
+python = "SyntaxError"
+explanation = """
+Give the operand a known type.
+"""
+
+[E0029]
+name = "type_operand_mismatch"
+severity = "error"
+title = "Collection operand of another element type"
+message = "`{type}` cannot take `{other}`: the elements are different types."
+python = "SyntaxError"
+explanation = """
+Pass a collection of the same element type.
+"""
+
+[E0030]
+name = "type_rebound_defined"
+severity = "error"
+title = "Function name assigned"
+message = "`{name}` is assigned as well as defined, so what it calls is unknown."
+python = "SyntaxError"
+explanation = """
+A call is typed from the function its name defines. Call it under a name
+nothing assigns to.
+"""
+
+[E0031]
+name = "type_imported_twice"
+severity = "error"
+title = "Name imported twice"
+message = "`{name}` is imported more than once, so what it calls is unknown."
+python = "SyntaxError"
+explanation = """
+Import the name once, under a name nothing else binds.
+"""
+
+[E0032]
+name = "type_rebound_imported"
+severity = "error"
+title = "Imported name assigned"
+message = "`{name}` is assigned as well as imported, so what it calls is unknown."
+python = "SyntaxError"
+explanation = """
+Call the import under a name nothing assigns to.
+"""
+
+[E0033]
+name = "type_recursion"
+severity = "error"
+title = "Re-entrant call"
+message = "`{function}` is re-entrant, so its result type is unknown."
+python = "SyntaxError"
+explanation = """
+A recursive call is typed from the function's annotations. Annotate the
+parameters and the return of the recursive function.
+"""
+
+[E0034]
+name = "type_context_limit"
+severity = "error"
+title = "Too many call contexts"
+message = "`{function}` hit the per-module context limit."
+python = "SyntaxError"
+explanation = """
+The function is called with too many distinct argument types. Call it with
+fewer, or annotate its parameters.
+"""
+
+[E0035]
+name = "type_unannotated_import"
+severity = "error"
+title = "Import without annotations"
+message = "`{name}` is imported from `{source}`, where its parameters carry no annotations, so what it returns is unknown."
+python = "SyntaxError"
+explanation = """
+An imported function is typed from its annotations. Annotate its parameters in
+the module it comes from.
+"""
+
+[E0036]
+name = "type_suppressed_import"
+severity = "error"
+title = "Import of a reported module"
+message = "`{module}` is reported, and no type it publishes may drive a dispatch here: {reason}."
+python = "SyntaxError"
+explanation = """
+The imported module has errors of its own. Fix that module first.
+"""
+
+[E0037]
+name = "type_import_cycle"
+severity = "error"
+title = "Import cycle"
+message = "`{module}` imports this module back, so its signatures are not available yet."
+python = "SyntaxError"
+explanation = """
+Break the import cycle between the two modules.
+"""
+
+[E0038]
+name = "type_not_iterable"
+severity = "error"
+title = "For loop over a non-iterable"
+message = "`{expression}` is a `{type}`; a for loop iterates a range or an array."
+python = "SyntaxError"
+explanation = """
+Loop over `range(...)` or an array.
+"""
+
+[E0039]
+name = "type_index_not_pine"
+severity = "error"
+title = "Indexing outside Pine"
+message = "Indexing `{type}` is not Pine."
+python = "SyntaxError"
+explanation = """
+Read elements with `array.get`, `matrix.get` or `map.get`.
+"""
+
+[E0040]
+name = "type_not_series"
+severity = "error"
+title = "History of a plain value"
+message = "`{expression}` is a plain `{type}`, not a series."
+python = "SyntaxError"
+explanation = """
+Only a series keeps its history. Declare the variable as a `Series` to read
+its past values.
+"""
+
+[E0041]
+name = "type_declared_mismatch"
+severity = "error"
+title = "Assignment of another type"
+message = "`{name}` is declared `{declared}` and assigned `{assigned}`."
+python = "SyntaxError"
+explanation = """
+Declare the variable with the type it is assigned, or assign the declared
+type.
+"""
+
+[E0042]
+name = "type_field_assign_mismatch"
+severity = "error"
+title = "Field assigned another type"
+message = "`{field}` holds `{declared}` and is assigned `{assigned}`."
+python = "SyntaxError"
+explanation = """
+Assign a value of the field's type.
+"""
+
+[E0043]
+name = "type_unknown_callee"
+severity = "error"
+title = "Unknown function"
+message = "`{name}` is not a function this module defines or imports, nor a lib name."
+python = "SyntaxError"
+explanation = """
+Define the function, import it, or call a lib name.
+"""
+
+[E0044]
+name = "type_callee_not_name"
+severity = "error"
+title = "Callee is not a name"
+message = "The callee is not a name."
+python = "SyntaxError"
+explanation = """
+Call a defined function or a lib name.
+"""
+
+[E0045]
+name = "type_unknown_class_field"
+severity = "error"
+title = "Field of a value of unknown class"
+message = "The class of `{value}` is not known here, so its field `{field}` has no type."
+python = "SyntaxError"
+explanation = """
+Annotate the value with the type it holds.
+"""
+
+[E0046]
+name = "type_unknown_class_method"
+severity = "error"
+title = "Method of a value of unknown class"
+message = "The class of `{value}` is not known here, so its method `{method}` has no type."
+python = "SyntaxError"
+explanation = """
+Annotate the receiver with the type it holds.
+"""
+
+[E0047]
+name = "type_unknown_class_store"
+severity = "error"
+title = "Field set on a value of unknown class"
+message = "The class of `{value}` is not known here, so its field `{field}` cannot be checked."
+python = "SyntaxError"
+explanation = """
+Annotate the value with the type it holds.
+"""
+
+[E0048]
+name = "type_no_field"
+severity = "error"
+title = "Unknown field"
+message = "`{owner}` has no field `{field}`."
+python = "SyntaxError"
+explanation = """
+Declare the field on the class, or use a field it has.
+"""
+
+[E0049]
+name = "type_no_field_to_assign"
+severity = "error"
+title = "Field set on a value without fields"
+message = "A `{type}` has no field `{field}` to assign."
+python = "SyntaxError"
+explanation = """
+Only objects of a `@udt` class have fields to set.
+"""
+
+[E0050]
+name = "type_loop_counter_field"
+severity = "error"
+title = "Unknown loop counter field"
+message = "The loop counter has no field `{field}`."
+python = "SyntaxError"
+explanation = """
+Read `value` or `entering`, or call `step` or `enter`.
+"""
+
+[E0051]
+name = "type_lib_namespace_call"
+severity = "error"
+title = "Lib namespace called"
+message = "`{name}` is a lib namespace, not a function."
+python = "SyntaxError"
+explanation = """
+Call a function in the namespace.
+"""
+
+[E0052]
+name = "type_lib_value_call"
+severity = "error"
+title = "Lib value called"
+message = "`{name}` is a lib value, not a function."
+python = "SyntaxError"
+explanation = """
+Read the value without calling it.
+"""
+
+[E0053]
+name = "type_method_not_found"
+severity = "error"
+title = "Unknown method"
+message = "`{method}` is not a method of `{type}` here."
+python = "SyntaxError"
+explanation = """
+Declare the method on the receiver's class, or call a method its type has.
+"""
+
+[E0054]
+name = "type_method_not_exported"
+severity = "error"
+title = "Method not reachable by name"
+message = "`{method}` is declared on `{type}`, but no export the runtime searches by name holds it."
+python = "SyntaxError"
+explanation = """
+Pass the method itself: `method_call(method, receiver, ...)`.
+"""
+
+[E0055]
+name = "type_loop_bounds_unknown"
+severity = "error"
+title = "Loop bounds without a known type"
+message = "The bounds of `{expression}` are not known here, so its counter has no type."
+python = "SyntaxError"
+explanation = """
+Give the loop bounds known numeric types.
+"""
+
+[E0056]
+name = "call_bound_not_number"
+severity = "error"
+title = "Bound is not a number"
+message = "`{function}` takes a number for a bound, `{type}` passed."
+python = "SyntaxError"
+explanation = """
+Pass `int` or `float` bounds.
+"""
+
+[E0057]
+name = "loop_step_arity"
+severity = "error"
+title = "step() arity"
+message = "`step` takes 1 argument, {count} passed."
+python = "SyntaxError"
+explanation = """
+Pass the bound: `step(to)`.
+"""
+
+[E0058]
+name = "loop_enter_arity"
+severity = "error"
+title = "enter() arity"
+message = "`enter` takes 0 or 1 argument(s), {count} passed."
+python = "SyntaxError"
+explanation = """
+Pass the step: `enter(by)`.
+"""
+
+[E0059]
+name = "method_call_shape"
+severity = "error"
+title = "method_call() arguments"
+message = "`method_call` takes a method and a receiver."
+python = "SyntaxError"
+explanation = """
+Spell it `method_call(method, receiver, ...)`.
+"""
+
+[E0060]
+name = "call_argument_count"
+severity = "error"
+title = "Wrong number of arguments"
+message = "`{function}` does not take {count} argument(s)."
+python = "SyntaxError"
+explanation = """
+Call the function the way it is declared.
+"""
+
+[E0061]
+name = "call_too_few_arguments"
+severity = "error"
+title = "Too few arguments"
+message = "`{function}` does not take {count} argument(s) (at least {least} needed)."
+python = "SyntaxError"
+explanation = """
+Pass every argument the function needs.
+"""
+
+[E0062]
+name = "call_positional_count"
+severity = "error"
+title = "Wrong number of positional arguments"
+message = "`{function}` takes {positional} positional argument(s), {count} passed."
+python = "SyntaxError"
+explanation = """
+Call the function the way it is declared.
+"""
+
+[E0063]
+name = "call_unknown_parameter"
+severity = "error"
+title = "Unknown parameter"
+message = "`{function}` has no parameter `{parameter}`."
+python = "SyntaxError"
+explanation = """
+Pass only the parameters the function declares.
+"""
+
+[E0064]
+name = "call_argument_type"
+severity = "error"
+title = "Argument of another type"
+message = "`{function}` takes `{declared}` for `{parameter}`, `{passed}` passed."
+python = "SyntaxError"
+explanation = """
+Pass a value of the declared type.
+"""
+
+[E0065]
+name = "call_no_overload"
+severity = "error"
+title = "No matching overload"
+message = "No overload of `{function}` takes these arguments."
+python = "SyntaxError"
+explanation = """
+Call it with argument types one of its overloads declares.
+"""
+
+[E0066]
+name = "call_argument_twice"
+severity = "error"
+title = "Argument passed twice"
+message = "`{parameter}` is passed to `{function}` twice."
+python = "SyntaxError"
+explanation = """
+Pass each argument once.
+"""
+
+[E0067]
+name = "call_missing_argument"
+severity = "error"
+title = "Missing argument"
+message = "`{function}` needs an argument for `{parameter}`."
+python = "SyntaxError"
+explanation = """
+Pass every parameter that has no default.
+"""
+
+[E0068]
+name = "constructor_field_count"
+severity = "error"
+title = "Wrong number of constructor arguments"
+message = "`{type}` has {fields} field(s), {count} argument(s) passed."
+python = "SyntaxError"
+explanation = """
+Pass at most one argument per field.
+"""
+
+[E0069]
+name = "constructor_missing_field"
+severity = "error"
+title = "Missing field value"
+message = "`{type}` needs a value for `{field}`."
+python = "SyntaxError"
+explanation = """
+Pass every field that has no default.
+"""
+
+[E0070]
+name = "constructor_field_type"
+severity = "error"
+title = "Field value of another type"
+message = "`{field}` holds `{declared}`, `{passed}` passed."
+python = "SyntaxError"
+explanation = """
+Pass a value of the field's type.
 """

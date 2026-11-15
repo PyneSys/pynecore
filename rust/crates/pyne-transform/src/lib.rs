@@ -31,6 +31,7 @@ use std::fmt;
 
 pub use pyne_ast::Unsupported;
 use pyne_ast::{Ast, NodeId};
+pub use pynecore_codes::Raised;
 use slot_layout::ModuleLayout;
 
 /// Why a native step did not hand back a tree.
@@ -38,9 +39,10 @@ use slot_layout::ModuleLayout;
 pub enum Error {
     /// A construct the port does not cover: the Python step runs instead
     Unsupported(String),
-    /// The module is invalid where the Python step raises (a `SyntaxError` on
-    /// a plot call outside the entry, a wildcard import without `__all__`, ...)
-    Rejected(String),
+    /// The module breaks a rule of Pyne code where the Python step raises its
+    /// coded `SyntaxError` (a `P` code: a plot call outside the entry, a wildcard
+    /// import without `__all__`, ...)
+    Rejected(Raised),
 }
 
 impl From<Unsupported> for Error {
@@ -53,7 +55,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Unsupported(message) => write!(f, "unsupported: {message}"),
-            Error::Rejected(message) => write!(f, "rejected: {message}"),
+            Error::Rejected(raised) => {
+                write!(f, "rejected: {}: {}", raised.code.code, raised.message())
+            }
         }
     }
 }

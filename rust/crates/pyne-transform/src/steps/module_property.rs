@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use pyne_ast::walk::{Transformer, Visited, generic_visit, walk};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId, Value};
 
-use crate::{Context, Error, Host};
+use crate::{Context, Error, Host, Raised};
 
 struct ModuleProperty<'h> {
     host: &'h dyn Host,
@@ -110,11 +110,9 @@ impl ModuleProperty<'_> {
             // A submodule reference, or an internal name: plain attribute access
             id
         } else {
-            let line = ast[id].loc.lineno.map_or_else(|| "None".to_string(), |l| l.to_string());
-            return Err(Error::Rejected(format!(
-                "unknown attribute '{name}' on module '{module_path}' (line {line}); if this \
-                 is a new pynecore.lib name, regenerate module_properties.json with \
-                 scripts/module_property_collector.py"
+            return Err(Error::Rejected(Raised::new(
+                &pynecore_codes::UNKNOWN_LIB_ATTRIBUTE,
+                [module_path.to_string(), name.to_string()],
             )));
         };
         ast.set_extra(result, "_processed", Value::Bool(true));

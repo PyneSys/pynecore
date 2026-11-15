@@ -1,6 +1,7 @@
 import ast
 from typing import Dict, Set, List, cast
 
+from ..errorcodes import LibImportAliasError, WildcardImportWithoutAllError
 from . import ast_walk
 from .lib_registry import lib_star_exports
 
@@ -37,6 +38,8 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
     """
 
     def __init__(self):
+        #: The source path of the module, for a rejection's location
+        self._module_file = '<script>'
         # Track import mappings: imported_name -> full_path
         self.import_map: Dict[str, List[str]] = {}
         # Track which names to replace with lib.xxx
@@ -97,16 +100,21 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
         """
         return set(lib_star_exports().get(module, ()))
 
-    def _handle_wildcard_import(self, module: str) -> None:
-        """Process a wildcard import by recording all names from module's __all__."""
+    def _handle_wildcard_import(self, module: str, node: ast.ImportFrom) -> None:
+        """Process a wildcard import by recording all names from module's __all__.
+
+        :param module: The module the import names
+        :param node: The import statement, for a rejection's location
+        :raises WildcardImportWithoutAllError: If the module has no ``__all__``
+        """
         # Get the exposed names from the module
         exposed = self._get_module_all(module)
 
         if not exposed:
             # No __all__ found, this is probably an error
-            raise SyntaxError(
-                f"Cannot use wildcard import: module {module} has no __all__ defined"
-            )
+            raise WildcardImportWithoutAllError(
+                module=module,
+                location=(self._module_file, node.lineno, node.col_offset + 1, None))
 
         self.wildcard_imports[module] = exposed
 
@@ -132,7 +140,7 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
         # Handle wildcard imports
         for alias in node.names:
             if alias.name == '*':
-                self._handle_wildcard_import(module)
+                self._handle_wildcard_import(module, node)
                 return
 
         # Handle regular imports
@@ -168,6 +176,7 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         """Handle module level transformations"""
+        self._module_file = getattr(node, '_module_file_path', '<script>')
         # First collect all imports
         has_lib_import = False
         for stmt in node.body:
@@ -176,7 +185,7 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
                     has_lib_import = True
 
             if isinstance(stmt, (ast.ImportFrom, ast.Import)):
-                self._validate_import(stmt)
+                self._validate_import(stmt, self._module_file)
                 if isinstance(stmt, ast.ImportFrom):
                     self._handle_import_from(stmt)
                 else:
@@ -277,14 +286,19 @@ class ImportNormalizerTransformer(ast_walk.NodeTransformer):
         return node
 
     @staticmethod
-    def _validate_import(node: ast.ImportFrom | ast.Import) -> None:
-        """Validate import statements for unsupported patterns."""
+    def _validate_import(node: ast.ImportFrom | ast.Import, path: str) -> None:
+        """Validate import statements for unsupported patterns.
+
+        :param node: The import statement
+        :param path: The module's source path, for a rejection's location
+        :raises LibImportAliasError: If ``lib`` is imported under an alias
+        """
         if isinstance(node, ast.ImportFrom):
             if node.module == 'pynecore':
                 for alias in node.names:
                     if alias.name == 'lib' and alias.asname:
-                        raise SyntaxError(
-                            "'lib' must be imported as itself, not as an alias")
+                        raise LibImportAliasError(
+                            location=(path, node.lineno, node.col_offset + 1, None))
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         """Transform variable references"""

@@ -1,6 +1,7 @@
 """Validate handwritten Pyne before security lowering in both language profiles."""
 import pytest
 
+from pynecore.errorcodes import DrawingInSecurityError
 from pynecore.core.import_hook import PyneLoader
 
 
@@ -29,7 +30,7 @@ def _load(tmp_path, source, mode=''):
 ])
 @pytest.mark.parametrize('request_name', ['security', 'security_lower_tf'])
 def __test_reject_drawing_dependencies__(tmp_path, expression, setup, mode, request_name):
-    with pytest.raises(SyntaxError, match='label.new.*cannot be used'):
+    with pytest.raises(DrawingInSecurityError, match=r'`label.new\(\)`'):
         _load(tmp_path, '@script.indicator("Probe")\ndef main():\n' + setup
               + f'    x = request.{request_name}(syminfo.tickerid, "D", {expression})\n', mode)
 
@@ -71,7 +72,7 @@ def main():
     'label.copy(na(Label))', 'line.copy(na(Line))', 'box.copy(na(Box))',
 ])
 def __test_all_drawing_constructors_and_copies__(tmp_path, expression):
-    with pytest.raises(SyntaxError, match='cannot be used in the expression'):
+    with pytest.raises(DrawingInSecurityError):
         _load(tmp_path, '''
 from pynecore.lib import line, box, table, position, polyline, linefill, color
 from pynecore.types import Line, Box
@@ -90,7 +91,7 @@ def main():
 ''',
 ])
 def __test_methods_and_request_parameters__(tmp_path, body):
-    with pytest.raises(SyntaxError, match='cannot be used in the expression'):
+    with pytest.raises(DrawingInSecurityError):
         _load(tmp_path, 'from pynecore.core.pine_method import method_call\n'
               '@script.indicator("Probe")\ndef main():\n' + body)
 

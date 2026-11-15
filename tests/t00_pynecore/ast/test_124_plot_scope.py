@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from pynecore.errorcodes import PlotAsValueError, PlotCallConditionalError
 from pynecore.core.import_hook import _analyse_tree
 
 
@@ -21,7 +22,7 @@ def __test_helper_analyse(body: str, preamble: str = '') -> ast.Module:
     'fill(None, None)', 'lib.bgcolor(None)', 'lib.barcolor(None)', 'lib.alertcondition(True)',
 ])
 def __test_plot_family_rejects_conditional_declarations__(call):
-    with pytest.raises(SyntaxError, match='unconditionally') as info:
+    with pytest.raises(PlotCallConditionalError) as info:
         __test_helper_analyse('if bar_index >= 3:\n    '+call)
     assert info.value.filename == str(Path('/tmp/plot-scope-test.py').resolve())
     assert info.value.text.strip() == call
@@ -46,7 +47,7 @@ def __test_plot_family_rejects_conditional_declarations__(call):
     'for i in range(1):\n    if bar_index < 3:\n        return\nplot(close)',
 ])
 def __test_local_and_skipped_plot_calls_are_rejected__(body):
-    with pytest.raises(SyntaxError, match='unconditionally'):
+    with pytest.raises(PlotCallConditionalError):
         __test_helper_analyse(body)
 
 
@@ -58,7 +59,7 @@ def __test_local_and_skipped_plot_calls_are_rejected__(body):
     ('', 'draw = plot\nrender = draw\nif bar_index >= 3:\n    render(close)'),
 ])
 def __test_aliases_cannot_bypass_plot_scope__(preamble, body):
-    with pytest.raises(SyntaxError, match='unconditionally'):
+    with pytest.raises(PlotCallConditionalError):
         __test_helper_analyse(body, preamble)
 
 
@@ -70,7 +71,7 @@ def __test_aliases_cannot_bypass_plot_scope__(preamble, body):
     'draw = plot\ndraw = helper\ndraw(close)',
 ])
 def __test_plot_callbacks_and_dynamic_aliases_are_rejected__(body):
-    with pytest.raises(SyntaxError, match='function value'):
+    with pytest.raises(PlotAsValueError):
         __test_helper_analyse(body)
 
 
@@ -94,7 +95,7 @@ def __test_unconditional_declarations_and_non_plot_calls_are_accepted__(body, pr
 
 def __test_module_level_calls_and_function_defaults_are_rejected__():
     for preamble in ('plot(close)', 'def helper(value=plot(close)):\n    pass'):
-        with pytest.raises(SyntaxError, match='unconditionally'):
+        with pytest.raises(PlotCallConditionalError):
             __test_helper_analyse('plot(close)', preamble)
 
 
@@ -128,6 +129,6 @@ def __test_invalid_plot_is_rejected_before_runner_creates_output__(tmp_path, sym
     output = tmp_path / 'plot.csv'
     bars = [OHLCV(timestamp=1704067200000+i*300000, open=100, high=101,
                   low=99, close=100, volume=1) for i in range(6)]
-    with pytest.raises(SyntaxError, match='unconditionally'):
+    with pytest.raises(PlotCallConditionalError):
         ScriptRunner(script, iter(bars), syminfo, plot_path=output)
     assert not output.exists()

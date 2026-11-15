@@ -11,6 +11,7 @@ import copy
 
 import pytest
 
+from pynecore.errorcodes import UnknownLibAttributeError
 from pynecore.transformers.module_property import ModulePropertyTransformer
 
 
@@ -76,9 +77,9 @@ def __test_user_library_path_is_plain_read__():
 
 
 def __test_unknown_name_on_known_module_raises__():
-    with pytest.raises(SyntaxError, match="nosuchname"):
+    with pytest.raises(UnknownLibAttributeError, match="nosuchname"):
         _transform("x = lib.ta.nosuchname")
-    with pytest.raises(SyntaxError, match="currency__"):
+    with pytest.raises(UnknownLibAttributeError, match="currency__"):
         _transform("x = lib.syminfo.currency__")
 
 

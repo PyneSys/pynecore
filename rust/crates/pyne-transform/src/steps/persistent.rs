@@ -20,7 +20,7 @@ use pyne_ast::walk::{Transformer, Visited, copy_location, generic_visit};
 use pyne_ast::{Ast, Constant, ExprContext, Int, Kind, NodeId, UnaryOperator};
 
 use crate::slot_layout::{ModuleLayout, scope_for_function};
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 const PERSISTENT_TYPES: &[&str] = &["Persistent", "IBPersistent", "IBPersistentSeries"];
 const VARIP_TYPES: &[&str] = &["IBPersistent", "IBPersistentSeries"];
@@ -271,9 +271,10 @@ impl Persistent<'_> {
             return Ok(Visited::Node(id));
         };
         if self.current_scope.is_empty() {
-            return Err(Error::Rejected(
-                "Persistent variables must be declared inside a function".into(),
-            ));
+            return Err(Error::Rejected(Raised::new(
+                &pynecore_codes::PERSISTENT_OUTSIDE_FUNCTION,
+                [] as [String; 0],
+            )));
         }
 
         let scope = self.current_scope.clone();

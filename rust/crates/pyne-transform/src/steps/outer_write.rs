@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use pyne_ast::walk::{children, walk, walk_statements};
 use pyne_ast::{Ast, ExprContext, Kind, NodeId};
 
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 /// Methods of the Python containers a script can hold that write the receiver.
 const MUTATING_METHODS: [&str; 13] = [
@@ -318,11 +318,7 @@ fn first_argument(ast: &Ast, args: &[NodeId], keywords: &[NodeId]) -> Option<Nod
 }
 
 fn reject(name: &str, verb: &str) -> Error {
-    Error::Rejected(format!(
-        "'{name}' {verb} inside a function: an object created outside a function cannot be \
-         modified inside one. Module-level state is not restored when a bar is re-executed; \
-         declare the value as 'Persistent' or 'IBPersistent' inside the function instead."
-    ))
+    Error::Rejected(Raised::new(&pynecore_codes::MODULE_STATE_MODIFIED, [name, verb]))
 }
 
 pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, Error> {

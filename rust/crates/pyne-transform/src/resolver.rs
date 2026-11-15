@@ -28,7 +28,7 @@ use crate::pine_type_table::{
     CallInterface, DepRecord, ModuleInterface, PineTypeTable, TABLE_ATTR,
 };
 use crate::slot_layout::ModuleLayout;
-use crate::{ANALYSIS, Context, Error, Host, LOWERING, SourceRead, half, run_steps};
+use crate::{ANALYSIS, Context, Error, Host, LOWERING, Raised, SourceRead, half, run_steps};
 
 type R<T> = Result<T, Unsupported>;
 
@@ -757,7 +757,7 @@ pub fn script_bool_na(ast: &Ast, module: NodeId) -> Option<bool> {
         }
     }
     let Some(entry) = entry else { return Some(false) };
-    let Kind::Call { keywords, .. } = ast.kind(entry) else { return Some(false) };
+    let Kind::Call { func, args, keywords, .. } = ast.kind(entry) else { return Some(false) };
     for &keyword in keywords {
         let Kind::Keyword { arg, value } = ast.kind(keyword) else { continue };
         if arg.as_deref() != Some("na_bool") {
@@ -768,8 +768,32 @@ pub fn script_bool_na(ast: &Ast, module: NodeId) -> Option<bool> {
             _ => None,
         };
     }
-    Some(false)
+    // An unpacked argument may carry `na_bool` where the loader cannot read it
+    let unpacked = args.iter().any(|&arg| matches!(ast.kind(arg), Kind::Starred { .. }))
+        || keywords
+            .iter()
+            .any(|&keyword| matches!(ast.kind(keyword), Kind::Keyword { arg: None, .. }));
+    if unpacked {
+        return None;
+    }
+    let Kind::Attribute { attr, .. } = ast.kind(*func) else { return Some(false) };
+    let position = match attr.as_str() {
+        "indicator" => NA_BOOL_POSITION_INDICATOR,
+        "strategy" => NA_BOOL_POSITION_STRATEGY,
+        _ => NA_BOOL_POSITION_LIBRARY,
+    };
+    let Some(&value) = args.get(position) else { return Some(false) };
+    match ast.kind(value) {
+        Kind::Constant { value: Constant::Bool(value), .. } => Some(*value),
+        _ => None,
+    }
 }
+
+/// Position of `na_bool` among each script decorator's positional parameters
+/// (`_NA_BOOL_POSITION`).
+const NA_BOOL_POSITION_INDICATOR: usize = 17;
+const NA_BOOL_POSITION_STRATEGY: usize = 35;
+const NA_BOOL_POSITION_LIBRARY: usize = 3;
 
 /// The characters whose NFKC form holds the reserved separator `·`: it, U+0387 GREEK
 /// ANO TELEIA and U+013F / U+0140 LATIN LETTER L WITH MIDDLE DOT.
@@ -807,10 +831,7 @@ pub fn reject_reserved_names(ast: &Ast, module: NodeId, source: &str) -> Result<
     if let Some(name) =
         identifiers(ast, module).into_iter().find(|name| name.contains(RESERVED_SOURCES))
     {
-        return Err(Error::Rejected(format!(
-            "'{name}' contains '\u{b7}', which is reserved for PyneCore's internal names in \
-             Pyne code \u{2014} rename the identifier"
-        )));
+        return Err(Error::Rejected(Raised::new(&pynecore_codes::RESERVED_NAME_CHAR, [name])));
     }
     Ok(())
 }
@@ -824,10 +845,7 @@ pub fn reject_pipeline_names(ast: &Ast, module: NodeId) -> Result<(), Error> {
             return Err(Error::Unsupported(format!("the identifier {name:?}")));
         }
         if is_pipeline_name(&name) {
-            return Err(Error::Rejected(format!(
-                "'{name}' is a name PyneCore's transform generates, reserved in Pyne code \
-                 \u{2014} rename the identifier"
-            )));
+            return Err(Error::Rejected(Raised::new(&pynecore_codes::PIPELINE_NAME, [name])));
         }
     }
     Ok(())
@@ -971,6 +989,20 @@ mod tests {
         let none = Resolver::new(Mem { data: false }, options());
         assert_eq!(none.interface(LIB).unwrap(), None);
         assert!(read_static_interface(&none, PLAIN).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_positional_na_bool_is_read() {
+        let choice = |decorator: &str| {
+            let source =
+                format!("from pynecore.lib import script\n{decorator}\ndef main():\n    pass\n");
+            let (ast, module) = pyne_parse::parse_module(&source).unwrap();
+            script_bool_na(&ast, module)
+        };
+        assert_eq!(choice("@script.library('x', False, False, True)"), Some(true));
+        assert_eq!(choice("@script.library('x', False, False)"), Some(false));
+        assert_eq!(choice("@script.library('x', False, False, FLAG)"), None);
+        assert_eq!(choice("@script.library(*options)"), None);
     }
 
     #[test]

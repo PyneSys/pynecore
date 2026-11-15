@@ -1191,7 +1191,11 @@ impl<'t> CallInline<'t> {
             let target =
                 ast.add(Kind::Name { id: INLINE_SITES.to_string(), ctx: ExprContext::Store });
             let value = tuple(ast, std::mem::take(&mut self.sites));
-            let table = ast.add(Kind::Assign { targets: vec![target], value, type_comment: None });
+            // The position `fix_missing_locations` gives a module-level node
+            let table = ast.add_at(
+                Kind::Assign { targets: vec![target], value, type_comment: None },
+                Loc::new(1, 0, 1, 0),
+            );
             let Kind::Module { body, .. } = ast.kind_mut(module) else { unreachable!() };
             body.insert(position, table);
         }

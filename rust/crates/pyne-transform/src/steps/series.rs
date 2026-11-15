@@ -28,7 +28,7 @@ use crate::pine_type_rules::{
     OBJECT, TY_ATTR, UNKNOWN, get_ty, get_varying, is_array, is_map, is_matrix, stamp_lowering,
 };
 use crate::slot_layout::{ModuleLayout, scope_for_function};
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 /// `lib` no-ops that address a series buffer itself instead of its value, mapped to
 /// the buffer attribute they set. Only a statement-position call on a series NAME is
@@ -368,9 +368,10 @@ impl Series<'_> {
             return Ok(Visited::Node(id));
         };
         if self.current_scope.is_empty() {
-            return Err(Error::Rejected(
-                "Series variables must be declared inside a function".into(),
-            ));
+            return Err(Error::Rejected(Raised::new(
+                &pynecore_codes::SERIES_OUTSIDE_FUNCTION,
+                [] as [String; 0],
+            )));
         }
         let elem = series_elem(ast, annotation, target);
         let pin =

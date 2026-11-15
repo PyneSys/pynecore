@@ -4,6 +4,7 @@ import re
 from collections.abc import Container, Iterator
 from typing import Any, TypeVar
 
+from ..errorcodes import StrategyStateInSecurityError
 from . import ast_walk
 from .lib_series_attrs import NON_SERIES_LIB_ATTRS
 from .locations import anchor_all_at, anchor_at, fix_locations
@@ -1346,14 +1347,10 @@ class SecurityTransformer(ast_walk.NodeTransformer):
                 bad = self._find_forbidden_strategy_state(expression)
                 if bad is not None:
                     fn_name = 'request.security_lower_tf' if is_ltf else 'request.security'
-                    raise SyntaxError(
-                        f"'strategy.{bad.attr}' cannot be used as the expression "
-                        f"argument of {fn_name}() — strategy state is only "
-                        f"available in the chart context, not in a security "
-                        f"context.",
-                        (self._module_file, getattr(bad, 'lineno', 0),
-                         getattr(bad, 'col_offset', 0) + 1, None)
-                    )
+                    raise StrategyStateInSecurityError(
+                        name=bad.attr, function=fn_name,
+                        location=(self._module_file, getattr(bad, 'lineno', 0),
+                                  getattr(bad, 'col_offset', 0) + 1, None))
 
             call_exprs[sec_id] = expression if expression is not None else self._lib_na()
 

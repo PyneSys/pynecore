@@ -48,7 +48,8 @@ impl Engine<'_, '_> {
         if self.multi_imports.contains(head) {
             let origin = self.unknown("rebound-name", node, head);
             self.diag(
-                &format!("'{head}' is imported more than once, so what it calls is unknown"),
+                &pynecore_codes::TYPE_IMPORTED_TWICE,
+                &[head],
                 node,
                 Some(origin),
                 &format!("import '{head}' once, under a name nothing else binds"),
@@ -58,7 +59,8 @@ impl Engine<'_, '_> {
         if self.import_rebound(head) {
             let origin = self.unknown("rebound-name", node, head);
             self.diag(
-                &format!("'{head}' is assigned as well as imported, so what it calls is unknown"),
+                &pynecore_codes::TYPE_REBOUND_IMPORTED,
+                &[head],
                 node,
                 Some(origin),
                 &format!("call '{head}' under a name nothing assigns to"),
@@ -154,11 +156,8 @@ impl Engine<'_, '_> {
             let place = format!("{}:{}", interface.path, sig.line);
             let origin = self.unknown("unannotated-import", node, &sig.name);
             self.diag(
-                &format!(
-                    "'{}' is imported from {place}, where its parameters carry no annotations, so \
-                     what it returns is unknown",
-                    sig.name
-                ),
+                &pynecore_codes::TYPE_UNANNOTATED_IMPORT,
+                &[&sig.name, &place],
                 node,
                 Some(origin),
                 &format!("annotate the parameters of '{}' in {place}", sig.name),
@@ -208,13 +207,19 @@ impl Engine<'_, '_> {
             *required <= argc && (*open_ended || argc <= *params as i64)
         });
         if !takes {
-            self.bad_call(node, name, &format!("'{name}' does not take {argc} argument(s)"));
+            self.bad_call(
+                node,
+                name,
+                &pynecore_codes::CALL_ARGUMENT_COUNT,
+                &[name, &argc.to_string()],
+            );
             return Ok(false);
         }
         for &keyword in &keywords {
             let arg = keyword_parts(self.ast, keyword).0.unwrap_or("");
             if !shapes.iter().any(|(_, _, _, names)| names.iter().any(|known| known == arg)) {
-                self.bad_call(node, name, &format!("'{name}' has no parameter '{arg}'"));
+                let arg = arg.to_string();
+                self.bad_call(node, name, &pynecore_codes::CALL_UNKNOWN_PARAMETER, &[name, &arg]);
                 return Ok(false);
             }
         }
@@ -231,7 +236,7 @@ impl Engine<'_, '_> {
             let (arg, value) = keyword_parts(self.ast, keyword);
             let arg = arg.unwrap_or("").to_string();
             if positional.contains(&&arg) {
-                self.bad_call(node, name, &format!("'{arg}' is passed to '{name}' twice"));
+                self.bad_call(node, name, &pynecore_codes::CALL_ARGUMENT_TWICE, &[&arg, name]);
                 return Ok(false);
             }
             if let Some(at) = sig.names.iter().position(|known| *known == arg) {
@@ -246,11 +251,8 @@ impl Engine<'_, '_> {
             self.bad_call(
                 node,
                 name,
-                &format!(
-                    "'{name}' takes {} for '{pname}', {} passed",
-                    render_ty(&declared),
-                    render_ty(&passed)
-                ),
+                &pynecore_codes::CALL_ARGUMENT_TYPE,
+                &[name, &render_ty(&declared), &pname, &render_ty(&passed)],
             );
             return Ok(false);
         }
@@ -282,9 +284,8 @@ impl Engine<'_, '_> {
     ) -> R<Option<Rc<ModuleInterface>>> {
         if !path.is_empty() && self.host.closes_cycle(path)? {
             self.node_diag(
-                &format!(
-                    "'{dotted}' imports this module back, so its signatures are not available yet"
-                ),
+                &pynecore_codes::TYPE_IMPORT_CYCLE,
+                &[dotted],
                 node,
                 "import-cycle",
                 dotted,
@@ -299,11 +300,8 @@ impl Engine<'_, '_> {
                 if !interface.suppressed.is_empty() {
                     let origin = self.unknown("suppressed-import", node, dotted);
                     self.diag(
-                        &format!(
-                            "'{dotted}' is reported, and no type it publishes may drive a dispatch \
-                             here: {}",
-                            interface.suppressed
-                        ),
+                        &pynecore_codes::TYPE_SUPPRESSED_IMPORT,
+                        &[dotted, &interface.suppressed],
                         node,
                         Some(origin),
                         &format!("fix '{dotted}' first"),

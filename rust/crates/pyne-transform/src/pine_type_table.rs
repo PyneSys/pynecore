@@ -181,6 +181,10 @@ pub struct Diag {
     /// End of the construct the complaint is about; 0 = a point
     pub end_line: i64,
     pub end_col: i64,
+    /// The registry code of the complaint (`E0001`), whose message `message` is
+    pub code: String,
+    /// The code's parameters, as the message shows them
+    pub args: Vec<String>,
 }
 
 /// One module another module's types were derived from.

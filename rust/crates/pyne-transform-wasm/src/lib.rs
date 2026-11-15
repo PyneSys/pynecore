@@ -30,7 +30,9 @@
 //!
 //! Response: `{"dump": str}` (the `ast.dump` of the transformed module, as the
 //! interpreter `python` names writes it),
-//! `{"rejected": str}` (the module is invalid), `{"unsupported": str}` (the
+//! `{"rejected": str, "code": str, "args": [str]}` (the module breaks a rule of
+//! Pyne code: the message, its `P` code and the code's arguments),
+//! `{"unsupported": str}` (the
 //! native port does not cover it), `{"error": str}` (a malformed request), or
 //! `{"needs": [need]}` when the request left a question about the modules around it
 //! open: `{"module": dotted}`, `{"origin": [name, importer, level]}` or
@@ -235,7 +237,11 @@ fn transform(request: &str) -> Result<Value, Value> {
     match outcome {
         Ok(dump) => Ok(json!({ "dump": dump })),
         Err(pyne_transform::Error::Unsupported(message)) => Err(json!({ "unsupported": message })),
-        Err(pyne_transform::Error::Rejected(message)) => Err(json!({ "rejected": message })),
+        Err(pyne_transform::Error::Rejected(raised)) => Err(json!({
+            "rejected": raised.message(),
+            "code": raised.code.code,
+            "args": raised.args,
+        })),
     }
 }
 

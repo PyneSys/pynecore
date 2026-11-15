@@ -19,12 +19,14 @@ import ast
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from ..core.errors import PyneSyntaxError
+from ..errorcodes import EXCEPTIONS
 from .pine_type_rules import UNKNOWN, ImplSig
 from .pine_qualifier import NOT_READ, SERIES
 
 __all__ = ['Unknown', 'Binding', 'FuncSig', 'CallSite', 'ContextKey',
            'ContextResult', 'Diag', 'DepRecord', 'ExportSig', 'ClassSig',
-           'ModuleInterface', 'PineTypeTable', 'PineTypeError', 'Analyser',
+           'ModuleInterface', 'PineTypeTable', 'diag_error', 'Analyser',
            'SCOPE_SEP', 'qualify', 'TABLE_ATTR', 'module_table']
 
 #: Separator the scope-qualified ids are spelled with. It is the same character
@@ -185,6 +187,10 @@ class Diag:
     #: structural rejection covers everything written inside it); 0 = a point
     end_line: int = 0
     end_col: int = 0
+    #: The registry code of the complaint (``E0001``), whose message ``message`` is
+    code: str = ''
+    #: The code's parameters, as the message shows them
+    args: tuple[str, ...] = ()
 
     def render(self) -> str:
         """Full one-line form: what happened, where it came from, how to fix it."""
@@ -438,28 +444,29 @@ class PineTypeTable:
         return self.bindings.get(scope, {}).get(name)
 
 
-class PineTypeError(SyntaxError):
+def diag_error(diag: Diag, filename: str, text: str | None = None) -> PyneSyntaxError:
     """
-    A typing failure that stops the transform.
+    The coded error a diagnostic describes, for a ``@pyne edge`` module whose
+    first diagnostic stops the transform: there an untypable construct breaks
+    the profile's promise rather than missing an optimization. Where the type
+    was lost and the remedy ride along as notes of the error.
 
-    Raised only in ``@pyne edge`` mode, where an untypable construct is a
-    contract violation rather than a missed optimization. It is a
-    ``SyntaxError`` on purpose: Python renders the 4-tuple with a real caret
-    under the offending column, the same way the security and series passes
-    report theirs.
+    :param diag: The diagnostic to raise
+    :param filename: Source path, for the traceback header
+    :param text: The offending source line, when it is available
+    :return: The error, ready to raise
     """
-
-    @classmethod
-    def from_diag(cls, diag: Diag, filename: str, text: str | None = None) -> 'PineTypeError':
-        """
-        Build the error a diagnostic describes.
-
-        :param diag: The diagnostic to raise
-        :param filename: Source path, for the traceback header
-        :param text: The offending source line, when it is available
-        :return: The error, ready to raise
-        """
-        return cls(diag.render(), (filename, diag.line, diag.col + 1, text))
+    cls = EXCEPTIONS[diag.code]
+    # The parameters by their registry names: a class's own constructor spells
+    # one that is a Python keyword or built-in with a trailing underscore
+    error = cls.__new__(cls)
+    PyneSyntaxError.__init__(error, location=(filename, diag.line, diag.col + 1, text),
+                             **dict(zip(cls.code.params, diag.args)))
+    if diag.origin is not None and (diag.origin.line, diag.origin.col) != (diag.line, diag.col):
+        error.add_note(f'the type was lost at line {diag.origin.line}: {diag.origin.reason}')
+    if diag.fix:
+        error.add_note(f'fix: {diag.fix}')
+    return error
 
 
 #: Produces one module's interface from its source path and the pipeline digest,

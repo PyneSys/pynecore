@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from pynecore.errorcodes import SeriesOutsideFunctionError
 from pynecore import lib
 from pynecore.core.instance_state import _make_state
 from pynecore.core.series import SeriesImpl
@@ -288,7 +289,7 @@ def main(x):
 
 def __test_module_level_series_rejected__():
     """ Module-level Series declarations raise a clear transform error """
-    with pytest.raises(SyntaxError):
+    with pytest.raises(SeriesOutsideFunctionError):
         _transform('''
 from pynecore import Series
 

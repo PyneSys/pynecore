@@ -9,6 +9,7 @@ conditional; the declaration itself must execute on every completed bar.
 import ast
 from dataclasses import dataclass, field
 
+from ..errorcodes import PlotAsValueError, PlotCallConditionalError
 from . import ast_walk
 
 __all__ = ['PlotScopeTransformer']
@@ -149,8 +150,7 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
         for call in calls:
             name = _PLOT_PATHS.get(path(call.func))
             if name is not None and call not in allowed:
-                self._reject(node, call, name, 'must be called unconditionally in the '
-                             'direct body of module-level main, before any possible early return')
+                self._reject(node, call, PlotCallConditionalError, name)
 
         for ref in references:
             name = _PLOT_PATHS.get(path(ref))
@@ -167,8 +167,7 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
                 scope = owners[target].resolve(target.id)
                 if scope is not None and len(scope.bindings[target.id]) == 1:
                     continue
-            self._reject(node, ref, name, 'cannot be passed or stored as a function value; '
-                         'use a direct call or a single static alias so its scope can be checked')
+            self._reject(node, ref, PlotAsValueError, name)
         return node
 
     @staticmethod
@@ -187,10 +186,17 @@ class PlotScopeTransformer(ast_walk.NodeTransformer):
                 pending.extend(ast_walk.iter_child_statements(current))
         return False
 
-    def _reject(self, module: ast.Module, node: ast.AST, name: str, reason: str) -> None:
-        """Raise a source-located error before the module can execute."""
+    def _reject(self, module: ast.Module, node: ast.AST,
+                error: type[PlotCallConditionalError | PlotAsValueError], name: str) -> None:
+        """Raise a source-located error before the module can execute.
+
+        :param module: The module, for its source path
+        :param node: The offending call or reference
+        :param error: The code's exception class
+        :param name: The plot function, as the script spells it
+        """
         line = getattr(node, 'lineno', 0)
         text = self._lines[line - 1] if 0 < line <= len(self._lines) else None
-        raise SyntaxError(f'{name}() {reason}.',
-                          (getattr(module, '_module_file_path', '<script>'), line,
-                           getattr(node, 'col_offset', 0) + 1, text))
+        raise error(function=name,
+                    location=(getattr(module, '_module_file_path', '<script>'), line,
+                              getattr(node, 'col_offset', 0) + 1, text))

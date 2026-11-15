@@ -30,6 +30,7 @@ not script code, and the AOT exporter skips them as well.
 """
 import ast
 
+from ..errorcodes import ModuleStateModifiedError
 from . import ast_walk
 
 __all__ = ['OuterWriteTransformer']
@@ -297,11 +298,7 @@ class OuterWriteTransformer(ast_walk.NodeTransformer):
 
     def _reject(self, node: ast.AST, name: str, kind: str) -> None:
         """Raise the located error naming the offending module-level binding."""
-        verb = ('is rebound' if kind == 'rebound' else 'is modified')
-        raise SyntaxError(
-            f"'{name}' {verb} inside a function: an object created outside a "
-            f"function cannot be modified inside one. Module-level state is not "
-            f"restored when a bar is re-executed; declare the value as "
-            f"'Persistent' or 'IBPersistent' inside the function instead.",
-            (self._module_file, getattr(node, 'lineno', 0),
-             getattr(node, 'col_offset', 0) + 1, None))
+        raise ModuleStateModifiedError(
+            name=name, how='is rebound' if kind == 'rebound' else 'is modified',
+            location=(self._module_file, getattr(node, 'lineno', 0),
+                      getattr(node, 'col_offset', 0) + 1, None))

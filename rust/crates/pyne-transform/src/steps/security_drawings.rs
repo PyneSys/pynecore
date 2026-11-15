@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use pyne_ast::walk::{children, walk};
 use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId};
 
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 /// The drawing constructors, by dotted path.
 const DRAWING_CALLS: [&str; 9] = [
@@ -361,9 +361,9 @@ pub fn run(ast: &mut Ast, module: NodeId, _ctx: &Context<'_>) -> Result<NodeId, 
             if matches!(kind, Kind::Call { .. })
                 && let Some(builtin) = collector.drawing_name(ast, current)?
             {
-                return Err(Error::Rejected(format!(
-                    "{builtin}() cannot be used in the expression of {}().",
-                    &request_name[4..]
+                return Err(Error::Rejected(Raised::new(
+                    &pynecore_codes::DRAWING_IN_SECURITY,
+                    [builtin.to_string(), request_name[4..].to_string()],
                 )));
             }
             if let Kind::Name { id, ctx: ExprContext::Load } = kind

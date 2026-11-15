@@ -323,7 +323,8 @@ impl Engine<'_, '_> {
             }
             let name = sig.name.clone();
             self.node_diag(
-                &format!("'{name}' has no field '{attr}'"),
+                &pynecore_codes::TYPE_NO_FIELD,
+                &[&name, &attr],
                 node,
                 "unknown-field",
                 &format!("{name}.{attr}"),
@@ -334,9 +335,8 @@ impl Engine<'_, '_> {
         if base == OBJECT && !self.is_reference(receiver) {
             let spelled = self.spelled(receiver)?;
             self.node_diag(
-                &format!(
-                    "the class of '{spelled}' is not known here, so its field '{attr}' has no type"
-                ),
+                &pynecore_codes::TYPE_UNKNOWN_CLASS_FIELD,
+                &[&spelled, &attr],
                 node,
                 "unknown-class",
                 &attr,
@@ -359,7 +359,8 @@ impl Engine<'_, '_> {
         }
         if attr != "value" {
             self.node_diag(
-                &format!("the loop counter has no field '{attr}'"),
+                &pynecore_codes::TYPE_LOOP_COUNTER_FIELD,
+                &[&attr],
                 node,
                 "unknown-field",
                 &format!("PineLoop.{attr}"),
@@ -372,9 +373,8 @@ impl Engine<'_, '_> {
             _ => {
                 let spelled = self.unparse(value)?;
                 self.node_diag(
-                    &format!(
-                        "the bounds of '{spelled}' are not known here, so its counter has no type"
-                    ),
+                    &pynecore_codes::TYPE_LOOP_BOUNDS_UNKNOWN,
+                    &[&spelled],
                     node,
                     "unknown-value",
                     "PineLoop.value",
@@ -409,7 +409,8 @@ impl Engine<'_, '_> {
                 result = UNKNOWN.to_string();
             } else {
                 self.node_diag(
-                    &format!("'{what}' takes a number for a bound, {} passed", render_ty(&ty)),
+                    &pynecore_codes::CALL_BOUND_NOT_NUMBER,
+                    &[what, &render_ty(&ty)],
                     node,
                     "bad-call",
                     what,
@@ -435,7 +436,8 @@ impl Engine<'_, '_> {
                 let arity =
                     call_arity(self.ast, node).map_or("None".to_string(), |n| n.to_string());
                 self.node_diag(
-                    &format!("'enter' takes 0 or 1 argument(s), {arity} passed"),
+                    &pynecore_codes::LOOP_ENTER_ARITY,
+                    &[&arity],
                     node,
                     "bad-call",
                     "PineLoop.enter",
@@ -456,7 +458,8 @@ impl Engine<'_, '_> {
         if args.len() != 1 || has_keywords {
             let arity = call_arity(self.ast, node).map_or("None".to_string(), |n| n.to_string());
             self.node_diag(
-                &format!("'step' takes 1 argument(s), {arity} passed"),
+                &pynecore_codes::LOOP_STEP_ARITY,
+                &[&arity],
                 node,
                 "bad-call",
                 "PineLoop.step",
@@ -546,7 +549,8 @@ impl Engine<'_, '_> {
         }
         if (is_array(&base) || is_matrix(&base) || is_map(&base)) && !self.is_series(value) {
             self.node_diag(
-                &format!("indexing {} is not Pine", render_ty(&base)),
+                &pynecore_codes::TYPE_INDEX_NOT_PINE,
+                &[&render_ty(&base)],
                 node,
                 "not-pine",
                 "Subscript",
@@ -558,7 +562,8 @@ impl Engine<'_, '_> {
             let spelled = self.unparse_prefix(value, 40)?;
             let rendered = render_ty(&base);
             self.node_diag(
-                &format!("'{spelled}' is a plain {rendered}, not a series"),
+                &pynecore_codes::TYPE_NOT_SERIES,
+                &[&spelled, &rendered],
                 node,
                 "not-series",
                 &rendered,

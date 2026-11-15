@@ -148,7 +148,8 @@ impl Engine<'_, '_> {
         if entry.is_none() && lib_type_override(callee).is_none() {
             if data::lib_namespaces().contains(callee) {
                 self.node_diag(
-                    &format!("'{callee}' is a lib namespace, not a function"),
+                    &pynecore_codes::TYPE_LIB_NAMESPACE_CALL,
+                    &[callee],
                     node,
                     "unknown-lib",
                     callee,
@@ -156,7 +157,8 @@ impl Engine<'_, '_> {
                 );
             } else {
                 self.node_diag(
-                    &format!("'{callee}' is not a lib name"),
+                    &pynecore_codes::TYPE_NOT_LIB_NAME,
+                    &[callee],
                     node,
                     "unknown-lib",
                     callee,
@@ -386,7 +388,8 @@ impl Engine<'_, '_> {
                     && !entry.callable =>
             {
                 self.node_diag(
-                    &format!("'{callee}' is a lib value, not a function"),
+                    &pynecore_codes::TYPE_LIB_VALUE_CALL,
+                    &[callee],
                     node,
                     "unknown-lib",
                     callee,
@@ -407,7 +410,8 @@ impl Engine<'_, '_> {
             self.bad_call(
                 node,
                 callee,
-                &format!("'{callee}' does not take {argc} argument(s) (at least {least} needed)"),
+                &pynecore_codes::CALL_TOO_FEW_ARGUMENTS,
+                &[callee, &argc.to_string(), &least.to_string()],
             );
             return Ok(false);
         }
@@ -420,7 +424,12 @@ impl Engine<'_, '_> {
             });
             if !taken {
                 let spelled = name.unwrap_or("None").to_string();
-                self.bad_call(node, callee, &format!("'{callee}' has no parameter '{spelled}'"));
+                self.bad_call(
+                    node,
+                    callee,
+                    &pynecore_codes::CALL_UNKNOWN_PARAMETER,
+                    &[callee, &spelled],
+                );
                 return Ok(false);
             }
         }
@@ -464,11 +473,8 @@ impl Engine<'_, '_> {
             self.bad_call(
                 node,
                 callee,
-                &format!(
-                    "'{callee}' takes {} for '{pname}', {} passed",
-                    render_ty(&declared),
-                    render_ty(&passed)
-                ),
+                &pynecore_codes::CALL_ARGUMENT_TYPE,
+                &[callee, &render_ty(&declared), &pname, &render_ty(&passed)],
             );
             return Ok(false);
         }
@@ -535,18 +541,16 @@ impl Engine<'_, '_> {
                 None => "None".to_string(),
                 Some(text) => text.clone(),
             });
-            let mut rendered = Vec::new();
-            for value in values {
-                rendered.push(match value {
-                    None => "None".to_string(),
-                    Some(text) => crate::unparse::str_repr(text, self.host.python())?,
-                });
-            }
+            let rendered: Vec<String> = values
+                .into_iter()
+                .map(|value| format!("`{}`", value.as_deref().unwrap_or("None")))
+                .collect();
             let func = facts::call_parts(self.ast, node).map(|(func, _, _)| func);
             let spelled = func.and_then(|func| self.dotted(func)).unwrap_or_default();
             let origin = self.unknown("context-dependent-pin", node, &spelled);
             self.diag(
-                &format!("overload pin differs per call context: [{}]", rendered.join(", ")),
+                &pynecore_codes::TYPE_PIN_PER_CONTEXT,
+                &[&rendered.join(", ")],
                 node,
                 Some(origin),
                 "annotate the parameters so every call site agrees",
@@ -956,11 +960,8 @@ impl Engine<'_, '_> {
             if other == UNKNOWN || (kind(&other) && element_of(&other) == UNKNOWN) {
                 unknown = self.unknown("unknown-value", place, &render_ty(&base));
                 self.diag(
-                    &format!(
-                        "{} takes an operand whose type is not known here, so what it holds \
-                         afterwards is not known either",
-                        render_ty(&base)
-                    ),
+                    &pynecore_codes::TYPE_OPERAND_UNKNOWN,
+                    &[&render_ty(&base)],
                     place,
                     Some(unknown.clone()),
                     "give the operand a known type",
@@ -973,11 +974,8 @@ impl Engine<'_, '_> {
                     detail: format!("{} vs {}", render_ty(&base), render_ty(&other)),
                 };
                 self.diag(
-                    &format!(
-                        "{} cannot take {}: the elements are different types",
-                        render_ty(&base),
-                        render_ty(&other)
-                    ),
+                    &pynecore_codes::TYPE_OPERAND_MISMATCH,
+                    &[&render_ty(&base), &render_ty(&other)],
                     place,
                     Some(unknown.clone()),
                     &format!("pass {}", render_ty(&base)),

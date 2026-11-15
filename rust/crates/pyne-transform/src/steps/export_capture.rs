@@ -24,7 +24,7 @@ use crate::pine_qualifier::{
 use crate::pine_type_rules::{
     CallRule, Classes, UNKNOWN, annotation_type, builtin_call_type, is_scalar,
 };
-use crate::{Context, Error, Host, Unsupported};
+use crate::{Context, Error, Host, Raised, Unsupported};
 
 /// The `enum` classes a member's class must derive from
 const ENUM_BASES: &[&str] = &["Enum", "StrEnum", "IntEnum"];
@@ -978,9 +978,9 @@ pub fn run(ast: &mut Ast, module: NodeId, ctx: &Context<'_>) -> Result<NodeId, E
                     }
                     continue;
                 }
-                return Err(Error::Rejected(format!(
-                    "Exported function \"{function_name}\" cannot capture non-constant library \
-                     global \"{name}\"."
+                return Err(Error::Rejected(Raised::new(
+                    &pynecore_codes::EXPORT_CAPTURES_GLOBAL,
+                    [function_name.to_string(), name.to_string()],
                 )));
             }
         }

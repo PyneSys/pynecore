@@ -4,6 +4,7 @@
 use std::rc::Rc;
 
 use pyne_ast::{Constant, Int, Kind, NodeId, Value};
+use pynecore_codes::Code;
 
 use super::facts::{
     self, arg_parts, arity, call_arity, every_param, fits, keyword_parts, reaches_library_methods,
@@ -81,7 +82,8 @@ impl Engine<'_, '_> {
                     return Ok(fallback);
                 }
                 self.node_diag(
-                    &format!("the call to '{name}' has no known type"),
+                    &pynecore_codes::TYPE_UNKNOWN_CALL,
+                    &[&name],
                     node,
                     "unknown-call",
                     &name,
@@ -89,13 +91,14 @@ impl Engine<'_, '_> {
                 );
                 return Ok(UNKNOWN.to_string());
             }
-            let message = if name.is_empty() {
-                "the callee is not a name".to_string()
+            let (code, code_args): (&'static Code, &[&str]) = if name.is_empty() {
+                (&pynecore_codes::TYPE_CALLEE_NOT_NAME, &[])
             } else {
-                format!("'{name}' is not a function this module defines or imports, nor a lib name")
+                (&pynecore_codes::TYPE_UNKNOWN_CALLEE, &[&name])
             };
             self.node_diag(
-                &message,
+                code,
+                code_args,
                 node,
                 "unknown-call",
                 &name,
@@ -106,7 +109,8 @@ impl Engine<'_, '_> {
         if shadowed {
             let origin = self.unknown("rebound-name", node, &name);
             self.diag(
-                &format!("'{name}' is assigned as well as defined, so what it calls is unknown"),
+                &pynecore_codes::TYPE_REBOUND_DEFINED,
+                &[&name],
                 node,
                 Some(origin),
                 &format!("call '{name}' under a name nothing assigns to"),
@@ -169,7 +173,7 @@ impl Engine<'_, '_> {
                 return Ok(true);
             }
         }
-        self.bad_call(node, name, &format!("no overload of '{name}' takes these arguments"));
+        self.bad_call(node, name, &pynecore_codes::CALL_NO_OVERLOAD, &[name]);
         Ok(false)
     }
 
@@ -210,11 +214,8 @@ impl Engine<'_, '_> {
             self.bad_call(
                 node,
                 name,
-                &format!(
-                    "'{class}' has {} field(s), {} argument(s) passed",
-                    fields.len(),
-                    args.len()
-                ),
+                &pynecore_codes::CONSTRUCTOR_FIELD_COUNT,
+                &[&class, &fields.len().to_string(), &args.len().to_string()],
             );
             return Ok(false);
         }
@@ -224,11 +225,11 @@ impl Engine<'_, '_> {
             let (arg, value) = keyword_parts(self.ast, keyword);
             let arg = arg.unwrap_or("").to_string();
             if !sig.fields.contains_key(&arg) {
-                self.bad_call(node, name, &format!("'{class}' has no field '{arg}'"));
+                self.bad_call(node, name, &pynecore_codes::TYPE_NO_FIELD, &[&class, &arg]);
                 return Ok(false);
             }
             if bound.contains_key(&arg) {
-                self.bad_call(node, name, &format!("'{arg}' is passed to '{class}' twice"));
+                self.bad_call(node, name, &pynecore_codes::CALL_ARGUMENT_TWICE, &[&arg, &class]);
                 return Ok(false);
             }
             bound.insert(arg, value);
@@ -239,7 +240,8 @@ impl Engine<'_, '_> {
                     self.bad_call(
                         node,
                         name,
-                        &format!("'{class}' needs a value for '{field_name}'"),
+                        &pynecore_codes::CONSTRUCTOR_MISSING_FIELD,
+                        &[&class, field_name],
                     );
                     return Ok(false);
                 }
@@ -251,11 +253,8 @@ impl Engine<'_, '_> {
                 self.bad_call(
                     node,
                     name,
-                    &format!(
-                        "'{class}.{field_name}' holds {}, {} passed",
-                        render_ty(&declared),
-                        render_ty(&given)
-                    ),
+                    &pynecore_codes::CONSTRUCTOR_FIELD_TYPE,
+                    &[&format!("{class}.{field_name}"), &render_ty(&declared), &render_ty(&given)],
                 );
                 return Ok(false);
             }
@@ -415,7 +414,8 @@ impl Engine<'_, '_> {
         if shadowed {
             let origin = self.unknown("rebound-name", node, &spelled);
             self.diag(
-                &format!("'{spelled}' is assigned as well as defined, so what it calls is unknown"),
+                &pynecore_codes::TYPE_REBOUND_DEFINED,
+                &[&spelled],
                 node,
                 Some(origin),
                 &format!("call '{spelled}' under a name nothing assigns to"),
@@ -447,7 +447,8 @@ impl Engine<'_, '_> {
         let (_, args, _) = facts::call_parts(self.ast, node).expect("a call");
         if args.len() < 2 {
             self.node_diag(
-                "'method_call' takes a method and a receiver",
+                &pynecore_codes::METHOD_CALL_SHAPE,
+                &[],
                 node,
                 "bad-call",
                 "method_call",
@@ -467,10 +468,8 @@ impl Engine<'_, '_> {
         if receiver_ty == OBJECT {
             let receiver_spelled = self.spelled(receiver)?;
             self.node_diag(
-                &format!(
-                    "the class of '{receiver_spelled}' is not known here, so its method '{spelled}' \
-                     has no type"
-                ),
+                &pynecore_codes::TYPE_UNKNOWN_CLASS_METHOD,
+                &[&receiver_spelled, &spelled],
                 node,
                 "unknown-class",
                 &spelled,
@@ -484,11 +483,8 @@ impl Engine<'_, '_> {
             && self.declares_method(&cid, &spelled, node)?
         {
             self.node_diag(
-                &format!(
-                    "'{spelled}' is declared on {}, but no export the runtime searches by name \
-                     holds it",
-                    render_ty(&receiver_ty)
-                ),
+                &pynecore_codes::TYPE_METHOD_NOT_EXPORTED,
+                &[&spelled, &render_ty(&receiver_ty)],
                 node,
                 "unknown-method",
                 &spelled,
@@ -497,7 +493,8 @@ impl Engine<'_, '_> {
             return Ok(UNKNOWN.to_string());
         }
         self.node_diag(
-            &format!("'{spelled}' is not a method of {} here", render_ty(&receiver_ty)),
+            &pynecore_codes::TYPE_METHOD_NOT_FOUND,
+            &[&spelled, &render_ty(&receiver_ty)],
             node,
             "unknown-method",
             &spelled,
@@ -892,12 +889,7 @@ impl Engine<'_, '_> {
         let guard = (key.to_string(), params.clone(), self.nid(target));
         if self.in_progress.contains(&guard) {
             let origin = self.unknown("recursion", node, key);
-            self.diag(
-                &format!("'{spelled}' is re-entrant, so its result type is unknown"),
-                node,
-                Some(origin),
-                "",
-            );
+            self.diag(&pynecore_codes::TYPE_RECURSION, &[&spelled], node, Some(origin), "");
             return Ok(UNKNOWN.to_string());
         }
         let quals = self.call_quals(target, node, &positional)?;
@@ -905,12 +897,7 @@ impl Engine<'_, '_> {
             self.analyse(key, target, params, Some(parents), Some(node), Some(quals))?
         else {
             let origin = self.unknown("context-budget", node, key);
-            self.diag(
-                &format!("'{spelled}' hit the per-module context limit"),
-                node,
-                Some(origin),
-                "",
-            );
+            self.diag(&pynecore_codes::TYPE_CONTEXT_LIMIT, &[&spelled], node, Some(origin), "");
             return Ok(UNKNOWN.to_string());
         };
         let (cid, ret, ret_qual) = {
@@ -961,11 +948,8 @@ impl Engine<'_, '_> {
                 self.bad_call(
                     node,
                     &name,
-                    &format!(
-                        "'{name}' takes {} positional argument(s), {} passed",
-                        positional.len(),
-                        args.len()
-                    ),
+                    &pynecore_codes::CALL_POSITIONAL_COUNT,
+                    &[&name, &positional.len().to_string(), &args.len().to_string()],
                 );
             }
             return Ok(None);
@@ -981,13 +965,23 @@ impl Engine<'_, '_> {
             let arg = arg.unwrap_or("").to_string();
             if !declared_names.contains(&arg) {
                 if report {
-                    self.bad_call(node, &name, &format!("'{name}' has no parameter '{arg}'"));
+                    self.bad_call(
+                        node,
+                        &name,
+                        &pynecore_codes::CALL_UNKNOWN_PARAMETER,
+                        &[&name, &arg],
+                    );
                 }
                 return Ok(None);
             }
             if bound.contains_key(&arg) {
                 if report {
-                    self.bad_call(node, &name, &format!("'{arg}' is passed to '{name}' twice"));
+                    self.bad_call(
+                        node,
+                        &name,
+                        &pynecore_codes::CALL_ARGUMENT_TWICE,
+                        &[&arg, &name],
+                    );
                 }
                 return Ok(None);
             }
@@ -1005,7 +999,8 @@ impl Engine<'_, '_> {
                     self.bad_call(
                         node,
                         &name,
-                        &format!("'{name}' needs an argument for '{arg_name}'"),
+                        &pynecore_codes::CALL_MISSING_ARGUMENT,
+                        &[&name, &arg_name],
                     );
                 }
                 return Ok(None);
@@ -1019,11 +1014,8 @@ impl Engine<'_, '_> {
                         self.bad_call(
                             node,
                             &name,
-                            &format!(
-                                "'{name}' takes {} for '{arg_name}', {} passed",
-                                render_ty(&annotated),
-                                render_ty(&given)
-                            ),
+                            &pynecore_codes::CALL_ARGUMENT_TYPE,
+                            &[&name, &render_ty(&annotated), &arg_name, &render_ty(&given)],
                         );
                     }
                     return Ok(None);
@@ -1079,10 +1071,17 @@ impl Engine<'_, '_> {
     }
 
     /// A call whose shape or argument types the callee does not take (`_bad_call`).
-    pub(super) fn bad_call(&mut self, node: NodeId, name: &str, message: &str) {
+    pub(super) fn bad_call(
+        &mut self,
+        node: NodeId,
+        name: &str,
+        code: &'static Code,
+        args: &[&str],
+    ) {
         self.bad_calls.insert(node);
         self.node_diag(
-            message,
+            code,
+            args,
             node,
             "bad-call",
             name,

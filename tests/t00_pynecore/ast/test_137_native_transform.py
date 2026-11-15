@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core import import_hook
+from pynecore.errorcodes import InputNotMainDefaultError, PlotCallConditionalError
 from pynecore.transformers import native, pipeline
 from pynecore.transformers.function_isolation import NON_TRANSFORMABLE_FUNCTIONS
 from pynecore.transformers.slot_layout import ModuleLayout
@@ -837,7 +838,7 @@ def __test_native_rejection_matches_python__(backend, monkeypatch):
              '    if close > 1:\n        plot(close)\n'
     tree = ast.parse(source)
     mode = import_hook._module_mode(tree)[1]
-    with pytest.raises(SyntaxError, match='plot'):
+    with pytest.raises(PlotCallConditionalError, match=r'`plot\(\)`'):
         import_hook._analyse_tree(tree, source, Path('rejected.py').resolve(), mode)
 
 
@@ -1352,5 +1353,5 @@ def __test_input_outside_main_defaults_is_rejected_natively__(source):
                 if isinstance(step, pipeline.Step) and step.name == 'Input')
     ctx = pipeline.PipelineContext(path=Path('rejected.py'), pyne_mode=None, source=source)
     assert isinstance(native.run(['Input'], ast.parse(source), ctx), native.Rejection)
-    with pytest.raises(SyntaxError, match='inputs must be declared as main'):
+    with pytest.raises(InputNotMainDefaultError):
         step.run(ast.parse(source), ctx)

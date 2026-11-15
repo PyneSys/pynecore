@@ -9,6 +9,7 @@ import ast
 
 import pytest
 
+from pynecore.errorcodes import PersistentOutsideFunctionError
 from pynecore.core.instance_state import _make_state
 from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
@@ -260,7 +261,7 @@ def main():
 
 def __test_module_level_persistent_rejected__():
     """ Module-level Persistent declarations raise a clear transform error """
-    with pytest.raises(SyntaxError):
+    with pytest.raises(PersistentOutsideFunctionError):
         _transform('''
 from pynecore import Persistent
 

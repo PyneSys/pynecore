@@ -49,6 +49,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from ..core.errors import Code
+from ..errorcodes import (
+    CALL_ARGUMENT_COUNT, CALL_ARGUMENT_TWICE, CALL_ARGUMENT_TYPE, CALL_BOUND_NOT_NUMBER,
+    CALL_MISSING_ARGUMENT, CALL_NO_OVERLOAD, CALL_POSITIONAL_COUNT, CALL_TOO_FEW_ARGUMENTS,
+    CALL_UNKNOWN_PARAMETER, CONSTRUCTOR_FIELD_COUNT, CONSTRUCTOR_FIELD_TYPE,
+    CONSTRUCTOR_MISSING_FIELD, LOOP_ENTER_ARITY, LOOP_STEP_ARITY, METHOD_CALL_SHAPE,
+    TYPE_CALLEE_NOT_NAME, TYPE_CONFLICT, TYPE_CONTEXT_LIMIT, TYPE_DECLARED_MISMATCH,
+    TYPE_FIELD_ASSIGN_MISMATCH, TYPE_IMPORT_CYCLE, TYPE_IMPORTED_TWICE, TYPE_INDEX_NOT_PINE,
+    TYPE_LIB_NAMESPACE_CALL, TYPE_LIB_VALUE_CALL, TYPE_LOOP_BOUNDS_UNKNOWN,
+    TYPE_LOOP_COUNTER_FIELD, TYPE_METHOD_NOT_EXPORTED, TYPE_METHOD_NOT_FOUND, TYPE_NO_FIELD,
+    TYPE_NO_FIELD_TO_ASSIGN, TYPE_NOT_ITERABLE, TYPE_NOT_LIB_NAME, TYPE_NOT_SERIES,
+    TYPE_OPERAND_MISMATCH, TYPE_OPERAND_UNKNOWN, TYPE_PIN_PER_CONTEXT, TYPE_REBOUND_DEFINED,
+    TYPE_REBOUND_IMPORTED, TYPE_RECURSION, TYPE_STARRED_TARGET, TYPE_SUPPRESSED_IMPORT,
+    TYPE_UNANNOTATED_IMPORT, TYPE_UNKNOWN_CALL, TYPE_UNKNOWN_CALLEE, TYPE_UNKNOWN_CLASS_FIELD,
+    TYPE_UNKNOWN_CLASS_METHOD, TYPE_UNKNOWN_CLASS_STORE, TYPE_UNPACK_COUNT,
+    TYPE_WIDEN_PER_CONTEXT,
+)
 from . import ast_walk
 from . import module_interface
 from .factory_fields import FactoryFields, dotted_name
@@ -770,7 +787,7 @@ class _Inference:
             existing.qual = max(existing.qual, qual,
                                 max(self._conds[existing.depth:], default=CONST))
         before = existing.ty
-        joined = self._joined(before, ty, node, f"'{name}'")
+        joined = self._joined(before, ty, node, f'`{name}`')
         existing.ty = joined
         if joined == UNKNOWN and existing.unknown is None:
             existing.unknown = self._shape_unknown(before, ty, node) or unknown \
@@ -873,8 +890,7 @@ class _Inference:
         # The DIAGNOSTIC is what marks the program wrong, and it points at the
         # pair that disagrees
         self._diag(
-            f'{what} gets both {render_ty(conflict[0])} and {render_ty(conflict[1])}, '
-            f'which are different types', node,
+            TYPE_CONFLICT, (what, render_ty(conflict[0]), render_ty(conflict[1])), node,
             self._shape_unknown(conflict[0], conflict[1], node)
             or self._unknown('joined-branches', node,
                              f'{render_ty(conflict[0])} vs {render_ty(conflict[1])}'),
@@ -902,11 +918,21 @@ class _Inference:
         return Unknown(reason=reason, line=getattr(node, 'lineno', 0),
                        col=getattr(node, 'col_offset', 0), detail=detail)
 
-    def _diag(self, message: str, node: ast.AST, origin: Unknown | None = None,
-              fix: str = '') -> None:
+    def _diag(self, code: Code, args: tuple[str, ...], node: ast.AST,
+              origin: Unknown | None = None, fix: str = '') -> None:
+        """
+        Report a typing complaint.
+
+        :param code: The registry code of the complaint
+        :param args: The code's parameters, as the message shows them
+        :param node: Where it is reported
+        :param origin: Where the type was lost
+        :param fix: The concrete remedy
+        """
         self.table.diags.append(Diag(
-            message=message, line=getattr(node, 'lineno', 0),
-            col=getattr(node, 'col_offset', 0), origin=origin, fix=fix))
+            message=code.render(*args), line=getattr(node, 'lineno', 0),
+            col=getattr(node, 'col_offset', 0), origin=origin, fix=fix,
+            code=code.code, args=args))
 
     # --- the per-node type view ------------------------------------------
 
@@ -1454,8 +1480,9 @@ class _Inference:
                     # carry the lie into every pin downstream
                     spelled = ast.unparse(stmt.target)
                     self._node_diag(
-                        f"'{spelled}' is declared {render_ty(declared)} and assigned "
-                        f"{render_ty(value_ty)}", stmt.target, 'type-mismatch', spelled,
+                        TYPE_DECLARED_MISMATCH,
+                        (spelled, render_ty(declared), render_ty(value_ty)),
+                        stmt.target, 'type-mismatch', spelled,
                         fix=f"declare it {render_ty(value_ty)}, or assign {render_ty(declared)}")
                     unknown = self._unknown('type-mismatch', stmt.target, spelled)
                     declared = UNKNOWN
@@ -1499,8 +1526,8 @@ class _Inference:
                 iter_ty = self._expr(stmt.iter)
                 if iter_ty in SCALARS:
                     self._node_diag(
-                        f"'{ast.unparse(stmt.iter)[:40]}' is a {render_ty(iter_ty)}; a for "
-                        f"loop iterates a range or an array", stmt.iter, 'not-iterable',
+                        TYPE_NOT_ITERABLE, (ast.unparse(stmt.iter)[:40], render_ty(iter_ty)),
+                        stmt.iter, 'not-iterable',
                         render_ty(iter_ty), fix='loop over range(...) or an array')
                     iter_ty = UNKNOWN
                 self._store_iteration(stmt, iter_ty)
@@ -2167,23 +2194,24 @@ class _Inference:
                 ty = self._declared_constructor(found, value, ty)
             if found is None:
                 self._node_diag(
-                    f"'{sig.name}' has no field '{node.attr}'", node,
+                    TYPE_NO_FIELD, (sig.name, node.attr), node,
                     'unknown-field', f'{sig.name}.{node.attr}',
                     fix=f"declare '{node.attr}' on '{sig.name}', or assign a field it has")
             elif ty not in _UNCHECKED and not _fits(found, ty):
                 self._node_diag(
-                    f"'{sig.name}.{node.attr}' holds {render_ty(found)} and is assigned "
-                    f"{render_ty(ty)}", node, 'type-mismatch', f'{sig.name}.{node.attr}',
+                    TYPE_FIELD_ASSIGN_MISMATCH,
+                    (f'{sig.name}.{node.attr}', render_ty(found), render_ty(ty)),
+                    node, 'type-mismatch', f'{sig.name}.{node.attr}',
                     fix=f'assign {render_ty(found)}')
             return
         if base in SCALARS:
             self._node_diag(
-                f"a {render_ty(base)} has no field '{node.attr}' to assign", node,
+                TYPE_NO_FIELD_TO_ASSIGN, (render_ty(base), node.attr), node,
                 'unknown-field', node.attr, fix='assign a field of a @udt object')
         elif base == OBJECT and not self._is_reference(node.value):
             self._node_diag(
-                f"the class of '{dotted_name(node.value) or ast.unparse(node.value)}' is not "
-                f"known here, so its field '{node.attr}' cannot be checked", node,
+                TYPE_UNKNOWN_CLASS_STORE,
+                (dotted_name(node.value) or ast.unparse(node.value), node.attr), node,
                 'unknown-class', node.attr, fix='annotate the value with the type it holds')
 
     def _distribute(self, target: ast.Tuple | ast.List, ty: str, source: ast.AST,
@@ -2207,8 +2235,7 @@ class _Inference:
                  for element in target.elts]
         if any(isinstance(element, ast.Starred) for element in target.elts):
             self._diag(
-                'a starred target takes an unknown number of elements, which Pine '
-                'has no form for', target,
+                TYPE_STARRED_TARGET, (), target,
                 self._unknown('shape-mismatch', target, render_ty(ty)),
                 fix='unpack exactly as many names as the tuple has elements')
             for name in names:
@@ -2217,8 +2244,7 @@ class _Inference:
         elements = elements_of(ty)
         if elements and len(elements) != len(names):
             self._diag(
-                f'{render_ty(ty)} has {len(elements)} elements, and this unpacks '
-                f'{len(names)}', target,
+                TYPE_UNPACK_COUNT, (render_ty(ty), str(len(elements)), str(len(names))), target,
                 self._unknown('shape-mismatch', target,
                               f'{len(elements)} vs {len(names)}'),
                 fix=f'unpack {len(elements)} names, as many as the tuple has')
@@ -2652,14 +2678,14 @@ class _Inference:
                 # evaluates to is the call's question, not the reference's
                 return OBJECT
             self._node_diag(
-                f"'{sig.name}' has no field '{node.attr}'", node,
+                TYPE_NO_FIELD, (sig.name, node.attr), node,
                 'unknown-field', f'{sig.name}.{node.attr}',
                 fix=f"declare '{node.attr}' on '{sig.name}', or read a field it has")
             return UNKNOWN
         if base == OBJECT and not self._is_reference(node.value):
             self._node_diag(
-                f"the class of '{dotted_name(node.value) or ast.unparse(node.value)}' is not "
-                f"known here, so its field '{node.attr}' has no type", node,
+                TYPE_UNKNOWN_CLASS_FIELD,
+                (dotted_name(node.value) or ast.unparse(node.value), node.attr), node,
                 'unknown-class', node.attr,
                 fix='annotate the value with the type it holds')
         return UNKNOWN
@@ -2686,15 +2712,15 @@ class _Inference:
         if node.attr == 'entering':
             return BOOL
         if node.attr != 'value':
-            self._node_diag(f"the loop counter has no field '{node.attr}'", node, 'unknown-field',
+            self._node_diag(TYPE_LOOP_COUNTER_FIELD, (node.attr,), node, 'unknown-field',
                             f'PineLoop.{node.attr}',
                             fix="read 'value' or 'entering', or call 'step' or 'enter'")
             return UNKNOWN
         counter = self._loop_counter(node.value)
         if counter is None or counter == UNKNOWN:
             self._node_diag(
-                f"the bounds of '{ast.unparse(node.value)}' are not known here, so its counter "
-                f'has no type', node, 'unknown-value', 'PineLoop.value',
+                TYPE_LOOP_BOUNDS_UNKNOWN, (ast.unparse(node.value),), node, 'unknown-value',
+                'PineLoop.value',
                 fix='give the loop bounds known numeric types')
             return UNKNOWN
         return counter
@@ -2739,7 +2765,7 @@ class _Inference:
                 result = UNKNOWN
             else:
                 self._node_diag(
-                    f"'{what}' takes a number for a bound, {render_ty(ty)} passed", node,
+                    CALL_BOUND_NOT_NUMBER, (what, render_ty(ty)), node,
                     'bad-call', what, fix='pass int or float bounds')
                 result = UNKNOWN
         return result
@@ -2757,7 +2783,7 @@ class _Inference:
         """
         if func.attr == 'enter':
             if len(node.args) > 1 or node.keywords:
-                self._node_diag(f"'enter' takes 0 or 1 argument(s), {_call_arity(node)} passed",
+                self._node_diag(LOOP_ENTER_ARITY, (str(_call_arity(node)),),
                                 node, 'bad-call', 'PineLoop.enter', fix="pass the step: 'enter(by)'")
                 return VOID
             self._widen_loop_counter(node, func, 'enter')
@@ -2765,7 +2791,7 @@ class _Inference:
         if func.attr != 'step':
             return UNKNOWN
         if len(node.args) != 1 or node.keywords:
-            self._node_diag(f"'step' takes 1 argument(s), {_call_arity(node)} passed", node,
+            self._node_diag(LOOP_STEP_ARITY, (str(_call_arity(node)),), node,
                             'bad-call', 'PineLoop.step', fix="pass the bound: 'step(to)'")
             return BOOL
         self._widen_loop_counter(node, func, 'step')
@@ -2807,12 +2833,13 @@ class _Inference:
         return node.id in self._imports or node.id in self._shadowed \
             or self._lookup(node.id) is None
 
-    def _node_diag(self, message: str, node: ast.AST, reason: str, detail: str,
-                   fix: str = '') -> None:
+    def _node_diag(self, code: Code, args: tuple[str, ...], node: ast.AST, reason: str,
+                   detail: str, fix: str = '') -> None:
         """
         Report a node once, however many walks reach it.
 
-        :param message: What happened
+        :param code: The registry code of the complaint
+        :param args: The code's parameters, as the message shows them
         :param node: The attribute node
         :param reason: The provenance reason
         :param detail: The provenance detail
@@ -2823,7 +2850,7 @@ class _Inference:
             if nid in self._shape_diags:
                 return
             self._shape_diags.add(nid)
-        self._diag(message, node, self._unknown(reason, node, detail), fix=fix)
+        self._diag(code, args, node, self._unknown(reason, node, detail), fix=fix)
 
     def _e_binop(self, node: ast.BinOp) -> str:
         left = self._expr(node.left)
@@ -2890,15 +2917,15 @@ class _Inference:
             # history like any other series, and ``prices[1]`` reads the
             # container of the bar before
             self._node_diag(
-                f'indexing {render_ty(base)} is not Pine', node, 'not-pine', 'Subscript',
+                TYPE_INDEX_NOT_PINE, (render_ty(base),), node, 'not-pine', 'Subscript',
                 fix='read elements with array.get / matrix.get / map.get')
             return UNKNOWN
         if base in SCALARS and not self._is_series(node.value):
             # The history operator reads a SERIES: a plain scalar name has no
             # bars behind it, and a call's result is a value, not a series
             self._node_diag(
-                f"'{ast.unparse(node.value)[:40]}' is a plain {render_ty(base)}, not a "
-                f"series", node, 'not-series', render_ty(base),
+                TYPE_NOT_SERIES, (ast.unparse(node.value)[:40], render_ty(base)), node,
+                'not-series', render_ty(base),
                 fix=f'declare it Series[{render_ty(base)}] to read its history')
             return UNKNOWN
         # MEASURED: ``d[1]`` on an int-typed ``d`` is int -- the history index
@@ -3012,10 +3039,10 @@ class _Inference:
         entry = lib_types().get(callee)
         if entry is None and LIB_TYPE_OVERRIDES.get(callee) is None:
             if callee in lib_namespaces():
-                self._node_diag(f"'{callee}' is a lib namespace, not a function", node,
+                self._node_diag(TYPE_LIB_NAMESPACE_CALL, (callee,), node,
                                 'unknown-lib', callee, fix=f"call a name in '{callee}'")
             else:
-                self._node_diag(f"'{callee}' is not a lib name", node, 'unknown-lib', callee,
+                self._node_diag(TYPE_NOT_LIB_NAME, (callee,), node, 'unknown-lib', callee,
                                 fix='call a lib name that exists')
         if isinstance(entry, dict) and argc is not None \
                 and not self._lib_call_fits(callee, entry, node):
@@ -3190,7 +3217,7 @@ class _Inference:
         elif kind == 'value' and entry.get('ty') in SCALARS and not entry.get('callable'):
             # ``close(1)``: a scalar is nothing a call can reach (a module
             # property may be called, and reads the same)
-            self._node_diag(f"'{callee}' is a lib value, not a function", node, 'unknown-lib',
+            self._node_diag(TYPE_LIB_VALUE_CALL, (callee,), node, 'unknown-lib',
                             callee, fix=f"read '{callee}' without calling it")
             return False
         else:
@@ -3198,12 +3225,12 @@ class _Inference:
         argc = len(positional_args) + len(node.keywords)
         if not any(_arity_fits(impl, argc) for impl in impls):
             counts = sorted({len(impl['params']) - impl['defaults'] for impl in impls})
-            self._bad_call(node, callee, f"'{callee}' does not take {argc} argument(s) "
-                                         f"(at least {counts[0]} needed)")
+            self._bad_call(node, callee, CALL_TOO_FEW_ARGUMENTS,
+                           (callee, str(argc), str(counts[0])))
             return False
         for keyword in node.keywords:
             if not any(keyword.arg in impl['names'] or impl.get('kwarg') for impl in impls):
-                self._bad_call(node, callee, f"'{callee}' has no parameter '{keyword.arg}'")
+                self._bad_call(node, callee, CALL_UNKNOWN_PARAMETER, (callee, keyword.arg))
                 return False
         if kind != 'function':
             return True
@@ -3233,8 +3260,8 @@ class _Inference:
                     continue
             if passed in _UNCHECKED or _fits(declared, passed):
                 continue
-            self._bad_call(node, callee, f"'{callee}' takes {render_ty(declared)} for "
-                                         f"'{pname}', {render_ty(passed)} passed")
+            self._bad_call(node, callee, CALL_ARGUMENT_TYPE,
+                           (callee, render_ty(declared), pname, render_ty(passed)))
             return False
         return True
 
@@ -3319,9 +3346,10 @@ class _Inference:
         set_pins(node, None if agreed else dict(seen))
         if diagnose and not agreed and nid not in self._pin_diags:
             self._pin_diags.add(nid)
+            pins = ', '.join(f'`{each}`' for each in sorted(set(seen.values()), key=str))
             self._diag(
-                f"overload pin differs per call context: {sorted(set(seen.values()), key=str)}",
-                node, self._unknown('context-dependent-pin', node, dotted_name(node.func) or ''),
+                TYPE_PIN_PER_CONTEXT, (pins,), node,
+                self._unknown('context-dependent-pin', node, dotted_name(node.func) or ''),
                 fix='annotate the parameters so every call site agrees')
         return pin
 
@@ -3453,9 +3481,7 @@ class _Inference:
                              for kind in self._widens.get(nid, {}).values())):
                 continue
             self._diag(
-                'the implicit conversion of a value differs per call context, and not '
-                'every instance can be given its own',
-                node, self._unknown('context-dependent-widen', node),
+                TYPE_WIDEN_PER_CONTEXT, (), node, self._unknown('context-dependent-widen', node),
                 fix='annotate the parameters so every call site passes the same types')
 
     def _declared_constructor(self, declared: str, value: ast.AST, value_ty: str) -> str:
@@ -3777,8 +3803,7 @@ class _Inference:
             if other == UNKNOWN or (kind(other) and element_of(other) == UNKNOWN):
                 unknown = self._unknown('unknown-value', where, render_ty(base))
                 self._diag(
-                    f'{render_ty(base)} takes an operand whose type is not known '
-                    f'here, so what it holds afterwards is not known either', where,
+                    TYPE_OPERAND_UNKNOWN, (render_ty(base),), where,
                     unknown, fix='give the operand a known type')
             else:
                 unknown = Unknown(reason='shape-mismatch',
@@ -3786,8 +3811,7 @@ class _Inference:
                                   col=getattr(where, 'col_offset', 0),
                                   detail=f'{render_ty(base)} vs {render_ty(other)}')
                 self._diag(
-                    f'{render_ty(base)} cannot take {render_ty(other)}: the '
-                    f'elements are different types', where, unknown,
+                    TYPE_OPERAND_MISMATCH, (render_ty(base), render_ty(other)), where, unknown,
                     fix=f'pass {render_ty(base)}')
         # Every failed merge takes the pins away, reported here or before
         if self._pins_suppressed is None:
@@ -3941,7 +3965,7 @@ class _Inference:
                     builtin, node.args, node.keywords, _call_arity(node))
                 if fallback is not None:
                     return fallback
-                self._node_diag(f"the call to '{name}' has no known type", node,
+                self._node_diag(TYPE_UNKNOWN_CALL, (name,), node,
                                 'unknown-call', name, fix=f"call '{name}' the way Pine spells it")
                 return UNKNOWN
             # Nothing answers for the callee: not a definition, not a class,
@@ -3949,16 +3973,15 @@ class _Inference:
             # whatever becomes of the value, so it is told here, not by the
             # reader of the result
             self._node_diag(
-                f"'{name}' is not a function this module defines or imports, nor a lib name"
-                if name else 'the callee is not a name', node, 'unknown-call', name,
+                TYPE_UNKNOWN_CALLEE if name else TYPE_CALLEE_NOT_NAME, (name,) if name else (),
+                node, 'unknown-call', name,
                 fix='define it, import it or call a lib name')
             return UNKNOWN
 
         key, frame, shadowed = resolved
         if shadowed:
             self._diag(
-                f"'{name}' is assigned as well as defined, so what it calls is unknown",
-                node, self._unknown('rebound-name', node, name),
+                TYPE_REBOUND_DEFINED, (name,), node, self._unknown('rebound-name', node, name),
                 fix=f"call '{name}' under a name nothing assigns to")
             return UNKNOWN
         is_group = key in self._overload_groups
@@ -4011,7 +4034,7 @@ class _Inference:
                 return True
             if self._call_params(impl, node, positional, report=False) is not None:
                 return True
-        self._bad_call(node, name, f"no overload of '{name}' takes these arguments")
+        self._bad_call(node, name, CALL_NO_OVERLOAD, (name,))
         return False
 
     def _constructor_call(self, name: str, node: ast.Call) -> str | None:
@@ -4064,30 +4087,30 @@ class _Inference:
             return True
         fields = list(sig.fields)
         if len(node.args) > len(fields):
-            self._bad_call(node, name, f"'{sig.name}' has {len(fields)} field(s), "
-                                       f"{len(node.args)} argument(s) passed")
+            self._bad_call(node, name, CONSTRUCTOR_FIELD_COUNT,
+                           (sig.name, str(len(fields)), str(len(node.args))))
             return False
         bound = dict(zip(fields, node.args))
         for keyword in node.keywords:
             if keyword.arg not in sig.fields:
-                self._bad_call(node, name, f"'{sig.name}' has no field '{keyword.arg}'")
+                self._bad_call(node, name, TYPE_NO_FIELD, (sig.name, keyword.arg))
                 return False
             if keyword.arg in bound:
-                self._bad_call(node, name, f"'{keyword.arg}' is passed to '{sig.name}' twice")
+                self._bad_call(node, name, CALL_ARGUMENT_TWICE, (keyword.arg, sig.name))
                 return False
             bound[keyword.arg] = keyword.value
         for index, field_name in enumerate(fields):
             passed = bound.get(field_name)
             if passed is None:
                 if index < sig.required:
-                    self._bad_call(node, name, f"'{sig.name}' needs a value for '{field_name}'")
+                    self._bad_call(node, name, CONSTRUCTOR_MISSING_FIELD, (sig.name, field_name))
                     return False
                 continue
             declared = sig.fields[field_name]
             given = self._ty_of(passed)
             if declared != UNKNOWN and given not in _UNCHECKED and not _fits(declared, given):
-                self._bad_call(node, name, f"'{sig.name}.{field_name}' holds "
-                                           f"{render_ty(declared)}, {render_ty(given)} passed")
+                self._bad_call(node, name, CONSTRUCTOR_FIELD_TYPE,
+                               (f'{sig.name}.{field_name}', render_ty(declared), render_ty(given)))
                 return False
             if given == TYPELESS:
                 # A typeless na passed for a field is the na of what the field holds
@@ -4347,8 +4370,8 @@ class _Inference:
         key, frame, shadowed = resolved
         if shadowed:
             self._diag(
-                f"'{spelled}' is assigned as well as defined, so what it calls is unknown",
-                node, self._unknown('rebound-name', node, spelled),
+                TYPE_REBOUND_DEFINED, (spelled,), node,
+                self._unknown('rebound-name', node, spelled),
                 fix=f"call '{spelled}' under a name nothing assigns to")
             return UNKNOWN
         if key in self._overload_groups:
@@ -4386,7 +4409,7 @@ class _Inference:
         :return: UNKNOWN
         """
         if len(node.args) < 2:
-            self._node_diag("'method_call' takes a method and a receiver", node, 'bad-call',
+            self._node_diag(METHOD_CALL_SHAPE, (), node, 'bad-call',
                             'method_call', fix="spell it 'method_call(method, receiver, ...)'")
             return UNKNOWN
         selector, receiver = node.args[0], node.args[1]
@@ -4399,20 +4422,21 @@ class _Inference:
             return UNKNOWN
         if receiver_ty == OBJECT:
             self._node_diag(
-                f"the class of '{dotted_name(receiver) or ast.unparse(receiver)}' is not known "
-                f"here, so its method '{spelled}' has no type", node, 'unknown-class', spelled,
+                TYPE_UNKNOWN_CLASS_METHOD,
+                (dotted_name(receiver) or ast.unparse(receiver), spelled), node,
+                'unknown-class', spelled,
                 fix='annotate the receiver with the type it holds')
             return UNKNOWN
         cid = class_of(receiver_ty)
         if isinstance(selector, ast.Constant) and cid is not None \
                 and self._declares_method(cid, spelled, node):
             self._node_diag(
-                f"'{spelled}' is declared on {render_ty(receiver_ty)}, but no export the "
-                f"runtime searches by name holds it", node, 'unknown-method', spelled,
+                TYPE_METHOD_NOT_EXPORTED, (spelled, render_ty(receiver_ty)), node,
+                'unknown-method', spelled,
                 fix=f"pass the method itself: 'method_call({spelled}, ...)'")
             return UNKNOWN
         self._node_diag(
-            f"'{spelled}' is not a method of {render_ty(receiver_ty)} here", node,
+            TYPE_METHOD_NOT_FOUND, (spelled, render_ty(receiver_ty)), node,
             'unknown-method', spelled,
             fix=f"declare '{spelled}' on the receiver's class, or call a method its shape has")
         return UNKNOWN
@@ -5024,13 +5048,13 @@ class _Inference:
                 self._call_q[nid] = settled.ret_qual
             return settled.ret
         if (key, params, node_id(target)) in self._in_progress:
-            self._diag(f"'{dotted_name(node.func)}' is re-entrant, so its result type is unknown",
-                       node, self._unknown('recursion', node, key))
+            self._diag(TYPE_RECURSION, (str(dotted_name(node.func)),), node,
+                       self._unknown('recursion', node, key))
             return UNKNOWN
         result = self._analyse(key, target, params, parents, node,
                                self._call_quals(target, node, positional))
         if result is None:
-            self._diag(f"'{dotted_name(node.func)}' hit the per-module context limit", node,
+            self._diag(TYPE_CONTEXT_LIMIT, (str(dotted_name(node.func)),), node,
                        self._unknown('context-budget', node, key))
             return UNKNOWN
         if nid is not None:
@@ -5066,9 +5090,9 @@ class _Inference:
         declared = target.args
         name = target.name
 
-        def reject(message: str) -> None:
+        def reject(code: Code, code_args: tuple[str, ...]) -> None:
             if report:
-                self._bad_call(node, name, message)
+                self._bad_call(node, name, code, code_args)
 
         if declared.vararg is not None or declared.kwarg is not None:
             return None
@@ -5078,8 +5102,7 @@ class _Inference:
             return None
         positional = list(declared.posonlyargs) + list(declared.args)
         if len(args) > len(positional):
-            reject(f"'{name}' takes {len(positional)} positional "
-                                       f"argument(s), {len(args)} passed")
+            reject(CALL_POSITIONAL_COUNT, (name, str(len(positional)), str(len(args))))
             return None
 
         bound: dict[str, ast.expr] = {}
@@ -5088,10 +5111,10 @@ class _Inference:
         declared_names = {a.arg for a in positional + list(declared.kwonlyargs)}
         for keyword in node.keywords:
             if keyword.arg not in declared_names:
-                reject(f"'{name}' has no parameter '{keyword.arg}'")
+                reject(CALL_UNKNOWN_PARAMETER, (name, keyword.arg))
                 return None
             if keyword.arg in bound:
-                reject(f"'{keyword.arg}' is passed to '{name}' twice")
+                reject(CALL_ARGUMENT_TWICE, (keyword.arg, name))
                 return None
             bound[keyword.arg] = keyword.value
 
@@ -5101,7 +5124,7 @@ class _Inference:
             passed = bound.get(arg.arg)
             default = defaults.get(arg.arg)
             if passed is None and default is None:
-                reject(f"'{name}' needs an argument for '{arg.arg}'")
+                reject(CALL_MISSING_ARGUMENT, (name, arg.arg))
                 return None
             annotated = annotation_type(arg.annotation, self._classes)
             if annotated != UNKNOWN:
@@ -5109,8 +5132,8 @@ class _Inference:
                 given = self._ty_of(given_node)
                 if passed is not None and given not in _UNCHECKED \
                         and not _fits(annotated, given):
-                    reject(f"'{name}' takes {render_ty(annotated)} for "
-                                    f"'{arg.arg}', {render_ty(given)} passed")
+                    reject(CALL_ARGUMENT_TYPE,
+                           (name, render_ty(annotated), arg.arg, render_ty(given)))
                     return None
                 if report and given == TYPELESS:
                     # A typeless na passed (or defaulted) to a string is the string na,
@@ -5156,10 +5179,17 @@ class _Inference:
             out.append(SERIES if passed is None else self._qual(passed))
         return tuple(out)
 
-    def _bad_call(self, node: ast.Call, name: str, message: str) -> None:
-        """A call whose shape or argument types the callee does not take."""
+    def _bad_call(self, node: ast.Call, name: str, code: Code, args: tuple[str, ...]) -> None:
+        """
+        Report a call whose shape or argument types the callee does not take.
+
+        :param node: The call node
+        :param name: The callee as written
+        :param code: The registry code of the complaint
+        :param args: The code's parameters, as the message shows them
+        """
         self._bad_calls.add(id(node))
-        self._node_diag(message, node, 'bad-call', name,
+        self._node_diag(code, args, node, 'bad-call', name,
                         fix=f"call '{name}' the way it is declared")
 
     # --- calls into another module ---------------------------------------
@@ -5190,14 +5220,12 @@ class _Inference:
             return UNKNOWN
         if head in self._multi_imports:
             self._diag(
-                f"'{head}' is imported more than once, so what it calls is unknown",
-                node, self._unknown('rebound-name', node, head),
+                TYPE_IMPORTED_TWICE, (head,), node, self._unknown('rebound-name', node, head),
                 fix=f"import '{head}' once, under a name nothing else binds")
             return UNKNOWN
         if self._import_rebound(head):
             self._diag(
-                f"'{head}' is assigned as well as imported, so what it calls is unknown",
-                node, self._unknown('rebound-name', node, head),
+                TYPE_REBOUND_IMPORTED, (head,), node, self._unknown('rebound-name', node, head),
                 fix=f"call '{head}' under a name nothing assigns to")
             return UNKNOWN
         if shadow is not None:
@@ -5280,8 +5308,7 @@ class _Inference:
             ty = UNKNOWN
             where = f'{interface.path}:{sig.line}'
             self._diag(
-                f"'{sig.name}' is imported from {where}, where its parameters carry no "
-                f"annotations, so what it returns is unknown", node,
+                TYPE_UNANNOTATED_IMPORT, (sig.name, where), node,
                 self._unknown('unannotated-import', node, sig.name),
                 fix=f"annotate the parameters of '{sig.name}' in {where}")
         self.table.calls.append(CallSite(
@@ -5313,11 +5340,11 @@ class _Inference:
         argc = len(positional_args) + len(node.keywords)
         if not any(shape.required <= argc and (shape.open_ended or argc <= len(shape.params))
                    for shape in shapes):
-            self._bad_call(node, name, f"'{name}' does not take {argc} argument(s)")
+            self._bad_call(node, name, CALL_ARGUMENT_COUNT, (name, str(argc)))
             return False
         for keyword in node.keywords:
             if not any(keyword.arg in shape.names for shape in shapes):
-                self._bad_call(node, name, f"'{name}' has no parameter '{keyword.arg}'")
+                self._bad_call(node, name, CALL_UNKNOWN_PARAMETER, (name, keyword.arg))
                 return False
         if sig.kind == 'group':
             return True
@@ -5328,7 +5355,7 @@ class _Inference:
         positional = set(sig.names[:len(positional_args)])
         for keyword in node.keywords:
             if keyword.arg in positional:
-                self._bad_call(node, name, f"'{keyword.arg}' is passed to '{name}' twice")
+                self._bad_call(node, name, CALL_ARGUMENT_TWICE, (keyword.arg, name))
                 return False
             if keyword.arg in sig.names:
                 given.append((keyword.arg, sig.params[sig.names.index(keyword.arg)],
@@ -5337,8 +5364,8 @@ class _Inference:
             passed = self._ty_of(arg)
             if declared == UNKNOWN or passed in _UNCHECKED or _fits(declared, passed):
                 continue
-            self._bad_call(node, name, f"'{name}' takes {render_ty(declared)} for '{pname}', "
-                                       f"{render_ty(passed)} passed")
+            self._bad_call(node, name, CALL_ARGUMENT_TYPE,
+                           (name, render_ty(declared), pname, render_ty(passed)))
             return False
         return True
 
@@ -5384,8 +5411,7 @@ class _Inference:
         """
         if module_interface.closes_cycle(path):
             self._node_diag(
-                f"'{dotted}' imports this module back, so its signatures are not "
-                f"available yet", node, 'import-cycle', dotted,
+                TYPE_IMPORT_CYCLE, (dotted,), node, 'import-cycle', dotted,
                 fix=f'break the import cycle between {self.table.module_path} and {path}')
             return None
         if path not in self._interfaces:
@@ -5397,8 +5423,7 @@ class _Inference:
                     # trust, and neither can a pin built here on one of its
                     # return types: this module gives its pins up with it
                     self._diag(
-                        f"'{dotted}' is reported, and no type it publishes may drive "
-                        f"a dispatch here: {interface.suppressed}", node,
+                        TYPE_SUPPRESSED_IMPORT, (dotted, interface.suppressed), node,
                         self._unknown('suppressed-import', node, dotted),
                         fix=f"fix '{dotted}' first")
                     if self._pins_suppressed is None:

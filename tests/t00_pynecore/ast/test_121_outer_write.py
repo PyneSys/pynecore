@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core.import_hook import _analyse_tree
+from pynecore.errorcodes import ModuleStateModifiedError
 
 #: A path outside the pynecore package, so the pass is applied (its own lib is
 #: exempt, like every other user-script-only pass of the pipeline).
@@ -26,13 +27,12 @@ def __test_helper_analyse(body: str) -> None:
     _analyse_tree(ast.parse(source), source, _PATH, None)
 
 
-def __test_helper_rejects(body: str, name: str) -> SyntaxError:
+def __test_helper_rejects(body: str, name: str) -> ModuleStateModifiedError:
     """Assert the snippet is rejected and the error names the binding."""
-    with pytest.raises(SyntaxError) as info:
+    with pytest.raises(ModuleStateModifiedError) as info:
         __test_helper_analyse(body)
     error = info.value
-    assert f"'{name}'" in str(error), str(error)
-    assert 'cannot be modified inside one' in str(error), str(error)
+    assert error.params['name'] == name, error.params
     return error
 
 

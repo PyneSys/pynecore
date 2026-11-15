@@ -8,7 +8,7 @@ PyneIDE's spec, extracted into ``edge_rules.json`` and applied by
 has a known Pine type, which the inference reports once per cause through
 ``pine_type_report``. Both halves are diagnostics; in hand-written code they
 are a coverage meter and stop nothing, in an edge module under
-``PYNE_EDGE_STRICT=1`` the first one is a ``PineTypeError`` with a real caret.
+``PYNE_EDGE_STRICT=1`` the first one is its code's error, with a real caret.
 """
 import ast
 import builtins
@@ -19,6 +19,9 @@ from pathlib import Path
 import pytest
 
 from pynecore.core.import_hook import PyneLoader
+from pynecore.errorcodes import (
+    TYPE_UNKNOWN_NAME, EdgeCallError, EdgePythonBuiltinError, EdgeSyntaxError, TypeUnknownNameError,
+)
 from ..pine_analysis import analyse_module
 from pynecore.transformers import pine_edge_gate, module_interface
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
@@ -26,7 +29,7 @@ from pynecore.transformers.pine_edge_gate import (
     EDGE_RULES_VERSION, DIAG_ENV, STRICT_ENV, edge_rules, gate_module, gated, render_diags,
 )
 from pynecore.transformers.pine_type_infer import infer_module, lib_star_exports
-from pynecore.transformers.pine_type_table import Diag, PineTypeError, PineTypeTable
+from pynecore.transformers.pine_type_table import Diag, PineTypeTable, Unknown, diag_error
 from pynecore.transformers.pine_type_report import unknown_diags
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -116,46 +119,48 @@ def __test_only_an_edge_module_is_gated__():
 # --- 2. the structural half --------------------------------------------------
 
 
-@pytest.mark.parametrize("snippet,reason,words", [
-    ('try:\n    x = 1\nexcept TypeError:\n    x = 2\n', 'edge-syntax', "'try'"),
+@pytest.mark.parametrize("snippet,reason,code,words", [
+    ('try:\n    x = 1\nexcept TypeError:\n    x = 2\n', 'edge-syntax', 'E0001', '`try`'),
     # Not at the start of the snippet: a string opening with ``with`` reads as SQL to the IDE
-    ('x = 1\nwith open("f") as h:\n    pass\n', 'edge-syntax', "'with'"),
-    ('match close:\n    case 1:\n        pass\n', 'edge-syntax', "'match'"),
-    ('def f():\n    global g\n', 'edge-syntax', "'global'"),
-    ('del close\n', 'edge-syntax', "'del'"),
-    ('assert close > 0, str.tostring(close)\n', 'edge-assert', 'assert message'),
-    ('x = {1: 2}\n', 'edge-syntax', 'dict literal'),
-    ('x = {1, 2}\n', 'edge-syntax', 'set literal'),
-    ('x = [i for i in (1, 2)]\n', 'edge-syntax', 'comprehension'),
-    ('x = f"{close}"\n', 'edge-syntax', 'f-string'),
-    ('x = (y := 1)\n', 'edge-syntax', "':='"),
-    ('x = close[1:2]\n', 'edge-syntax', 'slice'),
-    ('x = 1 | 2\n', 'edge-syntax', "'|'"),
-    ('x = 1 << 2\n', 'edge-syntax', "'<<'"),
-    ('x = close is None\n', 'edge-syntax', "'is'"),
-    ('def f(*a):\n    pass\n', 'edge-syntax', '*args'),
-    ('def f(a, *, b):\n    pass\n', 'edge-syntax', 'keyword-only'),
-    ('x = lambda: 1\n', 'edge-lambda', 'lambda'),
-    ('x = [1, 2]\n', 'edge-syntax', 'list literal'),
-    ('import os\n', 'edge-import', "'os'"),
-    ('from typing import List\n', 'edge-import', 'typing.List'),
-    ('from . import sibling\n', 'edge-import', 'relative'),
-    ('def f():\n    pass\nf.attr = 1\n', 'edge-attr-store', 'attribute'),
-    ('x = print\nx(1)\n', 'edge-call', "'x'"),
-    ('exec("1")\n', 'edge-call', "'exec'"),
+    ('x = 1\nwith open("f") as h:\n    pass\n', 'edge-syntax', 'E0001', '`with`'),
+    ('match close:\n    case 1:\n        pass\n', 'edge-syntax', 'E0001', '`match`'),
+    ('def f():\n    global g\n', 'edge-syntax', 'E0001', '`global`'),
+    ('del close\n', 'edge-syntax', 'E0001', '`del`'),
+    ('assert close > 0, str.tostring(close)\n', 'edge-assert', 'E0004', '`assert` message'),
+    ('x = {1: 2}\n', 'edge-syntax', 'E0001', 'dict literal'),
+    ('x = {1, 2}\n', 'edge-syntax', 'E0001', 'set literal'),
+    ('x = [i for i in (1, 2)]\n', 'edge-syntax', 'E0001', 'comprehension'),
+    ('x = f"{close}"\n', 'edge-syntax', 'E0001', 'f-string'),
+    ('x = (y := 1)\n', 'edge-syntax', 'E0001', '`:=`'),
+    ('x = close[1:2]\n', 'edge-syntax', 'E0001', 'slice'),
+    ('x = 1 | 2\n', 'edge-syntax', 'E0001', '`|`'),
+    ('x = 1 << 2\n', 'edge-syntax', 'E0001', '`<<`'),
+    ('x = close is None\n', 'edge-syntax', 'E0001', '`is`'),
+    ('def f(*a):\n    pass\n', 'edge-syntax', 'E0001', '`*args`'),
+    ('def f(a, *, b):\n    pass\n', 'edge-syntax', 'E0001', 'keyword-only'),
+    ('x = lambda: 1\n', 'edge-lambda', 'E0003', '`lambda`'),
+    ('x = [1, 2]\n', 'edge-syntax', 'E0001', 'list literal'),
+    ('import os\n', 'edge-import', 'E0006', '`os`'),
+    ('from typing import List\n', 'edge-import', 'E0006', '`typing.List`'),
+    ('from . import sibling\n', 'edge-import', 'E0006', 'relative'),
+    ('def f():\n    pass\nf.attr = 1\n', 'edge-attr-store', 'E0010', '`f`'),
+    ('x = print\nx(1)\n', 'edge-call', 'E0009', '`x`'),
+    ('exec("1")\n', 'edge-call', 'E0009', '`exec`'),
 ])
-def __test_a_construct_outside_the_profile_is_reported__(snippet: str, reason: str, words: str):
+def __test_a_construct_outside_the_profile_is_reported__(snippet: str, reason: str, code: str,
+                                                         words: str):
     diags = _gate(HEAD + snippet)
     assert diags, snippet
     assert _reasons(diags)[0] == reason, [diag.message for diag in diags]
+    assert diags[0].code == code, diags[0].message
     assert words in diags[0].message, diags[0].message
-    assert 'Pine' in diags[0].message and diags[0].fix
+    assert diags[0].fix
 
 
 def __test_one_construct_is_one_finding__():
     """The walk does not descend into a rejected construct"""
     diags = _gate(HEAD + 'x = [i | 1 for i in {1, 2}]\n')
-    assert len(diags) == 1 and 'comprehension' in diags[0].message
+    assert len(diags) == 1 and diags[0].code == 'E0001' and 'comprehension' in diags[0].message
 
 
 @pytest.mark.parametrize("snippet", [
@@ -182,11 +187,11 @@ def __test_pine_is_let_through__(snippet: str):
 
 def __test_a_class_is_a_field_list__():
     diags = _gate(HEAD + 'class A(object):\n    x: int\n')
-    assert 'inheritance' in diags[0].message
+    assert diags[0].code == 'E0008' and 'base classes' in diags[0].message
     diags = _gate(HEAD + 'class B:\n    x: int\n')
-    assert 'decorator' in diags[0].message
+    assert diags[0].code == 'E0008' and 'decorator' in diags[0].message
     diags = _gate(HEAD + '@udt\nclass C:\n    x: int\n    y = 1\n')
-    assert 'annotated fields and methods' in diags[0].message
+    assert diags[0].code == 'E0008' and 'annotated fields and methods' in diags[0].message
 
 
 def __test_a_class_body_declares_plain_methods__():
@@ -198,10 +203,10 @@ def __test_a_class_body_declares_plain_methods__():
     assert not diags, [diag.message for diag in diags]
     diags = _gate(HEAD + '@udt\nclass C:\n    x: int\n    @staticmethod\n'
                          '    def m():\n        pass\n')
-    assert any('decorated method' in diag.message for diag in diags), \
+    assert any(diag.code == 'E0008' and 'takes no decorator' in diag.message for diag in diags), \
         [diag.message for diag in diags]
     diags = _gate(HEAD + '@udt\nclass C:\n    x: int\n    def m():\n        pass\n')
-    assert 'receiver' in diags[0].message
+    assert diags[0].code == 'E0008' and 'receiver' in diags[0].message
 
 
 def __test_a_rejected_import_does_not_cascade_into_its_uses__():
@@ -262,7 +267,7 @@ def __test_the_builtin_named_lib_names_are_every_collision__():
 def __test_a_lib_name_left_to_the_builtin_is_reported__(snippet: str, name: str):
     diags = _gate(HEAD + snippet)
     assert _reasons(diags) == ['edge-builtin'], [diag.message for diag in diags]
-    assert f"'{name}'" in diags[0].message and 'Pine' in diags[0].message
+    assert diags[0].code == 'E0002' and diags[0].args[0] == name
     assert diags[0].fix is not None and f'from pynecore.lib import {name}' in diags[0].fix
     assert diags[0].end_col - diags[0].col == len(name)
 
@@ -325,7 +330,8 @@ def main(length: int):
     assert [diag.line for diag in diags] == [10, 14], render_diags(diags, 'probe.py')
     assert _reasons(diags) == ['unknown-field', 'unknown-return']
     assert diags[1].fix == "annotate the return of 'helper'"
-    assert "'.foo'" in diags[0].message
+    assert diags[0].code == 'E0019' and diags[0].args[0] == 'foo'
+    assert diags[1].code == 'E0014' and diags[1].args == ('helper',)
 
 
 def __test_each_root_kind_names_its_remedy__():
@@ -337,8 +343,9 @@ def main(length: int):
     return a + b + c
 ''')
     assert _reasons(diags) == ['unknown-call', 'unknown-lib-name']
-    assert "'getattr'" in diags[0].message and 'import it' in diags[0].fix
-    assert "'nosuch'" in diags[1].message
+    assert diags[0].code == 'E0043' and diags[0].args == ('getattr',)
+    assert 'import it' in diags[0].fix
+    assert diags[1].code == 'E0018' and diags[1].args == ('nosuch',)
 
 
 def __test_an_unannotated_parameter_is_the_cause__():
@@ -379,14 +386,15 @@ def main(length: int):
 
 
 def __test_the_error_carries_the_caret_the_origin_and_the_fix__():
-    diag = Diag(message="'a' has no known type", line=3, col=4,
-                origin=__import__('pynecore.transformers.pine_type_table',
-                                  fromlist=['Unknown']).Unknown('unannotated-param', 1, 8, 'x'),
-                fix="annotate 'x'")
-    error = PineTypeError.from_diag(diag, 'probe.py', '    a = x')
+    diag = Diag(message=TYPE_UNKNOWN_NAME.render('a'), line=3, col=4,
+                origin=Unknown('unannotated-param', 1, 8, 'x'),
+                fix="annotate 'x'", code=TYPE_UNKNOWN_NAME.code, args=('a',))
+    error = diag_error(diag, 'probe.py', '    a = x')
+    assert isinstance(error, TypeUnknownNameError)
     assert error.filename == 'probe.py' and error.lineno == 3 and error.offset == 5
     assert error.text == '    a = x'
-    assert 'type lost at line 1' in str(error) and "annotate 'x'" in str(error)
+    notes = '\n'.join(error.__notes__)
+    assert 'type was lost at line 1' in notes and "annotate 'x'" in notes
 
 
 def __test_the_dump_prints_one_line_per_diagnostic__():
@@ -430,10 +438,10 @@ def _compile(path: Path) -> None:
 def __test_strict_makes_the_first_diagnostic_an_error__(tmp_path, monkeypatch):
     monkeypatch.setenv(STRICT_ENV, '1')
     path = _write(tmp_path, 'edge_strict', EDGE_MODULE)
-    with pytest.raises(PineTypeError) as caught:
+    with pytest.raises(EdgeCallError) as caught:
         _compile(path)
     assert caught.value.lineno == 9 and caught.value.filename == str(path)
-    assert "'getattr'" in str(caught.value)
+    assert '`getattr`' in str(caught.value)
     assert caught.value.text is not None and 'getattr' in caught.value.text
 
 
@@ -472,9 +480,9 @@ def __test_strict_rejects_a_builtin_read_ahead_of_the_module_binding__(
     path = _write(tmp_path, 'edge_annotated_builtin', EDGE_MODULE.replace(
         'close\n\n\n@script', f'close\n\n{declaration}\n\n\n@script').replace(
         '    a = getattr(close, "x")', '    a = open + 1.0'))
-    with pytest.raises(PineTypeError) as caught:
+    with pytest.raises(EdgePythonBuiltinError) as caught:
         _compile(path)
-    assert "builtin 'open'" in str(caught.value)
+    assert "`open` is Python's built-in" in str(caught.value)
     assert caught.value.text is not None and caught.value.text.strip() == text
 
 
@@ -499,7 +507,7 @@ def __test_the_structural_half_comes_first__(tmp_path, monkeypatch):
     monkeypatch.setenv(STRICT_ENV, '1')
     path = _write(tmp_path, 'edge_syntax', EDGE_MODULE.replace(
         '    a = getattr(close, "x")', '    b = [1, 2]\n    a = getattr(close, "x")'))
-    with pytest.raises(PineTypeError) as caught:
+    with pytest.raises(EdgeSyntaxError) as caught:
         _compile(path)
     assert 'list literal' in str(caught.value) and caught.value.lineno == 9
 

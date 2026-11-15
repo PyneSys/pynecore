@@ -35,7 +35,7 @@ use crate::pine_type_rules::{
 };
 use crate::pine_type_table::{CallInterface, PineTypeTable};
 use crate::slot_layout::{DEFAULT_STATE_PARAM, ModuleLayout, SlotKind, scope_for_function};
-use crate::{Context, Error, Host};
+use crate::{Context, Error, Host, Raised};
 
 /// The runtime helpers by name, with the collision-safe alias a module imports them
 /// under (`HELPER_ALIASES`).
@@ -1295,9 +1295,10 @@ impl FunctionIsolation<'_, '_> {
                 _ => false,
             };
             if carries {
-                return Err(Error::Rejected(
-                    "Stateful function calls are not supported at module level".into(),
-                ));
+                return Err(Error::Rejected(Raised::new(
+                    &pynecore_codes::STATEFUL_CALL_AT_MODULE_LEVEL,
+                    [] as [String; 0],
+                )));
             }
             if let Some(pin) = stamp(ast, node, PIN_ATTR).cloned()
                 && route == Route::Uniform

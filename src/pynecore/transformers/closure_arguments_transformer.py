@@ -59,6 +59,7 @@ a capture of its own, under ``__capture·<name>__``, and passes that on::
 import ast
 from typing import Set, Dict, List, Optional, cast, Any
 
+from ..errorcodes import UnpackedReceiverError
 from . import ast_walk
 from .emission_settings import PYNE_RESERVED_NAME_CHAR
 from .locations import anchor_at, fix_locations
@@ -424,11 +425,9 @@ class ClosureArgumentsTransformer(ast_walk.NodeTransformer):
         :param node: The call node
         :param name: The called method
         """
-        raise SyntaxError(
-            f"{name}() uses variables of main(), so its receiver cannot come from an "
-            f"unpacked argument; pass the receiver explicitly: {name}(receiver, *args)",
-            (self._module_file, getattr(node, 'lineno', 0),
-             getattr(node, 'col_offset', 0) + 1, None))
+        raise UnpackedReceiverError(
+            function=name, location=(self._module_file, getattr(node, 'lineno', 0),
+                                     getattr(node, 'col_offset', 0) + 1, None))
 
     @staticmethod
     def _thread_after_receiver(node: ast.Call, captures: Dict[str, str],

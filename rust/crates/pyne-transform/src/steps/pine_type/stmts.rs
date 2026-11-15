@@ -82,11 +82,8 @@ impl Engine<'_, '_> {
                 {
                     let spelled = self.unparse(target)?;
                     self.node_diag(
-                        &format!(
-                            "'{spelled}' is declared {} and assigned {}",
-                            render_ty(was),
-                            render_ty(ty)
-                        ),
+                        &pynecore_codes::TYPE_DECLARED_MISMATCH,
+                        &[&spelled, &render_ty(was), &render_ty(ty)],
                         target,
                         "type-mismatch",
                         &spelled,
@@ -151,9 +148,8 @@ impl Engine<'_, '_> {
                     let spelled = self.unparse_prefix(iter, 40)?;
                     let rendered = render_ty(&iter_ty);
                     self.node_diag(
-                        &format!(
-                            "'{spelled}' is a {rendered}; a for loop iterates a range or an array"
-                        ),
+                        &pynecore_codes::TYPE_NOT_ITERABLE,
+                        &[&spelled, &rendered],
                         iter,
                         "not-iterable",
                         &rendered,
@@ -349,7 +345,8 @@ impl Engine<'_, '_> {
                 None => {
                     let name = &sig.name;
                     self.node_diag(
-                        &format!("'{name}' has no field '{attr}'"),
+                        &pynecore_codes::TYPE_NO_FIELD,
+                        &[name, &attr],
                         node,
                         "unknown-field",
                         &format!("{name}.{attr}"),
@@ -359,11 +356,8 @@ impl Engine<'_, '_> {
                 Some(found) if !unchecked(&ty) && !facts::fits(&found, &ty) => {
                     let name = &sig.name;
                     self.node_diag(
-                        &format!(
-                            "'{name}.{attr}' holds {} and is assigned {}",
-                            render_ty(&found),
-                            render_ty(&ty)
-                        ),
+                        &pynecore_codes::TYPE_FIELD_ASSIGN_MISMATCH,
+                        &[&format!("{name}.{attr}"), &render_ty(&found), &render_ty(&ty)],
                         node,
                         "type-mismatch",
                         &format!("{name}.{attr}"),
@@ -376,7 +370,8 @@ impl Engine<'_, '_> {
         }
         if SCALARS.contains(&base) {
             self.node_diag(
-                &format!("a {} has no field '{attr}' to assign", render_ty(base)),
+                &pynecore_codes::TYPE_NO_FIELD_TO_ASSIGN,
+                &[&render_ty(base), &attr],
                 node,
                 "unknown-field",
                 &attr,
@@ -385,10 +380,8 @@ impl Engine<'_, '_> {
         } else if base == OBJECT && !self.is_reference(receiver) {
             let spelled = self.spelled(receiver)?;
             self.node_diag(
-                &format!(
-                    "the class of '{spelled}' is not known here, so its field '{attr}' cannot be \
-                     checked"
-                ),
+                &pynecore_codes::TYPE_UNKNOWN_CLASS_STORE,
+                &[&spelled, &attr],
                 node,
                 "unknown-class",
                 &attr,
@@ -435,8 +428,8 @@ impl Engine<'_, '_> {
         if elts.iter().any(|&element| facts::is_starred(self.ast, element)) {
             let origin = self.unknown("shape-mismatch", target, &render_ty(ty));
             self.diag(
-                "a starred target takes an unknown number of elements, which Pine has no form \
-                 for",
+                &pynecore_codes::TYPE_STARRED_TARGET,
+                &[],
                 target,
                 Some(origin),
                 "unpack exactly as many names as the tuple has elements",
@@ -454,12 +447,8 @@ impl Engine<'_, '_> {
                 &format!("{} vs {}", elements.len(), names.len()),
             );
             self.diag(
-                &format!(
-                    "{} has {} elements, and this unpacks {}",
-                    render_ty(ty),
-                    elements.len(),
-                    names.len()
-                ),
+                &pynecore_codes::TYPE_UNPACK_COUNT,
+                &[&render_ty(ty), &elements.len().to_string(), &names.len().to_string()],
                 target,
                 Some(origin),
                 &format!("unpack {} names, as many as the tuple has", elements.len()),

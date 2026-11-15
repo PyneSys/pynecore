@@ -40,6 +40,7 @@ use std::rc::Rc;
 use indexmap::{IndexMap, IndexSet};
 use pyne_ast::walk::walk_statements;
 use pyne_ast::{Ast, Kind, NodeId, Unsupported, Value};
+use pynecore_codes::Code;
 
 use crate::node_ids::assign_node_ids;
 use crate::pine_qualifier::{CONST, SERIES};
@@ -481,7 +482,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             }
             (existing.ty.clone(), existing.unknown.is_some())
         };
-        let joined = self.joined(&before, ty, node, &format!("'{name}'"))?;
+        let joined = self.joined(&before, ty, node, &format!("`{name}`"))?;
         let unknown_now = if joined == UNKNOWN && !existing_unknown {
             Some(
                 self.shape_unknown(&before, ty, node)
@@ -567,11 +568,8 @@ impl<'a, 'h> Engine<'a, 'h> {
             )
         });
         self.diag(
-            &format!(
-                "{what} gets both {} and {}, which are different types",
-                render_ty(&first),
-                render_ty(&second)
-            ),
+            &pynecore_codes::TYPE_CONFLICT,
+            &[what, &render_ty(&first), &render_ty(&second)],
             node,
             Some(origin),
             "make both branches the same type",
@@ -599,27 +597,44 @@ impl<'a, 'h> Engine<'a, 'h> {
         }
     }
 
-    fn diag(&mut self, message: &str, node: NodeId, origin: Option<Unknown>, fix: &str) {
+    fn diag(
+        &mut self,
+        code: &'static Code,
+        args: &[&str],
+        node: NodeId,
+        origin: Option<Unknown>,
+        fix: &str,
+    ) {
         self.diags.push(Diag {
-            message: message.to_string(),
+            message: code.render(args),
             line: self.line(node),
             col: self.col(node),
             origin,
             fix: fix.to_string(),
             end_line: 0,
             end_col: 0,
+            code: code.code.to_string(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
         });
     }
 
     /// Report a node once, however many walks reach it (`_node_diag`).
-    fn node_diag(&mut self, message: &str, node: NodeId, reason: &str, detail: &str, fix: &str) {
+    fn node_diag(
+        &mut self,
+        code: &'static Code,
+        args: &[&str],
+        node: NodeId,
+        reason: &str,
+        detail: &str,
+        fix: &str,
+    ) {
         if let Some(nid) = self.nid(node)
             && !self.shape_diags.insert(nid)
         {
             return;
         }
         let origin = self.unknown(reason, node, detail);
-        self.diag(message, node, Some(origin), fix);
+        self.diag(code, args, node, Some(origin), fix);
     }
 
     // --- the per-node type view ------------------------------------------

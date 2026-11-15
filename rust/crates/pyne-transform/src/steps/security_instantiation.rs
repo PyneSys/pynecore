@@ -17,7 +17,7 @@ use pyne_ast::walk::{children, clone, descendants, docstring_end, walk, walk_sta
 use pyne_ast::{Ast, ExprContext, FieldMut, FieldRef, Kind, NodeId, Unsupported};
 
 use super::security::predicates::{has_security_call, is_security_call, is_security_lower_tf_call};
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 /// The most security calls one called function may reach through the functions
 /// it calls (`_MAX_FUNCTION_REQUESTS`): TradingView bounds a function's request
@@ -586,10 +586,9 @@ fn check_request_fanout(ast: &Ast, module: NodeId) -> Result<(), Error> {
         }
         let reached = totals.total(defs[0]);
         if reached > MAX_FUNCTION_REQUESTS {
-            return Err(Error::Rejected(format!(
-                "function '{name}' reaches {reached} request.security calls through the \
-                 functions it calls; a function can use at most {MAX_FUNCTION_REQUESTS} \
-                 request values"
+            return Err(Error::Rejected(Raised::new(
+                &pynecore_codes::TOO_MANY_FUNCTION_REQUESTS,
+                [name.to_string(), reached.to_string(), MAX_FUNCTION_REQUESTS.to_string()],
             )));
         }
     }

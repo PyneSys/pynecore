@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from pynecore.core.import_hook import PyneLoader
+from pynecore.errorcodes import PipelineNameError
 from pynecore.transformers.pipeline_names import is_pipeline_name
 
 __test_helper_script = '''"""@pyne"""
@@ -36,7 +37,7 @@ def __test_helper_compile(tmp_path: Path, module: str = '', body: str = '    pas
 
 def __test_a_generated_temporary_is_rejected__(tmp_path):
     """ A module variable named like a truthiness temporary is a compile error """
-    with pytest.raises(SyntaxError, match="'__bool1__' is a name PyneCore's transform generates"):
+    with pytest.raises(PipelineNameError, match="`__bool1__`"):
         __test_helper_compile(tmp_path, module='__bool1__ = 7.0')
 
 
@@ -44,13 +45,13 @@ def __test_a_generated_temporary_is_rejected__(tmp_path):
                                   '__dyn_default__', '__cmp12__', '__hist_3__'])
 def __test_every_family_is_rejected__(tmp_path, name):
     """ Plumbing, protocol and numbered temporaries alike """
-    with pytest.raises(SyntaxError, match=re.escape(f"'{name}'")):
+    with pytest.raises(PipelineNameError, match=re.escape(f"`{name}`")):
         __test_helper_compile(tmp_path, body=f'    {name} = 1')
 
 
 def __test_the_normalized_spelling_is_rejected__(tmp_path):
     """ Python binds the NFKC form, so a fullwidth spelling is the same name """
-    with pytest.raises(SyntaxError, match="'__state__'"):
+    with pytest.raises(PipelineNameError, match="`__state__`"):
         __test_helper_compile(tmp_path, body='    __ｓｔａｔｅ__ = 1')
 
 

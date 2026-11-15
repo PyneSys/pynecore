@@ -20,6 +20,7 @@ The runtime side of the contract (layout dict format, ``_make_state``,
 """
 import ast
 
+from ..errorcodes import StatefulMethodKindError
 from .locations import anchor_at
 from .pine_type_rules import OBJECT, stamp_lowering
 from .slot_layout import ModuleLayout, ScopeLayout
@@ -155,7 +156,7 @@ def _process_method(stmt: ast.FunctionDef, scope_id: str, used_imports: set[str]
     needs only the layout. Any other decorator decides itself what the
     attribute holds, so its state could not be routed.
 
-    :raises SyntaxError: For a state-carrying method with any other decorator
+    :raises StatefulMethodKindError: For a state-carrying method with any other decorator
     """
     decorators = stmt.decorator_list
     if not decorators:
@@ -167,9 +168,8 @@ def _process_method(stmt: ast.FunctionDef, scope_id: str, used_imports: set[str]
         decorators.append(_attach_decorator_ast(scope_id))
         used_imports.add('__attach_layout__')
         return
-    raise SyntaxError(
-        f"method '{stmt.name}' keeps state (a 'ta' call, a series or a persistent), "
-        f"which only a plain or a @staticmethod method can do (line {stmt.lineno})")
+    raise StatefulMethodKindError(
+        method=stmt.name, location=('<script>', stmt.lineno, stmt.col_offset + 1, None))
 
 
 def _process_defs(body: list[ast.stmt], scope_prefix: str, layout: ModuleLayout,
@@ -237,7 +237,12 @@ def apply_layout(tree: ast.Module, layout: ModuleLayout) -> ast.Module:
     # ("transformed module + no layout attribute -> provably stateless").
     layout.assign_scope_ids(tree)
     used_imports: set[str] = set()
-    tree.body = _process_defs(tree.body, '', layout, used_imports)
+    try:
+        tree.body = _process_defs(tree.body, '', layout, used_imports)
+    except StatefulMethodKindError as error:
+        # The walk over the definitions does not carry the module's path
+        error.filename = getattr(tree, '_module_file_path', '<script>')
+        raise
     index = _insert_index(tree.body)
     tree.body.insert(index, _layout_assign_ast(layout))
     if used_imports:

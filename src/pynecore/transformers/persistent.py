@@ -26,6 +26,7 @@ parent persistent of the same name.
 from typing import cast
 import ast
 
+from ..errorcodes import PersistentOutsideFunctionError
 from . import ast_walk
 from .slot_layout import ModuleLayout, scope_for_function
 from .varip_types import VARIP_TYPES
@@ -40,6 +41,8 @@ class PersistentTransformer(ast_walk.NodeTransformer):
 
     def __init__(self, layout: ModuleLayout):
         self.layout = layout
+        #: The source path of the module, for a rejection's location
+        self._module_file = '<script>'
         self.scope_stack: list[str] = []
         self.current_scope: str = ''
         # scope -> var name -> value slot
@@ -161,6 +164,7 @@ class PersistentTransformer(ast_walk.NodeTransformer):
         return node
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
+        self._module_file = getattr(node, '_module_file_path', '<script>')
         self.layout.assign_scope_ids(node)
         return cast(ast.Module, self.generic_visit(node))
 
@@ -209,7 +213,8 @@ class PersistentTransformer(ast_walk.NodeTransformer):
             return node
 
         if not self.current_scope:
-            raise SyntaxError("Persistent variables must be declared inside a function")
+            raise PersistentOutsideFunctionError(
+                location=(self._module_file, node.lineno, node.col_offset + 1, None))
 
         var_name = node.target.id
         self.persistent_declarations[self.current_scope].add(var_name)

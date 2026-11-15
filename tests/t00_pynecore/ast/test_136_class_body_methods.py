@@ -15,6 +15,7 @@ import ast
 
 import pytest
 
+from pynecore.errorcodes import StatefulMethodKindError
 from pynecore.core.instance_state import (RootChildSnapshot, _make_state, create_root,
                                           discard_root)
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
@@ -204,7 +205,7 @@ def main():
 def __test_any_other_decorator_on_a_stateful_method_is_refused__():
     """ A decorator decides what the attribute holds, so the state could not
     be routed: refused at transform time, never miscalled at run time """
-    with pytest.raises(SyntaxError, match="method 'count' keeps state"):
+    with pytest.raises(StatefulMethodKindError, match="`count`"):
         __test_helper_transform(__test_helper_COUNTER + '''
 class Tool:
     @classmethod

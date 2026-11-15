@@ -277,6 +277,12 @@ def python(codes: list[Code], sources: str) -> str:
     return "\n".join(lines)
 
 
+def _is_syntax(code: Code) -> bool:
+    """Whether a code's exception is a rule of the source: its class derives
+    from ``PyneSyntaxError`` and takes the place the rule was broken."""
+    return "SyntaxError" in code.python
+
+
 def _base(base: str) -> tuple[str | None, str]:
     """The import a base class of the registry's ``python`` needs, and how the
     module names it."""
@@ -345,11 +351,15 @@ def exceptions(codes: list[Code], sources: str) -> str:
         "and an exception class per code. The class derives from",
         ":class:`~pynecore.core.errors.PyneError` and the built-in exceptions the",
         "registry names, and takes the code's parameters as keyword arguments (a",
-        'parameter named as a Python keyword or built-in with a trailing underscore)."""',
+        "parameter named as a Python keyword or built-in with a trailing underscore). A",
+        "code whose built-in is :class:`SyntaxError` derives from",
+        ":class:`~pynecore.core.errors.PyneSyntaxError` and also takes the ``location``",
+        'its rule was broken at."""',
         "",
         *stdlib,
         *([""] if stdlib else []),
-        "from .core.errors import Code, PyneError",
+        "from .core.errors import Code, PyneError"
+        + (", PyneSyntaxError, SyntaxLocation" if any(map(_is_syntax, live)) else ""),
         *local,
         "",
     ]
@@ -361,13 +371,19 @@ def exceptions(codes: list[Code], sources: str) -> str:
             fields += [_py_str(c.fix_title, 4), _py_str(c.fix, 4)]
         lines += [f"{c.name.upper()} = Code(", *(f"    {f}," for f in fields), ")"]
     for c in live:
-        bases = ", ".join(["PyneError", *(name for _, name in map(_base, c.python))])
-        signature = ["self", *(["*"] if c.params else []),
-                     *(f"{_arg(p)}: object" for p in c.params)]
+        syntax = _is_syntax(c)
+        bases = ", ".join(["PyneSyntaxError" if syntax else "PyneError",
+                           *(name for base, name in map(_base, c.python)
+                             if not (syntax and base is None and name == "SyntaxError"))])
+        signature = ["self", *(["*"] if c.params or syntax else []),
+                     *(f"{_arg(p)}: object" for p in c.params),
+                     *(["location: SyntaxLocation | None = None"] if syntax else [])]
         if any(_arg(p) != p for p in c.params):
             call = ["**{" + ", ".join(f"{p!r}: {_arg(p)}" for p in c.params) + "}"]
         else:
             call = [f"{p}={p}" for p in c.params]
+        if syntax:
+            call.append("location=location")
         lines += [
             "",
             "",

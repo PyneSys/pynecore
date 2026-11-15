@@ -5,6 +5,7 @@ import ast
 
 import pytest
 
+from pynecore.errorcodes import TooManyFunctionRequestsError
 from pynecore.transformers.security_instantiation import SecurityInstantiationTransformer
 
 
@@ -235,9 +236,9 @@ def __test_fanout_beyond_tv_bound_rejected__(log):
     """A called function reaching more than 254 security calls is rejected
     (TradingView rejects 128 float requests, 256 elements) before cloning."""
     _transform(__test_helper_fan_source(6, leaf_calls=2))
-    with pytest.raises(SyntaxError, match="reaches 256 request.security calls"):
+    with pytest.raises(TooManyFunctionRequestsError, match="reaches 256 `request.security` calls"):
         _transform(__test_helper_fan_source(7, leaf_calls=2))
-    with pytest.raises(SyntaxError, match="'f8' reaches 256 "):
+    with pytest.raises(TooManyFunctionRequestsError, match="`f8` reaches 256 "):
         _transform(__test_helper_fan_source(40))
     log.info("runaway fan-out rejected OK")
 
@@ -248,13 +249,13 @@ def __test_fanout_counts_every_cloned_subtree__(log):
     security = "lib.request.security(lib.syminfo.tickerid, 'D', lib.close)"
     lambda_leaf = __test_helper_fan_source(8).replace(
         f"return {security}", f"return (lambda: {security})()")
-    with pytest.raises(SyntaxError, match="'f8' reaches 256 "):
+    with pytest.raises(TooManyFunctionRequestsError, match="`f8` reaches 256 "):
         _transform(lambda_leaf)
 
     method_leaf = __test_helper_fan_source(8).replace(
         f"return {security}",
         f"class C:\n        def m(self):\n            return {security}\n    return C().m()")
-    with pytest.raises(SyntaxError, match="'f8' reaches 256 "):
+    with pytest.raises(TooManyFunctionRequestsError, match="`f8` reaches 256 "):
         _transform(method_leaf)
 
     lines = [f"def f0():\n    return {security}"]
@@ -262,7 +263,7 @@ def __test_fanout_counts_every_cloned_subtree__(log):
         lines.append(f"def f{i}():\n    def g{i}():\n        return f{i - 1}() + f{i - 1}()\n"
                      f"    return 1")
     lines.append("def main():\n    v = f8()")
-    with pytest.raises(SyntaxError, match="'f8' reaches 256 "):
+    with pytest.raises(TooManyFunctionRequestsError, match="`f8` reaches 256 "):
         _transform("\n".join(lines) + "\n")
 
     lines = [f"def f0():\n    return {security}"]
@@ -270,7 +271,7 @@ def __test_fanout_counts_every_cloned_subtree__(log):
         lines.append(f"def f{i}():\n    def g{i}():\n        return f{i - 1}()\n"
                      f"    return g{i}() + g{i}()")
     lines.append("def main():\n    v = f8()")
-    with pytest.raises(SyntaxError, match="'f8' reaches 256 "):
+    with pytest.raises(TooManyFunctionRequestsError, match="`f8` reaches 256 "):
         _transform("\n".join(lines) + "\n")
     log.info("lambda / class / nested-def fan-out rejected OK")
 
@@ -282,7 +283,7 @@ def __test_fanout_counts_ambiguous_callees__(log):
     source = __test_helper_fan_source(7)
     _transform(source)
     duplicated = source.replace("def f1():", f"def f0():\n    return {security} + {security}\ndef f1():", 1)
-    with pytest.raises(SyntaxError, match="'f7' reaches 256 "):
+    with pytest.raises(TooManyFunctionRequestsError, match="`f7` reaches 256 "):
         _transform(duplicated)
     log.info("ambiguous-callee fan-out rejected OK")
 
@@ -331,7 +332,7 @@ def __test_fanout_stops_at_local_bindings__(log):
         assert '__pyne_inst' not in result
     result = _transform(f"{head}def f(sample):\n    return {calls}\n{tail}")
     assert result.count('lib.request.security(') == 2
-    with pytest.raises(SyntaxError, match="'f' reaches 256 "):
+    with pytest.raises(TooManyFunctionRequestsError, match="`f` reaches 256 "):
         _transform(f"{head}def f(fn):\n    global sample\n    return {calls}\n{tail}")
     log.info("local bindings stop the lexical lookup OK")
 

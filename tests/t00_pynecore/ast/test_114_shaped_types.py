@@ -449,9 +449,8 @@ nope = p.nowhere
 ''')
     reasons = {diag.origin.reason for diag in table.diags if diag.origin is not None}
     assert 'unknown-field' in reasons
-    assert [diag.render() for diag in table.diags] == [
-        "'Pivot' has no field 'nowhere' "
-        "-- declare 'nowhere' on 'Pivot', or read a field it has"]
+    assert [(diag.code, diag.args, diag.fix) for diag in table.diags] == [
+        ('E0048', ('Pivot', 'nowhere'), "declare 'nowhere' on 'Pivot', or read a field it has")]
 
 
 def __test_a_receiver_whose_class_was_lost_points_at_the_receiver__():
@@ -468,9 +467,8 @@ missing = m.depth
 ''')
     found = [diag for diag in table.diags
              if diag.origin is not None and diag.origin.reason == 'unknown-class']
-    assert [diag.render() for diag in found] == [
-        "the class of 'm' is not known here, so its field 'depth' has no type "
-        '-- annotate the value with the type it holds']
+    assert [(diag.code, diag.args, diag.fix) for diag in found] == [
+        ('E0045', ('m', 'depth'), 'annotate the value with the type it holds')]
 
 
 def __test_a_method_is_typed_from_the_class_it_attaches_to__():
@@ -973,11 +971,9 @@ def main(flag: bool):
     t = array.new_int(1, 0) if flag else array.new_float(1, 0.0)
     return a, t
 ''')
-    assert [diag.render() for diag in table.diags] == [
-        "'a' gets both array<int> and array<float>, which are different types "
-        '-- make both branches the same type',
-        'the ternary gets both array<int> and array<float>, which are different types '
-        '-- make both branches the same type',
+    assert [(diag.code, diag.args, diag.fix) for diag in table.diags] == [
+        ('E0023', ('`a`', 'array<int>', 'array<float>'), 'make both branches the same type'),
+        ('E0023', ('the ternary', 'array<int>', 'array<float>'), 'make both branches the same type'),
     ]
     assert {diag.origin.reason for diag in table.diags if diag.origin is not None} \
         == {'shape-mismatch'}
@@ -1264,9 +1260,8 @@ by_name = method_call('scale', p, 2)
     assert table.bindings['']['scaled'].ty == BOOL
     assert table.bindings['']['by_name'].ty == UNKNOWN
     # ... and the report says why, rather than asking for a declaration it has
-    assert [(diag.message, diag.fix) for diag in table.diags] == [(
-        "'scale' is declared on Pivot, but no export the runtime searches by name holds it",
-        "pass the method itself: 'method_call(scale, ...)'")]
+    assert [(diag.code, diag.args, diag.fix) for diag in table.diags] == [(
+        'E0054', ('scale', 'Pivot'), "pass the method itself: 'method_call(scale, ...)'")]
 
 
 def _method_def(name: str, ret: str, value: str, proxy: bool = True) -> str:
@@ -1350,7 +1345,8 @@ def __test_a_named_method_on_a_class_follows_the_runtime_search__(
     try:
         ran = type(importlib.import_module('shp_search_app').out).__name__
     except (AssertionError, TypeError) as error:
-        ran = type(error).__name__
+        # A coded runtime error is named by the built-in exception it derives from
+        ran = next(cls.__name__ for cls in type(error).__mro__ if cls.__module__ == 'builtins')
     assert ran == outcome
 
 
@@ -1726,9 +1722,9 @@ def main(x: int, f: float):
 ''')
     assert _reasons(table) == ['unknown-field', 'type-mismatch', 'unknown-field']
     assert _lines(table) == [4, 5, 8]
-    assert "'Pivot' has no field 'nosuch'" in table.diags[0].message
-    assert "holds int and is assigned float" in table.diags[1].message
-    assert "a int has no field 'y'" in table.diags[2].message
+    assert (table.diags[0].code, table.diags[0].args) == ('E0048', ('Pivot', 'nosuch'))
+    assert (table.diags[1].code, table.diags[1].args[1:]) == ('E0042', ('int', 'float'))
+    assert (table.diags[2].code, table.diags[2].args) == ('E0049', ('int', 'y'))
 
 
 def __test_a_bare_object_cannot_take_a_field_store__():
@@ -1848,13 +1844,14 @@ def main():
     assert types['r7'] == INT and types['r8'] == INT
     assert all(types[name] == UNKNOWN for name in ('r1', 'r2', 'r3', 'r4', 'r5', 'r6'))
     assert _reasons(table) == ['bad-call'] * 6
-    messages = [diag.message for diag in table.diags]
-    assert "'f' needs an argument for 'b'" in messages[0]
-    assert "takes 2 positional argument(s), 3 passed" in messages[1]
-    assert "'f' has no parameter 'nosuch'" in messages[2]
-    assert "'a' is passed to 'f' twice" in messages[3]
-    assert "'g' takes int for 'a', string passed" in messages[4]
-    assert "'g' takes int for 'a', float passed" in messages[5]
+    assert [(diag.code, diag.args) for diag in table.diags] == [
+        ('E0067', ('f', 'b')),
+        ('E0062', ('f', '2', '3')),
+        ('E0063', ('f', 'nosuch')),
+        ('E0066', ('a', 'f')),
+        ('E0064', ('g', 'int', 'a', 'string')),
+        ('E0064', ('g', 'int', 'a', 'float')),
+    ]
 
 
 def __test_a_lib_call_is_held_to_its_signature__():
@@ -1875,11 +1872,12 @@ def main():
     assert types['d'] == FLOAT and types['f'] == INT
     assert all(types[name] == UNKNOWN for name in ('a', 'b', 'c', 'e'))
     assert _reasons(table) == ['bad-call'] * 4
-    messages = [diag.message for diag in table.diags]
-    assert "'ta.sma' does not take 1 argument(s)" in messages[0]
-    assert "'ta.sma' takes float for 'source', string passed" in messages[1]
-    assert "'ta.sma' takes int for 'length', float passed" in messages[2]
-    assert "'ta.sma' has no parameter 'nosuch'" in messages[3]
+    assert [(diag.code, diag.args) for diag in table.diags] == [
+        ('E0061', ('ta.sma', '1', '2')),
+        ('E0064', ('ta.sma', 'float', 'source', 'string')),
+        ('E0064', ('ta.sma', 'int', 'length', 'float')),
+        ('E0063', ('ta.sma', 'nosuch')),
+    ]
 
 
 def __test_an_element_put_has_to_fit_the_array__():
@@ -2030,7 +2028,7 @@ def main():
     assert types['r5'] == INT and types['r6'] == INT
     assert all(types[name] == UNKNOWN for name in ('r1', 'r2', 'r3', 'r4'))
     assert _reasons(table) == ['bad-call'] * 4
-    assert all("no overload of 'f'" in diag.message for diag in table.diags)
+    assert all((diag.code, diag.args) == ('E0065', ('f',)) for diag in table.diags)
 
 
 def __test_a_constructor_is_held_to_its_fields__():
@@ -2057,12 +2055,13 @@ def main():
     assert all(types[name] == UNKNOWN for name in ('a', 'b', 'c', 'd', 'e'))
     assert all(types[name] == object_ty(class_id('test', 'Pair')) for name in ('f', 'g', 'h'))
     assert _reasons(table) == ['bad-call'] * 5
-    messages = [diag.message for diag in table.diags]
-    assert "'Pair' has 2 field(s), 3 argument(s) passed" in messages[0]
-    assert "'Pair' has no field 'nosuch'" in messages[1]
-    assert "'Pair.price' holds float, string passed" in messages[2]
-    assert "'Pair' needs a value for 'price'" in messages[3]
-    assert "'price' is passed to 'Pair' twice" in messages[4]
+    assert [(diag.code, diag.args) for diag in table.diags] == [
+        ('E0068', ('Pair', '2', '3')),
+        ('E0048', ('Pair', 'nosuch')),
+        ('E0070', ('Pair.price', 'float', 'string')),
+        ('E0069', ('Pair', 'price')),
+        ('E0066', ('price', 'Pair')),
+    ]
 
 
 def __test_a_map_and_a_matrix_put_are_checked_like_an_array_put__():
@@ -2105,7 +2104,7 @@ def main():
     return b
 ''')
     assert _reasons(table) == ['unknown-lib']
-    assert "'close' is a lib value" in table.diags[0].message
+    assert (table.diags[0].code, table.diags[0].args) == ('E0052', ('close',))
     types = {name: binding.ty for name, binding in table.bindings['main'].items()}
     assert types['a'] == UNKNOWN and types['b'] == STR and types['c'] == INT
 
@@ -2201,7 +2200,7 @@ def main():
     return i
 ''')
     assert _reasons(table) == ['bad-call', 'unknown-value']
-    assert "'pine_loop' takes a number for a bound, string passed" in table.diags[0].message
+    assert (table.diags[0].code, table.diags[0].args) == ('E0056', ('pine_loop', 'string'))
     assert [diag.line for diag in table.diags] == [6, 8]
 
 
@@ -2258,7 +2257,7 @@ def main():
     return i
 ''')
     assert 'bad-call' in _reasons(table)
-    assert any("'enter' takes 0 or 1 argument(s)" in diag.message for diag in table.diags)
+    assert any((diag.code, diag.args) == ('E0058', ('2',)) for diag in table.diags)
 
 
 def __test_a_compiled_library_export_proxy_is_a_callable_reference__(tmp_path, monkeypatch):
@@ -2411,9 +2410,8 @@ def main():
     assert types['x'] == STR and types['y'] == INT
     assert types['z'] == UNKNOWN and types['w'] == UNKNOWN
     assert sorted(_reasons(table)) == ['bad-call', 'unknown-return']
-    messages = sorted(diag.message for diag in table.diags)
-    assert messages == ["no overload of 'scale' takes these arguments",
-                        "the call to method 'scale' has no known type"]
+    found = sorted((diag.code, diag.args) for diag in table.diags)
+    assert found == [('E0016', ('scale',)), ('E0065', ('scale',))]
     pins = {node.targets[0].id: get_pin(node.value) for node in ast.walk(tree)
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Name) and node.value.func.id == 'method_call'}
@@ -2503,8 +2501,8 @@ def main(n):
     # ``n`` is reported as an unannotated parameter; the method call on it says
     # nothing new, its receiver's UNKNOWN carries the provenance
     assert _reasons(table) == ['unknown-method', 'rebound-name', 'unannotated-param']
-    assert table.diags[0].message == "'copy' is not a method of Pivot here"
-    assert table.diags[1].message == "'bump' is assigned as well as defined, so what it calls is unknown"
+    assert (table.diags[0].code, table.diags[0].args) == ('E0053', ('copy', 'Pivot'))
+    assert (table.diags[1].code, table.diags[1].args) == ('E0030', ('bump',))
     assert _lines(table)[:2] == [11, 12]
     assert not any('method_call' in diag.message for diag in table.diags)
 

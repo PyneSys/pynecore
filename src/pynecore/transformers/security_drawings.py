@@ -2,6 +2,7 @@
 import ast
 from dataclasses import dataclass, field
 
+from ..errorcodes import DrawingInSecurityError
 from . import ast_walk
 
 _DRAWING_CALLS = frozenset(
@@ -167,10 +168,9 @@ class SecurityDrawingsTransformer(ast_walk.NodeTransformer):
                 builtin = drawing_name(current) if isinstance(current, ast.Call) else None
                 if builtin is not None:
                     filename = getattr(node, '_module_file_path', '<pyne>')
-                    raise SyntaxError(
-                        f'{builtin}() cannot be used in the expression of {request_name[4:]}().',
-                        (filename, current.lineno, current.col_offset + 1, None),
-                    )
+                    raise DrawingInSecurityError(
+                        name=builtin, function=request_name[4:],
+                        location=(filename, current.lineno, current.col_offset + 1, None))
                 if isinstance(current, ast.Name) and isinstance(current.ctx, ast.Load):
                     scope = owners[current].resolve(current.id)
                     if scope is not None:

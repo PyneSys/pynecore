@@ -25,6 +25,8 @@ from pynecore.transformers.emission_settings import (
 if TYPE_CHECKING:
     import ast
 
+    from pynecore.core.errors import SyntaxLocation
+
     from pynecore.transformers.pine_type_table import (
         DepRecord, Diag, ModuleInterface, PineTypeTable,
     )
@@ -69,6 +71,9 @@ _PYNE_SET_BOOL_NA = '__pyne_set_bool_na·__'
 #: boundary (``pine_export.Exported``) so a library's exported function runs
 #: its own script's bool semantics, not its caller's
 _PYNE_NA_BOOL = '__pyne_na_bool__'
+#: Position of ``na_bool`` among each script decorator's positional parameters
+#: (:meth:`~pynecore.core.script.Script.indicator` and its siblings)
+_NA_BOOL_POSITION = {'indicator': 17, 'strategy': 35, 'library': 3}
 
 # Recursion limit every pipeline stage runs under. The passes need about 3 Python
 # frames per level of AST nesting (1516 measured on a 503-deep ``elif`` chain), so
@@ -141,12 +146,12 @@ def _identifiers(tree: "ast.Module") -> "Iterator[tuple[ast.AST, str]]":
                     yield node, name
 
 
-def _identifier_error(node: "ast.AST", message: str, source: str, path: Path) -> SyntaxError:
-    """A ``SyntaxError`` pointing at the identifier a node spells."""
+def _identifier_location(node: "ast.AST", source: str, path: Path) -> "SyntaxLocation":
+    """Where the identifier a node spells is, for the error that rejects it."""
     lineno = getattr(node, 'lineno', 1)
     lines = source.splitlines()
-    return SyntaxError(message, (str(path), lineno, getattr(node, 'col_offset', 0) + 1,
-                                 lines[lineno - 1] if 0 < lineno <= len(lines) else None))
+    return (str(path), lineno, getattr(node, 'col_offset', 0) + 1,
+            lines[lineno - 1] if 0 < lineno <= len(lines) else None)
 
 
 def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
@@ -155,7 +160,8 @@ def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
     :param tree: Parsed module AST of ``source``.
     :param source: Full module source, used for the error location.
     :param path: Source path, used for the error location.
-    :raises SyntaxError: If any identifier resolves to a name containing the separator.
+    :raises ReservedNameCharError: If any identifier resolves to a name containing the
+        separator.
     """
     # ASCII is NFKC-invariant and the separator is not ASCII, so a pure-ASCII module —
     # virtually every script — cannot produce a reserved name in any spelling
@@ -173,10 +179,10 @@ def _reject_reserved_names(tree: "ast.Module", source: str, path: Path) -> None:
         return
     for node, name in _identifiers(tree):
         if PYNE_RESERVED_NAME_CHAR in name:
-            raise _identifier_error(
-                node, f"'{name}' contains '{PYNE_RESERVED_NAME_CHAR}', which is reserved "
-                      f"for PyneCore's internal names in Pyne code — rename the identifier",
-                source, path)
+            # The codes import the lib, which this leaf module must not load at import
+            from pynecore.errorcodes import ReservedNameCharError
+            raise ReservedNameCharError(name=name,
+                                        location=_identifier_location(node, source, path))
 
 
 def _reject_pipeline_names(tree: "ast.Module", source: str, path: Path) -> None:
@@ -185,7 +191,7 @@ def _reject_pipeline_names(tree: "ast.Module", source: str, path: Path) -> None:
     :param tree: Parsed module AST of ``source``, its ``__test_`` functions removed.
     :param source: Full module source, used for the prefilter and the error location.
     :param path: Source path, used for the error location.
-    :raises SyntaxError: If any identifier is a name of :data:`PIPELINE_NAME`.
+    :raises PipelineNameError: If any identifier is a name of :data:`PIPELINE_NAME`.
     """
     # Every such identifier is spelled in the source, after NFKC normalization for
     # a module that leaves ASCII; a module whose text holds no match -- virtually
@@ -196,9 +202,9 @@ def _reject_pipeline_names(tree: "ast.Module", source: str, path: Path) -> None:
         return
     for node, name in _identifiers(tree):
         if is_pipeline_name(name):
-            raise _identifier_error(
-                node, f"'{name}' is a name PyneCore's transform generates, reserved in "
-                      f"Pyne code — rename the identifier", source, path)
+            from pynecore.errorcodes import PipelineNameError
+            raise PipelineNameError(name=name,
+                                    location=_identifier_location(node, source, path))
 
 
 #: Environment switch turning OFF the merge of one context group into ONE child
@@ -572,18 +578,21 @@ def _script_bool_na(tree: "ast.Module", path: Path) -> bool | None:
 
     The choice must hold before the module body runs -- a UDT field default or
     a ``bool b = na`` at module level builds its na at import -- so the loader
-    reads the keyword statically and bakes the call into the module prologue.
+    reads the argument statically and bakes the call into the module prologue.
     The decorator is resolved through the module's own import bindings, so
     ``@script.indicator``, ``@lib.script.indicator``, ``@pynecore.lib.script.indicator``,
     an alias of ``script`` and an ``import pynecore.lib as X`` alias are all recognized.
 
     :param tree: The parsed module, before analysis.
     :param path: The module's path, for the error location.
-    :return: The ``na_bool`` keyword's value (False when the decorator omits it), or
-             None for a module without a ``script.indicator/strategy/library`` decorator.
-    :raises SyntaxError: When ``na_bool`` is not a literal ``True`` or ``False``, or a
-        script decorator stands on a function other than ``main``, or ``main`` is
-        decorated twice.
+    :return: The ``na_bool`` argument's value, passed by keyword or by position (False
+             when the decorator omits it), or None for a module without a
+             ``script.indicator/strategy/library`` decorator.
+    :raises NaBoolNotLiteralError: When ``na_bool`` is not a literal ``True`` or ``False``,
+        or the decorator unpacks an argument that may hold it.
+    :raises ScriptDecoratorNotOnMainError: When a script decorator stands on a function
+        other than ``main``.
+    :raises DuplicateScriptDecoratorError: When ``main`` is decorated twice.
     """
     import ast
 
@@ -627,13 +636,14 @@ def _script_bool_na(tree: "ast.Module", path: Path) -> bool | None:
             if not isinstance(decorator, ast.Call) or not is_script_decorator(decorator.func):
                 continue
             if node.name != 'main':
-                raise SyntaxError(
-                    f"the script decorator belongs on 'main', not on '{node.name}'",
-                    (str(path), decorator.lineno, decorator.col_offset + 1, None))
+                from pynecore.errorcodes import ScriptDecoratorNotOnMainError
+                raise ScriptDecoratorNotOnMainError(
+                    function=node.name,
+                    location=(str(path), decorator.lineno, decorator.col_offset + 1, None))
             if entry is not None:
-                raise SyntaxError(
-                    "a module has one script decorator: 'main' is defined twice",
-                    (str(path), decorator.lineno, decorator.col_offset + 1, None))
+                from pynecore.errorcodes import DuplicateScriptDecoratorError
+                raise DuplicateScriptDecoratorError(
+                    location=(str(path), decorator.lineno, decorator.col_offset + 1, None))
             entry = decorator
             break
     if entry is None:
@@ -645,11 +655,24 @@ def _script_bool_na(tree: "ast.Module", path: Path) -> bool | None:
         if isinstance(value, ast.Constant) and isinstance(value.value, bool):
             return value.value
         # The loader must know the answer before the module runs
-        raise SyntaxError(
-            "na_bool must be a literal True or False: the script's bool "
-            "semantics are fixed before its module body runs",
-            (str(path), value.lineno, value.col_offset + 1, None))
-    return False
+        from pynecore.errorcodes import NaBoolNotLiteralError
+        raise NaBoolNotLiteralError(location=(str(path), value.lineno, value.col_offset + 1, None))
+    # An unpacked argument may carry ``na_bool`` where the loader cannot read it
+    unpacked = [arg.value for arg in entry.args if isinstance(arg, ast.Starred)]
+    unpacked += [keyword.value for keyword in entry.keywords if keyword.arg is None]
+    if unpacked:
+        value = unpacked[0]
+        from pynecore.errorcodes import NaBoolNotLiteralError
+        raise NaBoolNotLiteralError(location=(str(path), value.lineno, value.col_offset + 1, None))
+    assert isinstance(entry.func, ast.Attribute)
+    position = _NA_BOOL_POSITION[entry.func.attr]
+    if len(entry.args) <= position:
+        return False
+    value = entry.args[position]
+    if isinstance(value, ast.Constant) and isinstance(value.value, bool):
+        return value.value
+    from pynecore.errorcodes import NaBoolNotLiteralError
+    raise NaBoolNotLiteralError(location=(str(path), value.lineno, value.col_offset + 1, None))
 
 
 def _nesting_depth(tree: "ast.AST") -> int:
@@ -765,7 +788,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
     from pynecore.transformers.pine_edge_gate import (
         diag_dump_enabled, gate_module, gated, render_diags, strict_enabled,
     )
-    from pynecore.transformers.pine_type_table import PineTypeError
+    from pynecore.transformers.pine_type_table import diag_error
     from pynecore.transformers.pine_type_table import module_table
 
     edge = gated(pyne_mode)
@@ -796,7 +819,7 @@ def _analyse_tree(tree: "ast.Module", source: str, path: Path,
             first = table.diags[0]
             lines = source.splitlines()
             text = lines[first.line - 1] if 0 < first.line <= len(lines) else None
-            raise PineTypeError.from_diag(first, str(path), text)
+            raise diag_error(first, str(path), text)
     return transformed
 
 

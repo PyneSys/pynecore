@@ -171,6 +171,8 @@ impl<'py> Classes<'py> {
             fix: string(&get("fix")?)?,
             end_line: int(&get("end_line")?)?,
             end_col: int(&get("end_col")?)?,
+            code: string(&get("code")?)?,
+            args: tuple(&get("args")?, string)?,
         })
     }
 
@@ -364,6 +366,8 @@ impl<'py> Classes<'py> {
         kwargs.set_item("fix", &diag.fix)?;
         kwargs.set_item("end_line", diag.end_line)?;
         kwargs.set_item("end_col", diag.end_col)?;
+        kwargs.set_item("code", &diag.code)?;
+        kwargs.set_item("args", PyTuple::new(self.table.py(), &diag.args)?)?;
         self.diag.call((), Some(&kwargs))
     }
 

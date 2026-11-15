@@ -11,7 +11,7 @@ use pyne_ast::walk::{children, docstring_end, future_end};
 use pyne_ast::{Ast, Constant, ExprContext, Int, Kind, NodeId};
 
 use crate::resolver::is_pipeline_name;
-use crate::{Context, Error};
+use crate::{Context, Error, Raised};
 
 /// Builtin price series accepted by generic `input()` as source names
 /// (`price_series.BUILTIN_PRICE_SERIES`).
@@ -190,12 +190,12 @@ impl Input {
             Kind::Call { .. } if !self.declared.contains(&node) && is_input_call(ast, node) => {
                 // An input outside the parameter defaults gets no `_id`: it never
                 // reaches the settings file and silently runs with its default
-                let line =
-                    ast[node].loc.lineno.map_or_else(|| "None".to_string(), |l| l.to_string());
-                Err(Error::Rejected(format!(
-                    "the input call on line {line} is not a main() parameter default; inputs \
-                     must be declared as main() parameter defaults: \
-                     def main(length=input.int(14, ...))"
+                let Kind::Call { func, .. } = ast.kind(node) else { unreachable!() };
+                let spelled = crate::pine_type_rules::dotted(ast, *func).unwrap_or_default();
+                let function = spelled.strip_prefix("lib.").unwrap_or(&spelled).to_string();
+                Err(Error::Rejected(Raised::new(
+                    &pynecore_codes::INPUT_NOT_MAIN_DEFAULT,
+                    [function],
                 )))
             }
             _ => self.generic_visit(ast, node),

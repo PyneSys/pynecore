@@ -38,6 +38,7 @@ Must run after ImportNormalizerTransformer (security calls are in their
 import ast
 from collections.abc import Callable
 
+from ..errorcodes import TooManyFunctionRequestsError
 from . import ast_walk
 from .locations import anchor_all_at
 from .security_calls import has_security_call, is_security_call, is_security_lower_tf_call
@@ -427,7 +428,7 @@ class SecurityInstantiationTransformer:
         nowhere is the global scope and is not bounded.
 
         :param module: The module before instantiation
-        :raises SyntaxError: If a called function exceeds the bound
+        :raises TooManyFunctionRequestsError: If a called function exceeds the bound
         """
         infos = self._collect_functions(module)
         total = self._request_totals(module, infos)
@@ -444,11 +445,10 @@ class SecurityInstantiationTransformer:
                 continue
             reached = total(defs[0].node)
             if reached > _MAX_FUNCTION_REQUESTS:
-                raise SyntaxError(
-                    f"function '{name}' reaches {reached} request.security calls through "
-                    f"the functions it calls; a function can use at most "
-                    f"{_MAX_FUNCTION_REQUESTS} request values"
-                )
+                raise TooManyFunctionRequestsError(
+                    function=name, count=reached, limit=_MAX_FUNCTION_REQUESTS,
+                    location=(getattr(module, '_module_file_path', '<script>'),
+                              defs[0].node.lineno, defs[0].node.col_offset + 1, None))
 
     # --- cloning ---
 
