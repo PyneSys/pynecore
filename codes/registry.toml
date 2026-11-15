@@ -561,8 +561,9 @@ severity = "error"
 title = "Syntax outside the Edge profile"
 message = "{construct} is not allowed in the Pyne Edge profile."
 explanation = """
-The Pyne Edge profile is the subset of Python that compiles to WebAssembly.
-This construct is outside it; a full `@pyne` script can use it.
+The Pyne Edge profile is the subset of Python that is enough for everything a
+Pine Script program needs: every Pine script can be written in it. This
+construct is outside it; a full `@pyne` script can use it.
 """
 
 [E0002]
@@ -591,8 +592,8 @@ severity = "error"
 title = "assert message that is not a string literal"
 message = "An `assert` message must be a string literal in the Pyne Edge profile."
 explanation = """
-The message is part of the runtime error, so it is fixed when the script is
-compiled.
+The message is fixed text, as Pine's own messages are: the profile has no use
+for one built while the script runs.
 """
 
 [E0005]
@@ -620,8 +621,8 @@ severity = "error"
 title = "Decorator outside the Edge profile"
 message = "Only `@script.indicator/strategy/library(...)`, `@method` and `@export` can decorate a function in the Pyne Edge profile."
 explanation = """
-Other decorators change a function at run time, which the compiled form
-cannot follow.
+Other decorators change a function while the script runs, which nothing in
+Pine needs.
 """
 
 [E0008]
