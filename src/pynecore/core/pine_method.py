@@ -22,6 +22,7 @@ from functools import partial
 
 from ..lib import array, matrix, box, line, label, table, linefill, polyline
 from ..lib import map as map_lib
+from ..codes import UnknownMethodAtRunError
 from ..utils.sequence_view import SequenceView
 from ..types import matrix as matrix_types
 from ..types import line as line_types
@@ -312,7 +313,7 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
             if type(var) is NA:
                 return var
 
-            assert False, f'No such method: {var}->{method}'
+            raise UnknownMethodAtRunError(type_=receiver_type.__name__, method=method)
 
         # It is a local method, it should be a local function
         elif callable(method):

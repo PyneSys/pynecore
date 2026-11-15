@@ -10,11 +10,12 @@ drawing keeps answering na through its getters.
 """
 import pytest
 
+from pynecore.codes import NaObjectCopyError, NaObjectFieldError
 from pynecore.core.pine_udt import udt, udt_copy
 from pynecore.lib import chart
 from pynecore.types.chart import ChartPoint
 from pynecore.types.line import Line
-from pynecore.types.na import NA, NaFieldError
+from pynecore.types.na import NA
 
 
 @udt
@@ -35,24 +36,24 @@ class Kind:
 
 def __test_reading_a_field_of_an_na_object_raises__():
     """A field read on an na user-defined object or chart point is an error"""
-    with pytest.raises(NaFieldError, match="field 'v'"):
+    with pytest.raises(NaObjectFieldError, match='`v`'):
         _ = NA(Inner).v
-    with pytest.raises(NaFieldError, match="field 'price'"):
+    with pytest.raises(NaObjectFieldError, match='`price`'):
         _ = NA(ChartPoint).price
-    with pytest.raises(NaFieldError, match="field 'v'"):
+    with pytest.raises(NaObjectFieldError, match='`v`'):
         _ = Outer().inner.v
 
 
 def __test_writing_a_field_of_an_na_object_raises__():
     """A field write on an na object is the same error, not a raw AttributeError"""
     na_inner = NA(Inner)
-    with pytest.raises(NaFieldError, match="field 'v'"):
+    with pytest.raises(NaObjectFieldError, match='`v`'):
         na_inner.v = 2.0
 
 
 def __test_copying_an_na_object_raises__():
     """Copying an na user-defined object is an error, an na drawing copies to na"""
-    with pytest.raises(NaFieldError, match="cannot be copied"):
+    with pytest.raises(NaObjectCopyError):
         udt_copy(NA(Inner))
     na_line = NA(Line)
     assert udt_copy(na_line) is na_line
@@ -60,23 +61,23 @@ def __test_copying_an_na_object_raises__():
 
 def __test_copying_an_na_chart_point_raises_on_both_spellings__():
     """``p.copy()`` and ``chart.point.copy(p)`` on an na point are the same error"""
-    with pytest.raises(NaFieldError, match="cannot be copied"):
+    with pytest.raises(NaObjectCopyError):
         udt_copy(NA(ChartPoint))
-    with pytest.raises(NaFieldError, match="cannot be copied"):
+    with pytest.raises(NaObjectCopyError):
         chart.point.copy(NA(ChartPoint))
 
 
 def __test_a_field_named_type_is_a_field_too__():
     """A field called ``type`` raises like any other and leaves the shared na intact"""
     na_kind = NA(Kind)
-    with pytest.raises(NaFieldError, match="field 'type'"):
+    with pytest.raises(NaObjectFieldError, match='`type`'):
         _ = na_kind.type
-    with pytest.raises(NaFieldError, match="field 'type'"):
+    with pytest.raises(NaObjectFieldError, match='`type`'):
         na_kind.type = 2.0
     assert NA(Kind) is na_kind
-    with pytest.raises(NaFieldError, match="field 'v'"):
+    with pytest.raises(NaObjectFieldError, match='`v`'):
         _ = NA(Kind).v
-    with pytest.raises(NaFieldError, match="cannot be copied"):
+    with pytest.raises(NaObjectCopyError):
         udt_copy(NA(Kind))
 
 

@@ -27,6 +27,12 @@ from ..types.label import Label
 from ..types.linefill import LineFill
 from ..types.table import Table
 from . import order as _order
+from ..codes import (ArgumentNegativeError as _ArgumentNegativeError,
+                     ArgumentOrderError as _ArgumentOrderError,
+                     EmptyCollectionError as _EmptyCollectionError,
+                     IndexOutOfRangeError as _IndexOutOfRangeError,
+                     PercentageOutOfRangeError as _PercentageOutOfRangeError,
+                     SizeMismatchError as _SizeMismatchError)
 
 T = TypeVar('T')
 Number = TypeVar('Number', int, float)
@@ -331,7 +337,8 @@ def covariance(id1: list[Number], id2: list[Number], biased: bool = True) -> flo
     :param biased: If True, calculates the biased covariance. If False, calculates the unbiased covariance.
     :return: Covariance between the elements in the two arrays, or na if the arrays are empty
     """
-    assert len(id1) == len(id2), "Input arrays must have the same length!"
+    if len(id1) != len(id2):
+        raise _SizeMismatchError(function='array.covariance', left=len(id1), right=len(id2))
     pairs = [(float(v1), float(v2)) for v1, v2 in zip(id1, id2)
              if v1 == v1 and v2 == v2]
     if not pairs:
@@ -387,7 +394,7 @@ def fill(id: list[T] | SequenceView[T], value: T,
     :param value: Value to fill
     :param index_from: Index to start filling from
     :param index_to: Index to stop filling at
-    :raises IndexError: If a bound is out of range
+    :raises IndexOutOfRangeError: If a bound is out of range
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
     #   fill(a, 5, na, 2) -> 5,5,30,40      fill(a, 5, 1, na) -> 10,5,5,5
@@ -406,9 +413,9 @@ def fill(id: list[T] | SequenceView[T], value: T,
     start = int(index_from) if index_from == index_from else 0  # is_na_arg
     stop = int(cast(int, index_to)) if index_to == index_to else length  # is_na_arg
     if not 0 <= start < length:
-        raise IndexError(f"Start index {start} is out of bounds, array size is {length}")
+        raise _IndexOutOfRangeError(function='array.fill', index=start, size=length)
     if not 0 <= stop <= length:
-        raise IndexError(f"End index {stop} is out of bounds, array size is {length}")
+        raise _IndexOutOfRangeError(function='array.fill', index=stop, size=length)
     id[start:stop] = [value] * (stop - start)
 
 
@@ -421,7 +428,7 @@ def first(id: list[T]) -> T:
     :return: First element in the array
     """
     if len(id) == 0:
-        raise RuntimeError("Cannot get first element of an empty array!")
+        raise _EmptyCollectionError(function='array.first')
     return id[0]
 
 
@@ -536,7 +543,7 @@ def insert(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     :param id: Input array
     :param index: Index to insert the value at
     :param value: Value to insert
-    :raises IndexError: If the index is out of range
+    :raises IndexOutOfRangeError: If the index is out of range
     """
     if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
@@ -554,7 +561,7 @@ def insert(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     # equivalent range from Python's own indexing and need none.
     length = len(id)
     if not -length <= index <= length:
-        raise IndexError(f"Index {index} is out of bounds, array size is {length}")
+        raise _IndexOutOfRangeError(function='array.insert', index=index, size=length)
     id.insert(index, value)
 
 
@@ -580,7 +587,7 @@ def last(id: list[T]) -> T:
     :return: Last element in the array
     """
     if len(id) == 0:
-        raise RuntimeError("Cannot get last element of an empty array!")
+        raise _EmptyCollectionError(function='array.last')
     return id[-1]
 
 
@@ -707,7 +714,7 @@ def mode(id: list[T]) -> T:
 
 
 # noinspection PyShadowingNames
-def _na_size(size: int | NA) -> int:
+def _na_size(size: int | NA, function: str) -> int:
     """
     Normalize an array constructor ``size`` argument.
 
@@ -715,11 +722,14 @@ def _na_size(size: int | NA) -> int:
     empty array instead of failing. A genuinely negative size is still rejected.
 
     :param size: Requested array size, possibly ``na``
+    :param function: The Pine name of the constructor
     :return: Non-negative integer size
+    :raises ArgumentNegativeError: If the size is negative
     """
     if not (size == size):  # is_na_arg
         return 0
-    assert size >= 0, "Size must be >=0!"
+    if not size >= 0:
+        raise _ArgumentNegativeError(function=function, parameter='size', value=size)
     return int(size)
 
 
@@ -733,7 +743,7 @@ def new_box(size: int | NA = 0, initial_value: Box = NA(Box)) -> list[Box]:
     :param initial_value: Initial value to set for each element in the array
     :return: New array of box objects
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_box')
     assert isinstance(initial_value, (Box, NA)), "Initial value must be Box!"
     return [initial_value] * size
 
@@ -748,7 +758,7 @@ def new_line(size: int | NA = 0, initial_value: Line = NA(Line)) -> list[Line]:
     :param initial_value: Initial value to set for each element in the array
     :return: New array of line objects
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_line')
     assert isinstance(initial_value, (Line, NA)), "Initial value must be Line!"
     return [initial_value] * size
 
@@ -763,7 +773,7 @@ def new_label(size: int | NA = 0, initial_value: Label = NA(Label)) -> list[Labe
     :param initial_value: Initial value to set for each element in the array
     :return: New array of label objects
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_label')
     assert isinstance(initial_value, (Label, NA)), "Initial value must be Label!"
     return [initial_value] * size
 
@@ -779,7 +789,7 @@ def new_linefill(size: int | NA = 0,
     :param initial_value: Initial value to set for each element in the array
     :return: New array of linefill objects
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_linefill')
     assert isinstance(initial_value, (LineFill, NA)), "Initial value must be LineFill!"
     return [initial_value] * size
 
@@ -794,7 +804,7 @@ def new_table(size: int | NA = 0, initial_value: Table = NA(Table)) -> list[Tabl
     :param initial_value: Initial value to set for each element in the array
     :return: New array of table objects
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_table')
     assert isinstance(initial_value, (Table, NA)), "Initial value must be Table!"
     return [initial_value] * size
 
@@ -808,7 +818,7 @@ def new(size: int | NA = 0, initial_value: T = NA(T)) -> list[T]:
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new')
     return [initial_value] * size
 
 
@@ -821,7 +831,7 @@ def new_bool(size: int | NA = 0, initial_value: bool | None = None) -> list[bool
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_bool')
     # The default, and any na passed, is the bool na the script runs with (na or
     # false), decided at call time
     if initial_value is None or isinstance(initial_value, NA):
@@ -839,7 +849,7 @@ def new_color(size: int | NA = 0, initial_value: Color = NA(Color)) -> list[Colo
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_color')
     assert isinstance(initial_value, (Color, NA)), "Initial value must be Color!"
     return [initial_value] * size
 
@@ -853,7 +863,7 @@ def new_float(size: int | NA = 0, initial_value: float | int = na_float) -> list
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_float')
     assert isinstance(initial_value, (float, int, NA)), "Initial value must be float!"
     if isinstance(initial_value, int):
         initial_value = float(initial_value)
@@ -869,7 +879,7 @@ def new_int(size: int | NA = 0, initial_value: int = na_int) -> list[int]:
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_int')
     # No type assert on the value: an int-TYPED Pine expression may carry a
     # fractional value (``14 / 8``), and TradingView stores it unchanged --
     # ``array.get(array.new_int(1, 7 / 4), 0)`` is 1.75, not 1. Truncation
@@ -886,7 +896,7 @@ def new_string(size: int | NA = 0, initial_value: str = NA(str)) -> list[str]:
     :param initial_value: Initial value to set for each element in the array
     :return: New array of the specified size
     """
-    size = _na_size(size)
+    size = _na_size(size, 'array.new_string')
     if isinstance(initial_value, NA):
         # A typeless na: the string na is the empty string
         initial_value = ""
@@ -907,7 +917,7 @@ def _select_linear_interpolation(non_na: list[float], n: int, percentage: float)
     :param n: Total conceptual array length, na elements included
     :param percentage: Percentile (0-100, not 0-1)
     :return: Interpolated value at the given percentile, or na if the percentage is na
-    :raises ValueError: If percentage is not in [0, 100]
+    :raises PercentageOutOfRangeError: If percentage is not in [0, 100]
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100): an na percentage yields na
     # here, unlike the nearest-rank form, which answers it as 0. The guard lives in
@@ -917,7 +927,8 @@ def _select_linear_interpolation(non_na: list[float], n: int, percentage: float)
     if not (0 <= percentage <= 100):
         # Measured: TradingView halts on a percentage outside [0, 100] (RE10002),
         # so this is an error there too, not a tolerated na-like argument.
-        raise ValueError("Percentage must be between 0 and 100")
+        raise _PercentageOutOfRangeError(function='array.percentile_linear_interpolation',
+                                         parameter='percentage', value=percentage)
     m = len(non_na)
 
     # 1-based interpolation position over the full length
@@ -976,7 +987,7 @@ def percentile_linear_interpolation(id: list[Any], percentage: float) -> float:
     :param id: List of numeric values, possibly containing na elements
     :param percentage: Percentile (0-100, not 0-1)
     :return: Interpolated value at the given percentile, or na (see above)
-    :raises ValueError: If percentage is not in [0, 100]
+    :raises PercentageOutOfRangeError: If percentage is not in [0, 100]
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100): an empty array returns na
     # and keeps running -- it is not the error an out-of-range percentage gets.
@@ -1001,7 +1012,7 @@ def _select_nearest_rank(non_na: list[float], n: int, percentage: float) -> floa
     :param percentage: Percentile (0-100), na counts as 0
     :return: The value at the nearest rank, or na if the rank falls on a na
              element
-    :raises ValueError: If percentage is not between 0 and 100
+    :raises PercentageOutOfRangeError: If percentage is not between 0 and 100
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100): an na percentage answers
     # exactly what 0 answers -- the smallest value, on [4, 3, 2, 1] as well, so it
@@ -1011,7 +1022,8 @@ def _select_nearest_rank(non_na: list[float], n: int, percentage: float) -> floa
         percentage = 0
     if not (0 <= percentage <= 100):
         # Measured: TradingView halts on a percentage outside [0, 100] (RE10002).
-        raise ValueError("Percentage must be between 0 and 100")
+        raise _PercentageOutOfRangeError(function='array.percentile_nearest_rank',
+                                         parameter='percentage', value=percentage)
     m = len(non_na)
     if percentage == 0:
         return non_na[0] if m > 0 else na_float
@@ -1048,7 +1060,7 @@ def percentile_nearest_rank(id: list[Any], percentage: float) -> float:
     :param percentage: Percentile (0-100), na counts as 0
     :return: The value at the nearest rank for the specified percentile, or na
              if that rank falls on a na element
-    :raises ValueError: If percentage is not between 0 and 100
+    :raises PercentageOutOfRangeError: If percentage is not between 0 and 100
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100): an empty array returns na
     # and keeps running.
@@ -1086,7 +1098,7 @@ def percentrank(id: list[Number], index: int) -> float:
     :param id: Input array
     :param index: Index of the element to calculate rank for
     :return: Percentile rank (0-100), or na if the element at index is na
-    :raises ValueError: If the index is out of range
+    :raises IndexOutOfRangeError: If the index is out of range
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100): percentrank with an na
     # index returns 0 on [10, 20, 30, 40], exactly what index 0 returns; on the
@@ -1105,7 +1117,7 @@ def percentrank(id: list[Number], index: int) -> float:
         # Measured on TradingView: percentrank([10, 20, 30, 40], -1) halts with
         # RE10045, so an out-of-range index is an error here, unlike in
         # get/set/remove/insert which accept negative indices.
-        raise ValueError("Index out of range")
+        raise _IndexOutOfRangeError(function='array.percentrank', index=index, size=len(id))
 
     # Measured on TradingView (FX:EURUSD 240, bar 100): percentrank on a
     # one-element array returns na for index 0 and for an na index. The rank
@@ -1138,7 +1150,10 @@ def pop(id: list[T] | SequenceView[T]) -> T:
 
     :param id: Input array
     :return: Last element from the array
+    :raises EmptyCollectionError: If the array is empty
     """
+    if not id:
+        raise _EmptyCollectionError(function='array.pop')
     return id.pop()
 
 
@@ -1178,7 +1193,7 @@ def remove(id: list[T] | SequenceView[T], index: int) -> T:
     :param id: Input array
     :param index: Index of the element to remove
     :return: The removed element, or na if the index is na
-    :raises IndexError: If the index is out of range
+    :raises IndexOutOfRangeError: If the index is out of range
     """
     if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
@@ -1189,7 +1204,10 @@ def remove(id: list[T] | SequenceView[T], index: int) -> T:
         # PyneCore array is a plain list with no runtime element type, so that
         # branch is not reproducible; the tolerant behaviour is used uniformly.
         return cast(T, _na_element(id))
-    return id.pop(int(index))  # float-carried integer index, see get()
+    index = int(index)  # float-carried integer index, see get()
+    if not -len(id) <= index < len(id):
+        raise _IndexOutOfRangeError(function='array.remove', index=index, size=len(id))
+    return id.pop(index)
 
 
 # noinspection PyShadowingBuiltins
@@ -1213,14 +1231,17 @@ def set(id: list[T] | SequenceView[T], index: int, value: T) -> None:
     :param id: Input array
     :param index: Index of the element to set
     :param value: Value to set
-    :raises IndexError: If the index is out of range
+    :raises IndexOutOfRangeError: If the index is out of range
     """
     if not (index == index):  # is_na_arg
         # Measured on TradingView (FX:EURUSD 240, bar 100):
         #   set([10, 20, 30, 40], na, 99) -> 10,20,30,40 size 4
         #   set(array.new_int(), na, 9)   -> size 0
         return
-    id[int(index)] = value  # float-carried integer index, see get()
+    index = int(index)  # float-carried integer index, see get()
+    if not -len(id) <= index < len(id):
+        raise _IndexOutOfRangeError(function='array.set', index=index, size=len(id))
+    id[index] = value
 
 
 # noinspection PyShadowingBuiltins
@@ -1230,7 +1251,10 @@ def shift(id: list[T] | SequenceView[T]) -> T:
 
     :param id: Input array
     :return: First element from the array
+    :raises EmptyCollectionError: If the array is empty
     """
+    if not id:
+        raise _EmptyCollectionError(function='array.shift')
     return id.pop(0)
 
 
@@ -1265,7 +1289,8 @@ def slice(id: list[T] | SequenceView[T], index_from: int, index_to: int) -> Sequ
     :param index_from: Index to start the sub-array from
     :param index_to: Index to end the sub-array at
     :return: Slice view of the original array
-    :raises ValueError: If the indices are out of range or start after each other
+    :raises IndexOutOfRangeError: If an index is out of range
+    :raises ArgumentOrderError: If ``index_to`` is less than ``index_from``
     """
     # Measured on TradingView (FX:EURUSD 240, bar 100, array [10, 20, 30, 40]):
     #   slice(a, na, 2)  -> 10,20        size 2
@@ -1284,11 +1309,12 @@ def slice(id: list[T] | SequenceView[T], index_from: int, index_to: int) -> Sequ
     # indices: slice(array.new<int>(0), na, na) halts with RE10045 too.
     n = len(id)
     if not 0 <= start < n:
-        raise ValueError(f"Start index {start} is out of range, array size is {n}")
+        raise _IndexOutOfRangeError(function='array.slice', index=start, size=n)
     if not 0 <= stop <= n:
-        raise ValueError(f"End index {stop} is out of range, array size is {n}")
+        raise _IndexOutOfRangeError(function='array.slice', index=stop, size=n)
     if start > stop:
-        raise ValueError(f"Start index {start} is greater than end index {stop}")
+        raise _ArgumentOrderError(function='array.slice', parameter='index_to', value=stop,
+                                  other='index_from', bound=start)
 
     return SequenceView(id)[start:stop]  # type: ignore
 

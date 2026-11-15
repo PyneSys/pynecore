@@ -2,7 +2,7 @@ from math import isfinite
 from typing import Any, TypeVar, Generic, Type, Self
 
 __all__ = [
-    'NA', 'NaFieldError', 'na_float', 'na_int', 'na_bool', 'na_str', 'isna_num', 'set_bool_na',
+    'NA', 'na_float', 'na_int', 'na_bool', 'na_str', 'isna_num', 'set_bool_na',
     'new_bool_na',
 ]
 
@@ -66,11 +66,7 @@ def set_bool_na(enabled: bool) -> None:
     _bool_na_seen = _bool_na_seen or enabled
 
 
-class NaFieldError(RuntimeError):
-    """A script read or wrote a field of an object that is na."""
-
-
-def _field_error(na_type: Any, name: str) -> NaFieldError | None:
+def _field_error(na_type: Any, name: str) -> RuntimeError | None:
     """The error for touching ``name`` on an na of ``na_type``, if it is a field.
 
     Only the objects whose fields a script reads directly carry the
@@ -84,7 +80,9 @@ def _field_error(na_type: Any, name: str) -> NaFieldError | None:
     if not getattr(na_type, '__pyne_object__', False) \
             or name not in getattr(na_type, '__dataclass_fields__', ()):
         return None
-    return NaFieldError(f"field '{name}' of an na {na_type.__name__} object is not available")
+    # The codes module imports this one, through core.errors
+    from ..codes import NaObjectFieldError
+    return NaObjectFieldError(name=name)
 
 
 class NA(Generic[T]):

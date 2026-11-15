@@ -8,6 +8,7 @@ takes its first dimension from the array; omitting the array inserts na cells.
 """
 import pytest
 
+from pynecore.codes import SizeMismatchError
 from pynecore.lib import matrix
 from pynecore.types.line import Line
 from pynecore.types.na import NA
@@ -30,7 +31,7 @@ def __test_wrong_row_size_is_rejected_before_mutation__(size, rows):
     m = matrix.new(rows, 3, 0.0)
     before = [row.copy() for row in m.data]
     values = [float(i + 1) for i in range(size)]
-    with pytest.raises(ValueError, match="does not match the matrix column count"):
+    with pytest.raises(SizeMismatchError, match="matrix.add_row"):
         matrix.add_row(m, rows, values)
     assert matrix.rows(m) == rows and matrix.columns(m) == 3
     assert m.data == before
@@ -44,7 +45,7 @@ def __test_wrong_column_size_is_rejected_before_mutation__(size, cols):
     m = matrix.new(2, cols, 0.0)
     before = [row.copy() for row in m.data]
     values = [float(i + 1) for i in range(size)]
-    with pytest.raises(ValueError, match="does not match the matrix row count"):
+    with pytest.raises(SizeMismatchError, match="matrix.add_col"):
         matrix.add_col(m, cols, values)
     assert matrix.rows(m) == 2 and matrix.columns(m) == cols
     assert m.data == before
@@ -109,7 +110,7 @@ def __test_matching_array_with_only_opposite_dimension__():
 def __test_one_empty_dimension_does_not_take_size_from_array__():
     """A 3x0 or 0x3 matrix rejects a non-empty array and accepts an empty one."""
     m = matrix.new(3, 0, 0.0)
-    with pytest.raises(ValueError, match="does not match the matrix column count"):
+    with pytest.raises(SizeMismatchError, match="matrix.add_row"):
         matrix.add_row(m, 3, [1.0, 2.0])
     assert matrix.rows(m) == 3 and matrix.columns(m) == 0
     assert m.data == [[], [], []]
@@ -117,7 +118,7 @@ def __test_one_empty_dimension_does_not_take_size_from_array__():
     assert matrix.rows(m) == 4 and matrix.columns(m) == 0
     assert m.data == [[], [], [], []]
     m = matrix.new(0, 3, 0.0)
-    with pytest.raises(ValueError, match="does not match the matrix row count"):
+    with pytest.raises(SizeMismatchError, match="matrix.add_col"):
         matrix.add_col(m, 3, [1.0, 2.0])
     assert matrix.rows(m) == 0 and matrix.columns(m) == 3
     assert m.data == []

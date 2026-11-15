@@ -43,5 +43,5 @@ def __test_malformed_offsets_are_rejected__():
     """Forms TradingView refuses to compile must raise here too"""
     for datestring in ("2026-08-01T11:00:00-05", "2026-08-01T11:00:00-5",
                        "2026-08-01T11:00:00Z", "2026-08-01T11:00:00 -0500"):
-        with pytest.raises(ValueError, match="Invalid date format"):
+        with pytest.raises(ValueError, match="is not a valid date"):
             parse_datestring(datestring)

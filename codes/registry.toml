@@ -26,8 +26,6 @@
 #   """
 #   python = "ZeroDivisionError"     # a runtime code: the built-in exception
 #                                    # class(es) its exception derives from
-#   python_message = "..."           # PyneCore's message today, when a caller
-#                                    # matches it: the same parameters
 #   exception = "..."                # the exception class's name, where the one
 #                                    # made of `name` (CamelCase, ending in
 #                                    # Error) would be a built-in's
@@ -103,7 +101,7 @@ name = "argument_not_positive"
 severity = "error"
 title = "Argument must be greater than 0"
 message = "`{function}`: `{parameter}` must be greater than 0, but it is {value}."
-python = "AssertionError"
+python = ["AssertionError", "ValueError"]
 explanation = """
 A built-in got a length, a period or a multiplier of 0 or less. Pine refuses
 these values too.
@@ -145,7 +143,7 @@ name = "index_out_of_range"
 severity = "error"
 title = "Index out of range"
 message = "`{function}`: index {index} is out of range for a size of {size}."
-python = "IndexError"
+python = ["IndexError", "ValueError"]
 explanation = """
 An array, matrix or series view was read or written at an index it does not
 have. Indexes start at 0; a negative index counts from the end where the
@@ -234,10 +232,13 @@ name = "resource_limit"
 severity = "error"
 title = "Resource limit exceeded"
 message = "The run exceeded the limit of {limit} {resource}."
+python = "RuntimeError"
 explanation = """
 The script created more objects, drawings or memory than the runtime allows,
 or a regular expression needed too many steps. The limit protects the run
-from running out of memory or time.
+from running out of memory or time. PyneCore takes the limit of
+`request.security` contexts from the `PYNESYS_MAX_SECURITY_CONTEXTS`
+environment variable.
 """
 
 [R0019]
@@ -245,7 +246,7 @@ name = "invalid_timeframe"
 severity = "error"
 title = "Invalid timeframe"
 message = "`{timeframe}` is not a valid timeframe."
-python = "AssertionError"
+python = ["AssertionError", "ValueError"]
 explanation = """
 A timeframe is a positive multiplier and a unit: `1`, `60`, `1D`, `1W`, `1M`,
 `30S`. An empty string, an unknown unit or a multiplier of 0 is not one.
@@ -311,7 +312,7 @@ name = "unknown_timezone"
 severity = "error"
 title = "Unknown time zone"
 message = "`{timezone}` is not a known time zone."
-python = "ValueError"
+python = "pynecore.core.datetime.TimezoneNotFoundError"
 explanation = """
 A time zone is an IANA name, such as `America/New_York`, or a UTC offset,
 such as `UTC-5` or `GMT+0530`.
@@ -323,11 +324,11 @@ severity = "error"
 title = "No data for request.security"
 message = "`request.security` needs the data of {symbol} on the {timeframe} timeframe, and none was given."
 python = "ValueError"
-python_message = "No OHLCV data found for security context (symbol='{symbol}', timeframe='{timeframe}'). Provide data via the security_data parameter, e.g.: security_data={{'{symbol}': 'path/to/data.ohlcv'}}"
 explanation = """
 A `request.security()` call asks for another symbol or timeframe. The run
 reads it from the data handed to it; give the data of this symbol and
-timeframe too.
+timeframe too: `pyne run` takes it with `--security`, a `ScriptRunner` with
+its `security_data` parameter (`security_data={'EXCHANGE:SYMBOL': 'path/to/data.ohlcv'}`).
 """
 
 [R0027]
@@ -336,7 +337,6 @@ severity = "error"
 title = "Lower timeframe request of a higher timeframe"
 message = "`request.security_lower_tf` cannot request `{timeframe}`, which is higher than the script's `{chart}`."
 python = "RuntimeError"
-python_message = "request.security_lower_tf() requests the '{timeframe}' timeframe, which is higher than the '{chart}' timeframe the script runs on. Use a lower timeframe, or pass ignore_invalid_timeframe=true to get na instead."
 explanation = """
 `request.security_lower_tf()` reads the bars inside each bar of the script,
 so its timeframe must be lower. Pass `ignore_invalid_timeframe = true` to get
@@ -514,7 +514,7 @@ name = "na_object_field"
 severity = "error"
 title = "Field of an na object"
 message = "`{name}` is a field of an `na` object."
-python = "pynecore.types.na.NaFieldError"
+python = "RuntimeError"
 explanation = """
 A field was read or written on a user-defined object or a `chart.point` that
 is `na`: directly, through a method, nested (`o.inner.v`) or inside `na()`.
@@ -527,7 +527,7 @@ name = "na_object_copy"
 severity = "error"
 title = "Copy of an na object"
 message = "An `na` object cannot be copied."
-python = "pynecore.types.na.NaFieldError"
+python = "RuntimeError"
 explanation = """
 `copy()` was called on a user-defined object or a `chart.point` that is
 `na`. A copy reads every field, so the object must exist: create it first,
@@ -540,7 +540,6 @@ severity = "error"
 title = "Symbol detail not given"
 message = "`syminfo.{name}` is not given for this symbol."
 python = "AttributeError"
-python_message = "module 'pynecore.lib.syminfo' has no attribute '{name}'"
 explanation = """
 Some symbol details exist only when the data provider supplies them, such as
 `syminfo.avg_spread`. The symbol of this run has none, so reading it stops the

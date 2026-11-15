@@ -50,6 +50,7 @@ straddling candle into the period its open falls in.
 """
 from typing import TYPE_CHECKING, Iterable
 
+from ..codes import ScriptTimeframeError
 from ..types.ohlcv import OHLCV
 from ..types.na import na_float
 from ..lib import timeframe as tf_module
@@ -101,7 +102,7 @@ class ScriptTimeframe:
         :param chart_timeframe: The chart (data feed) timeframe.
         :param syminfo: Chart symbol info, for session anchoring.
         :param tz: Exchange timezone.
-        :raises ValueError: If the script timeframe is finer than the chart's, or
+        :raises ScriptTimeframeError: If the script timeframe is finer than the chart's, or
             if the chart grid does not nest inside the script's.
         """
         script_mod, _ = tf_module._process_tf(timeframe)
@@ -115,12 +116,8 @@ class ScriptTimeframe:
             # timeframe.period answers 900s and the chart bar shows the LAST
             # intrabar execution), but it needs an intrabar feed the runner does
             # not have here. Refused rather than silently run on chart bars.
-            raise ValueError(
-                f"Script timeframe '{timeframe}' is lower than the chart "
-                f"timeframe '{chart_timeframe}'. Running a script on a finer "
-                f"grid than the chart feed is not supported; load the data on "
-                f"the '{timeframe}' timeframe instead."
-            )
+            raise ScriptTimeframeError(timeframe=timeframe, chart=chart_timeframe,
+                                       why="it is lower than the data's timeframe")
 
         if chart_mod in ('', 'S'):
             nests = (script_sec % chart_sec == 0 if script_mod in ('', 'S')
@@ -133,12 +130,9 @@ class ScriptTimeframe:
             # periods into the period of its open silently corrupts both bars
             # (the first gets foreign volume and a close from past its own end,
             # the second loses that stretch entirely).
-            raise ValueError(
-                f"Chart timeframe '{chart_timeframe}' does not nest inside "
-                f"script timeframe '{timeframe}': its bars would straddle the "
-                f"script's period boundaries. Load the data on a timeframe the "
-                f"script timeframe is a whole multiple of."
-            )
+            raise ScriptTimeframeError(timeframe=timeframe, chart=chart_timeframe,
+                                       why="it is not a whole multiple of the data's "
+                                           "timeframe")
 
         self.timeframe = timeframe
         self.gaps = gaps
@@ -327,14 +321,9 @@ class ScriptTimeframe:
                 # boundaries (UTC-aligned 120-minute bars under a daily script on
                 # a UTC+1 exchange: the 22:00 UTC bar runs 23:00-01:00 local and
                 # crosses local midnight) divides perfectly yet still straddles.
-                raise ValueError(
-                    f"Chart bar at {candle.timestamp} on timeframe "
-                    f"'{self._chart_timeframe}' crosses a '{self.timeframe}' "
-                    f"period boundary: the chart grid is offset from the "
-                    f"script's periods, so its bars cannot be folded into them "
-                    f"without corrupting both. Load the data on a timeframe "
-                    f"whose bars align with the script's period boundaries."
-                )
+                raise ScriptTimeframeError(
+                    timeframe=self.timeframe, chart=self._chart_timeframe,
+                    why=f"the data bar at {candle.timestamp} crosses one of its periods")
         forced = last_chart_bar and not self._feed_end_known
         _, _, closed = self._aggregator.update(
             candle.timestamp, candle.open, candle.high, candle.low,

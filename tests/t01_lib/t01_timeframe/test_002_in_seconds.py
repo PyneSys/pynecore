@@ -20,10 +20,11 @@ def main():
 def __test_timeframe_in_seconds__(csv_reader, runner, dict_comparator):
     """ timeframe.in_seconds() """
     import pytest
+    from pynecore.codes import InvalidTimeframeError, TickTimeframeError
 
     with csv_reader('timeframe_is.csv', subdir="data") as cr:
         for candle, _plot in runner(cr).run_iter():
             dict_comparator(_plot, candle.extra_fields)
 
-    pytest.raises(ValueError, timeframe.in_seconds, "5T").match("Not supported timeframe!")
-    pytest.raises(AssertionError, timeframe.in_seconds, "5Q").match("Invalid timeframe: wrong modifier!")
+    pytest.raises(TickTimeframeError, timeframe.in_seconds, "5T").match("`5T`")
+    pytest.raises(InvalidTimeframeError, timeframe.in_seconds, "5Q").match("`5Q`")

@@ -15,6 +15,9 @@ from collections import deque
 from ..types import (Series, Persistent, IBPersistent, NA, PyneFloat, PyneInt, PyneBool,
                      na_float)
 from ..types.na import na_int
+from ..codes import (ArgumentNegativeError as _ArgumentNegativeError,
+                     ArgumentNotPositiveError as _ArgumentNotPositiveError,
+                     PercentageOutOfRangeError as _PercentageOutOfRangeError)
 from ..core.module_property import module_property, module_function_property
 from pynecore.core.overload import overload
 
@@ -149,7 +152,8 @@ def alma(series: Series[float], length: int, offset: float = 0.85, sigma: float 
     :param floor:  Specifies whether the offset calculation is floored before ALMA is calculated. Default value is false
     :return: The ALMA of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.alma', parameter='length', value=length)
     if not (series == series):  # is_na_arg
         return na_float
     length = int(length)
@@ -189,7 +193,8 @@ def atr(length: int) -> PyneFloat:
     :param length: The length of the ATR
     :return: The ATR of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.atr', parameter='length', value=length)
     return rma(tr(True), length)
 
 
@@ -220,8 +225,10 @@ def bb(series: float, length: int, mult: float | int) -> tuple[PyneFloat, PyneFl
     :param mult: The multiplier of the BB
     :return: The Bollinger Bands (BB) of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
-    assert mult > 0, "Invalid multiplier, multiplier must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.bb', parameter='length', value=length)
+    if not mult > 0:
+        raise _ArgumentNotPositiveError(function='ta.bb', parameter='mult', value=mult)
 
     std_dev = stdev(series, length)
 
@@ -276,7 +283,8 @@ def change(source: Series[TFIB], length: int = 1) -> TFIB:
     # step to be representable -- ``ta.change`` reproduced it bit for bit). Dust
     # below Pine's 1e-10 comparison tolerance is absorbed by the comparison
     # operators, not by this function.
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.change', parameter='length', value=length)
     length = int(length)
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
     first_bar: Persistent[int] = -1
@@ -411,7 +419,9 @@ def correlation(source1: Series[float], source2: Series[float], length: int) -> 
     #   vx  = max(0, sx2 / length - mx * mx), likewise vy -- the clamp ``variance`` uses
     #   cov / sqrt(vx * vy), ONE square root over the product; two separate roots
     #   differ by one ulp on roughly 40% of the bars.
-    assert length > 0, "Length must be greater than 0"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.correlation', parameter='length',
+                                        value=length)
     length = int(length)
 
     # All five rolling machines must advance on every bar (na bars included), so
@@ -551,7 +561,8 @@ def dev(source: Series[float], length: int, _mean: PyneFloat | None = None) -> P
     # Bit-exact with Pine (measured, probes m556): TradingView computes the plain
     # newest-first loop ``sum(abs(source[i] - sma)) / length`` -- exactly the shape
     # below with the exact rolling-sum sma.
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.dev', parameter='length', value=length)
     if length == 1:
         return 0.0
     length = int(length)
@@ -590,8 +601,11 @@ def dmi(diLength: int, adxSmoothing: int) -> tuple[PyneFloat, PyneFloat, PyneFlo
              - Negative Directional Movement (-DI)
              - Average Directional Movement Index (ADX)
     """
-    assert diLength > 0, "Invalid DI length, DI length must be greater than 0!"
-    assert adxSmoothing > 0, "Invalid ADX smoothing, ADX smoothing must be greater than 0!"
+    if not diLength > 0:
+        raise _ArgumentNotPositiveError(function='ta.dmi', parameter='diLength', value=diLength)
+    if not adxSmoothing > 0:
+        raise _ArgumentNotPositiveError(function='ta.dmi', parameter='adxSmoothing',
+                                        value=adxSmoothing)
     up = change(high)
     down = -change(low)
     # All three rolling averages must be entered on EVERY bar, the first one
@@ -643,7 +657,8 @@ def ema(source: PyneFloat, length: int) -> PyneFloat:
     # ``alpha * source + (1 - alpha) * prev`` drifts from TradingView on more than half
     # of the bars, and so does ``alpha * source + prev - alpha * prev``. The seed is the
     # na-compacted sma on the bar where that sma first exists.
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.ema', parameter='length', value=length)
     length = int(length)
     if length == 1:  # Shortcut
         return source
@@ -676,7 +691,8 @@ def falling(source: float, length: int) -> bool:
     :param length: The length of the falling test
     :return: True if the source series is falling for length bars long
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.falling', parameter='length', value=length)
     length = int(length)
 
     last_val: Persistent[float] = na_float
@@ -820,7 +836,8 @@ def highest(source: Series[float], length: int, _bars: bool = False, _tuple: boo
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.highest', parameter='length', value=length)
     if _series_length:
         return _series_window_extreme(source, length, True, _bars, _tuple, _check_eq)
     # The bar clock addresses the ring: a Python int inside the machine
@@ -1000,7 +1017,8 @@ def hma(source: float, length: int) -> PyneFloat:
     :param length: The length of the HMA
     :return: The Hull Moving Average (HMA) of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.hma', parameter='length', value=length)
     if not (source == source):  # is_na_arg
         return na_float
     length = int(length)
@@ -1034,8 +1052,10 @@ def kc(series: float, length: int, mult: float | int, useTrueRange: bool = True)
     :param useTrueRange: Specifies whether to use True Range for KC calculation
     :return: The Keltner Channels (KC) of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
-    assert mult > 0, "Invalid multiplier, multiplier must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.kc', parameter='length', value=length)
+    if not mult > 0:
+        raise _ArgumentNotPositiveError(function='ta.kc', parameter='mult', value=mult)
 
     base = ema(series, length)
     span = tr(False) if useTrueRange else (high - low)
@@ -1197,7 +1217,8 @@ def linreg(source: Series[float], length: int, offset: int, _series_length: bool
     # invalid 0 rather than a value that passes ``> 0`` and then divides by zero.
     length = int(length)
     offset = int(offset)
-    assert length > 0, "Invalid length, must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.linreg', parameter='length', value=length)
     if length == 1:
         return source
     if _series_length:
@@ -1266,7 +1287,8 @@ def lowest(source: Series[float], length: int,
     # An int-typed Pine value can still carry a fraction (``int / int``); the
     # truncation happens where an integer is required — see ``_check_type``.
     length = int(length)
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.lowest', parameter='length', value=length)
     if _series_length:
         return _series_window_extreme(source, length, False, _bars, _tuple, _check_eq)
     # The bar clock addresses the ring: a Python int inside the machine
@@ -1402,9 +1424,12 @@ def macd(source: float, fastlen: int, slowlen: int, siglen: int) \
              - Signal Line
              - Histogram
     """
-    assert fastlen > 0, "Invalid fast length, fast length must be greater than 0!"
-    assert slowlen > 0, "Invalid slow length, slow length must be greater than 0!"
-    assert siglen > 0, "Invalid signal length, signal length must be greater than 0!"
+    if not fastlen > 0:
+        raise _ArgumentNotPositiveError(function='ta.macd', parameter='fastlen', value=fastlen)
+    if not slowlen > 0:
+        raise _ArgumentNotPositiveError(function='ta.macd', parameter='slowlen', value=slowlen)
+    if not siglen > 0:
+        raise _ArgumentNotPositiveError(function='ta.macd', parameter='siglen', value=siglen)
     fast = ema(source, fastlen)
     slow = ema(source, slowlen)
     if not (fast == fast) or not (slow == slow):
@@ -1472,7 +1497,8 @@ def median(source: Series[TFI], length: int) -> TFI:
     # precedes the domain check, because a 1.5 IS a 1 and a 0.5 IS an invalid 0
     # rather than a value that passes ``> 0`` and then indexes an empty heap.
     length = int(length)
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.median', parameter='length', value=length)
     # History is only read on a mid-run length change (window rebuild); keep the
     # buffer large enough for that. The resize is monotonic and floored at the
     # series' own default: a series ``length`` that dips low must not shrink the
@@ -1575,7 +1601,8 @@ def mfi(series: float, length: int) -> PyneFloat:
     # Tolerant direction test measured on TradingView (probes m548/m549); the empty
     # case was measured separately (probe m550) on an exactly flat source, where the
     # tolerance plays no part.
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.mfi', parameter='length', value=length)
     if not (series == series):  # is_na_arg
         return na_float
     length = int(length)
@@ -1646,7 +1673,8 @@ def mode(source: Series[TFI], length: int) -> TFI:
     # function runs on the truncated length: a 1.5 IS a 1, and a 0.5 IS an
     # invalid 0 rather than a value that passes ``> 0`` and then returns na.
     length = int(length)
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.mode', parameter='length', value=length)
     if length > capacity:
         capacity = length
         max_bars_back(src, capacity)
@@ -1837,12 +1865,13 @@ def _rank_linear(ranks: list[float], percentage: float) -> float:
     :param ranks: The window in rank order, na elements included
     :param percentage: Percentile (0-100)
     :return: The interpolated value, or na
-    :raises ValueError: If percentage is not in [0, 100]
+    :raises PercentageOutOfRangeError: If percentage is not in [0, 100]
     """
     if not (percentage == percentage):  # is_na_arg
         return na_float
     if not (0 <= percentage <= 100):
-        raise ValueError("Percentage must be between 0 and 100")
+        raise _PercentageOutOfRangeError(function='ta.percentile_linear_interpolation', parameter='percentage',
+                                         value=percentage)
     n = len(ranks)
     # 1-based interpolation position over the full window length
     pos = n * percentage / 100.0 + 0.5
@@ -1873,12 +1902,13 @@ def _rank_nearest(ranks: list[float], percentage: float) -> float:
     :param ranks: The window in rank order, na elements included
     :param percentage: Percentile (0-100), na counts as 0
     :return: The value at the nearest rank, or na if that rank holds one
-    :raises ValueError: If percentage is not in [0, 100]
+    :raises PercentageOutOfRangeError: If percentage is not in [0, 100]
     """
     if not (percentage == percentage):  # is_na_arg
         percentage = 0
     if not (0 <= percentage <= 100):
-        raise ValueError("Percentage must be between 0 and 100")
+        raise _PercentageOutOfRangeError(function='ta.percentile_nearest_rank', parameter='percentage',
+                                         value=percentage)
     n = len(ranks)
     rank = math.ceil(percentage * n / 100)
     rank = builtins.max(1, builtins.min(rank, n))
@@ -1919,7 +1949,9 @@ def percentile_linear_interpolation(source: Series[float], length: int, percenta
     # precedes the domain check, because a 1.5 IS a 1 and a 0.5 IS an invalid 0
     # rather than a value that passes ``> 0`` and then answers na forever.
     length = int(length)
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.percentile_linear_interpolation', parameter='length',
+                                        value=length)
     # The underfull top-up below reads up to ``length - 1`` bars of history; keep
     # the buffer large enough for that. Done before the warmup guard so the oldest
     # candles are kept from the first bar on. The resize is monotonic and floored
@@ -2030,7 +2062,9 @@ def percentile_nearest_rank(source: Series[float], length: int, percentage: int 
     # precedes the domain check, because a 1.5 IS a 1 and a 0.5 IS an invalid 0
     # rather than a value that passes ``> 0`` and then answers na forever.
     length = int(length)
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.percentile_nearest_rank', parameter='length',
+                                        value=length)
     # The underfull top-up reads up to ``length - 1`` bars of history; keep the
     # buffer large enough for that. Done before the warmup guard so the oldest
     # candles are kept from the first bar on. The resize is monotonic and floored
@@ -2090,7 +2124,9 @@ def percentrank(source: Series[float], length: int) -> PyneFloat:
     :param length: Number of bars back to include in the calculation
     :return: The percentage of values less than or equal to the current value
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.percentrank', parameter='length',
+                                        value=length)
     length = int(length)
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
     # The final slice reads ``length + 1`` candles of history; a buffer of
@@ -2299,8 +2335,11 @@ def pivothigh(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     # bar five back once nothing beat it.
     leftbars = int(leftbars)
     rightbars = int(rightbars)
-    assert leftbars >= 0, "Invalid leftbars, leftbars must not be negative!"
-    assert rightbars >= 0, "Invalid rightbars, rightbars must not be negative!"
+    if not leftbars >= 0:
+        raise _ArgumentNegativeError(function='ta.pivothigh', parameter='leftbars', value=leftbars)
+    if not rightbars >= 0:
+        raise _ArgumentNegativeError(function='ta.pivothigh', parameter='rightbars',
+                                     value=rightbars)
 
     if not (source == source):  # is_na_arg
         return na_float
@@ -2353,8 +2392,11 @@ def pivotlow(source: float, leftbars: int, rightbars: int) -> PyneFloat:
     # and ``(low, 0, 5)`` reports the bar five back once nothing undercut it.
     leftbars = int(leftbars)
     rightbars = int(rightbars)
-    assert leftbars >= 0, "Invalid leftbars, leftbars must not be negative!"
-    assert rightbars >= 0, "Invalid rightbars, rightbars must not be negative!"
+    if not leftbars >= 0:
+        raise _ArgumentNegativeError(function='ta.pivotlow', parameter='leftbars', value=leftbars)
+    if not rightbars >= 0:
+        raise _ArgumentNegativeError(function='ta.pivotlow', parameter='rightbars',
+                                     value=rightbars)
 
     if not (source == source):  # is_na_arg
         return na_float
@@ -2434,7 +2476,8 @@ def range(source: Series[TFI], length: int) -> TFI:
     :param length: Number of bars
     :return: The range of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.range', parameter='length', value=length)
     # The result has the source's type; pyright needs the casts, PyCharm does not
     if not (source == source):  # is_na_arg
         # noinspection PyUnnecessaryCast
@@ -2453,7 +2496,8 @@ def rci(source: Series[float], length: int) -> PyneFloat:
     :param length: Length of RCI calculation period
     :return: RCI value between -100 and 100, or na during warmup
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.rci', parameter='length', value=length)
     length = int(length)
     capacity: Persistent[int] = _SeriesImpl.DEFAULT_MAX_BARS_BACK
     # The slice below reads ``length`` candles of history; grow the source
@@ -2531,7 +2575,8 @@ def rising(source: float, length: int) -> bool:
     :param length: The length of the rising test
     :return: True if the source series is rising for length bars long
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.rising', parameter='length', value=length)
     length = int(length)
 
     last_val: Persistent[float] = na_float
@@ -2565,7 +2610,8 @@ def rma(source: PyneFloat, length: int) -> PyneFloat:
     # Measured law (probes m558): the step is ``(prev * (length - 1) + source) / length``.
     # This is NOT ``ema`` with alpha = 1 / length -- both alpha shapes drift from
     # TradingView on the majority of bars, so rma runs its own machine.
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.rma', parameter='length', value=length)
     length = int(length)
     if length == 1:  # Shortcut
         return source
@@ -2593,7 +2639,8 @@ def roc(source: Series[float], length: int) -> PyneFloat:
     :param length: The length of the ROC
     :return: The Rate of Change (ROC) of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.roc', parameter='length', value=length)
     if not (source == source):  # is_na_arg
         return na_float
     length = int(length)
@@ -2624,7 +2671,8 @@ def rsi(source: float, length: int) -> PyneFloat:
     :param length: The length of the RSI
     :return: The Relative Strength Index (RSI) of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.rsi', parameter='length', value=length)
     if not (source == source):  # is_na_arg
         return na_float
 
@@ -2836,7 +2884,8 @@ def stoch(source: float | Series[float], high: float | Series[float], low: float
     :param length: The length of the Stochastic Oscillator
     :return: The Stochastic Oscillator of the source series
     """
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.stoch', parameter='length', value=length)
     if not (source == source and high == high and low == low):
         return na_float
     length = int(length)
@@ -2874,7 +2923,9 @@ def supertrend(factor: float | int, atrPeriod: int) -> tuple[PyneFloat, PyneFloa
     # close-to-band margin 2.0e-5, with nothing in the (0, 1e-10) band (probe m555). A
     # sub-tolerance perturbation of a band could not flip a direction decision either,
     # since those margins stay four decades above it.
-    assert atrPeriod > 0, "Invalid ATR period, must be greater than 0!"
+    if not atrPeriod > 0:
+        raise _ArgumentNotPositiveError(function='ta.supertrend', parameter='atrPeriod',
+                                        value=atrPeriod)
 
     # Store persistent state
     prev_lower: Persistent[float] = na_float
@@ -2986,8 +3037,12 @@ def tsi(source: Series[float], short_length: int, long_length: int) -> PyneFloat
     :param long_length: Long length
     :return: True strength index between -1 and 1
     """
-    assert short_length > 0, "Invalid short length, must be greater than 0!"
-    assert long_length > 0, "Invalid long length, must be greater than 0!"
+    if not short_length > 0:
+        raise _ArgumentNotPositiveError(function='ta.tsi', parameter='short_length',
+                                        value=short_length)
+    if not long_length > 0:
+        raise _ArgumentNotPositiveError(function='ta.tsi', parameter='long_length',
+                                        value=long_length)
     if not (source == source):  # is_na_arg
         return na_float
 
@@ -3035,7 +3090,8 @@ def variance(source: Series[float],
     #   unbiased: max(0, q / (length - 1) - p * m / (length - 1))
     # The unbiased subtraction is distributed over the division exactly as written --
     # visible whenever ``length - 1`` is not a power of two.
-    assert length > 0, "Invalid length, must be > 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.variance', parameter='length', value=length)
     length = int(length)
 
     # Both rolling machines must advance on every bar (na bars included), so
@@ -3069,7 +3125,9 @@ def valuewhen(condition: bool, source: TFIB, occurrence: int) -> TFIB:
     # domain check runs on the truncated value, which is the occurrence actually
     # looked up: a -0.5 IS occurrence 0, not an out-of-domain argument.
     occurrence = int(occurrence)
-    assert occurrence >= 0, "Invalid occurrence, must be >= 0!"
+    if not occurrence >= 0:
+        raise _ArgumentNegativeError(function='ta.valuewhen', parameter='occurrence',
+                                     value=occurrence)
 
     # The remembered value survives every bar the condition is false, so a na
     # source on such a bar must not blank the result. A na source ON a condition
@@ -3205,7 +3263,8 @@ def wma(source: Series[float], length: int) -> PyneFloat:
     # cannot be kept incremental -- an O(1) rolling update gives different last bits.
     # The forward-filled window was measured on scattered, consecutive and leading
     # gaps at every length.
-    assert length > 0, "Invalid length, length must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.wma', parameter='length', value=length)
     length = int(length)
 
     count: Persistent[int] = 0
@@ -3262,7 +3321,8 @@ def wpr(length: int) -> PyneFloat:
     :param length: Length of the indicator
     :return: Williams %R value
     """
-    assert length > 0, "Invalid length, must be greater than 0!"
+    if not length > 0:
+        raise _ArgumentNotPositiveError(function='ta.wpr', parameter='length', value=length)
     length = int(length)
 
     if length == 1:

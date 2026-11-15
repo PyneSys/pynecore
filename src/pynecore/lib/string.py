@@ -7,6 +7,10 @@ from math import isinf, copysign as _copysign
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_HALF_EVEN, localcontext
 
+from ..codes import (ArgumentNegativeError as _ArgumentNegativeError,
+                     ArgumentOrderError as _ArgumentOrderError,
+                     InvalidFormatError as _InvalidFormatError,
+                     InvalidRegexError as _InvalidRegexError)
 from ..core.format_args import check_format_args as _check_format_args
 from ..core.safe_convert import native_int_or as _native_int_or
 from ..types.matrix import Matrix as _Matrix
@@ -849,7 +853,7 @@ def _parse_time_format(fmt: str) -> tuple[str | tuple[str, int], ...]:
 
     :param fmt: The pattern
     :return: The literal strings and ``(letter, count)`` fields, in order
-    :raises ValueError: On a letter that is no pattern letter
+    :raises InvalidFormatError: On a letter that is no pattern letter
     """
     tokens: list[str | tuple[str, int]] = []
     literal: list[str] = []
@@ -879,7 +883,7 @@ def _parse_time_format(fmt: str) -> tuple[str | tuple[str, int], ...]:
             continue
         if c not in _TIME_LETTERS:
             # MEASURED: an unquoted ``T`` fails with "Invalid `format` value" (RE10122)
-            raise ValueError(f"Invalid format value for str.format_time(): {fmt}")
+            raise _InvalidFormatError(pattern=fmt, function='str.format_time')
         j = i
         while j < n and fmt[j] == c:
             j += 1
@@ -1090,7 +1094,7 @@ def _parse_format_pattern(pattern: str) -> tuple[str | tuple[str, str, str], ...
 
     :param pattern: The ``str.format`` pattern
     :return: Literal strings and (index, type, style) placeholder segments in order
-    :raises ValueError: If the pattern ends inside a placeholder
+    :raises InvalidFormatError: If the pattern ends inside a placeholder
     """
     parts: list[str | tuple[str, str, str]] = []
     seg = ['', '', '', '']
@@ -1146,7 +1150,7 @@ def _parse_format_pattern(pattern: str) -> tuple[str | tuple[str, str, str], ...
     # An unclosed placeholder is an error, except with a brace still open inside
     # it -- Java drops that one silently instead of reporting it.
     if part != _SEG_RAW and not brace_depth:
-        raise ValueError("Format pattern ends inside a placeholder")
+        raise _InvalidFormatError(pattern=pattern, function='str.format')
     if seg[_SEG_RAW]:
         parts.append(seg[_SEG_RAW])
     return tuple(parts)
@@ -1166,7 +1170,7 @@ def format(formatString: str, *args: Any) -> str:
     :param formatString: Format pattern
     :param args: Values to format
     :return: Formatted string; a na format pattern is the empty string
-    :raises ValueError: If the pattern is malformed
+    :raises InvalidFormatError: If the pattern is malformed
     :raises TypeError: If an argument is not an int, float, bool or string value or an array
         of them
     """
@@ -1184,7 +1188,7 @@ def format(formatString: str, *args: Any) -> str:
 
         index, arg_type, style = piece
         if not _ARG_INDEX_RE.match(index):
-            raise ValueError(f"Invalid argument index: {index}")
+            raise _InvalidFormatError(pattern=formatString, function='str.format')
         position = int(index)
         if position >= len(args):
             # An index with no argument behind it is echoed as its own placeholder
@@ -1224,7 +1228,7 @@ def format_time(time: int | NA[int], format: str | None = None,
     :param format: A ``SimpleDateFormat`` pattern, ``yyyy-MM-dd'T'HH:mm:ssZ`` by default
     :param timezone: Timezone string (UTC±HHMM, GMT±HHMM or IANA name)
     :return: Formatted time string; a na ``time`` is the epoch
-    :raises ValueError: On an unquoted letter that is no pattern letter
+    :raises InvalidFormatError: On an unquoted letter that is no pattern letter
     """
     # MEASURED (v5 and v6): a na time formats as 0, the epoch -- ``1970-01-01 00:00:00.000``
     # in UTC -- and the result is not na
@@ -1292,13 +1296,17 @@ def match(source: str, regex: str) -> str:
     :param source: Source string
     :param regex: Regular expression
     :return: New substring of the source string if it matches a regex regular expression, an empty string otherwise.
+    :raises InvalidRegexError: If the regular expression does not compile
     """
     # A typeless na is the string na, the empty string
     if isinstance(source, NA) or source is None:
         source = ""
     if isinstance(regex, NA) or regex is None:
         regex = ""
-    m = re.match(_pine_regex_to_python(regex), source)
+    try:
+        m = re.match(_pine_regex_to_python(regex), source)
+    except re.error as e:
+        raise _InvalidRegexError(pattern=regex, reason=e.msg) from None
     if m is None:
         return ""
     return m.group()
@@ -1461,6 +1469,8 @@ def substring(source: str, begin_pos: int, end_pos: int | None = None) -> PyneSt
     :param end_pos: The ending position
     :return: The substring of the source string starting at the specified position and ending at
              the specified position; a na source is the empty string
+    :raises ArgumentNegativeError: If the starting position is negative
+    :raises ArgumentOrderError: If the ending position is before the starting one
     """
     # A typeless na source is the string na, the empty string. The end position
     # defaults to ``len(source)``, so the source has to be resolved before any
@@ -1475,10 +1485,14 @@ def substring(source: str, begin_pos: int, end_pos: int | None = None) -> PyneSt
     # is "hello" -- an na start is 0 -- while substring("hello", 3, na) is "lo", so
     # an na end reaches the end of the source the way an omitted one does.
     begin_pos = _native_int_or(begin_pos, 0)
-    assert begin_pos >= 0, "Positions must be >= 0!"
+    if not begin_pos >= 0:
+        raise _ArgumentNegativeError(function='str.substring', parameter='begin_pos',
+                                     value=begin_pos)
     if end_pos is not None:
         end_pos = _native_int_or(end_pos, len(source))
-        assert end_pos >= begin_pos, "End position must be >= begin position!"
+        if not end_pos >= begin_pos:
+            raise _ArgumentOrderError(function='str.substring', parameter='end_pos',
+                                      value=end_pos, other='begin_pos', bound=begin_pos)
     if begin_pos == end_pos:
         return ""
     if end_pos is None:

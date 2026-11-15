@@ -98,7 +98,7 @@ _BAD = [
     ('[R0001]\nname="a"\nseverity="error"\ntitle="t"\nmessage="m {a}"\nfix_title="t"\nfix="{b}"\n'
      'explanation="e"', "only the message's parameters"),
     ('[R0001]\nname="a"\nseverity="error"\ntitle="t"\nmessage="m {a}"\npython_message="{b}"\n'
-     'explanation="e"', "python_message needs python"),
+     'explanation="e"', "fields are"),
     ('[R0001]\nname="runtime_error"\nseverity="error"\ntitle="t"\nmessage="m"\nexplanation="e"',
      "built-in's"),
     ('[R0001]\nname="a"\nseverity="error"\ntitle="t"\nmessage="m"\nexplanation="e"\n'

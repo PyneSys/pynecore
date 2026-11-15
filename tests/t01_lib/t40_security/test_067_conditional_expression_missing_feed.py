@@ -145,6 +145,7 @@ def __test_taken_branch_raises_at_the_reading_bar__(runner, log):
     whose condition holds reads the context, and that read has no value to
     return, so it raises there — not at startup.
     """
+    from pynecore.codes import SECURITY_DATA_MISSING
     import sys
     from pathlib import Path
 
@@ -164,7 +165,7 @@ def __test_taken_branch_raises_at_the_reading_bar__(runner, log):
     rows, error = __test_helper_run_with_timeout(scenario, seconds=60)
 
     assert error is not None, "the read of an unprovisioned context did not raise"
-    assert "No OHLCV data found for security context" in str(error), \
+    assert getattr(error, 'code', None) is SECURITY_DATA_MISSING, \
         f"unexpected error message: {error}"
     assert "PYTEST:TEST" in str(error), f"the error does not name the symbol: {error}"
     assert len(rows) == _SWITCH_BAR, \

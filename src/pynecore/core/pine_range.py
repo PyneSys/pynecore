@@ -1,5 +1,7 @@
 from typing import Iterable
 
+from pynecore.codes import ArgumentNotPositiveError, ArgumentZeroError
+from pynecore.core.errors import PyneError
 from pynecore.core.pine_compare import EPSILON
 from pynecore.types.pine_types import PyneFloat, PyneInt
 
@@ -7,7 +9,12 @@ from pynecore.types.pine_types import PyneFloat, PyneInt
 #: below stops the script at run time, also on a descending loop -- ``by`` is
 #: the step's size, the direction comes from ``from`` and ``to``. A na ``by``
 #: is no error: the counter turns na after the first iteration and the loop ends.
-_STEP_ERROR = "The step of a for loop must be greater than zero"
+def _step_error(function: str, by: PyneInt | PyneFloat) -> PyneError:
+    """The error of a ``by`` of zero or below: ``R0008`` for zero, ``R0006``
+    for a negative step."""
+    if by == 0:
+        return ArgumentZeroError(function=function, parameter='by')
+    return ArgumentNotPositiveError(function=function, parameter='by', value=by)
 
 
 def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat,
@@ -27,10 +34,11 @@ def pine_range(from_num: PyneInt | PyneFloat, to_num: PyneInt | PyneFloat,
     :param step_num: Step size (optional, defaults to 1); the direction comes from
                      ``from_num`` and ``to_num``
     :return: The counter values from from_num to to_num (inclusive)
-    :raises ValueError: If step_num is zero or negative
+    :raises ArgumentZeroError: If step_num is zero
+    :raises ArgumentNotPositiveError: If step_num is negative
     """
     if step_num is not None and step_num <= 0:
-        raise ValueError(_STEP_ERROR)
+        raise _step_error('pine_range', step_num)
     # Fast path: integral bounds map exactly onto a native range, which iterates at C
     # speed instead of resuming a Python generator on every step; ``map(float, ...)``
     # hands the values over as floats without a Python-level frame per step. The vast
@@ -147,12 +155,13 @@ class PineLoop:
 
         :param by: The loop's ``by`` value, or None when the loop has none
         :return: The signed step
-        :raises ValueError: If the step is zero or negative
+        :raises ArgumentZeroError: If the step is zero
+        :raises ArgumentNotPositiveError: If the step is negative
         """
         if by is None:
             return 1 if self._ascending else -1
         if by <= 0:
-            raise ValueError(_STEP_ERROR)
+            raise _step_error('for', by)
         return by if self._ascending else -by
 
     def step(self, to_num: PyneInt | PyneFloat) -> bool:
@@ -164,7 +173,8 @@ class PineLoop:
 
         :param to_num: The loop's ``to`` bound, freshly evaluated by the caller
         :return: True while the counter is still within the bound
-        :raises ValueError: If the step is zero or negative
+        :raises ArgumentZeroError: If the step is zero
+        :raises ArgumentNotPositiveError: If the step is negative
         """
         phase = self._phase
         if phase == 3:
@@ -191,7 +201,8 @@ class PineLoop:
         Take the ``by`` value after the entry read of an ``entry`` mode loop.
 
         :param step_num: The loop's ``by`` value, or None when the loop has none
-        :raises ValueError: If the step is zero or negative
+        :raises ArgumentZeroError: If the step is zero
+        :raises ArgumentNotPositiveError: If the step is negative
         """
         self._step = self._signed_step(step_num)
         self.entering = False

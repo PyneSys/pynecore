@@ -8,6 +8,7 @@ TV-measured double; a value under 1e-3 was printed rounded to 20 decimals.
 """
 import pytest
 
+from pynecore.codes import EmptyCollectionError, MatrixHoldsNaError, MatrixNotSquareError
 from pynecore.lib import matrix
 from pynecore.types.matrix import Matrix
 
@@ -350,7 +351,7 @@ def __test_int_matrix_keeps_fractional_values__():
 @pytest.mark.parametrize("function", [matrix.eigenvalues, matrix.eigenvectors])
 def __test_empty_matrix_is_an_error__(function):
     """TV-measured: a 0x0 matrix is a runtime error in both functions."""
-    with pytest.raises(ValueError, match="empty matrix"):
+    with pytest.raises(EmptyCollectionError):
         function(matrix.new(0, 0, 0.0))
 
 
@@ -359,12 +360,12 @@ def __test_na_element_is_an_error__(function):
     """TV-measured: a matrix with a na cell is a runtime error in both functions."""
     m = matrix.new(2, 2, 1.0)
     matrix.set(m, 0, 0, float('nan'))
-    with pytest.raises(ValueError, match="contains na"):
+    with pytest.raises(MatrixHoldsNaError):
         function(m)
 
 
 @pytest.mark.parametrize("function", [matrix.eigenvalues, matrix.eigenvectors])
 def __test_non_square_matrix_is_an_error__(function):
     """TV-measured: a 2x3 matrix is a runtime error in both functions."""
-    with pytest.raises(ValueError, match=r"non-square \(2x3\)"):
+    with pytest.raises(MatrixNotSquareError, match="2 rows and 3 columns"):
         function(matrix.new(2, 3, 1.0))

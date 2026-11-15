@@ -611,9 +611,6 @@
     "NA": {
       "type": "variable"
     },
-    "NaFieldError": {
-      "type": "variable"
-    },
     "PyneInt": {
       "type": "variable"
     },

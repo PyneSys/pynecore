@@ -4,6 +4,7 @@ from ..types.na import NA, na_float, na_int
 from ..types.pine_types import PyneFloat, PyneInt
 from .session import regular
 
+from ..codes import SyminfoMemberMissingError as _SyminfoMemberMissingError
 from ..core.module_property import module_function_property
 from ..core.syminfo import SymInfoSession, SymInfoInterval
 
@@ -95,6 +96,18 @@ _size_round_factor: float
 # are module properties over these cells.
 _prefix: str = ""
 _ticker: str = ""
+
+
+def __getattr__(name: str):
+    """A symbol detail the module declares but the run has not given.
+
+    :param name: The attribute
+    :raises SyminfoMemberMissingError: For a declared detail the symbol has none of
+    :raises AttributeError: For any other name
+    """
+    if not name.startswith('_') and name in __annotations__:
+        raise _SyminfoMemberMissingError(name=name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _symbol_parts(symbol: str) -> tuple[str, str]:

@@ -248,7 +248,7 @@ def __test_sequence_view_method_dispatch__():
 
 def __test_no_such_method_asserts__():
     """ An unresolvable string method fails loudly """
-    with pytest.raises(AssertionError, match='No such method'):
+    with pytest.raises(AssertionError, match='has no method `definitely_missing`'):
         method_call('definitely_missing', _Receiver())
 
 

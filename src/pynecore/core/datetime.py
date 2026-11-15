@@ -202,10 +202,9 @@ def _parse_timezone_cached(timezone: str) -> ZoneInfo:
         # common cause is a missing IANA database (Windows ships none by default).
         if not _timezone_db_available():
             raise TimezoneNotFoundError(_missing_timezone_message(timezone))
-        raise TimezoneNotFoundError(
-            f"Unknown timezone {timezone!r}. Use a valid IANA name "
-            "(e.g. 'America/New_York') or a UTC/GMT±HHMM offset (e.g. 'UTC-5', 'GMT+0530')."
-        )
+        # The codes module builds its error on this module's TimezoneNotFoundError
+        from ..codes import UnknownTimezoneError
+        raise UnknownTimezoneError(timezone=timezone)
 
     prefix, sign, hours, minutes = match.groups()
     hours = int(hours)
@@ -293,6 +292,13 @@ def parse_timezone(timezone: str | None) -> ZoneInfo:
     return _parse_timezone_cached(timezone)
 
 
+def _invalid_date(text: str) -> ValueError:
+    """The error of a date string no format takes."""
+    # The codes module imports this one
+    from ..codes import InvalidDateError
+    return InvalidDateError(text=text)
+
+
 def parse_datestring(datestring: str) -> datetime:
     """
     Parse date string using multiple formats.
@@ -304,9 +310,10 @@ def parse_datestring(datestring: str) -> datetime:
 
     :param datestring: Date string to parse
     :return: Parsed datetime object
-    :raises ValueError: If the date format is invalid
+    :raises InvalidDateError: If the date format is invalid
     """
     datestring = datestring.strip()
+    text = datestring
     if not datestring:
         return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     datestring = _normalize_month_words(datestring)
@@ -373,7 +380,10 @@ def parse_datestring(datestring: str) -> datetime:
     # This prevents the timezone regex from incorrectly matching date parts like -09 in 2025-01-09
     iso_date_match = re.match(r'^\d{4}-\d{2}-\d{2}$', datestring)
     if iso_date_match:
-        return datetime.strptime(datestring, "%Y-%m-%d").replace(tzinfo=UTC)
+        try:
+            return datetime.strptime(datestring, "%Y-%m-%d").replace(tzinfo=UTC)
+        except ValueError:
+            raise _invalid_date(text) from None
 
     # Year-only and year-month dates, where TradingView fills the missing components
     # in with the start of the period -- measured: "2025" -> 2025-01-01 00:00 and
@@ -383,7 +393,10 @@ def parse_datestring(datestring: str) -> datetime:
     partial_match = re.match(r'^(\d{4})(?:[-/.](\d{1,2}))?$', datestring)
     if partial_match:
         year, month = partial_match.groups()
-        return datetime(int(year), int(month) if month else 1, 1, tzinfo=UTC)
+        try:
+            return datetime(int(year), int(month) if month else 1, 1, tzinfo=UTC)
+        except ValueError:
+            raise _invalid_date(text) from None
 
     # Extract timezone if present at the end for other formats
     # The regex requires whitespace before timezone to avoid matching date parts
@@ -424,17 +437,7 @@ def parse_datestring(datestring: str) -> datetime:
         except ValueError:
             continue
 
-    raise ValueError(
-        f"Invalid date format: {datestring}\n"
-        "Supported formats:\n"
-        "- ISO Style: '2020-02-20T15:30:00+02:00', '2025-01-01 01:23:45-05:00',"
-        " '2021-01-13:05:00'\n"
-        "- With fraction: '2024-08-01T04:38:47.731215+00:00'\n"
-        "- RFC Style: '20 Feb 2020 15:30:00 GMT+0200', '1 January 2018 00:00 +0000'\n"
-        "- Simple Pine: 'Feb 01 2020 22:10:05', '1 January 2018', '2020-02-20'\n"
-        "- Numeric, month first: '01-01-2023', '03/04/2023', '03.04.2023 10:20:30'\n"
-        "- Partial, year first: '2025', '2025-06', '2025.06', 'Jan 2025'"
-    )
+    raise _invalid_date(text)
 
 
 # The Gregorian calendar repeats exactly every 400 years

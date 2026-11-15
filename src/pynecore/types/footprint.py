@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from .volume_row import VolumeRow
+from ..codes import NotAvailableError
 
 
 @dataclass(slots=True, eq=False)
@@ -14,28 +15,28 @@ class Footprint:
 
     def buy_volume(self) -> float:
         """Total buy volume for the bar."""
-        raise NotImplementedError("Footprint.buy_volume() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='footprint.buy_volume')
 
     def sell_volume(self) -> float:
         """Total sell volume for the bar."""
-        raise NotImplementedError("Footprint.sell_volume() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='footprint.sell_volume')
 
     def delta(self) -> float:
         """Volume delta (buy - sell) for the bar."""
-        raise NotImplementedError("Footprint.delta() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='footprint.delta')
 
     def total_volume(self) -> float:
         """Total volume (buy + sell) for the bar."""
-        raise NotImplementedError("Footprint.total_volume() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='footprint.total_volume')
 
     def vah(self) -> VolumeRow:
         """Value Area High row."""
-        raise NotImplementedError("Footprint.vah() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='footprint.vah')
 
     def val(self) -> VolumeRow:
         """Value Area Low row."""
-        raise NotImplementedError("Footprint.val() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='footprint.val')
 
     def poc(self) -> VolumeRow:
         """Point of Control row."""
-        raise NotImplementedError("Footprint.poc() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='footprint.poc')

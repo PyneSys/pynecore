@@ -72,7 +72,7 @@ def __test_numeric_dates_with_explicit_offset__():
 
 def __test_day_first_is_rejected__():
     """"13-04-2023" must raise like TV's compile error -- no day-first fallback"""
-    with pytest.raises(ValueError, match="Invalid date format"):
+    with pytest.raises(ValueError, match="is not a valid date"):
         parse_datestring("13-04-2023")
 
 

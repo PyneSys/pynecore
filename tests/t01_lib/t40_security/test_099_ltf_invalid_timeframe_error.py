@@ -23,7 +23,7 @@ def __test_an_ltf_above_the_script_timeframe_stops_the_run__(runner):
                   low=99.0, close=100.0, volume=1.0) for i in range(48)]
     r = runner(bars, {"period": "60"})
     evaluated = []
-    with pytest.raises(RuntimeError, match=r"'D' timeframe, which is higher than the '60'"):
+    with pytest.raises(RuntimeError, match=r"cannot request `D`, which is higher than the script's `60`"):
         for candle, _values in r.run_iter():
             evaluated.append(candle)
     assert not evaluated, f"{len(evaluated)} bars ran before the error"

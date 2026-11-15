@@ -99,11 +99,12 @@ def main():
 def __test_timeframe_basic__(runner, dummy_ohlcv_iter, monkeypatch):
     """ Basic """
     import pytest
+    from pynecore.codes import InvalidTimeframeError
 
     next(runner(dummy_ohlcv_iter).run_iter())
 
     monkeypatch.setattr(syminfo, "period", "3Y")
-    pytest.raises(AssertionError, timeframe.multiplier).match("Invalid timeframe: wrong modifier!")
+    pytest.raises(InvalidTimeframeError, timeframe.multiplier).match("`3Y`")
 
     monkeypatch.setattr(syminfo, "period", "5X")
-    pytest.raises(AssertionError, timeframe.change, "1D").match("Invalid timeframe: wrong modifier!")
+    pytest.raises(InvalidTimeframeError, timeframe.change, "1D").match("`5X`")

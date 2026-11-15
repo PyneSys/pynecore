@@ -97,5 +97,5 @@ def __test_rejected_forms__():
     for datestring in ("UTC01 Jan 2022 00:00", "UTC 2022-01-01T05:00", "01 Jan 2022 00:00 CET",
                        "01 Jan 2022 00:00 A", "01 Jan 2022 00:00 America/New_York",
                        "01 Jan 2022 +0300"):
-        with pytest.raises(ValueError, match="Invalid date format"):
+        with pytest.raises(ValueError, match="is not a valid date"):
             parse_datestring(datestring)

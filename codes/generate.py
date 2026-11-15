@@ -51,8 +51,8 @@ NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
 SEVERITIES = ("error", "warning", "info")
 FIELDS = {"name", "severity", "title", "message", "since", "explanation", "retired", "fix_title",
-          "fix", "python", "python_message", "exception"}
-OPTIONAL = {"since", "retired", "fix_title", "fix", "python", "python_message", "exception"}
+          "fix", "python", "exception"}
+OPTIONAL = {"since", "retired", "fix_title", "fix", "python", "exception"}
 CLASS_RE = re.compile(r"[A-Z][A-Za-z0-9]*Error")
 
 #: The domains of the codes a run raises (``RUNTIME``).
@@ -142,14 +142,6 @@ def load(path: Path, domains: str = DOMAINS) -> list[Code]:
             raise ValueError(f"{where}: a quick fix has both fix_title and fix")
         if set(fix_params) - set(params):
             raise ValueError(f"{where}: a quick fix uses only the message's parameters")
-        if "python_message" in row:
-            try:
-                py_params = _params(row["python_message"])
-            except ValueError as e:
-                raise ValueError(f"{where}: {e}") from None
-            if "python" not in row or set(py_params) - set(params):
-                raise ValueError(f"{where}: python_message needs python and uses only the "
-                                 "message's parameters")
         names.add(row["name"])
         entry = Code(code, row["name"], row["severity"], row["title"].strip(), row["message"],
                      params, row.get("since"), row["explanation"].strip(), row.get("retired"),

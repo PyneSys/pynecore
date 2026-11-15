@@ -336,6 +336,7 @@ def __test_missing_feed_still_raises_with_slicing__(runner, log):
     ``ValueError`` whether the child runs a slice or the whole ``main()`` — a
     dropped read would turn the failure into a quiet ``na``.
     """
+    from pynecore.codes import SECURITY_DATA_MISSING
     sliced_done, sliced_error = __test_helper_run_with_timeout(
         lambda: __test_helper_run_missing_feed(runner, False))
     plain_done, plain_error = __test_helper_run_with_timeout(
@@ -344,7 +345,7 @@ def __test_missing_feed_still_raises_with_slicing__(runner, log):
     assert sliced_error is not None, "the sliced run swallowed the missing feed"
     assert plain_error is not None, "the whole-main run swallowed the missing feed"
     for error in (sliced_error, plain_error):
-        assert "No OHLCV data found for security context" in str(error), \
+        assert getattr(error, 'code', None) is SECURITY_DATA_MISSING, \
             f"unexpected error message: {error}"
         assert "PYTEST:TEST" in str(error), \
             f"the error does not name the symbol: {error}"

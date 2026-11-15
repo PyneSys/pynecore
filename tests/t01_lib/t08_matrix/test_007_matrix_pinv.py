@@ -9,6 +9,7 @@ decimals.
 """
 import pytest
 
+from pynecore.codes import MatrixSingularError
 from pynecore.lib import matrix
 from pynecore.types.matrix import Matrix
 
@@ -311,7 +312,7 @@ def __test_inv_matches_tv__(rows, expected):
 ])
 def __test_inv_of_a_singular_matrix_is_an_error__(rows):
     """TV-measured: a zero pivot, and one under 1e-11 too, is a runtime error in inv()."""
-    with pytest.raises(ValueError, match="singular"):
+    with pytest.raises(MatrixSingularError):
         matrix.inv(__test_helper_matrix(rows))
 
 

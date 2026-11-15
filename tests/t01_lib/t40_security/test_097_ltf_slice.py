@@ -53,13 +53,15 @@ def __test_the_unsliced_child_reaches_the_chart_side_statement__(runner, log):
     """Unsliced, the LTF child evaluates the chart's statements that raise there.
 
     The child evaluates ``matrix.get(boxes, 0, 0)`` on its own bars, where the
-    chart's row was never added, and dies with an ``IndexError`` (converter corpus
-    1a04048648, Volume Analysis - Heatmap and Volume Profile).
+    chart's row was never added, and dies with the index error of ``matrix.get``
+    (converter corpus 1a04048648, Volume Analysis - Heatmap and Volume Profile).
     """
+    from pynecore.codes import INDEX_OUT_OF_RANGE
     try:
         __test_helper_run(runner, no_slice=True)
-    except RuntimeError as exc:
-        assert "IndexError" in str(exc), f"unexpected failure: {exc}"
+    except IndexError as exc:
+        assert getattr(exc, 'code', None) is INDEX_OUT_OF_RANGE, f"unexpected failure: {exc}"
+        assert "`matrix.get`" in str(exc), f"unexpected failure: {exc}"
     else:
         raise AssertionError("the unsliced child did not reach the chart-side statement")
     log.info("the unsliced child died on the chart-side statement")

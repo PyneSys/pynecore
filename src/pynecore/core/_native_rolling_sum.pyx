@@ -29,6 +29,7 @@ import array as _array
 
 from . import rolling_sum as _rs
 from .safe_convert import native_int as _native_int
+from ..codes import ArgumentNotPositiveError as _ArgumentNotPositiveError
 from .series import SeriesImpl as _SeriesImpl
 from ..types.na import na_float as _na_float
 
@@ -40,7 +41,6 @@ cdef array.array _DOUBLES = _array.array('d')
 # stored-bar count, and on a stored bar it fails the ``max_bars_back`` limit anyway
 cdef long long _LENGTH_CAP = 1LL << 62
 
-cdef str _LENGTH_ERROR = "Invalid length, length must be greater than 0!"
 
 cdef str _STALE_TOKEN_ERROR = _rs._STALE_TOKEN_ERROR
 
@@ -186,7 +186,8 @@ cdef class SumMachine:
         cdef long long new_cap, size, pos, old_cap, keep, start, i
         cdef array.array old, fresh
         if max_bars_back <= 0:
-            raise ValueError("The max_bars_back must be a positive integer!")
+            raise _ArgumentNotPositiveError(function='max_bars_back', parameter='num',
+                                            value=max_bars_back)
         if max_bars_back > _SeriesImpl.MAXIMUM_MAX_BARS_BACK:
             raise ValueError(
                 f"The max_bars_back cannot exceed {_SeriesImpl.MAXIMUM_MAX_BARS_BACK}!")
@@ -241,7 +242,7 @@ cdef class SumMachine:
 
         # ``native_int`` of the original, with its two common shapes kept in C: a
         # float length truncates toward zero exactly like ``int()``, and a non-finite
-        # one (an na) takes the Python path, where the assert rejects it
+        # one (an na) takes the Python path, where the length check rejects it
         if type(length) is float and PyFloat_AS_DOUBLE(length) - PyFloat_AS_DOUBLE(length) == 0.0:
             d = PyFloat_AS_DOUBLE(length)
             if d >= <double> _LENGTH_CAP:
@@ -250,7 +251,9 @@ cdef class SumMachine:
                 clen = -1
             else:
                 clen = <long long> d
-            assert clen > 0, _LENGTH_ERROR
+            if clen <= 0:
+                raise _ArgumentNotPositiveError(function='math.sum', parameter='length',
+                                                value=clen)
         else:
             if type(length) is not int:
                 length = _native_int(length)
@@ -260,9 +263,13 @@ cdef class SumMachine:
                     clen = _LENGTH_CAP
                 elif overflow < 0:
                     clen = -1
-                assert clen > 0, _LENGTH_ERROR
+                if clen <= 0:
+                    raise _ArgumentNotPositiveError(function='math.sum', parameter='length',
+                                                    value=length)
             else:
-                assert length > 0, _LENGTH_ERROR
+                if not length > 0:
+                    raise _ArgumentNotPositiveError(function='math.sum', parameter='length',
+                                                    value=length)
                 clen = length
 
         n = self.seen

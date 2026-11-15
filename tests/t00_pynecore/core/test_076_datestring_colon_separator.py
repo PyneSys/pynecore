@@ -53,5 +53,5 @@ def __test_colon_separator_with_offset__():
 def __test_malformed_separators_are_rejected__():
     """Forms TradingView refuses to compile must raise here too"""
     for datestring in ("2021-01-1305:00", "2021-01-13x05:00", "2021-01-13:05"):
-        with pytest.raises(ValueError, match="Invalid date format"):
+        with pytest.raises(ValueError, match="is not a valid date"):
             parse_datestring(datestring)

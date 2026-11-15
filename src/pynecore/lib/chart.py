@@ -2,7 +2,8 @@ from copy import copy as _copy
 
 from ..types.color import Color
 from ..types.chart import ChartPoint
-from ..types.na import NA, NaFieldError, na_int
+from ..codes import NaObjectCopyError as _NaObjectCopyError
+from ..types.na import NA, na_int
 from ..types.pine_types import PyneInt
 from ..core.module_property import module_property
 
@@ -120,10 +121,10 @@ class _ChartPoint:
 
         :param id: The chart.point object to copy
         :return: A new chart.point object with the same field values
-        :raises NaFieldError: When ``id`` is na: copying reads its fields
+        :raises NaObjectCopyError: When ``id`` is na: copying reads its fields
         """
         if isinstance(id, NA):
-            raise NaFieldError("an na ChartPoint object cannot be copied")
+            raise _NaObjectCopyError()
         return _copy(id)
 
 

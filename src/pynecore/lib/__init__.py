@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, time as dt_time, date, UTC, \
 
 from pynecore.types.source import Source
 
+from ..codes import InvalidSessionError as _InvalidSessionError
 from ..core.module_property import module_property, module_function_property
 from ..core.series import SeriesImpl as _SeriesImpl
 
@@ -1263,7 +1264,7 @@ def _parse_session_string(session: str, timezone: str | None = None) -> tuple['S
                     "0400-0700,0900-1300:23456", "0930-1600|1000-1300:7")
     :param timezone: Timezone string, defaults to exchange timezone if None
     :return: One SessionInfo per time range and section, in the order they were written
-    :raises ValueError: If session string is invalid
+    :raises InvalidSessionError: If session string is invalid
     """
     # The exchange fallback is resolved here rather than inside the cached parse so
     # a later symbol change takes effect instead of returning the previous run's
@@ -1303,7 +1304,7 @@ def _parse_session_string_cached(session: str, timezone: str) -> 'tuple[SessionI
     :param timezone: Timezone string, already resolved to a concrete zone
     :return: One SessionInfo per time range, in the order they were written, or
              ``None`` when the string selects the symbol's own session
-    :raises ValueError: If session string is invalid
+    :raises InvalidSessionError: If session string is invalid
     """
     from ..types.session import SessionInfo
 
@@ -1340,13 +1341,13 @@ def _parse_session_string_cached(session: str, timezone: str) -> 'tuple[SessionI
     for section in sections:
         parts = section.split(':')
         if len(parts) > 2:
-            raise ValueError(f"Invalid session section {section!r} in session: {session}")
+            raise _InvalidSessionError(session=session)
         ranges = _parse_session_ranges(parts[0], session)
         if len(parts) == 1 or not parts[1]:
             # MEASURED: "0930-1600|1700-1800" and "1100-1400:|1200-1300" halt with
             # "duplicated default section"
             if has_default:
-                raise ValueError(f"Duplicated default section in session: {session}")
+                raise _InvalidSessionError(session=session)
             has_default = True
             parsed.append((ranges, None))
         else:
@@ -1384,7 +1385,7 @@ def _parse_session_ranges(text: str, session: str) -> tuple[tuple[dt_time, dt_ti
     :param session: The whole session string, for error messages
     :return: ``(start, end)`` time-of-day pairs; an end at or before the start is on
              the next day, equal endpoints span the whole day
-    :raises ValueError: If a range is malformed or out of range
+    :raises InvalidSessionError: If a range is malformed or out of range
     """
     if not text:
         return ()
@@ -1398,7 +1399,7 @@ def _parse_session_ranges(text: str, session: str) -> tuple[tuple[dt_time, dt_ti
         # "1100 -1400" and an empty entry all halt the script
         if (len(entry) != 9 or entry[4] != '-'
                 or not _SESSION_DIGITS.issuperset(entry[:4] + entry[5:])):
-            raise ValueError(f"Invalid session range {entry!r} in session: {session}")
+            raise _InvalidSessionError(session=session)
         start_minutes = int(entry[:2]) * 60 + int(entry[2:4])
         end_minutes = int(entry[5:7]) * 60 + int(entry[7:])
         # MEASURED (CAPITALCOM:BTCUSD, "UTC", start and end hours up to 99, minutes up
@@ -1413,7 +1414,7 @@ def _parse_session_ranges(text: str, session: str) -> tuple[tuple[dt_time, dt_ti
             end_of_run = end_minutes or _MINUTES_PER_DAY
             if not (start_minutes - _MINUTES_PER_DAY < end_of_run <= start_minutes
                     < 2 * _MINUTES_PER_DAY):
-                raise ValueError(f"Invalid session range {entry!r} in session: {session}")
+                raise _InvalidSessionError(session=session)
         start_minutes %= _MINUTES_PER_DAY
         end_minutes %= _MINUTES_PER_DAY
         ranges.append((dt_time(*divmod(start_minutes, 60)), dt_time(*divmod(end_minutes, 60))))
@@ -1427,12 +1428,12 @@ def _parse_session_days(text: str, session: str) -> frozenset[int]:
     :param text: Day digits, 1 (Sunday) .. 7 (Saturday), in any order
     :param session: The whole session string, for error messages
     :return: The day numbers
-    :raises ValueError: If a character is not a day digit
+    :raises InvalidSessionError: If a character is not a day digit
     """
     # MEASURED: ":0", ":8", ":9", ":abc", ":23456a", ":23456," and ":2345 6" halt the
     # script with "Invalid days specification"; a repeated digit is accepted
     if not _SESSION_DAY_DIGITS.issuperset(text):
-        raise ValueError(f"Invalid days specification {text!r} in session: {session}")
+        raise _InvalidSessionError(session=session)
     return frozenset(int(day_char) for day_char in text)
 
 

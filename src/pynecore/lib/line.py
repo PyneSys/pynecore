@@ -1,6 +1,7 @@
 from copy import copy as _copy
 from typing import Any, overload
 
+from ..codes import LinePriceXlocError as _LinePriceXlocError
 from ..core.module_property import module_property
 from ..types.chart import ChartPoint
 from ..types.base import next_vid
@@ -410,14 +411,14 @@ def get_price(id: Line, x: int) -> PyneFloat:
     :param id: Line object
     :param x: Bar index for which price is required
     :return: Price value of line 'id' at bar index 'x'
-    :raises RuntimeError: If the line was created with xloc.bar_time instead of xloc.bar_index
+    :raises LinePriceXlocError: If the line was created with xloc.bar_time instead of xloc.bar_index
     """
     if isinstance(id, NA):
         return na_float
     
     # Check if line was created with xloc.bar_index
     if id.xloc != _xloc.bar_index:
-        raise RuntimeError("line.get_price() can only be called for lines created using 'xloc.bar_index'")
+        raise _LinePriceXlocError()
     
     # Line is considered to have been created using 'extend=extend.both'
     # Calculate the slope of the line

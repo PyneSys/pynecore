@@ -6,6 +6,7 @@ import importlib
 import pytest
 
 import pynecore.lib as lib
+from pynecore.codes import UnknownTimezoneError
 from pynecore.core import datetime as core_datetime
 from pynecore.core.overload import Implementation, _anchored
 from pynecore.core.script_runner import ScriptRunner
@@ -92,7 +93,7 @@ def __test_unknown_timezone_does_not_reuse_a_previous_result__(monkeypatch):
     bound = lib.timestamp.__pyne_bind__('iii')
     bound(2025, 1, 1)
     monkeypatch.setattr(lib.syminfo, 'timezone', 'Not/AZone')
-    with pytest.raises(core_datetime.TimezoneNotFoundError, match='Unknown timezone'):
+    with pytest.raises(UnknownTimezoneError, match='`Not/AZone`'):
         bound(2025, 1, 1)
 
 

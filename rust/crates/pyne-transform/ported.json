@@ -13,7 +13,7 @@
   },
   "BuiltinShadow": {
     "module": "builtin_shadow",
-    "digest": "0731734b0add1a1ef918a848ff409f699264c27798f4b21bc2028926e1136122"
+    "digest": "a1615c7920d55d0fb4366f11061098bfd7f85c97c71b55d656d0a39950f024af"
   },
   "ImportNormalizer": {
     "module": "import_normalizer",
@@ -37,7 +37,7 @@
   },
   "ConstFold": {
     "module": "const_fold",
-    "digest": "ed7433ee7e1439e0976c5e277b11ab63d2b02a4bb70abb7eb45abab2fece139f"
+    "digest": "db1384404ec45a18106cad434dedcc73729c36b77e5e9a67cc9566a9e7e906c8"
   },
   "DynamicDefault": {
     "module": "dynamic_default",
@@ -69,7 +69,7 @@
   },
   "ModuleProperty": {
     "module": "module_property",
-    "digest": "1b6d0590f617b1418526f2119abb05b8904d1115e354167ae375159bee17dcc3"
+    "digest": "89cc52e30689bb403d30e8707085a26ff569025c7c21acd9e815f8f284145f20"
   },
   "TaVariableHoist": {
     "module": "ta_variable_hoist",
@@ -117,11 +117,11 @@
   },
   "CallInline": {
     "module": "call_inline",
-    "digest": "b695d69d97e679926f6e8ba98b9234dd96528fc30950ff526d421fe1d23f7efb"
+    "digest": "c8bbb8ee4d0a3ab753c6653f6597fd0d9f339bf3986bbbae4234bfd37f85168b"
   },
   "FunctionIsolation": {
     "module": "function_isolation",
-    "digest": "a1464ac50030bb2ad1f342b33962cfc68a79707f65521acc922dfef85dd3b50d"
+    "digest": "a39889d56cd01f4701c22205cdd40627a5565c95706b503c9e09c77dc73abee6"
   },
   "ScriptRequirements": {
     "module": "script_requirements",

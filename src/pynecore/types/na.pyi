@@ -11,9 +11,6 @@ T = TypeVar('T')
 def isna_num(x: Any) -> bool: ...
 
 
-class NaFieldError(RuntimeError): ...
-
-
 class NA(Generic[T]):
     __pyne_na_type__: Type[T] | T | None
 

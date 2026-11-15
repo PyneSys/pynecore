@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from ..codes import NotAvailableError
+
 
 @dataclass(slots=True, eq=False)
 class VolumeRow:
@@ -13,24 +15,24 @@ class VolumeRow:
 
     def up_price(self) -> float:
         """Upper price boundary of the row."""
-        raise NotImplementedError("VolumeRow.up_price() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='volume_row.up_price')
 
     def down_price(self) -> float:
         """Lower price boundary of the row."""
-        raise NotImplementedError("VolumeRow.down_price() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='volume_row.down_price')
 
     def buy_volume(self) -> float:
         """Buy volume for this row."""
-        raise NotImplementedError("VolumeRow.buy_volume() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='volume_row.buy_volume')
 
     def sell_volume(self) -> float:
         """Sell volume for this row."""
-        raise NotImplementedError("VolumeRow.sell_volume() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='volume_row.sell_volume')
 
     def delta(self) -> float:
         """Volume delta (buy - sell) for this row."""
-        raise NotImplementedError("VolumeRow.delta() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='volume_row.delta')
 
     def total_volume(self) -> float:
         """Total volume for this row."""
-        raise NotImplementedError("VolumeRow.total_volume() is not yet implemented in PyneCore")
+        raise NotAvailableError(function='volume_row.total_volume')

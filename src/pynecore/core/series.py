@@ -3,6 +3,7 @@ from typing import Any, TypeVar, Generic, Iterator, Callable, cast, overload
 
 from types import ModuleType
 
+from ..codes import ArgumentNotPositiveError
 from ..types.na import NA, na_float, na_str
 
 __all__ = ['SeriesImpl', 'CollectionSeriesImpl', 'close_collection_bar', 'inline_series']
@@ -143,10 +144,12 @@ class SeriesImpl(Generic[T]):
         - If decreased, only the most recent 'new_value + 1' items are kept.
 
         :param new_max_bars_back: The new 'max_bars_back' value.
-        :raises ValueError: If new_value <= 0.
+        :raises ArgumentNotPositiveError: If new_value <= 0.
+        :raises ValueError: Above :attr:`MAXIMUM_MAX_BARS_BACK`.
         """
         if new_max_bars_back <= 0:
-            raise ValueError("The max_bars_back must be a positive integer!")
+            raise ArgumentNotPositiveError(function='max_bars_back', parameter='num',
+                                           value=new_max_bars_back)
         if new_max_bars_back > SeriesImpl.MAXIMUM_MAX_BARS_BACK:
             raise ValueError(f"The max_bars_back cannot exceed {self.MAXIMUM_MAX_BARS_BACK}!")
 

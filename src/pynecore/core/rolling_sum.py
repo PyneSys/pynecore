@@ -40,6 +40,7 @@ import os as _os
 from typing import Any
 
 from .safe_convert import native_int
+from ..codes import ArgumentNotPositiveError
 from .series import SeriesImpl
 from ..types.na import na_float
 
@@ -148,7 +149,8 @@ class SumMachine:
         if type(length) is not int:
             length = native_int(length)
 
-        assert length > 0, "Invalid length, length must be greater than 0!"
+        if not length > 0:
+            raise ArgumentNotPositiveError(function='math.sum', parameter='length', value=length)
 
         n = self.seen
         if not source_na:
@@ -361,10 +363,12 @@ class SumMachine:
         setter: the history kept is the newest ``max_bars_back + 1`` values.
 
         :param max_bars_back: The new ``max_bars_back``.
+        :raises ArgumentNotPositiveError: When ``max_bars_back`` is not positive.
         :raises ValueError: Above :attr:`SeriesImpl.MAXIMUM_MAX_BARS_BACK`.
         """
         if max_bars_back <= 0:
-            raise ValueError("The max_bars_back must be a positive integer!")
+            raise ArgumentNotPositiveError(function='max_bars_back', parameter='num',
+                                           value=max_bars_back)
         if max_bars_back > SeriesImpl.MAXIMUM_MAX_BARS_BACK:
             raise ValueError(f"The max_bars_back cannot exceed {SeriesImpl.MAXIMUM_MAX_BARS_BACK}!")
         new_cap = max_bars_back + 1

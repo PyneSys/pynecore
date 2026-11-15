@@ -16,6 +16,7 @@ import pytest
 
 import pynecore.lib as lib
 from pynecore.core import datetime as pcd
+from pynecore.codes import UnknownTimezoneError
 from pynecore.core.datetime import parse_timezone, TimezoneNotFoundError
 from pynecore.types.na import NA
 
@@ -50,11 +51,11 @@ def __test_valid_iana_and_offsets_resolve__():
 
 
 def __test_unknown_name_raises_clear_error__():
-    """An unresolvable name (DB present) reports 'Unknown timezone', not a tzdata hint"""
-    with pytest.raises(TimezoneNotFoundError, match="Unknown timezone"):
+    """An unresolvable name (DB present) is the unknown time zone error, not a tzdata hint"""
+    with pytest.raises(UnknownTimezoneError, match="`Not/AZone`"):
         parse_timezone("Not/AZone")
     # PST/CST are not IANA zone names; previously these wrongly hit the tzdata hint
-    with pytest.raises(TimezoneNotFoundError, match="Unknown timezone"):
+    with pytest.raises(UnknownTimezoneError, match="`PST`"):
         parse_timezone("PST")
 
 

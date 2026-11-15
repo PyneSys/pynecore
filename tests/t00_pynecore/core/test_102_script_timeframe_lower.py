@@ -48,9 +48,8 @@ def __test_lower_script_timeframe_is_refused__(runner):
         runner(iter(bars), syminfo_override={"period": "15"},
                last_bar_index=len(bars) - 1, last_bar_time=bars[-1].timestamp)
     message = str(exc.value)
-    assert "'5'" in message and "'15'" in message
-    assert "lower than the chart timeframe" in message
-    assert "not supported" in message
+    assert "`5`" in message and "`15`" in message
+    assert "lower than the data's timeframe" in message
 
 
 def __test_equal_script_timeframe_runs_on_chart_bars__(runner):

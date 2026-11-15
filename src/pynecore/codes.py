@@ -9,7 +9,7 @@ import decimal
 import re
 
 from .core.errors import Code, PyneError
-from .types.na import NaFieldError
+from .core.datetime import TimezoneNotFoundError
 
 EDGE_SYNTAX = Code(
     'E0001',
@@ -541,7 +541,7 @@ class ScriptRuntimeError(PyneError, RuntimeError):
         super().__init__(message=message)
 
 
-class ArgumentNotPositiveError(PyneError, AssertionError):
+class ArgumentNotPositiveError(PyneError, AssertionError, ValueError):
     """R0006: Argument must be greater than 0"""
     code = ARGUMENT_NOT_POSITIVE
 
@@ -573,7 +573,7 @@ class PercentageOutOfRangeError(PyneError, ValueError):
         super().__init__(function=function, parameter=parameter, value=value)
 
 
-class IndexOutOfRangeError(PyneError, IndexError):
+class IndexOutOfRangeError(PyneError, IndexError, ValueError):
     """R0010: Index out of range"""
     code = INDEX_OUT_OF_RANGE
 
@@ -637,7 +637,7 @@ class UnboundVariableError(PyneError, UnboundLocalError):
         super().__init__(name=name)
 
 
-class ResourceLimitError(PyneError):
+class ResourceLimitError(PyneError, RuntimeError):
     """R0018: Resource limit exceeded"""
     code = RESOURCE_LIMIT
 
@@ -645,7 +645,7 @@ class ResourceLimitError(PyneError):
         super().__init__(limit=limit, resource=resource)
 
 
-class InvalidTimeframeError(PyneError, AssertionError):
+class InvalidTimeframeError(PyneError, AssertionError, ValueError):
     """R0019: Invalid timeframe"""
     code = INVALID_TIMEFRAME
 
@@ -693,7 +693,7 @@ class InvalidRegexError(PyneError, re.error):
         super().__init__(pattern=pattern, reason=reason)
 
 
-class UnknownTimezoneError(PyneError, ValueError):
+class UnknownTimezoneError(PyneError, TimezoneNotFoundError):
     """R0025: Unknown time zone"""
     code = UNKNOWN_TIMEZONE
 
@@ -839,7 +839,7 @@ class InvalidOptionError(PyneError):
         super().__init__(option=option, why=why)
 
 
-class NaObjectFieldError(PyneError, NaFieldError):
+class NaObjectFieldError(PyneError, RuntimeError):
     """R0043: Field of an na object"""
     code = NA_OBJECT_FIELD
 
@@ -847,7 +847,7 @@ class NaObjectFieldError(PyneError, NaFieldError):
         super().__init__(name=name)
 
 
-class NaObjectCopyError(PyneError, NaFieldError):
+class NaObjectCopyError(PyneError, RuntimeError):
     """R0044: Copy of an na object"""
     code = NA_OBJECT_COPY
 

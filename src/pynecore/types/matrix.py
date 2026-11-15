@@ -4,6 +4,9 @@ import math
 from typing import TypeVar, Generic, Any, Iterator, cast
 from collections import Counter
 from .na import NA, na_float
+from ..codes import (ArgumentNegativeError, EmptyCollectionError, IndexOutOfRangeError,
+                     MatrixHoldsNaError, MatrixNotSquareError, MatrixSingularError,
+                     NoConvergenceError, SizeMismatchError)
 
 T = TypeVar('T')
 
@@ -53,20 +56,18 @@ class Matrix(Generic[T]):
         :param row: The index where the new row will be inserted. If None, appends to the end.
         :param array_id: Array whose size must match the column count. A 0x0 matrix takes its
                         column count from the array size.
-        :raises IndexError: If row index is out of bounds.
-        :raises ValueError: If the array size does not match the column count.
+        :raises IndexOutOfRangeError: If row index is out of bounds.
+        :raises SizeMismatchError: If the array size does not match the column count.
         """
         row_idx: int = self.rows if row is None else row
 
         if row_idx < 0 or row_idx > self.rows:
-            raise IndexError(f"Row index {row_idx} out of bounds for matrix with {self.rows} rows")
+            raise IndexOutOfRangeError(function='matrix.add_row', index=row_idx, size=self.rows)
 
         if array_id is not None:
             if (self.rows != 0 or self.cols != 0) and len(array_id) != self.cols:
-                raise ValueError(
-                    f"Row array size {len(array_id)} does not match the matrix column count "
-                    f"{self.cols}"
-                )
+                raise SizeMismatchError(function='matrix.add_row', left=len(array_id),
+                                        right=self.cols)
             self.cols = len(array_id)
             new_row = array_id.copy()
         else:
@@ -97,10 +98,10 @@ class Matrix(Generic[T]):
 
         :param column: Index of the required column.
         :return: An array containing the column values.
-        :raises IndexError: If column index is out of bounds.
+        :raises IndexOutOfRangeError: If column index is out of bounds.
         """
         if column < 0 or column >= self.cols:
-            raise IndexError(f"Column index {column} out of bounds")
+            raise IndexOutOfRangeError(function='matrix.col', index=column, size=self.cols)
         return [self.data[row][column] for row in range(self.rows)]
 
     def columns(self) -> int:
@@ -117,15 +118,15 @@ class Matrix(Generic[T]):
 
         :param other: Matrix object whose elements will be appended.
         :return: This matrix after concatenation.
-        :raises ValueError: If matrices don't have the same number of columns.
+        :raises SizeMismatchError: If matrices don't have the same number of columns.
         """
         if self.cols != other.cols:
-            raise ValueError("Matrices must have the same number of columns")
+            raise SizeMismatchError(function='matrix.concat', left=self.cols, right=other.cols)
 
-        # Append all rows from other matrix
-        for row in other.data:
-            self.data.append(row[:])
-        self.rows += other.rows
+        # Copy the rows before appending: ``other`` may be this very matrix
+        added = [row[:] for row in other.data]
+        self.data.extend(added)
+        self.rows += len(added)
         return self
 
     def copy(self) -> Matrix:
@@ -147,10 +148,10 @@ class Matrix(Generic[T]):
         Return the determinant of a square matrix.
 
         :return: The determinant value of the matrix.
-        :raises ValueError: If matrix is not square.
+        :raises MatrixNotSquareError: If matrix is not square.
         """
         if self.rows != self.cols:
-            raise ValueError("Determinant can only be calculated for square matrices")
+            raise MatrixNotSquareError(function='matrix.det', rows=self.rows, columns=self.cols)
 
         if self.rows == 0:
             return 1
@@ -168,13 +169,14 @@ class Matrix(Generic[T]):
 
         :param other: Matrix object or scalar value to be subtracted.
         :return: A new matrix containing the difference.
-        :raises ValueError: If matrix dimensions don't match.
+        :raises SizeMismatchError: If matrix dimensions don't match.
         """
         result = Matrix(self.rows, self.cols, self.na_element)
 
         if isinstance(other, Matrix):
             if self.rows != other.rows or self.cols != other.cols:
-                raise ValueError("Matrices must have same dimensions")
+                raise SizeMismatchError(function='matrix.diff', left=f'{self.rows}x{self.cols}',
+                                        right=f'{other.rows}x{other.cols}')
             for i in range(self.rows):
                 for j in range(self.cols):
                     result.data[i][j] = self.data[i][j] - other.data[i][j]
@@ -220,10 +222,11 @@ class Matrix(Generic[T]):
         :param row: Index of the required row.
         :param column: Index of the required column.
         :return: The value at the specified position.
-        :raises IndexError: If indices are out of bounds.
+        :raises IndexOutOfRangeError: If indices are out of bounds.
         """
         if row < 0 or row >= self.rows or column < 0 or column >= self.cols:
-            raise IndexError(f"Index ({row}, {column}) out of bounds")
+            raise IndexOutOfRangeError(function='matrix.get', index=f'({row}, {column})',
+                                       size=f'{self.rows}x{self.cols}')
         return self.data[row][column]
 
     def set(self, row: int, column: int, value: T) -> None:
@@ -233,10 +236,11 @@ class Matrix(Generic[T]):
         :param row: The row index of the element to be modified.
         :param column: The column index of the element to be modified.
         :param value: The new value to be set.
-        :raises IndexError: If indices are out of bounds.
+        :raises IndexOutOfRangeError: If indices are out of bounds.
         """
         if row < 0 or row >= self.rows or column < 0 or column >= self.cols:
-            raise IndexError(f"Index ({row}, {column}) out of bounds")
+            raise IndexOutOfRangeError(function='matrix.set', index=f'({row}, {column})',
+                                       size=f'{self.rows}x{self.cols}')
         self.data[row][column] = value
 
     def max(self) -> float | int | NA[float]:
@@ -324,12 +328,12 @@ class Matrix(Generic[T]):
 
         :param other: Second matrix object, array, or scalar value.
         :return: A new matrix (matrix multiplication) or array (vector multiplication).
-        :raises ValueError: If dimensions are incompatible for multiplication.
+        :raises SizeMismatchError: If dimensions are incompatible for multiplication.
         """
         if isinstance(other, Matrix):
             # Matrix multiplication
             if self.cols != other.rows:
-                raise ValueError("Invalid dimensions for matrix multiplication")
+                raise SizeMismatchError(function='matrix.mult', left=self.cols, right=other.rows)
 
             result = Matrix(self.rows, other.cols, self.na_element)
             for i in range(self.rows):
@@ -343,7 +347,7 @@ class Matrix(Generic[T]):
         elif isinstance(other, list):
             # Matrix-vector multiplication
             if self.cols != len(other):
-                raise ValueError("Invalid dimensions for matrix-vector multiplication")
+                raise SizeMismatchError(function='matrix.mult', left=self.cols, right=len(other))
 
             result = []
             for i in range(self.rows):
@@ -367,12 +371,13 @@ class Matrix(Generic[T]):
 
         :param column: The index of the column to be removed. If None, removes last column.
         :return: An array containing the removed column's values.
-        :raises IndexError: If column index is out of bounds.
+        :raises IndexOutOfRangeError: If column index is out of bounds.
         """
         col_idx: int = (self.cols - 1) if column is None else column
 
         if col_idx < 0 or col_idx >= self.cols:
-            raise IndexError(f"Column index {col_idx} out of bounds")
+            raise IndexOutOfRangeError(function='matrix.remove_col', index=col_idx,
+                                       size=self.cols)
 
         removed = []
         for row in self.data:
@@ -386,12 +391,13 @@ class Matrix(Generic[T]):
 
         :param row: The index of the row to be removed. If None, removes last row.
         :return: An array containing the removed row's values.
-        :raises IndexError: If row index is out of bounds.
+        :raises IndexOutOfRangeError: If row index is out of bounds.
         """
         row_idx: int = (self.rows - 1) if row is None else row
 
         if row_idx < 0 or row_idx >= self.rows:
-            raise IndexError(f"Row index {row_idx} out of bounds")
+            raise IndexOutOfRangeError(function='matrix.remove_row', index=row_idx,
+                                       size=self.rows)
 
         removed = self.data.pop(row_idx)
         self.rows -= 1
@@ -403,10 +409,17 @@ class Matrix(Generic[T]):
 
         :param rows: The number of rows of the reshaped matrix.
         :param columns: The number of columns of the reshaped matrix.
-        :raises ValueError: If new shape doesn't have same number of elements.
+        :raises ArgumentNegativeError: If a requested dimension is negative.
+        :raises SizeMismatchError: If new shape doesn't have same number of elements.
         """
+        if rows < 0:
+            raise ArgumentNegativeError(function='matrix.reshape', parameter='rows', value=rows)
+        if columns < 0:
+            raise ArgumentNegativeError(function='matrix.reshape', parameter='columns',
+                                        value=columns)
         if rows * columns != self.rows * self.cols:
-            raise ValueError("New shape must have same number of elements")
+            raise SizeMismatchError(function='matrix.reshape', left=self.rows * self.cols,
+                                    right=rows * columns)
 
         # Flatten to 1D
         flat = []
@@ -439,10 +452,10 @@ class Matrix(Generic[T]):
 
         :param row: Index of the required row.
         :return: An array containing the row values.
-        :raises IndexError: If row index is out of bounds.
+        :raises IndexOutOfRangeError: If row index is out of bounds.
         """
         if row < 0 or row >= self.rows:
-            raise IndexError(f"Row index {row} out of bounds")
+            raise IndexOutOfRangeError(function='matrix.row', index=row, size=self.rows)
         return self.data[row][:]
 
     def sort(self, column: int = 0, order: str = 'ascending') -> None:
@@ -451,10 +464,10 @@ class Matrix(Generic[T]):
 
         :param column: Index of the column whose sorted values determine the new order of rows.
         :param order: The sort order. 'ascending' (default) or 'descending'.
-        :raises IndexError: If column index is out of bounds.
+        :raises IndexOutOfRangeError: If column index is out of bounds.
         """
         if column < 0 or column >= self.cols:
-            raise IndexError(f"Column index {column} out of bounds")
+            raise IndexOutOfRangeError(function='matrix.sort', index=column, size=self.cols)
 
         reverse = order == 'descending'
         self.data.sort(key=lambda row: row[column], reverse=reverse)
@@ -487,13 +500,14 @@ class Matrix(Generic[T]):
 
         :param other: Second matrix object or scalar value.
         :return: A new matrix containing the sum.
-        :raises ValueError: If matrix dimensions don't match.
+        :raises SizeMismatchError: If matrix dimensions don't match.
         """
         result = Matrix(self.rows, self.cols, self.na_element)
 
         if isinstance(other, Matrix):
             if self.rows != other.rows or self.cols != other.cols:
-                raise ValueError("Matrices must have same dimensions")
+                raise SizeMismatchError(function='matrix.sum', left=f'{self.rows}x{self.cols}',
+                                        right=f'{other.rows}x{other.cols}')
             for i in range(self.rows):
                 for j in range(self.cols):
                     result.data[i][j] = self.data[i][j] + other.data[i][j]
@@ -511,10 +525,11 @@ class Matrix(Generic[T]):
 
         :param column1: Index of the first column to be swapped.
         :param column2: Index of the second column to be swapped.
-        :raises IndexError: If column indices are out of bounds.
+        :raises IndexOutOfRangeError: If column indices are out of bounds.
         """
         if column1 < 0 or column1 >= self.cols or column2 < 0 or column2 >= self.cols:
-            raise IndexError("Column index out of bounds")
+            bad = column1 if column1 < 0 or column1 >= self.cols else column2
+            raise IndexOutOfRangeError(function='matrix.swap_columns', index=bad, size=self.cols)
 
         for row in self.data:
             row[column1], row[column2] = row[column2], row[column1]
@@ -525,10 +540,11 @@ class Matrix(Generic[T]):
 
         :param row1: Index of the first row to be swapped.
         :param row2: Index of the second row to be swapped.
-        :raises IndexError: If row indices are out of bounds.
+        :raises IndexOutOfRangeError: If row indices are out of bounds.
         """
         if row1 < 0 or row1 >= self.rows or row2 < 0 or row2 >= self.rows:
-            raise IndexError("Row index out of bounds")
+            bad = row1 if row1 < 0 or row1 >= self.rows else row2
+            raise IndexOutOfRangeError(function='matrix.swap_rows', index=bad, size=self.rows)
 
         self.data[row1], self.data[row2] = self.data[row2], self.data[row1]
 
@@ -537,10 +553,10 @@ class Matrix(Generic[T]):
         Calculate the trace of a matrix (sum of the main diagonal's elements).
 
         :return: The trace value of the matrix.
-        :raises ValueError: If matrix is not square.
+        :raises MatrixNotSquareError: If matrix is not square.
         """
         if self.rows != self.cols:
-            raise ValueError("Trace can only be calculated for square matrices")
+            raise MatrixNotSquareError(function='matrix.trace', rows=self.rows, columns=self.cols)
 
         trace_sum = 0
         for i in range(self.rows):
@@ -796,10 +812,10 @@ class Matrix(Generic[T]):
 
         :param power: The number of times the matrix will be multiplied by itself.
         :return: The matrix raised to the specified power.
-        :raises ValueError: If matrix is not square.
+        :raises MatrixNotSquareError: If matrix is not square.
         """
         if self.rows != self.cols:
-            raise ValueError("Power can only be calculated for square matrices")
+            raise MatrixNotSquareError(function='matrix.pow', rows=self.rows, columns=self.cols)
 
         if power == 0:
             # Return identity matrix
@@ -858,13 +874,14 @@ class Matrix(Generic[T]):
         than ``1e-11`` in magnitude makes the matrix singular.
 
         :return: A new matrix which is the inverse of this matrix.
-        :raises ValueError: If matrix is not square or is singular.
+        :raises MatrixNotSquareError: If the matrix is not square.
+        :raises MatrixSingularError: If the matrix is singular.
         """
         if self.rows != self.cols:
-            raise ValueError("Inverse can only be calculated for square matrices")
+            raise MatrixNotSquareError(function='matrix.inv', rows=self.rows, columns=self.cols)
         inverse = _lu_inverse(self._float_rows())
         if inverse is None:
-            raise ValueError("Matrix is singular")
+            raise MatrixSingularError(function='matrix.inv')
         result = Matrix(self.rows, self.cols, self.na_element)
         result.data = inverse
         return result
@@ -914,9 +931,13 @@ class Matrix(Generic[T]):
 
         :return: An array containing the eigenvalues. It has the element type of the matrix, so
                  an int matrix gives an int array that still holds fractional values.
-        :raises ValueError: If the matrix is empty, contains na or is not square.
+        :raises EmptyCollectionError: If the matrix is empty.
+        :raises MatrixHoldsNaError: If the matrix contains na.
+        :raises MatrixNotSquareError: If the matrix is not square.
+        :raises NoConvergenceError: If the decomposition does not converge.
+        :raises MatrixSingularError: If a non-symmetric matrix has a zero norm.
         """
-        return _eigen_decomposition(self._eigen_input())[0]
+        return self._eigen('matrix.eigenvalues')[0]
 
     def eigenvectors(self) -> Matrix:
         """
@@ -929,28 +950,48 @@ class Matrix(Generic[T]):
 
         :return: A new matrix of the type of this one containing the eigenvectors, so an int
                  matrix gives an int matrix that still holds fractional values.
-        :raises ValueError: If the matrix is empty, contains na or is not square.
+        :raises EmptyCollectionError: If the matrix is empty.
+        :raises MatrixHoldsNaError: If the matrix contains na.
+        :raises MatrixNotSquareError: If the matrix is not square.
+        :raises NoConvergenceError: If the decomposition does not converge.
+        :raises MatrixSingularError: If a non-symmetric matrix has a zero norm.
         """
         result = Matrix(self.rows, self.cols, self.na_element)
-        result.data = _eigen_decomposition(self._eigen_input())[1]
+        result.data = self._eigen('matrix.eigenvectors')[1]
         return result
 
-    def _eigen_input(self) -> list[list[float]]:
+    def _eigen(self, function: str) -> tuple[list[float], list[list[float]]]:
+        """
+        The eigen decomposition of the matrix, its failures raised as ``function``'s.
+
+        :param function: The Pine name of the built-in that asks for it
+        :return: The eigenvalues and the eigenvectors (one per column)
+        """
+        a = self._eigen_input(function)
+        try:
+            return _eigen_decomposition(a)
+        except _NotConverged:
+            raise NoConvergenceError(function=function) from None
+        except _ZeroNorm:
+            raise MatrixSingularError(function=function) from None
+
+    def _eigen_input(self, function: str) -> list[list[float]]:
         """
         Validate the matrix for an eigen decomposition and copy it as floats.
 
         :return: The cells as a new list of float rows.
-        :raises ValueError: If the matrix is empty, contains na or is not square.
+        :raises EmptyCollectionError: If the matrix is empty.
+        :raises MatrixHoldsNaError: If the matrix contains na.
+        :raises MatrixNotSquareError: If the matrix is not square.
         """
         if self.rows == 0 or self.cols == 0:
-            raise ValueError("Eigen decomposition of an empty matrix")
+            raise EmptyCollectionError(function=function)
         for row in self.data:
             for val in row:
                 if isinstance(val, NA) or val != val:
-                    raise ValueError("Eigen decomposition of a matrix that contains na values")
+                    raise MatrixHoldsNaError(function=function)
         if self.rows != self.cols:
-            raise ValueError(f"Eigen decomposition of a non-square ({self.rows}x{self.cols}) "
-                             f"matrix")
+            raise MatrixNotSquareError(function=function, rows=self.rows, columns=self.cols)
         return self._float_rows()
 
     def add_col(self, col: int | None = None, array_id: list[Any] | None = None) -> None:
@@ -962,20 +1003,18 @@ class Matrix(Generic[T]):
         :param col: The index where the new column will be inserted. If None, appends to the end.
         :param array_id: Array whose size must match the row count. A 0x0 matrix takes its row
                         count from the array size.
-        :raises IndexError: If column index is out of bounds.
-        :raises ValueError: If the array size does not match the row count.
+        :raises IndexOutOfRangeError: If column index is out of bounds.
+        :raises SizeMismatchError: If the array size does not match the row count.
         """
         col_idx: int = self.cols if col is None else col
 
         if col_idx < 0 or col_idx > self.cols:
-            raise IndexError(f"Column index {col_idx} out of bounds")
+            raise IndexOutOfRangeError(function='matrix.add_col', index=col_idx, size=self.cols)
 
         if array_id is not None:
             if (self.rows != 0 or self.cols != 0) and len(array_id) != self.rows:
-                raise ValueError(
-                    f"Column array size {len(array_id)} does not match the matrix row count "
-                    f"{self.rows}"
-                )
+                raise SizeMismatchError(function='matrix.add_col', left=len(array_id),
+                                        right=self.rows)
             if self.rows == 0:
                 self.rows = len(array_id)
                 self.data = [[] for _ in range(self.rows)]
@@ -1007,14 +1046,22 @@ _EIGEN_SPLIT_TOLERANCE = 1e-12
 _EIGEN_MIN_DOUBLE = 5e-324
 
 
+class _NotConverged(Exception):
+    """An eigen decomposition's iteration ran out of steps."""
+
+
+class _ZeroNorm(Exception):
+    """The Schur form of an eigen decomposition has no norm to scale with."""
+
+
 def _eigen_decomposition(a: list[list[float]]) -> tuple[list[float], list[list[float]]]:
     """
     Compute the real eigenvalues and the eigenvectors of a square float matrix.
 
     :param a: The rows of the matrix; they are not modified.
     :return: The eigenvalues and the rows of the matrix whose columns are the eigenvectors.
-    :raises ValueError: If the iteration does not converge or a non-symmetric matrix has a
-                        zero norm.
+    :raises _NotConverged: If the iteration does not converge.
+    :raises _ZeroNorm: If a non-symmetric matrix has a zero norm.
     """
     n = len(a)
     tolerance = 10 * n * n * _EIGEN_EPS
@@ -1106,7 +1153,7 @@ def _eigen_symmetric(a: list[list[float]]) -> tuple[list[float], list[list[float
 
     :param a: The rows of the matrix; they are not modified.
     :return: The eigenvalues in descending order and the orthonormal eigenvector columns.
-    :raises ValueError: If the QL iteration does not converge.
+    :raises _NotConverged: If the QL iteration does not converge.
     """
     main, secondary, z = _tridiagonalize(a)
     n = len(main)
@@ -1139,7 +1186,7 @@ def _eigen_symmetric(a: list[list[float]]) -> tuple[list[float], list[list[float
             if m == j:
                 break
             if iterations == 30:
-                raise ValueError("Eigen decomposition did not converge")
+                raise _NotConverged
             iterations += 1
             q = (d[j + 1] - d[j]) / (2 * e[j])
             t = math.sqrt(1 + q * q)
@@ -1297,7 +1344,7 @@ def _real_schur(a: list[list[float]]) -> tuple[list[list[float]], list[list[floa
 
     :param a: The rows of the matrix; they are not modified.
     :return: The quasi upper triangular T and the orthogonal P of ``A = P T P^T``.
-    :raises ValueError: If the QR iteration does not converge.
+    :raises _NotConverged: If the QR iteration does not converge.
     """
     t, p = _hessenberg(a)
     n = len(t)
@@ -1386,7 +1433,7 @@ def _real_schur(a: list[list[float]]) -> tuple[list[list[float]], list[list[floa
                     x = y = w = 0.964
             iteration += 1
             if iteration > 100:
-                raise ValueError("Eigen decomposition did not converge")
+                raise _NotConverged
 
             # Look for two consecutive small sub-diagonal elements
             im = iu - 2
@@ -1515,7 +1562,8 @@ def _eigen_general(a: list[list[float]]) -> tuple[list[float], list[list[float]]
 
     :param a: The rows of the matrix; they are not modified.
     :return: The real parts of the eigenvalues and the eigenvector columns.
-    :raises ValueError: If the QR iteration does not converge or the matrix has a zero norm.
+    :raises _NotConverged: If the QR iteration does not converge.
+    :raises _ZeroNorm: If the matrix has a zero norm.
     """
     t, v = _real_schur(a)
     n = len(t)
@@ -1540,7 +1588,7 @@ def _eigen_general(a: list[list[float]]) -> tuple[list[float], list[list[float]]
 
     norm = _hessenberg_norm(t)
     if norm <= _EIGEN_SPLIT_TOLERANCE:
-        raise ValueError("Eigen decomposition of a matrix with zero norm")
+        raise _ZeroNorm
 
     # Back-substitute to find the vectors of the upper triangular form
     r = s = z = 0.0

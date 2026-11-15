@@ -51,7 +51,7 @@ def __test_month_name_and_year__():
 
 def __test_month_first_partial_is_rejected__():
     """"06 2025" must raise -- TradingView rejects a leading month"""
-    with pytest.raises(ValueError, match="Invalid date format"):
+    with pytest.raises(ValueError, match="is not a valid date"):
         parse_datestring("06 2025")
 
 

@@ -1155,9 +1155,11 @@ class CallInlineTransformer(ast_walk.NodeTransformer):
             elif not isinstance(node.body[i], ast.Expr):
                 break
         if self._sites:
+            # The position ``fix_missing_locations`` gives a module-level node
             node.body.insert(insert_pos, ast.Assign(
                 targets=[ast.Name(id=INLINE_SITES, ctx=ast.Store())],
-                value=ast.Tuple(elts=self._sites, ctx=ast.Load())))
+                value=ast.Tuple(elts=self._sites, ctx=ast.Load()),
+                lineno=1, col_offset=0, end_lineno=1, end_col_offset=0))
         if self._used:
             node.body.insert(insert_pos, ast.ImportFrom(
                 module=SUPPORT_MODULE,

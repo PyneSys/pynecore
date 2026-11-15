@@ -2,6 +2,7 @@
 Pine Script ``ticker.*`` namespace - ticker identifier construction.
 """
 from . import syminfo
+from ..codes import NotAvailableError as _NotAvailableError
 
 __all__ = [
     'heikinashi',
@@ -158,10 +159,9 @@ def renko(symbol: str, style: str | None = None, param: float | None = None,
     :param param: Value of the selected style
     :param request_wicks: Whether wick values are reflected
     :param source: The price source
-    :raises NotImplementedError: PyneCore has no synthetic chart-type data feeds
+    :raises NotAvailableError: PyneCore has no synthetic chart-type data feeds
     """
-    raise NotImplementedError("ticker.renko() is not supported: "
-                              "PyneCore has no synthetic chart-type data feeds")
+    raise _NotAvailableError(function='ticker.renko')
 
 
 # noinspection PyUnusedLocal
@@ -175,10 +175,9 @@ def pointfigure(symbol: str, source: str | None = None, style: str | None = None
     :param style: Point & Figure box size style
     :param param: Value of the selected style
     :param reversal: The reversal amount
-    :raises NotImplementedError: PyneCore has no synthetic chart-type data feeds
+    :raises NotAvailableError: PyneCore has no synthetic chart-type data feeds
     """
-    raise NotImplementedError("ticker.pointfigure() is not supported: "
-                              "PyneCore has no synthetic chart-type data feeds")
+    raise _NotAvailableError(function='ticker.pointfigure')
 
 
 # noinspection PyUnusedLocal
@@ -188,10 +187,9 @@ def kagi(symbol: str, reversal: float) -> str:
 
     :param symbol: The ticker identifier
     :param reversal: The reversal amount
-    :raises NotImplementedError: PyneCore has no synthetic chart-type data feeds
+    :raises NotAvailableError: PyneCore has no synthetic chart-type data feeds
     """
-    raise NotImplementedError("ticker.kagi() is not supported: "
-                              "PyneCore has no synthetic chart-type data feeds")
+    raise _NotAvailableError(function='ticker.kagi')
 
 
 # noinspection PyUnusedLocal
@@ -201,7 +199,6 @@ def linebreak(symbol: str, number_of_lines: int) -> str:
 
     :param symbol: The ticker identifier
     :param number_of_lines: The number of lines
-    :raises NotImplementedError: PyneCore has no synthetic chart-type data feeds
+    :raises NotAvailableError: PyneCore has no synthetic chart-type data feeds
     """
-    raise NotImplementedError("ticker.linebreak() is not supported: "
-                              "PyneCore has no synthetic chart-type data feeds")
+    raise _NotAvailableError(function='ticker.linebreak')

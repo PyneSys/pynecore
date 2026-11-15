@@ -37,6 +37,8 @@ from pynecore.types.session import Session
 from pynecore.core.csv_file import CSVWriter
 from pynecore.core.data_path import with_data_extension
 from pynecore.core.drawing_snapshot import DrawingSnapshot
+from pynecore.codes import (InvalidTimeframeError, ResourceLimitError, SecurityDataMissingError,
+                            SecurityTimeframeHigherError)
 from pynecore.core.error_location import located
 from pynecore.core.errors import MAIN_MODULE, MODULE_ID, PyneError
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
@@ -666,17 +668,14 @@ def _ltf_timeframe_too_high(timeframe: str, script_tf: str) -> bool:
     return req_sec is not None and script_sec is not None and req_sec > script_sec
 
 
-def _ltf_timeframe_error(timeframe: str, script_tf: str) -> RuntimeError:
+def _ltf_timeframe_error(timeframe: str, script_tf: str) -> SecurityTimeframeHigherError:
     """The error of a ``request.security_lower_tf()`` above the script's timeframe.
 
     :param timeframe: The requested timeframe.
     :param script_tf: The timeframe the script body runs on.
     :return: The error to raise.
     """
-    return RuntimeError(
-        f"request.security_lower_tf() requests the {timeframe!r} timeframe, which is "
-        f"higher than the {script_tf!r} timeframe the script runs on. Use a lower "
-        f"timeframe, or pass ignore_invalid_timeframe=true to get na instead.")
+    return SecurityTimeframeHigherError(timeframe=timeframe, chart=script_tf)
 
 
 def _measure_feed_period_sec(path: Path, declared: str | None = None) -> int | None:
@@ -1181,7 +1180,7 @@ def _security_merge_group(sid: str, all_sec_ids: list[str], contexts: dict,
     :param no_process_ids: Chart-served and ignored contexts.
     :param unresolved_ids: Contexts still waiting for their runtime symbol/TF.
     :param ohlcv_paths: Resolved data source per context.
-    :param missing_data: Per-context missing-feed message, if any.
+    :param missing_data: Per-context ``(symbol, timeframe)`` of a missing feed, if any.
     :param disabled: ``PYNE_NO_SECURITY_MERGE`` — one child per context.
     :param cyclic_groups: Groups merging would deadlock (see
         :func:`_security_cyclic_groups`).
@@ -1539,7 +1538,7 @@ class ScriptRunner:
         # run never takes, so its resolution tolerates a missing feed; the
         # demand is only real at a ``__sec_read__``, and that is where the error
         # belongs. Empty whenever every resolved context has data.
-        self._missing_sec_data: 'dict[str, str]' = {}
+        self._missing_sec_data: 'dict[str, tuple[str, str]]' = {}
         # Optional per-bar driver for ``__auto_rate_*`` rate-source
         # subprocesses. Installed by ``create_chart_protocol`` when any
         # auto-rate sec_ids exist; left as ``None`` for backtests / runs
@@ -1794,7 +1793,7 @@ class ScriptRunner:
         if script_tf:
             script_tf_sec = _try_in_seconds(script_tf)
             if script_tf_sec is None:
-                raise ValueError(f"Invalid script timeframe: '{script_tf}'!")
+                raise InvalidTimeframeError(timeframe=script_tf)
             chart_tf = str(syminfo.period)
             # Modifier included: '1D' and '1440' are the same number of seconds
             # but not the same grid, so a daily script on a 1440-minute chart is
@@ -2574,11 +2573,8 @@ class ScriptRunner:
                 }
                 max_security = int(os.environ.get('PYNESYS_MAX_SECURITY_CONTEXTS', '64'))
                 if len(sec_contexts) > max_security:
-                    raise RuntimeError(
-                        f"Script requests too many securities: {len(sec_contexts)} "
-                        f"(limit: {max_security}). "
-                        f"Set PYNESYS_MAX_SECURITY_CONTEXTS to change the limit."
-                    )
+                    raise ResourceLimitError(limit=max_security,
+                                             resource='request.security contexts')
 
                 from .security import (
                     setup_security_states, create_chart_protocol,
@@ -2801,9 +2797,9 @@ class ScriptRunner:
                         'has_producer': (_sid not in no_process_ids
                                          or _sid in same_context_ids),
                         # A runtime-resolved context with no feed behind it:
-                        # the message its first REAL read has to raise, on the
-                        # chart and in a consumer child alike. ``None`` when
-                        # the context is provisioned.
+                        # the ``(symbol, timeframe)`` its first REAL read raises
+                        # the error of, on the chart and in a consumer child
+                        # alike. ``None`` when the context is provisioned.
                         'missing_data': self._missing_sec_data.get(_sid),
                         # An LTF request above the script's timeframe: every
                         # read answers na
@@ -5241,20 +5237,20 @@ class ScriptRunner:
           the Pine-style symbol through ``chart_provider_instance.resolve_symbol``
           (which consults the plugin's ``config.symbol_map`` TOML table
           first, falling back to ``normalize_symbol``).
-        - **Backtest mode** (no chart provider): raises ``ValueError`` —
+        - **Backtest mode** (no chart provider): raises ``SecurityDataMissingError`` —
           a security context cannot be resolved without either an explicit
           ``--security`` file mapping or ``ignore_invalid_symbol``.
 
         :param contexts: The ``__security_contexts__`` dict from the script module
         :param defer_missing: Tolerate a missing feed instead of raising: the
                               context resolves to ``None``, a warning names it,
-                              and the error it would have raised is stored on
+                              and its ``(symbol, timeframe)`` is stored on
                               ``self._missing_sec_data`` for its first read.
         :return: Dict mapping sec_id to an OHLCV file path (``str``), a
                  :class:`PluginSymbol` for live-mode subprocesses, or
                  ``None`` when the context was opted out via
                  ``ignore_invalid_symbol``.
-        :raises ValueError: If no data found and ignore_invalid_symbol is not True
+        :raises SecurityDataMissingError: If no data found and ignore_invalid_symbol is not True
         """
         from .security import SECURITY_TRACE_ENV
 
@@ -5390,11 +5386,11 @@ class ScriptRunner:
                         result[sec_id] = str(expected)
                         continue
                     if expected is not None:
-                        # A map entry whose file is missing is a hint on the canonical
-                        # error below, never an error of its own: raising here would
-                        # replace the message callers match on to discover contexts.
+                        # A map entry whose file is missing is a warning beside the
+                        # coded error below, never an error of its own: raising here
+                        # would replace the code callers match on to discover contexts.
                         map_hint = (
-                            f" Note: {symbol!r} @ {tf_for_file!r} is mapped to "
+                            f"{symbol!r} @ {tf_for_file!r} is mapped to "
                             f"{mapped.provider}:{mapped.native_symbol!r} by "
                             f"config/symbol_map.toml, but the derived data file "
                             f"{expected.name} was not found in {expected.parent}. "
@@ -5430,13 +5426,8 @@ class ScriptRunner:
                 result[sec_id] = None
                 continue
 
-            message = (
-                f"No OHLCV data found for security context "
-                f"(symbol={symbol!r}, timeframe={timeframe!r}). "
-                f"Provide data via the security_data parameter, e.g.: "
-                f"security_data={{'{symbol}': 'path/to/data.ohlcv'}}"
-                f"{map_hint}"
-            )
+            if map_hint:
+                logger.warning(map_hint)
             if defer_missing or traced:
                 # A runtime-resolved context signals every bar even when it
                 # stands in a branch that is never taken (a ternary evaluates
@@ -5449,11 +5440,11 @@ class ScriptRunner:
                     f"timeframe={timeframe!r}): no OHLCV data found, so the "
                     f"context stays without a data source and reading it fails"
                 )
-                self._missing_sec_data[sec_id] = message
+                self._missing_sec_data[sec_id] = (symbol, timeframe)
                 result[sec_id] = None
                 continue
 
-            raise ValueError(message)
+            raise SecurityDataMissingError(symbol=symbol, timeframe=timeframe)
         return result
 
     def _prefetch_sec_syminfos(

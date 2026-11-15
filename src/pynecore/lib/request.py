@@ -4,6 +4,7 @@ from math import nan
 from typing import TYPE_CHECKING, Any, TypeVar, overload, overload as _typing_overload
 
 from ..types.footprint import Footprint
+from ..codes import NotAvailableError as _NotAvailableError
 from ..types.na import NA
 from . import syminfo
 
@@ -178,7 +179,7 @@ def dividends(
             syminfo.type == 'crypto' and syminfo.tickerid and ticker == syminfo.tickerid
     ):
         return nan
-    raise NotImplementedError("request.dividends() is not yet implemented in PyneCore")
+    raise _NotAvailableError(function='request.dividends')
 
 
 # Pine signature parity: the data source is not implemented, so most parameters go unread
@@ -201,7 +202,7 @@ def splits(
             syminfo.type == 'crypto' and syminfo.tickerid and ticker == syminfo.tickerid
     ):
         return nan
-    raise NotImplementedError("request.splits() is not yet implemented in PyneCore")
+    raise _NotAvailableError(function='request.splits')
 
 
 # Pine signature parity: the data source is not implemented, so most parameters go unread
@@ -225,7 +226,7 @@ def earnings(
             syminfo.type == 'crypto' and syminfo.tickerid and ticker == syminfo.tickerid
     ):
         return nan
-    raise NotImplementedError("request.earnings() is not yet implemented in PyneCore")
+    raise _NotAvailableError(function='request.earnings')
 
 
 # Pine signature parity: the data source is not implemented, so most parameters go unread
@@ -244,29 +245,29 @@ def financial(
     :param ignore_invalid_symbol: If True, return na instead of raising
     :param currency: Currency for conversion
     :return: Financial value or na
-    :raises NotImplementedError: When ignore_invalid_symbol is False
+    :raises NotAvailableError: When ignore_invalid_symbol is False
     """
     if ignore_invalid_symbol:
         return nan
-    raise NotImplementedError("request.financial() is not yet implemented in PyneCore")
+    raise _NotAvailableError(function='request.financial')
 
 
 def economic(*_, **__) -> float:
     """
     Request economic data.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    :raises NotAvailableError: Not yet implemented in PyneCore
     """
-    raise NotImplementedError("request.economic() is not yet implemented in PyneCore")
+    raise _NotAvailableError(function='request.economic')
 
 
 def quandl(*_, **__) -> float:
     """
     Request data from Quandl/Nasdaq.
 
-    :raises NotImplementedError: Not yet implemented in PyneCore
+    :raises NotAvailableError: Not yet implemented in PyneCore
     """
-    raise NotImplementedError("request.quandl() is not yet implemented in PyneCore")
+    raise _NotAvailableError(function='request.quandl')
 
 
 # The static face of seed: the result is the expression's own type. Spelled through the

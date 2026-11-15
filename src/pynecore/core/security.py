@@ -30,6 +30,7 @@ from typing import Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from .datetime import parse_timezone
+from ..codes import SecurityDataMissingError, SecurityVariesInLoopError
 from .errors import PyneError, RUNTIME_ROOTS
 from .import_hook import security_dev_skip_disabled
 from .lookahead import ALLOW_LOOKAHEAD
@@ -1435,7 +1436,7 @@ def create_chart_protocol(
     same_context_ids: 'set[str] | frozenset[str]' = frozenset(),
     no_process_ids: 'set[str] | frozenset[str]' = frozenset(),
     unresolved_ids: 'set[str] | frozenset[str]' = frozenset(),
-    missing_data_ids: 'dict[str, str] | None' = None,
+    missing_data_ids: 'dict[str, tuple[str, str]] | None' = None,
     result_blocks: dict[str, ResultBlock] | None = None,
     currency_conversions: dict[str, tuple[str, str]] | None = None,
     sec_processes: 'dict[str, BaseProcess] | None' = None,
@@ -1489,7 +1490,7 @@ def create_chart_protocol(
                            it. Such a context cannot be started before that
                            signal (see ``_start``).
     :param missing_data_ids: Runtime-resolved contexts whose feed turned out to
-                             be missing, mapped to the error message. Captured by
+                             be missing, mapped to their ``(symbol, timeframe)``. Captured by
                              reference: the resolver fills it as it resolves. A
                              ternary or ``and``/``or`` branch evaluates its
                              ``request.security()`` call every bar even when the
@@ -2788,7 +2789,7 @@ def create_chart_protocol(
                 )
             if _same_value(chart_bar_value.get(sec_id), value):
                 return
-            raise RuntimeError("loop-varying security expression is not supported")
+            raise SecurityVariesInLoopError()
         chart_bar_written.add(sec_id)
         chart_bar_value[sec_id] = value
         if sec_id not in consumed_ids:
@@ -2845,7 +2846,7 @@ def create_chart_protocol(
         # an untaken branch costs nothing; an actual read has no value to
         # return.
         if missing_data_ids and sec_id in missing_data_ids:
-            raise ValueError(missing_data_ids[sec_id])
+            raise _data_missing(missing_data_ids[sec_id])
         # ``ignore_invalid_symbol=True`` may downgrade a live security to
         # ``no-process`` after syminfo prefetch fails — no subprocess is
         # ever spawned, so ``data_ready`` would never be set and a plain
@@ -3003,9 +3004,19 @@ def create_chart_protocol(
     )
 
 
+def _data_missing(missing: 'tuple[str, str] | list[str]') -> SecurityDataMissingError:
+    """The error of the first read of a context resolved without a feed.
+
+    :param missing: The context's ``(symbol, timeframe)``
+    :return: The error
+    """
+    symbol, timeframe = missing
+    return SecurityDataMissingError(symbol=symbol, timeframe=timeframe)
+
+
 def _trace_first_reads(read, signal_values: dict[str, tuple],
                        same_context_ids: 'set[str] | frozenset[str]',
-                       missing_data_ids: dict[str, str], path: str):
+                       missing_data_ids: dict[str, tuple[str, str]], path: str):
     """Wrap the chart-side read so every context's first read is logged.
 
     :param read: The chart-side ``__sec_read__``.
@@ -3487,9 +3498,7 @@ def create_security_protocol(
                     )
                 if _same_value(bar_value[sid], value):
                     return
-                raise RuntimeError(
-                    "loop-varying security expression is not supported"
-                )
+                raise SecurityVariesInLoopError()
             bar_written[sid] = True
             bar_value[sid] = value
             last_own_value[sid] = value
@@ -3589,7 +3598,7 @@ def create_security_protocol(
             # feed: the child replays the whole script on its own prices, so
             # it can take a branch the chart never does.
             if known_record is not None and known_record.get('missing_data'):
-                raise ValueError(known_record['missing_data'])
+                raise _data_missing(known_record['missing_data'])
         if sid not in depends:
             # Not a dependency of this context: the read cannot influence this
             # expression, so it never waits. ``depends`` also excludes producers
@@ -3601,7 +3610,7 @@ def create_security_protocol(
             return default
         record = _peer_record(sid)
         if record is not None and record.get('missing_data'):
-            raise ValueError(record['missing_data'])
+            raise _data_missing(record['missing_data'])
         if record is not None and record.get('invalid_timeframe'):
             return NA(list)
         if (record is None or not record.get('has_producer')

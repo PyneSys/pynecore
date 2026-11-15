@@ -719,12 +719,13 @@ class Resampler:
         self._windows: tuple[_Window, _Window, _Window] = (_NO_WINDOW, _NO_WINDOW, _NO_WINDOW)
 
     def _validate_timeframe(self) -> None:
-        """Validate that the timeframe is supported."""
-        try:
-            # noinspection PyProtectedMember
-            tf_module._in_seconds(self.timeframe)
-        except (ValueError, AssertionError) as e:
-            raise ValueError(f"Invalid timeframe: {self.timeframe}") from e
+        """Validate that the timeframe is supported.
+
+        :raises InvalidTimeframeError: If the timeframe is invalid
+        :raises TickTimeframeError: If the timeframe is a tick timeframe
+        """
+        # noinspection PyProtectedMember
+        tf_module._in_seconds(self.timeframe)
 
     @classmethod
     @lru_cache(maxsize=128)

@@ -6,6 +6,8 @@ if TYPE_CHECKING:
 from functools import lru_cache
 from datetime import datetime, timedelta
 
+from ..codes import (InvalidTimeframeError as _InvalidTimeframeError,
+                     TickTimeframeError as _TickTimeframeError)
 from ..core.module_property import module_property
 from ..types.pine_types import PyneInt, pine_int
 
@@ -38,9 +40,10 @@ def _process_tf(timeframe: str) -> tuple[str, int]:
 
     :param timeframe: The timeframe string in TradingView format
     :return: A tuple with the modifier and multiplier
-    :raises AssertionError: If the timeframe is invalid
+    :raises InvalidTimeframeError: If the timeframe is invalid
     """
-    assert len(timeframe) > 0, "Invalid timeframe: empty string!"
+    if len(timeframe) == 0:
+        raise _InvalidTimeframeError(timeframe=timeframe)
 
     # Simple minutes
     if timeframe.isdigit():
@@ -49,19 +52,21 @@ def _process_tf(timeframe: str) -> tuple[str, int]:
 
     # Multiplier and modifier
     elif len(timeframe) > 1:
-        if not timeframe[-1].isdigit():
-            _modifier = timeframe[-1]
+        if timeframe[-1].isdigit():
+            raise _InvalidTimeframeError(timeframe=timeframe)
+        _modifier = timeframe[-1]
+        try:
             _multiplier = int(timeframe[:-1])
-        else:
-            raise AssertionError("Invalid timeframe format!")
+        except ValueError:
+            raise _InvalidTimeframeError(timeframe=timeframe) from None
 
     # Just a single character
     else:
         _modifier = timeframe
         _multiplier = 1
 
-    assert _modifier in ('', 'T', 'S', 'D', 'W', 'M'), "Invalid timeframe: wrong modifier!"
-    assert _multiplier > 0, "Invalid timeframe: wrong multiplier!"
+    if _modifier not in ('', 'T', 'S', 'D', 'W', 'M') or not _multiplier > 0:
+        raise _InvalidTimeframeError(timeframe=timeframe)
     return _modifier, _multiplier
 
 
@@ -199,7 +204,8 @@ def _in_seconds(timeframe: str | None = None) -> int:
     :param timeframe: The timeframe to convert. If not provided or an empty string,
         uses the current chart timeframe.
     :return: The timeframe in seconds
-    :raises ValueError: If the timeframe is invalid
+    :raises InvalidTimeframeError: If the timeframe is invalid
+    :raises TickTimeframeError: If the timeframe is a tick timeframe
     """
     if not timeframe:
         timeframe: str = _current_period()
@@ -215,7 +221,7 @@ def _in_seconds(timeframe: str | None = None) -> int:
     elif _modifier == '':
         return _multiplier * 60
     else:
-        raise ValueError("Not supported timeframe!")
+        raise _TickTimeframeError(timeframe=timeframe)
 
 
 def in_seconds(timeframe: str | None = None) -> PyneInt:
