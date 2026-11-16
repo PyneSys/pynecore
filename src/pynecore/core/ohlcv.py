@@ -24,7 +24,7 @@ from pynecore.core.syminfo import SymInfoInterval, tick_grid
 from pynecore.types.ohlcv import OHLCV, AskOHLC
 
 __all__ = ["OHLCVWriter", "OHLCVReader", "ChartBarWindow", "parse_timezone_name",
-           "record_count", "copy_ohlcv_tail", "restore_f32_volume"]
+           "record_count", "copy_ohlcv_tail", "restore_f32_volume", "validate_candle"]
 
 _MAGIC = b"\x89PYN\r\n\x1a\n"
 _VERSION_MAJOR = 2
@@ -575,13 +575,17 @@ def _ohlc_slack(*values: float) -> float:
     return math.ulp(scale) * _OHLC_RELATION_ULPS
 
 
-def _validate_candle(candle: OHLCV, where: str) -> None:
+def validate_candle(candle: OHLCV, where: str) -> None:
     """Refuse a bar no OHLCV file can hold.
 
     :param candle: The bar
-    :param where: The file it goes to
-    :raises InvalidDataError: If a value is infinite or the high/low is not the extreme
+    :param where: Where the bar goes, named in the error
+    :raises InvalidDataError: If the timestamp is outside the signed 64-bit range, a value
+        is infinite or the high/low is not the extreme
     """
+    if not -(1 << 63) <= candle.timestamp < (1 << 63):
+        raise InvalidDataError(where=where, why=f"the timestamp {candle.timestamp} is "
+                                                f"outside the signed 64-bit range")
     values = (candle.open, candle.high, candle.low, candle.close, candle.volume)
     if any(math.isinf(value) for value in values):
         raise InvalidDataError(where=where, why=f"the bar at {candle.timestamp} has an "
@@ -1414,10 +1418,7 @@ class OHLCVWriter:
             raise RuntimeError(
                 "OHLCV writer cannot publish: the previous header could not be restored"
             )
-        _validate_candle(candle, self.path)
-        if not -(1 << 63) <= candle.timestamp < (1 << 63):
-            raise InvalidDataError(where=self.path, why=f"the timestamp {candle.timestamp} is "
-                                                        f"outside the signed 64-bit range")
+        validate_candle(candle, self.path)
         if self._last_timestamp is not None and candle.timestamp <= self._last_timestamp:
             if candle.timestamp == self._last_timestamp:
                 raise InvalidDataError(where=self.path, why=f"the timestamp {candle.timestamp} "

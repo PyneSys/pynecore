@@ -447,21 +447,25 @@ warnings go to a `DownloadListener` you may subclass; failures are raised (`Prov
 `ProviderSetupError`, `ValueError` for a bad start value). `download_provider_history_resilient()`
 also rides out transient provider outages, as a long-running live run needs.
 
+The OHLCV file is the one a `pyne data download` of the same symbol and timeframe writes, so a
+download replaces it. With `in_memory=True` the history stays in `history.bars` instead, and
+nothing is written into `data_dir`, not even the symbol information. The provider still gets
+`data_dir`: it finds the workdir's config next to it.
+
 ```python
 import itertools
-from pynecore.core.ohlcv import OHLCVReader
 from pynecore.core.provider_download import download_provider_history, open_live_stream
 
 history = download_provider_history("ccxt:BYBIT:BTC/USDT:USDT@1", "-500",
-                                    data_dir=workdir / "data", config_dir=workdir / "config")
-with OHLCVReader(history.ohlcv_path) as reader:
-    bars = list(reader.read_from(history.time_from_ts or 0))
-    live = open_live_stream(history, last_historical_timestamp=bars[-1].timestamp,
-                            on_feed_status=show_status)
-    runner = ScriptRunner(Path("rsi.py"), itertools.chain(bars, live), history.syminfo,
-                          live=True)
-    for candle, plot_data in runner.run_iter(yield_ticks=True):
-        ...
+                                    data_dir=workdir / "data", config_dir=workdir / "config",
+                                    in_memory=True)
+bars = [bar for bar in history.bars if bar.timestamp >= (history.time_from_ts or 0)]
+live = open_live_stream(history, last_historical_timestamp=bars[-1].timestamp,
+                        on_feed_status=show_status)
+runner = ScriptRunner(Path("rsi.py"), itertools.chain(bars, live), history.syminfo,
+                      live=True)
+for candle, plot_data in runner.run_iter(yield_ticks=True):
+    ...
 ```
 
 The connection opens as soon as `open_live_stream()` is called, so no bar is lost while the

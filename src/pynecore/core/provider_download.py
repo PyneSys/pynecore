@@ -7,10 +7,11 @@ providers the same way. Progress and warnings go to a :class:`DownloadListener`,
 failures are raised.
 """
 import os
+import shutil
 import tempfile
 import threading
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace as dc_replace
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
@@ -24,10 +25,11 @@ from pynecore.core.config import ensure_config
 from pynecore.core.live_runner import FeedStatus, LiveStop, live_ohlcv_generator
 from pynecore.lib.timeframe import in_seconds
 from pynecore.core._file_io import exclusive_file_lock, replace_file
-from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter
+from pynecore.core.ohlcv import OHLCVReader, OHLCVWriter, validate_candle
 from pynecore.core.provider_string import ProviderString, parse_provider_string
 from pynecore.core.session import is_in_session
 from pynecore.core.syminfo import SymInfo
+from pynecore.errorcodes import InvalidDataError
 from pynecore.types.ohlcv import OHLCV
 
 if TYPE_CHECKING:
@@ -151,7 +153,10 @@ def parse_time_value(value: str | None, *, allow_bars: bool = False) -> datetime
 class ProviderHistory:
     """A provider's downloaded history: the chart data of a provider-mode run.
 
-    :ivar ohlcv_path: The OHLCV file the history was written to.
+    :ivar ohlcv_path: The OHLCV file the history was written to; ``None`` for a history
+        held in memory.
+    :ivar bars: The bars of a history held in memory, oldest first; ``None`` when they
+        were written to :attr:`~ProviderHistory.ohlcv_path`.
     :ivar syminfo: The symbol information, fresh from the venue.
     :ivar parsed_string: The parsed provider string.
     :ivar provider_instance: The provider plugin instance, already authenticated; a live
@@ -164,10 +169,11 @@ class ProviderHistory:
         then may hold partial data.
     """
 
-    def __init__(self, ohlcv_path: Path, syminfo: SymInfo, parsed_string: ProviderString,
+    def __init__(self, ohlcv_path: Path | None, syminfo: SymInfo, parsed_string: ProviderString,
                  provider_instance: ProviderPlugin, time_from_ts: int | None = None,
-                 as_of_ts: int | None = None):
+                 as_of_ts: int | None = None, bars: list[OHLCV] | None = None):
         self.ohlcv_path = ohlcv_path
+        self.bars = bars
         self.syminfo = syminfo
         self.provider_instance = provider_instance
         self.parsed_string: ProviderString = parsed_string
@@ -331,6 +337,13 @@ def _ohlcv_download_lock(ohlcv_path: Path | None):
         yield
 
 
+#: The suffix the OHLCV writer and reader give the extra-field sidecar of a data file
+_EXTRA_SIDECAR_SUFFIX = '.extra.csv'
+
+#: The suffix of a published file kept aside while a download replaces it
+_REPLACED_SUFFIX = '.replaced'
+
+
 @contextmanager
 def _atomic_ohlcv_download_target(provider: ProviderPlugin):
     """Write one provider download privately, then atomically publish it.
@@ -342,7 +355,9 @@ def _atomic_ohlcv_download_target(provider: ProviderPlugin):
     The private writer declares the same period as the provider's own writer,
     so the published file carries the timeframe the provider was built for.
     ``truncate=True`` turns the empty file ``mkstemp`` reserved into a valid
-    empty OHLCV file instead of an unwritable zero-byte one.
+    empty OHLCV file instead of an unwritable zero-byte one. The writer keeps
+    extra fields in an ``.extra.csv`` sidecar next to the private file, which is
+    published together with it (see :func:`_publish_download`).
     """
     final_path = provider.ohlcv_path
     if final_path is None:
@@ -365,16 +380,99 @@ def _atomic_ohlcv_download_target(provider: ProviderPlugin):
             )
             try:
                 yield
-                replace_file(temp_path, final_path)
+                _publish_download(temp_path, final_path)
             finally:
                 provider.ohlcv_path = final_path
                 provider.ohlcv_file = original_writer
     finally:
         temp_path.unlink(missing_ok=True)
+        temp_path.with_suffix(_EXTRA_SIDECAR_SUFFIX).unlink(missing_ok=True)
+
+
+def _publish_download(temp_path: Path, final_path: Path) -> None:
+    """Publish a private download over the canonical OHLCV file, with its sidecar.
+
+    The reader demands exactly one sidecar row per record, so the canonical file
+    and its ``.extra.csv`` sidecar have to change together: the download's own
+    sidecar replaces the previous one, and a download without one removes the
+    previous one. The binary file is always replaced in one atomic step, so the
+    canonical path never goes missing.
+
+    The steps run in an order that never puts a binary next to a sidecar of the
+    other dataset: the previous sidecar is moved aside first, then the binary is
+    replaced, and the download's own sidecar comes last. In between, the canonical
+    file reads as a dataset without extra fields. When a step fails, the previous
+    dataset is put back whole: its binary is kept under a second name (a hard
+    link, or a copy where the filesystem has none) for as long as the new sidecar
+    can still fail. When even that restore fails, the kept files stay next to the
+    canonical one for a manual recovery.
+
+    :param temp_path: The finished private file.
+    :param final_path: The canonical file.
+    """
+    temp_extra = temp_path.with_suffix(_EXTRA_SIDECAR_SUFFIX)
+    final_extra = final_path.with_suffix(_EXTRA_SIDECAR_SUFFIX)
+    new_extra = temp_extra.exists()
+    old_extra = final_extra.exists()
+    if not new_extra and not old_extra:
+        replace_file(temp_path, final_path)
+        return
+
+    previous = final_path.with_name(final_path.name + _REPLACED_SUFFIX)
+    stale_extra = final_extra.with_name(final_extra.name + _REPLACED_SUFFIX)
+    keep_previous = new_extra and final_path.exists()
+    if keep_previous:
+        _keep_file(final_path, previous)
+    extra_aside = False
+    restore_failed = False
+    try:
+        if old_extra:
+            replace_file(final_extra, stale_extra)
+            extra_aside = True
+        try:
+            replace_file(temp_path, final_path)
+            if new_extra:
+                try:
+                    replace_file(temp_extra, final_extra)
+                except OSError:
+                    restore_failed = True
+                    if keep_previous:
+                        replace_file(previous, final_path)
+                    else:
+                        final_path.unlink()
+                    restore_failed = False
+                    raise
+        except OSError:
+            if extra_aside and not restore_failed:
+                restore_failed = True
+                replace_file(stale_extra, final_extra)
+                restore_failed = False
+            raise
+    finally:
+        if not restore_failed:
+            previous.unlink(missing_ok=True)
+            stale_extra.unlink(missing_ok=True)
+
+
+def _keep_file(path: Path, keep: Path) -> None:
+    """Keep the current contents of a file under a second name.
+
+    A hard link costs nothing and survives the atomic replacement of ``path``; a
+    filesystem without hard links gets a copy.
+
+    :param path: The file to keep.
+    :param keep: The second name.
+    """
+    keep.unlink(missing_ok=True)
+    try:
+        os.link(path, keep)
+    except OSError:
+        shutil.copy2(path, keep)
 
 
 def fetch_provider_symbol_info(provider: ProviderPlugin,
-                               listener: DownloadListener | None = None) -> SymInfo:
+                               listener: DownloadListener | None = None, *,
+                               save: bool = True) -> SymInfo:
     """Load the symbol metadata for a provider-mode run, fresh from the venue.
 
     Provider mode re-downloads the bar data on every run, and the metadata
@@ -388,10 +486,14 @@ def fetch_provider_symbol_info(provider: ProviderPlugin,
 
     :param provider: The provider plugin instance.
     :param listener: Receives the warning of a failed refresh.
+    :param save: Write the fresh metadata into the sidecar next to the OHLCV file; without
+        it the sidecar is only read, as the fallback.
     :return: The symbol information.
     """
     cached = provider.is_symbol_info_exists()
     try:
+        if not save:
+            return provider.fetch_symbol_info()
         return provider.get_symbol_info(force_update=True)
     except Exception as e:  # plugin exception families differ per venue
         if not cached:
@@ -401,17 +503,72 @@ def fetch_provider_symbol_info(provider: ProviderPlugin,
         return provider.get_symbol_info()
 
 
+def _validate_bars(bars: list[OHLCV], provider_str: str) -> None:
+    """Refuse the bars the OHLCV writer refuses for a file: malformed or out of time order.
+
+    :param bars: The downloaded bars.
+    :param provider_str: The provider string, named in the error.
+    :raises InvalidDataError: If a bar is malformed (see
+        :func:`~pynecore.core.ohlcv.validate_candle`) or a timestamp does not follow the
+        previous one.
+    """
+    for bar in bars:
+        validate_candle(bar, provider_str)
+    for prev, bar in zip(bars, bars[1:]):
+        if bar.timestamp == prev.timestamp:
+            raise InvalidDataError(where=provider_str,
+                                   why=f"the timestamp {bar.timestamp} is there twice")
+        if bar.timestamp < prev.timestamp:
+            raise InvalidDataError(where=provider_str,
+                                   why=f"the timestamp {bar.timestamp} follows {prev.timestamp}")
+
+
+def _download_to_memory(provider: ProviderPlugin, time_from: datetime, time_to: datetime,
+                        on_progress: Callable[[datetime], None]) -> list[OHLCV]:
+    """Run a provider download that hands its bars to a list instead of the OHLCV file.
+
+    Every provider stores what it downloads through
+    :meth:`~pynecore.core.plugin.ProviderPlugin.save_ohlcv_data`, so redirecting that one
+    method keeps the plugin's own download unchanged.
+
+    :param provider: The provider plugin instance.
+    :param time_from: Naive UTC start of the window.
+    :param time_to: Naive UTC end of the window.
+    :param on_progress: Receives the download's progress.
+    :return: The downloaded bars, in the order the provider saved them.
+    """
+    bars: list[OHLCV] = []
+
+    def capture(data: OHLCV | list[OHLCV]) -> None:
+        if isinstance(data, OHLCV):
+            bars.append(data)
+        else:
+            bars.extend(data)
+
+    original_save = provider.save_ohlcv_data
+    provider.save_ohlcv_data = capture  # type: ignore[method-assign]
+    try:
+        provider.download_ohlcv(time_from, time_to, on_progress=on_progress)
+    finally:
+        provider.save_ohlcv_data = original_save  # type: ignore[method-assign]
+    return bars
+
+
 def download_provider_history(provider_str: str, time_from_str: str | None, *,
                               data_dir: Path, config_dir: Path,
-                              listener: DownloadListener | None = None) -> ProviderHistory:
+                              listener: DownloadListener | None = None,
+                              in_memory: bool = False) -> ProviderHistory:
     """
-    Download the history of a provider string into its OHLCV file.
+    Download the history of a provider string into its OHLCV file, or into memory.
 
     :param provider_str: Provider string (e.g. "ccxt:BYBIT:BTC/USDT:USDT@1D").
     :param time_from_str: The start (date, days, or -bars); ``None`` means -500 bars.
     :param data_dir: The workdir's ``data`` directory, where the OHLCV file is written.
     :param config_dir: The workdir's ``config`` directory, holding the plugin configs.
     :param listener: Receives the progress and the warnings of the download.
+    :param in_memory: Keep the bars in :attr:`ProviderHistory.bars` and write nothing into
+        ``data_dir``: neither the OHLCV file nor its symbol info sidecar. The provider is
+        still built on ``data_dir``, which is how it finds the workdir's config.
     :return: The downloaded history.
     :raises ProviderSetupError: If the plugin is not a data provider.
     :raises ValueError: If the start is not a valid time value.
@@ -476,7 +633,7 @@ def download_provider_history(provider_str: str, time_from_str: str | None, *,
     report.symbol_info_started()
     fetched = False
     try:
-        syminfo = fetch_provider_symbol_info(provider_instance, report)
+        syminfo = fetch_provider_symbol_info(provider_instance, report, save=not in_memory)
         fetched = True
     finally:
         report.symbol_info_finished(fetched)
@@ -490,6 +647,7 @@ def download_provider_history(provider_str: str, time_from_str: str | None, *,
     max_retries = 4
     report.download_started(time_from_dt)
     downloaded = False
+    bars: list[OHLCV] = []
     try:
         # Oldest real bar the venue served on the previous attempt. When a
         # further-extended ``from`` fails to pull any older bar, the feed's
@@ -501,34 +659,47 @@ def download_provider_history(provider_str: str, time_from_str: str | None, *,
         # on the kernel flock and then reads a complete file, never a
         # half-truncated one. The lock spans the whole retry loop and the
         # bar-count pin below so no other process can rewrite the file between
-        # our download and our reads.
+        # our download and our reads. A history in memory shares nothing.
         exact_from_ts: int | None = None
         as_of_ts: int | None = None
-        with _atomic_ohlcv_download_target(provider_instance):
+        target = nullcontext() if in_memory \
+            else _atomic_ohlcv_download_target(provider_instance)
+        with target:
+            # Where the downloaded bars are: the list of a history in memory, or the
+            # provider's file (inside the target above, its private copy)
+            downloaded_bars: list[OHLCV] | Path
             for attempt in range(max_retries + 1):
-                # Every pass rewrites the whole file, the last bar included
+                # Every pass downloads the whole window again, the last bar included
                 as_of_ts = int(datetime.now(UTC).timestamp() * 1000)
-                with provider_instance as ohlcv_writer:
-                    ohlcv_writer.truncate()
 
-                    # Providers take naive UTC datetimes.
-                    time_from_dl = time_from_dt.astimezone(UTC).replace(tzinfo=None)
-                    time_to_dl = time_to_dt.astimezone(UTC).replace(tzinfo=None)
+                # Providers take naive UTC datetimes.
+                time_from_dl = time_from_dt.astimezone(UTC).replace(tzinfo=None)
+                time_to_dl = time_to_dt.astimezone(UTC).replace(tzinfo=None)
 
-                    total_seconds = int((time_to_dl - time_from_dl).total_seconds())
+                total_seconds = int((time_to_dl - time_from_dl).total_seconds())
 
-                    report.download_attempt(time_from_dl, total_seconds)
+                report.download_attempt(time_from_dl, total_seconds)
 
-                    def cb_progress(current_time: datetime):
-                        report.download_progress(
-                            int((current_time - time_from_dl).total_seconds()))
+                def cb_progress(current_time: datetime):
+                    report.download_progress(
+                        int((current_time - time_from_dl).total_seconds()))
 
-                    # One batch for the whole download: a provider that saves bar by
-                    # bar would otherwise pay two fsyncs per bar.
-                    with ohlcv_writer.batched():
-                        provider_instance.download_ohlcv(
-                            time_from_dl, time_to_dl, on_progress=cb_progress,
-                        )
+                if in_memory:
+                    bars = _download_to_memory(provider_instance, time_from_dl, time_to_dl,
+                                               cb_progress)
+                    _validate_bars(bars, provider_str)
+                    downloaded_bars = bars
+                else:
+                    assert provider_instance.ohlcv_path is not None
+                    downloaded_bars = provider_instance.ohlcv_path
+                    with provider_instance as ohlcv_writer:
+                        ohlcv_writer.truncate()
+                        # One batch for the whole download: a provider that saves bar
+                        # by bar would otherwise pay two fsyncs per bar.
+                        with ohlcv_writer.batched():
+                            provider_instance.download_ohlcv(
+                                time_from_dl, time_to_dl, on_progress=cb_progress,
+                            )
 
                 if bar_count is None:
                     break
@@ -538,10 +709,7 @@ def download_provider_history(provider_str: str, time_from_str: str | None, *,
                 # the count is the venue's own coverage.
                 window_from_ts = int(time_from_dt.timestamp() * 1000)
                 window_to_ts = int(time_to_dt.timestamp() * 1000)
-                with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
-                    real_ts = [b.timestamp for b in r.read_from(
-                        window_from_ts, window_to_ts,
-                    )]
+                real_ts = _bar_timestamps(downloaded_bars, window_from_ts, window_to_ts)
                 real_bars = len(real_ts)
                 oldest_ts = min(real_ts) if real_ts else None
 
@@ -598,16 +766,12 @@ def download_provider_history(provider_str: str, time_from_str: str | None, *,
                 # Only ever move the window start earlier.
                 time_from_dt = min(time_from_dt, candidate)
 
-            assert provider_instance.ohlcv_path is not None
-
             # For bar-count mode, pin the start timestamp to the N-th last real
             # bar so the reader serves *exactly* N bars, not the over-fetched
             # surplus we used to guarantee coverage through gaps.
             if bar_count is not None:
-                with OHLCVReader(provider_instance.ohlcv_path) as r:  # type: ignore[arg-type]
-                    real_ts = [b.timestamp for b in r.read_from(
-                        0, int(time_to_dt.timestamp() * 1000),
-                    )]
+                real_ts = _bar_timestamps(downloaded_bars, 0,
+                                          int(time_to_dt.timestamp() * 1000))
                 if len(real_ts) >= bar_count:
                     exact_from_ts = real_ts[-bar_count]
         downloaded = True
@@ -615,13 +779,29 @@ def download_provider_history(provider_str: str, time_from_str: str | None, *,
         report.download_finished(downloaded)
 
     return ProviderHistory(
-        ohlcv_path=provider_instance.ohlcv_path,
+        ohlcv_path=None if in_memory else provider_instance.ohlcv_path,
         syminfo=syminfo,
         provider_instance=provider_instance,
         parsed_string=ps,
         time_from_ts=exact_from_ts,
         as_of_ts=as_of_ts,
+        bars=bars if in_memory else None,
     )
+
+
+def _bar_timestamps(bars: list[OHLCV] | Path, from_ts: int, to_ts: int) -> list[int]:
+    """The timestamps of the downloaded bars in an inclusive window, oldest first.
+
+    :param bars: The bars of a download held in memory, or the OHLCV file of a file
+        download.
+    :param from_ts: Inclusive window start, Unix milliseconds.
+    :param to_ts: Inclusive window end, Unix milliseconds.
+    :return: The timestamps.
+    """
+    if isinstance(bars, list):
+        return [bar.timestamp for bar in bars if from_ts <= bar.timestamp <= to_ts]
+    with OHLCVReader(bars) as reader:
+        return [bar.timestamp for bar in reader.read_from(from_ts, to_ts)]
 
 
 #: Startup provider-download retry backoff (seconds): the first wait and the
@@ -659,7 +839,7 @@ def _wait_before_retry(delay: float, stop: LiveStop | None = None) -> None:
 def download_provider_history_resilient(
         provider_str: str, time_from_str: str | None, *, data_dir: Path, config_dir: Path,
         retry_transient: bool, listener: DownloadListener | None = None,
-        stop: LiveStop | None = None,
+        stop: LiveStop | None = None, in_memory: bool = False,
 ) -> ProviderHistory:
     """Download provider data, riding out transient broker outages.
 
@@ -686,6 +866,7 @@ def download_provider_history_resilient(
     :param listener: Receives the progress, the warnings and every retry wait.
     :param stop: Ends a retry wait at once when set from another thread (a front end
         without ``Ctrl-C``); a download pass already running is not interrupted.
+    :param in_memory: See :func:`download_provider_history`.
     :return: The downloaded history.
     :raises ProviderError: On a permanent failure, or any failure without ``retry_transient``.
     :raises DownloadStopped: If ``stop`` was set before a retry.
@@ -699,7 +880,8 @@ def download_provider_history_resilient(
             raise DownloadStopped()
         try:
             return download_provider_history(provider_str, time_from_str, data_dir=data_dir,
-                                             config_dir=config_dir, listener=listener)
+                                             config_dir=config_dir, listener=listener,
+                                             in_memory=in_memory)
         except ProviderError as e:
             if not (retry_transient and is_retryable_provider_error(e)):
                 raise

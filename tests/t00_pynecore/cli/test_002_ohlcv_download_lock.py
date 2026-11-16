@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from pynecore.core import provider_download
 from pynecore.core.provider_download import (
     _atomic_ohlcv_download_target,
     _ohlcv_download_lock,
@@ -179,3 +180,97 @@ def __test_atomic_download_keeps_canonical_file_complete_during_rewrite__(
         assert snapshot.read(0) == first
     with OHLCVReader(path) as reader:
         assert reader.end_timestamp == second.timestamp
+
+
+def __test_atomic_download_publishes_the_extra_field_sidecar__(tmp_path):
+    """The extra-field sidecar is published with the file, and a later download
+    without extra fields removes it instead of leaving it next to the new records"""
+    path = tmp_path / "prov_SYM_1.ohlcv"
+    extra = OHLCV(1_700_000_040_000, 1.0, 2.0, 0.5, 1.5, 10.0, extra_fields={"funding": 0.25})
+    plain = OHLCV(1_700_000_100_000, 1.5, 2.5, 1.0, 2.0, 11.0)
+
+    provider: Any = SimpleNamespace(ohlcv_path=path, ohlcv_file=OHLCVWriter(path, "1"))
+    with _atomic_ohlcv_download_target(provider):
+        with provider.ohlcv_file as writer:
+            writer.write(extra)
+    with OHLCVReader(path) as reader:
+        assert reader.read(0).extra_fields == {"funding": 0.25}
+
+    with _atomic_ohlcv_download_target(provider):
+        with provider.ohlcv_file as writer:
+            writer.write(extra._replace(extra_fields=None))
+            writer.write(plain)
+    with OHLCVReader(path) as reader:
+        assert [bar.extra_fields for bar in reader.read_from(0)] == [None, None]
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["prov_SYM_1.ohlcv",
+                                                          "prov_SYM_1.ohlcv.lock"]
+
+
+def __test_helper_download(path: Path, bars: list[OHLCV]) -> None:
+    """Publish one atomic download of ``bars`` over ``path``."""
+    provider: Any = SimpleNamespace(ohlcv_path=path, ohlcv_file=OHLCVWriter(path, "1"))
+    with _atomic_ohlcv_download_target(provider):
+        with provider.ohlcv_file as writer:
+            for bar in bars:
+                writer.write(bar)
+
+
+def __test_helper_dataset(path: Path) -> list[tuple[float, Any]]:
+    """The ``(close, extra_fields)`` pairs a reader opening ``path`` sees."""
+    with OHLCVReader(path) as reader:
+        return [(bar.close, bar.extra_fields) for bar in reader.read_from(0)]
+
+
+__test_helper_old_bar = OHLCV(1_700_000_040_000, 1.0, 2.0, 0.5, 1.5, 10.0,
+                              extra_fields={"funding": 0.25})
+__test_helper_new_bar = OHLCV(1_700_000_040_000, 1.0, 2.5, 0.5, 2.0, 11.0,
+                              extra_fields={"funding": 0.5})
+
+
+@pytest.mark.parametrize("failing", ["binary", "sidecar"])
+def __test_atomic_download_failure_leaves_the_previous_dataset_whole__(
+        tmp_path, monkeypatch, failing,
+):
+    """A failed publication step puts the previous binary and sidecar back together"""
+    path = tmp_path / "prov_SYM_1.ohlcv"
+    __test_helper_download(path, [__test_helper_old_bar])
+    failing_target = path if failing == "binary" else path.with_suffix(".extra.csv")
+    real_replace = provider_download.replace_file
+
+    def replace(source, destination):
+        if Path(destination) == failing_target and Path(source).name.startswith("."):
+            raise OSError("injected publication failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(provider_download, "replace_file", replace)
+    with pytest.raises(OSError, match="injected"):
+        __test_helper_download(path, [__test_helper_new_bar])
+
+    assert __test_helper_dataset(path) == [(1.5, {"funding": 0.25})]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "prov_SYM_1.extra.csv", "prov_SYM_1.ohlcv", "prov_SYM_1.ohlcv.lock",
+    ]
+
+
+def __test_atomic_download_never_pairs_a_binary_with_the_other_sidecar__(
+        tmp_path, monkeypatch,
+):
+    """A reader opening the canonical file between publication steps sees the old
+    dataset, the new one, or one of them without extra fields, never a mix"""
+    path = tmp_path / "prov_SYM_1.ohlcv"
+    __test_helper_download(path, [__test_helper_old_bar])
+    real_replace = provider_download.replace_file
+    seen: list[list[tuple[float, Any]]] = []
+
+    def replace(source, destination):
+        real_replace(source, destination)
+        seen.append(__test_helper_dataset(path))
+
+    monkeypatch.setattr(provider_download, "replace_file", replace)
+    __test_helper_download(path, [__test_helper_new_bar])
+
+    allowed = ([(1.5, {"funding": 0.25})], [(1.5, None)], [(2.0, None)],
+               [(2.0, {"funding": 0.5})])
+    assert seen and all(dataset in allowed for dataset in seen)
+    assert seen[-1] == [(2.0, {"funding": 0.5})]

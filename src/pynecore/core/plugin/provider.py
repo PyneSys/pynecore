@@ -316,6 +316,17 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         if self.is_symbol_info_exists() and not force_update:
             return SymInfo.load_toml(toml_path)
 
+        sym_info = self.fetch_symbol_info()
+        sym_info.save_toml(toml_path)
+        return sym_info
+
+    def fetch_symbol_info(self) -> SymInfo:
+        """
+        Fetch the symbol info from the exchange, without writing it anywhere.
+
+        :return: Symbol information, with an estimated ``mincontract`` when the exchange
+            has none.
+        """
         sym_info = self.update_symbol_info()
         if sym_info.mincontract <= 0.0:
             # No exchange value (providers signal that with 0.0): estimate it.
@@ -323,7 +334,6 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
             # volume data, see ``mincontract_estimated``.
             sym_info.mincontract = default_mincontract(sym_info.type, sym_info.basecurrency)
             self.mincontract_estimated = True
-        sym_info.save_toml(toml_path)
         return sym_info
 
     def save_ohlcv_data(self, data: OHLCV | list[OHLCV]):
