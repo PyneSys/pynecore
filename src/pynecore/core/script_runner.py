@@ -45,6 +45,7 @@ from pynecore.errorcodes import (InvalidDataError, InvalidOptionError, InvalidTi
                             SecurityTimeframeHigherError)
 from pynecore.core.error_location import located
 from pynecore.core.errors import MAIN_MODULE, MODULE_ID, PyneError
+from pynecore.core.live_timing import is_catch_up, is_stale_update
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
 from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, copy_ohlcv_tail, restore_f32_volume
 from pynecore.core.script_timeframe import ScriptTimeframe
@@ -159,6 +160,11 @@ def _close_price_or_none() -> float | None:
     if isinstance(val, (int, float)):
         return float(val)
     return None
+
+
+def _wall_clock_ms() -> float:
+    """The system clock as UNIX milliseconds, the live runner's default clock."""
+    return time.time() * 1000.0
 
 
 def script_module_name(script_path: Path) -> str:
@@ -1348,7 +1354,7 @@ class ScriptRunner:
                  '_config_dir', '_symbol_map', '_script_timeframe',
                  '_chart_bar_window',
                  'broker_balance', '_sim_logged_open_ids', '_inputs', '_settings', '_live',
-                 '_live_history_trades', '_history_as_of', '_profiler')
+                 '_live_history_trades', '_history_as_of', '_live_clock', '_profiler')
 
     # noinspection PyProtectedMember
     def __init__(self, script_path: Path, ohlcv_iter: Iterable[OHLCV], syminfo: SymInfo, *,
@@ -1360,6 +1366,7 @@ class ScriptRunner:
                  live: bool = False,
                  live_history_trades: bool = False,
                  history_as_of: int | None = None,
+                 live_clock: Callable[[], float] | None = None,
                  inputs: dict[str, Any] | None = None,
                  settings: dict[str, Any] | None = None,
                  security_data: 'dict[str, str | Path | PluginSymbol] | None' = None,
@@ -1419,7 +1426,14 @@ class ScriptRunner:
                      arrives, while a historical bar is held until the next item shows
                      whether it was the last one. Strategy orders start at the transition:
                      the warmup bars only build the script's state, unless
-                     ``live_history_trades`` is set.
+                     ``live_history_trades`` is set. A closed live bar delivered too late
+                     to be the live edge (:func:`~pynecore.core.live_timing.is_catch_up`,
+                     judged by ``live_clock``) is a catch-up bar, replayed after an outage
+                     or a slow reconnect: under the same condition it only builds state
+                     too, and a broker run leaves the venue untouched on it. An intra-bar
+                     update processed past its slot's close deadline
+                     (:func:`~pynecore.core.live_timing.is_stale_update`) is held the
+                     same way. The first fresh bar or update trades again.
         :param live_history_trades: Paper trading in live mode: let the strategy trade on the
                                     warmup bars too, as a backtest that the live phase then
                                     continues, position and all. Off by default, so a live run
@@ -1435,6 +1449,10 @@ class ScriptRunner:
                               downloaded bar counts as partial when its period had not ended by
                               then, however late the warmup reaches it. ``None`` takes the time
                               the runner is created.
+        :param live_clock: Returns the current UNIX time in milliseconds; a live run judges
+                           by it whether a closed bar is a catch-up bar. ``None`` reads the
+                           system clock. A feed replayed on a timeline of its own passes the
+                           time that timeline is at.
         :param inputs: Optional dictionary of input values to pass to the script, keyed by
                        the ``main()`` parameter name; overrides values from .toml files
         :param settings: Optional dictionary of script settings (decorator arguments such as
@@ -1772,6 +1790,7 @@ class ScriptRunner:
         self._live_history_trades = live_history_trades
         self._history_as_of = (history_as_of if history_as_of is not None
                                else int(time.time() * 1000))
+        self._live_clock = live_clock if live_clock is not None else _wall_clock_ms
         # Pre-increment scheme: bumped at the start of each bar's processing
         # (warmup, live, security loops). Starting at -1 keeps the first
         # processed bar at index 0 — matches Pine ``bar_index`` semantics.
@@ -4130,6 +4149,38 @@ class ScriptRunner:
                 prev_live_update: OHLCV | None = None
                 # Closed trades of the current bar already narrated by [SIM] lines
                 sim_logged_closed = 0
+                # A closed bar the stream delivers late (an outage, a slow reconnect)
+                # is replayed history: the script computes on it like on a warmup bar
+                # but does not trade, under the warmup's own condition. A burst of
+                # them keeps the latch closed until the first fresh update. An
+                # intra-bar update processed past its slot's close deadline (a
+                # lagging consumer's backlog) is no live edge either. ``None`` when
+                # the latch does not apply (an indicator, paper trading on the
+                # history) or the timeframe has no fixed period.
+                catch_up_tf = (_try_in_seconds(str(self.syminfo.period))
+                               if is_strat and not self._live_history_trades else None)
+                live_clock = self._live_clock
+
+                # noinspection PyProtectedMember
+                def _latch_catch_up(update: OHLCV) -> None:
+                    """Close or open the trade latch by how late ``update`` is processed.
+
+                    :param update: The live update about to run.
+                    """
+                    assert catch_up_tf
+                    rule = is_catch_up if update.is_closed else is_stale_update
+                    late = rule(update.timestamp, catch_up_tf, live_clock())
+                    if late == lib._strategy_suppressed:
+                        return
+                    lib._strategy_suppressed = late
+                    if late:
+                        broker_info("catch-up %s ts=%d: the strategy computes on it "
+                                    "without trading",
+                                    "bar" if update.is_closed else "update",
+                                    update.timestamp)
+                    else:
+                        broker_info("live edge reached at ts=%d — trading resumes",
+                                    update.timestamp)
 
                 live_stream = itertools.chain([first_live_update], ohlcv_iterator)
                 for bar_update in live_stream:
@@ -4287,6 +4338,8 @@ class ScriptRunner:
                         lib._viz_dyn.clear()
                         lib._viz_seq.clear()
                         lib._plot_ids.clear()
+                        if catch_up_tf:
+                            _latch_catch_up(candle)
                         if run_on_every_tick:
                             # Broker sync runs before the script so orders queued by the
                             # previous tick dispatch now, and async fills from watch_orders
@@ -4310,6 +4363,8 @@ class ScriptRunner:
                     elif not bar_update.is_closed:
                         # ── Subsequent intra-bar tick ──
                         sub_bars.append(candle)
+                        if catch_up_tf:
+                            _latch_catch_up(candle)
                         if run_on_every_tick:
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.restore()
@@ -4334,6 +4389,8 @@ class ScriptRunner:
                     elif bar_update.is_closed:
                         # ── Bar close ──
                         last_confirmed_timestamp = candle.timestamp
+                        if catch_up_tf:
+                            _latch_catch_up(candle)
                         if is_new_bar:
                             sub_bars = []
                             if var_snapshot and var_snapshot.has_vars:
@@ -4432,11 +4489,21 @@ class ScriptRunner:
                             # new entry from queueing); and enforce post-bar
                             # rules before the sync so the queued risk-close
                             # ships in the same dispatch cycle.
+                            #
+                            # A catch-up bar leaves the venue untouched: the fills
+                            # drained above are booked, the open trades are marked
+                            # to its close for the script, and everything else
+                            # (risk rules, restart settle, sync) waits for the first
+                            # fresh bar, as on a warmup bar. The Pine order book is
+                            # event-driven, so the orders of the last fresh bar
+                            # stay in it and that bar's sync finds them unchanged.
+                            suppressed = lib._strategy_suppressed
                             if is_strat and position:
                                 bpos = cast('BrokerPosition', position)
                                 bpos.update_unrealized_pnl(float(lib.close))
-                                # noinspection PyProtectedMember
-                                bpos._handle_bar_open_risk()
+                                if not suppressed:
+                                    # noinspection PyProtectedMember
+                                    bpos._handle_bar_open_risk()
                             lib._plot_data.clear()
                             lib._viz_dyn.clear()
                             lib._viz_seq.clear()
@@ -4451,12 +4518,12 @@ class ScriptRunner:
                             # script, so its mutation takes effect. Idempotent:
                             # returns immediately once the one-time reconstruct
                             # has latched, so steady-state bars pay nothing.
-                            if is_strat and position \
+                            if is_strat and position and not suppressed \
                                     and self._order_sync_engine is not None:
                                 cast('OrderSyncEngine', self._order_sync_engine) \
                                     .settle_restart_state(int(lib.last_bar_time))
                             _run_libs_and_main()
-                            if is_strat and position:
+                            if is_strat and position and not suppressed:
                                 # noinspection PyProtectedMember
                                 cast('BrokerPosition', position)._enforce_post_bar_risk()
                                 self._process_orders(position)

@@ -1,0 +1,429 @@
+"""
+Closed-bar recovery of the chart's live stream, owned by the framework.
+
+A provider with ``core_stream_recovery`` has the close its socket missed asked from its
+history once the venue has published it, the gap of an outage filled after every
+reconnect before the new subscription's bars, and the subscription reconnected once
+closes keep coming only from the history. A history query that fails is never taken
+for "no bar": the stream waits for an answer instead of going on over the gap. A slot
+that had no trades gets the bar the venue's history has for it: a zero-volume filler,
+or none on a venue whose history skips such slots.
+"""
+import asyncio
+import threading
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+
+import pytest
+
+from pynecore.core.live_runner import LiveStop, live_ohlcv_generator
+from pynecore.core.script_runner import LIVE_TRANSITION
+from pynecore.core.syminfo import SymInfo, SymInfoInterval
+from pynecore.types.ohlcv import OHLCV
+
+_TF_MS = 60_000
+
+
+def _make_syminfo(opening_hours: list[SymInfoInterval]) -> SymInfo:
+    """A UTC symbol with the given weekly session calendar; the rest are throw-away values."""
+    return SymInfo(prefix="TEST", description="test", ticker="TEST", currency="USD",
+                   period="1", type="crypto", mintick=0.01, pricescale=100, minmove=1,
+                   pointvalue=1.0, mincontract=1.0, opening_hours=opening_hours,
+                   session_starts=[], session_ends=[], timezone="UTC")
+
+
+def _bar(timestamp: int, close: float = 100.0, *, volume: float = 10.0,
+         is_closed: bool = True) -> OHLCV:
+    return OHLCV(timestamp=timestamp, open=close, high=close + 1.0, low=close - 1.0,
+                 close=close, volume=volume, is_closed=is_closed)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+class _Venue:
+    """A venue whose socket replays one script per connection and whose history the test sets.
+
+    The socket hands out its script's items in order (an exception is raised from
+    ``watch_ohlcv``), then stays silent while the connection looks healthy. The history
+    returns the bars of :attr:`~_Venue.history` after the requested open, and fails while
+    :attr:`~_Venue.history_failures` is positive.
+    """
+
+    reconnect_delay = 0.01
+    max_reconnect_delay = 0.05
+    feed_timeout_bars = None
+
+    def __init__(self, scripts: list[list[OHLCV | BaseException]], *, core_recovery: bool = True,
+                 idle_bars: bool = True, publish_lag: float = 0.0):
+        self.core_stream_recovery = core_recovery
+        self.history_has_idle_bars = idle_bars
+        self.history_publish_lag = publish_lag
+        self.scripts = scripts
+        self.history: list[OHLCV] = []
+        self.history_failures = 0
+        self.history_calls: list[tuple[float, int]] = []
+        self.connects = 0
+        self.watch_calls = 0
+        self._cond = threading.Condition()
+        self._connected = False
+        self._socket: asyncio.Queue | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def connect(self):
+        self._loop = asyncio.get_running_loop()
+        socket: asyncio.Queue = asyncio.Queue()
+        with self._cond:
+            self.connects += 1
+            script = self.scripts[self.connects - 1] if self.connects <= len(self.scripts) else []
+            self._cond.notify_all()
+        for item in script:
+            socket.put_nowait(item)
+        self._socket = socket
+        self._connected = True
+
+    async def disconnect(self):
+        self._connected = False
+
+    @property
+    def is_connected(self):
+        return self._connected
+
+    async def watch_ohlcv(self, _symbol: str, _timeframe: str) -> OHLCV:
+        assert self._socket is not None
+        with self._cond:
+            self.watch_calls += 1
+            self._cond.notify_all()
+        item = await self._socket.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    async def backfill_closed_bars(self, _symbol: str, _timeframe: str,
+                                   since_ms: int) -> list[OHLCV]:
+        with self._cond:
+            self.history_calls.append((time.time(), since_ms))
+            failing = self.history_failures > 0
+            if failing:
+                self.history_failures -= 1
+            answer = [bar for bar in self.history if bar.timestamp > since_ms]
+            self._cond.notify_all()
+        if failing:
+            raise ConnectionError("history endpoint down")
+        return answer
+
+    def set_history(self, bars: list[OHLCV], *, failures: int = 0) -> None:
+        with self._cond:
+            self.history = bars
+            self.history_failures = failures
+
+    def push(self, item: OHLCV) -> None:
+        assert self._loop is not None and self._socket is not None
+        self._loop.call_soon_threadsafe(self._socket.put_nowait, item)
+
+    def wait_for(self, predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+        with self._cond:
+            return self._cond.wait_for(predicate, timeout)
+
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        return symbol
+
+    async def on_disconnect(self):
+        pass
+
+    async def on_reconnect(self):
+        pass
+
+    @staticmethod
+    async def can_shutdown():
+        return True
+
+
+class _Consumer:
+    """Pulls a live stream on its own thread and records the updates and closed bars it yields."""
+
+    def __init__(self, venue: _Venue, **kwargs):
+        self.stop = LiveStop()
+        self.closed: list[OHLCV] = []
+        self.updates: list[OHLCV] = []
+        self.error: BaseException | None = None
+        self._cond = threading.Condition()
+        self._stream = live_ohlcv_generator(venue, "BTC/USDT", "1", stop=self.stop,
+                                            shutdown_timeout=5.0, **kwargs)
+        self._thread = threading.Thread(target=self._pull, daemon=True)
+        self._thread.start()
+
+    def _pull(self) -> None:
+        try:
+            for item in self._stream:
+                if item is LIVE_TRANSITION:
+                    continue
+                with self._cond:
+                    self.updates.append(item)
+                    if item.is_closed:
+                        self.closed.append(item)
+                    self._cond.notify_all()
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the test
+            self.error = exc
+
+    def wait_for(self, predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+        with self._cond:
+            return self._cond.wait_for(predicate, timeout)
+
+    def stamps(self) -> list[int]:
+        with self._cond:
+            return [bar.timestamp for bar in self.closed]
+
+    def update_keys(self) -> list[tuple[int, float, bool]]:
+        """Timestamp, close and closed flag of every update yielded so far."""
+        with self._cond:
+            return [(bar.timestamp, bar.close, bar.is_closed) for bar in self.updates]
+
+    def close(self) -> None:
+        self.stop.set()
+        self._thread.join(timeout=10.0)
+        assert not self._thread.is_alive(), "the stream did not stop"
+        assert self.error is None, f"the stream raised: {self.error!r}"
+
+
+def __test_missed_close_comes_from_history_after_the_publish_lag__():
+    """The close the socket missed is asked once the lag past its close is over
+
+    The forming bar of the slot is dropped for the history's close, and the query
+    waits for the publish lag instead of the boundary deadline half a minute later.
+    """
+    lag = 0.4
+    last = _now_ms() - 2 * _TF_MS + 300
+    slot = last + _TF_MS
+    venue = _Venue([[_bar(last), _bar(slot, 150.0, volume=3.0, is_closed=False)]],
+                   publish_lag=lag)
+    venue.set_history([_bar(slot, 155.0, volume=12.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2, timeout=10.0)
+        recovered = consumer.closed[1]
+        assert (recovered.timestamp, recovered.close, recovered.volume) == (slot, 155.0, 12.0)
+        due = (slot + _TF_MS) / 1000.0 + lag
+        first_call, since = venue.history_calls[0]
+        assert since == last
+        assert due - 0.05 <= first_call <= due + 1.5, (
+            f"history asked {first_call - due:+.2f}s from its due time")
+    finally:
+        consumer.close()
+
+
+def __test_failed_query_holds_the_slot_until_the_history_answers__():
+    """A failed query is not a "no bar" answer: the overdue slot is neither filled nor skipped
+
+    Once the history answers, its bar is the slot's close; the next overdue slot,
+    answered empty on a venue with idle bars, gets the zero-volume filler.
+    """
+    last = (_now_ms() // _TF_MS) * _TF_MS - 4 * _TF_MS
+    venue = _Venue([[_bar(last)]])
+    venue.set_history([], failures=1_000_000)
+    consumer = _Consumer(venue)
+    try:
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 4)
+        assert consumer.stamps() == [last], "a slot was settled without a history answer"
+        venue.set_history([_bar(last + _TF_MS, 120.0)])
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+        recovered, filler = consumer.closed[1], consumer.closed[2]
+        assert (recovered.timestamp, recovered.close, recovered.volume) == (
+            last + _TF_MS, 120.0, 10.0)
+        assert (filler.timestamp, filler.close, filler.volume) == (
+            last + 2 * _TF_MS, 120.0, 0.0)
+    finally:
+        consumer.close()
+
+
+def __test_a_later_socket_close_waits_behind_an_unanswered_slot__():
+    """The socket's close of a later slot does not move the cursor past a slot still unanswered
+
+    Handed on at once, it would make the slot's history close a bar behind the cursor,
+    which could then never be spliced in.
+    """
+    last = (_now_ms() // _TF_MS) * _TF_MS - 4 * _TF_MS
+    s1, s2 = last + _TF_MS, last + 2 * _TF_MS
+    venue = _Venue([[_bar(last)]])
+    venue.set_history([], failures=1_000_000)
+    consumer = _Consumer(venue)
+    try:
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 2)
+        venue.push(_bar(s2, 102.0))
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 5)
+        assert consumer.stamps() == [last], "a later close went on over the unanswered slot"
+        venue.set_history([_bar(s1, 101.0)])
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+        assert [(bar.timestamp, bar.close) for bar in consumer.closed[:3]] == [
+            (last, 100.0), (s1, 101.0), (s2, 102.0)]
+        assert all(since == last for _, since in venue.history_calls[:5])
+    finally:
+        consumer.close()
+
+
+def __test_a_later_forming_bar_waits_behind_an_unanswered_slot__():
+    """An update of a later slot is held too: the consumer's clock would pass the slot"""
+    last = (_now_ms() // _TF_MS) * _TF_MS - 4 * _TF_MS
+    s1, s2 = last + _TF_MS, last + 2 * _TF_MS
+    venue = _Venue([[_bar(last)]])
+    venue.set_history([], failures=1_000_000)
+    consumer = _Consumer(venue)
+    try:
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 2)
+        venue.push(_bar(s2, 102.0, is_closed=False))
+        venue.push(_bar(s2, 103.0, is_closed=False))
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 5)
+        assert [key[0] for key in consumer.update_keys()] == [last], \
+            "a later forming bar went on over the unanswered slot"
+        venue.set_history([_bar(s1, 101.0)])
+        assert consumer.wait_for(lambda: len(consumer.updates) >= 3)
+        # Only the newest update of the held forming slot goes on
+        assert consumer.update_keys()[:3] == [(last, 100.0, True), (s1, 101.0, True), (s2, 103.0, False)]
+    finally:
+        consumer.close()
+
+
+def __test_a_held_close_after_a_session_break_goes_on_once_the_gap_is_filled__():
+    """A held close past a session break is replayed when the last in-session slot is settled
+
+    The slot after it is in the closed session, so it is never settled; with no further
+    socket update the held close still has to go on.
+    """
+    last = (_now_ms() // _TF_MS) * _TF_MS - 4 * _TF_MS
+    s1, s2, s3 = last + _TF_MS, last + 2 * _TF_MS, last + 3 * _TF_MS
+    # A daily one-minute break at s2: each day's session runs from s3 overnight to s2
+    reopen = datetime.fromtimestamp(s3 / 1000.0, tz=UTC).time()
+    break_start = datetime.fromtimestamp(s2 / 1000.0, tz=UTC).time()
+    syminfo = _make_syminfo([SymInfoInterval(day=d, start=reopen, end=break_start)
+                             for d in range(7)])
+    venue = _Venue([[_bar(last)]])
+    venue.set_history([], failures=1_000_000)
+    consumer = _Consumer(venue, syminfo=syminfo)
+    try:
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 2)
+        venue.push(_bar(s3, 103.0))
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 4)
+        assert consumer.stamps() == [last], "a post-break close went on over the unanswered slot"
+        venue.set_history([_bar(s1, 101.0)])
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 3), \
+            "the held post-break close stayed stuck behind the closed-session slot"
+        assert [(bar.timestamp, bar.close) for bar in consumer.closed] == [
+            (last, 100.0), (s1, 101.0), (s3, 103.0)]
+    finally:
+        consumer.close()
+
+
+@pytest.mark.parametrize("core_recovery", [True, False])
+def __test_idle_slots_stay_empty_on_a_venue_without_idle_bars__(core_recovery):
+    """No filler where the venue's history has no bar: the cursor waits for the next real close
+
+    Each overdue slot costs at most one query, and the watchdog does not spin on a
+    deadline it cannot settle.
+    """
+    last = _now_ms() - 4 * _TF_MS - 40_000
+    next_real = last + 4 * _TF_MS
+    venue = _Venue([[_bar(last)]], core_recovery=core_recovery, idle_bars=False)
+    consumer = _Consumer(venue)
+    try:
+        if core_recovery:
+            assert venue.wait_for(lambda: len(venue.history_calls) >= 3)
+        # The three overdue slots are settled; the fourth closes later
+        baseline = venue.watch_calls
+        assert not venue.wait_for(lambda: venue.watch_calls > baseline + 10, timeout=1.0), \
+            "the watchdog spins on an overdue slot it left empty"
+        venue.push(_bar(next_real, 140.0))
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
+        assert consumer.stamps() == [last, next_real]
+        assert all(bar.volume > 0.0 for bar in consumer.closed)
+        assert len(venue.history_calls) == (3 if core_recovery else 0)
+        assert all(since == last for _, since in venue.history_calls)
+    finally:
+        consumer.close()
+
+
+def __test_reconnect_fills_the_outage_before_the_new_subscription__():
+    """The bars closed during the outage go on before the new socket's first close"""
+    last = _now_ms() - 2 * _TF_MS
+    s1, s2, s3 = last + _TF_MS, last + 2 * _TF_MS, last + 3 * _TF_MS
+    venue = _Venue([[_bar(last), ConnectionError("socket dropped")], [_bar(s3, 103.0)]],
+                   publish_lag=60.0)
+    venue.set_history([_bar(s1, 101.0), _bar(s2, 102.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 4)
+        assert [(bar.timestamp, bar.close) for bar in consumer.closed] == [
+            (last, 100.0), (s1, 101.0), (s2, 102.0), (s3, 103.0)]
+        assert venue.connects == 2
+        assert [since for _, since in venue.history_calls] == [last]
+    finally:
+        consumer.close()
+
+
+def __test_failed_reconnect_fill_is_another_reconnect_round__():
+    """A reconnect whose gap query fails does not go live: it reconnects and asks again"""
+    # The outage's slot closes just now and the next one is forming: no slot is
+    # overdue yet, so only the reconnect asks the history
+    last = _now_ms() - 2 * _TF_MS
+    s1, s2 = last + _TF_MS, last + 2 * _TF_MS
+    forming = _bar(s2, 102.0, is_closed=False)
+    venue = _Venue([[_bar(last), ConnectionError("socket dropped")], [forming], [forming]],
+                   publish_lag=60.0)
+    venue.set_history([_bar(s1, 101.0)], failures=1)
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.updates) >= 3)
+        assert consumer.update_keys() == [
+            (last, 100.0, True), (s1, 101.0, True), (s2, 102.0, False)]
+        assert venue.connects == 3
+        assert [since for _, since in venue.history_calls] == [last, last]
+    finally:
+        consumer.close()
+
+
+def __test_closes_only_from_history_reconnect_the_subscription__():
+    """Two closes with trades the socket showed nothing of: the subscription is renewed"""
+    last = _now_ms() - 3 * _TF_MS - 40_000
+    s1, s2 = last + _TF_MS, last + 2 * _TF_MS
+    venue = _Venue([[_bar(last)]])
+    venue.set_history([_bar(s1, 101.0), _bar(s2, 102.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+        assert consumer.stamps() == [last, s1, s2]
+        assert venue.wait_for(lambda: venue.connects >= 2)
+    finally:
+        consumer.close()
+
+
+def __test_late_socket_closes_do_not_count_as_a_dead_subscription__():
+    """The socket showed the slots' trades, only their closes were late: no reconnect"""
+    last = _now_ms() - 3 * _TF_MS - 40_000
+    s1, s2, s3 = last + _TF_MS, last + 2 * _TF_MS, last + 3 * _TF_MS
+    venue = _Venue([[_bar(s2, 102.0, is_closed=False), _bar(last)]])
+    venue.set_history([_bar(s1, 101.0), _bar(s2, 102.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+        venue.push(_bar(s3, 103.0))
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 4)
+        assert consumer.stamps() == [last, s1, s2, s3]
+        assert venue.connects == 1
+    finally:
+        consumer.close()
+
+
+def __test_startup_gap_failure_waits_until_stopped__():
+    """A startup gap query that keeps failing never lets a live bar through, and a stop ends it"""
+    last = _now_ms() - 3 * _TF_MS
+    venue = _Venue([[_bar(last + 3 * _TF_MS)]])
+    venue.set_history([], failures=1_000_000)
+    consumer = _Consumer(venue, last_historical_timestamp=last)
+    assert venue.wait_for(lambda: len(venue.history_calls) >= 3)
+    started = time.monotonic()
+    consumer.close()
+    assert time.monotonic() - started < 5.0
+    assert consumer.closed == []
+    assert not venue.is_connected

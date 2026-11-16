@@ -668,13 +668,16 @@ def __test_live_intra_bar_sync_dispatches_on_next_tick__(tmp_path):
     for key in [script_path.stem]:
         sys.modules.pop(key, None)
 
-    # Live mode runs the historical suppression and live transition paths as in production
+    # Live mode runs the historical suppression and live transition paths as in production.
+    # The clock reads the live bar's close: the bars sit far in the past, and on the
+    # system clock the closing tick would be a catch-up bar, which does not sync.
     runner = ScriptRunner(
         script_path=script_path,
         ohlcv_iter=observing_iter(),
         syminfo=_make_syminfo(),
         broker_plugin=plugin,  # type: ignore[arg-type]
         live=True,
+        live_clock=lambda: live_ts + 86_400_000,
     )
     runner.script.calc_on_every_tick = True
 
@@ -771,12 +774,15 @@ def __test_live_broker_marks_open_trade_before_each_tick__(tmp_path):
 
     sys.modules.pop(script_path.stem, None)
 
+    # The clock reads the live bar's close: the bars sit far in the past, and on the
+    # system clock the closing tick would be a catch-up bar
     runner = ScriptRunner(
         script_path=script_path,
         ohlcv_iter=observing_iter(),
         syminfo=_make_syminfo(),
         broker_plugin=cast(BrokerPlugin, plugin),
         live=True,
+        live_clock=lambda: live_ts + 86_400_000,
     )
     runner.script.calc_on_every_tick = True
 

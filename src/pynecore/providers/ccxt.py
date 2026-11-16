@@ -47,6 +47,10 @@ _KNOWN_LIMITS = {
     'huobi': 2000,
 }
 
+# Exchanges whose OHLCV history has no candle for a period without trades. Every other
+# exchange is taken to return a zero-volume candle there.
+_NO_IDLE_BAR_EXCHANGES = frozenset({'coinbase'})
+
 _PYNECORE_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({
     'sandbox',
     'default_type',
@@ -156,6 +160,12 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
     # on every quiet stretch; 30 bars keeps the dead-feed safety net while
     # making false positives rare.
     feed_timeout_bars = 30
+
+    # The stream has no gap recovery of its own and ``backfill_closed_bars`` is a
+    # pure REST query, so the framework recovers missed closes and reconnect gaps.
+    # A trade-built candle closes only with the next trade, which on a quiet pair
+    # can come long after the bar's close: there the history delivers the close.
+    core_stream_recovery = True
 
     @classmethod
     @override
@@ -321,6 +331,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 f"Unknown exchange: {exchange_name!r}. Run "
                 f"`pyne data download ccxt --list-brokers` to see available exchanges."
             ) from None
+        self.history_has_idle_bars = self._client.id not in _NO_IDLE_BAR_EXCHANGES
         if self.config and getattr(self.config, 'sandbox', False):
             try:
                 self._client.set_sandbox_mode(True)

@@ -104,6 +104,15 @@ def __test_without_a_live_client_nothing_is_queried__():
     assert _run(provider, 0) == []
 
 
+def __test_idle_bars_in_the_history_depend_on_the_exchange__():
+    """An exchange whose history skips periods without trades says so to the stream"""
+    pytest.importorskip("ccxt")
+    from pynecore.providers.ccxt import CCXTProvider
+    assert _provider().history_has_idle_bars is True
+    coinbase = CCXTProvider(symbol="COINBASE:BTC/USD", timeframe="1", ohlcv_dir=None)
+    assert coinbase.history_has_idle_bars is False
+
+
 def __test_rollover_closes_with_the_final_record_of_the_batch__():
     """The batch that opens the next candle also updates the previous one: that is its close
 

@@ -43,13 +43,27 @@ def __test_helper_make_ohlcv(ts, close=100.0, is_closed=True):
 
 
 def __test_helper_create_live_runner(script_path, module_key, syminfo, ohlcv_iter):
-    """Helper: clean module cache, create a live ScriptRunner."""
+    """Helper: clean module cache, create a live ScriptRunner.
+
+    Its clock reads the close of the newest bar the feed delivered. The bars sit on
+    a timeline of their own, far in the past: on the system clock every live bar
+    would be a catch-up bar, which does not trade.
+    """
     from pynecore.core.script_runner import ScriptRunner
+    from pynecore.types.ohlcv import OHLCV
 
     for key in [module_key, script_path.stem]:
         sys.modules.pop(key, None)
+    now = [0.0]
 
-    return ScriptRunner(script_path, ohlcv_iter, syminfo, live=True)
+    def delivered_on_time():
+        for item in ohlcv_iter:
+            if isinstance(item, OHLCV):
+                now[0] = item.timestamp + 60
+            yield item
+
+    return ScriptRunner(script_path, delivered_on_time(), syminfo, live=True,
+                        live_clock=lambda: now[0])
 
 
 def __test_helper_chain_live(historical, live):

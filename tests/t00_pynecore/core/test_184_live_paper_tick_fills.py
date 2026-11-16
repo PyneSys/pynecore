@@ -66,8 +66,11 @@ def __test_helper_run(script_path, module_key, syminfo, live, on_close=False):
         sys.modules.pop(key, None)
 
     historical = [__test_helper_bar(i * 60, 100.0, 100.0, 100.0, 100.0) for i in range(3)]
+    # The bars sit on a timeline of their own, far in the past: on the system clock
+    # the live bar would be a catch-up bar, which does not trade. The clock reads the
+    # end of the live bar the updates belong to, as when the feed delivers on time.
     runner = ScriptRunner(script_path, itertools.chain(historical, [LIVE_TRANSITION], live),
-                          syminfo, live=True)
+                          syminfo, live=True, live_clock=lambda: live[-1].timestamp + 60)
     runner.script.process_orders_on_close = on_close
     results = []
     for _candle, plot_data, trades in runner.run_iter():

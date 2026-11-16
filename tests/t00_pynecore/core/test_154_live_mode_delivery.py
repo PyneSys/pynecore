@@ -20,12 +20,27 @@ def __test_helper_bar(i, is_closed=True):
 
 
 def __test_helper_runner(script_path, module_key, syminfo, ohlcv_iter):
+    """A live runner whose clock reads the close of the newest bar the feed delivered.
+
+    The bars sit on a timeline of their own, far in the past: on the system clock
+    every live bar would be a catch-up bar, which does not trade.
+    """
     import sys
     from pynecore.core.script_runner import ScriptRunner
+    from pynecore.types.ohlcv import OHLCV
 
     for key in [module_key, script_path.stem]:
         sys.modules.pop(key, None)
-    return ScriptRunner(script_path, ohlcv_iter, syminfo, live=True)
+    now = [0.0]
+
+    def delivered_on_time():
+        for item in ohlcv_iter:
+            if isinstance(item, OHLCV):
+                now[0] = item.timestamp + 60_000
+            yield item
+
+    return ScriptRunner(script_path, delivered_on_time(), syminfo, live=True,
+                        live_clock=lambda: now[0])
 
 
 def __test_closed_live_bar_is_delivered_before_the_next_item__(script_path, module_key, syminfo):

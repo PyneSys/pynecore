@@ -33,7 +33,11 @@ when it is newer than every closed bar handed on before it. The startup gap
 between the warmup history and the subscription is filled this way, and so is
 any later fill a consumer requests through :class:`ClosedBarBackfill`, so a
 history bar and the socket's close of the same or a neighbouring slot reach the
-consumer once and in order, whichever arrives first.
+consumer once and in order, whichever arrives first. A provider with
+:attr:`LiveProviderPlugin.core_stream_recovery` has the gap after every reconnect
+and a close its socket missed filled the same way. A history query that fails is
+retried; the stream does not hand on a later bar over a gap the venue has not
+answered for.
 
 Dedup: the duplicate-filter for ``last_historical_timestamp`` uses
 **strict** less-than for both closed bars and intra-bar updates. The
@@ -66,6 +70,7 @@ from pynecore.types.ohlcv import OHLCV, AskOHLC
 from pynecore.core.plugin import is_retryable_provider_error
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
+from pynecore.core.live_timing import close_grace_seconds, is_catch_up
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.session import is_in_session, is_point_in_session
 from pynecore.lib.timeframe import _in_seconds
@@ -527,6 +532,30 @@ _HOOK_CANCEL_GRACE_S = 5.0
 # consumer's join — alive. Exposed at module scope so tests can shrink it.
 _LOOP_SWEEP_GRACE_S = 5.0
 
+# History queries for one missed close, spread between the provider's history
+# publish lag and the close's deadline. A quiet market, where the history has
+# nothing to add, pays at most this many queries per bar.
+_MISSED_CLOSE_PROBES = 3
+
+# Consecutive closes delivered only by the history, for slots the socket showed
+# no update of although they had trades, after which the subscription counts as
+# dead and is reconnected.
+_STALE_HISTORY_CLOSES = 2
+
+
+def _backoff_delay(provider: LiveProviderPlugin, attempt: int) -> float:
+    """The provider's reconnect backoff before retry ``attempt``.
+
+    Starts at :attr:`LiveProviderPlugin.reconnect_delay`, doubles per attempt and
+    saturates at :attr:`LiveProviderPlugin.max_reconnect_delay`.
+
+    :param attempt: The retry, counted from 1.
+    :return: The delay in seconds.
+    """
+    # The exponent is clamped so the power stays a small int
+    return min(provider.reconnect_delay * (2 ** min(attempt - 1, 16)),
+               provider.max_reconnect_delay)
+
 
 def _warn_this_attempt(attempts: int) -> bool:
     """Reconnect-log rate policy: WARNING for the first attempts of an
@@ -774,11 +803,18 @@ def live_ohlcv_generator(
                      closes.
     :param boundary_watchdog: Close a slot the stream received no close for once its
                               grace is over: the forming bar is finalized, an idle slot
-                              gets a zero-volume filler. ``False`` for a consumer that
-                              recovers a missed close itself through ``backfill`` (a live
-                              ``request.security`` context): there a close that is only
-                              late must not be replaced by a filler before the history
-                              has it. The feed-liveness checks run either way.
+                              gets a zero-volume filler, or no bar at all when the
+                              venue's history has none for an idle slot
+                              (:attr:`LiveProviderPlugin.history_has_idle_bars`). With
+                              :attr:`LiveProviderPlugin.core_stream_recovery` the
+                              history is asked for the missed close first, and a slot
+                              whose query has not been answered waits for the answer.
+                              ``False`` for a consumer that recovers a missed close
+                              itself through ``backfill`` (a live ``request.security``
+                              context): there a close that is only late must not be
+                              replaced by a filler before the history has it, and the
+                              stream recovers nothing in-stream. The feed-liveness
+                              checks run either way.
     :return: Iterator yielding OHLCV objects (both closed and intra-bar) interleaved
              with a single ``LIVE_TRANSITION`` sentinel marking the warmup→live boundary.
     """
@@ -963,15 +999,17 @@ def live_ohlcv_generator(
     # OHLCV timestamps are Unix milliseconds, so every deadline compared
     # against a bar timestamp is computed on the millisecond axis.
     tf_ms = tf_seconds * 1000
-    # Grace past close before declaring a bar missed. The minimum is set
-    # to 15s so plugins that recover dropped WS bars via REST have a
-    # realistic window to fetch and inject the missing bar before this
-    # synth fires — exchanges typically publish a closed bar to REST 5-10s
-    # past close, and the plugin watchdog needs a few extra seconds to
-    # detect, fetch and inject. The cap (30s) keeps longer TFs from
-    # sitting on idle gaps too long.
-    bar_grace = max(15.0, min(tf_seconds * 0.5, 30.0))
-    bar_grace_ms = bar_grace * 1000.0
+    # Grace past close before declaring a bar missed
+    bar_grace_ms = close_grace_seconds(tf_seconds) * 1000.0
+
+    # In-stream recovery of missed closes from the venue's history. Only on a
+    # stream that closes its own slots: without the boundary watchdog the
+    # consumer recovers a missed close itself (``backfill``). Read with defaults
+    # so a duck-typed provider keeps the plain behaviour.
+    core_recovery = boundary_watchdog and bool(
+        getattr(provider, "core_stream_recovery", False))
+    history_has_idle_bars = bool(getattr(provider, "history_has_idle_bars", True))
+    publish_lag_ms = float(getattr(provider, "history_publish_lag", 10.0)) * 1000.0
 
     # Feed-liveness watchdog threshold: how long ``watch_ohlcv`` may stay
     # silent during an open session before the feed is declared dead and a
@@ -1157,7 +1195,84 @@ def live_ohlcv_generator(
         # Drives the rate-limited synth warning: first of a streak warns,
         # then every ``_SYNTH_WARN_EVERY``th, the rest log at DEBUG.
         synth_streak = 0
+        # Newest slot the boundary watchdog decided has no bar, on a venue whose
+        # history has none for a slot without trades: the watchdog moves on to
+        # the next slot while the closed-bar cursor stays where it is.
+        empty_slot_ts: int | None = None
+        # Missed-close probe of the slot whose close the stream waits for: when
+        # the next history query is due, and whether one has been answered (an
+        # empty answer included) or how many failed since the slot became due.
+        probe_slot: int | None = None
+        probe_next_ms = float("inf")
+        probe_answered = False
+        probe_failures = 0
+        # Newest slot the socket delivered any update for, and the run of
+        # consecutive closes only the history delivered although the slot had
+        # trades (see ``_STALE_HISTORY_CLOSES``).
+        socket_seen_ts: int | None = None
+        history_close_streak = 0
+        # Socket updates of a slot after the awaited one, held while the awaited
+        # slot is not settled: handing one on would move the closed-bar cursor (or
+        # the consumer's forming bar) past the awaited slot, and its close could
+        # then never be spliced in. Replayed in order once the slot is settled.
+        # Closed bars are all kept, a forming slot only by its newest update.
+        held_updates: list[OHLCV] = []
+
+        async def _stop_within(seconds: float) -> bool:
+            """Wait up to ``seconds`` for a shutdown request.
+
+            :param seconds: The longest wait.
+            :return: ``True`` when the shutdown was requested.
+            """
+            try:
+                await asyncio.wait_for(stop_aevent.wait(), timeout=seconds)
+                return True
+            except asyncio.TimeoutError:
+                return False
+
+        def _awaited_slot() -> int | None:
+            """Open of the slot whose close the stream waits for.
+
+            :return: The slot after the newest closed or empty-decided one, ``None``
+                before the first close.
+            """
+            if last_closed_bar is None:
+                return None
+            base = last_closed_bar.timestamp
+            if empty_slot_ts is not None and empty_slot_ts > base:
+                base = empty_slot_ts
+            return base + tf_ms
+
+        def _probe_times(slot: int) -> list[float]:
+            """When the history is asked for the close of ``slot``, in epoch ms.
+
+            The first query waits for the provider's publish lag past the close,
+            the rest are spread evenly up to the close's deadline; none is later
+            than the deadline.
+
+            :param slot: Open of the slot.
+            :return: Ascending query times.
+            """
+            close_ms = slot + tf_ms
+            deadline_ms = close_ms + bar_grace_ms
+            first_ms = min(close_ms + publish_lag_ms, deadline_ms)
+            step_ms = (deadline_ms - first_ms) / _MISSED_CLOSE_PROBES
+            if step_ms <= 0.0:
+                return [first_ms]
+            return [first_ms + k * step_ms for k in range(_MISSED_CLOSE_PROBES)]
+
+        def _sync_probe(slot: int | None) -> None:
+            """Start the probe schedule of ``slot`` when the awaited slot changed."""
+            nonlocal probe_slot, probe_next_ms, probe_answered, probe_failures
+            if slot == probe_slot:
+                return
+            probe_slot = slot
+            probe_answered = False
+            probe_failures = 0
+            probe_next_ms = float("inf") if slot is None else _probe_times(slot)[0]
+
         async def _connect_with_initial_backoff() -> None:
+
             """Open the first provider connection, riding out transient faults.
 
             A transient socket/TLS fault on the very first connect — a broker
@@ -1264,7 +1379,7 @@ def live_ohlcv_generator(
 
             history_query = getattr(provider, "backfill_closed_bars", None)
 
-            def _splice_closed(bars: list[OHLCV], since_ms: int) -> int:
+            def _splice_closed(bars: list[OHLCV], since_ms: int) -> list[OHLCV]:
                 """Hand on the closed history bars the stream has not, in order.
 
                 The one entry point of history bars into the stream, and the
@@ -1281,10 +1396,10 @@ def live_ohlcv_generator(
 
                 :param bars: The provider's answer, in any order.
                 :param since_ms: The bar open the query asked after.
-                :return: The number of bars handed on.
+                :return: The bars handed on, ascending.
                 """
                 nonlocal last_closed_bar, last_forming_bar, settled_ts, synth_streak
-                accepted = 0
+                accepted: list[OHLCV] = []
                 for history_bar in sorted(bars, key=lambda b: b.timestamp):
                     if not history_bar.is_closed or history_bar.timestamp <= since_ms:
                         continue
@@ -1301,10 +1416,10 @@ def live_ohlcv_generator(
                             and history_bar.timestamp >= last_forming_bar.timestamp):
                         last_forming_bar = None
                     bar_queue.put(history_bar)
-                    accepted += 1
+                    accepted.append(history_bar)
                 return accepted
 
-            async def _fill_from_history(since_ms: int | None) -> int:
+            async def _query_history(since_ms: int | None) -> list[OHLCV] | None:
                 """Query the provider for the closed bars after the cursor and splice them.
 
                 The query starts after the newest of ``since_ms``, the warmup
@@ -1315,17 +1430,17 @@ def live_ohlcv_generator(
 
                 :param since_ms: Open of the newest closed bar the consumer holds,
                     ``None`` when it holds none.
-                :return: The number of bars handed on.
+                :return: The bars handed on, ``None`` when a shutdown ended the query.
                 """
                 query = history_query
                 if query is None:
-                    return 0
+                    return []
                 floors = [stamp for stamp in (
                     since_ms, last_historical_timestamp,
                     None if last_closed_bar is None else last_closed_bar.timestamp,
                 ) if stamp is not None]
                 if not floors:
-                    return 0
+                    return []
                 floor = max(floors)
                 recovered: list[OHLCV] = []
 
@@ -1335,39 +1450,105 @@ def live_ohlcv_generator(
                     recovered.extend(await run(watch_symbol, timeframe, floor))
 
                 if await _await_or_stop(_run_query(query)):
-                    return 0
+                    return None
                 return _splice_closed(recovered, floor)
+
+            async def _fill_from_history(since_ms: int | None) -> int:
+                """Splice the closed history bars after ``since_ms`` and the cursor.
+
+                The fill :class:`ClosedBarBackfill` serves; a provider failure
+                propagates to the requester.
+
+                :param since_ms: Open of the newest closed bar the consumer holds,
+                    ``None`` when it holds none.
+                :return: The number of bars handed on.
+                """
+                accepted = await _query_history(since_ms)
+                return 0 if accepted is None else len(accepted)
+
+            async def _probe_missed_close(slot: int) -> bool:
+                """Ask the history for the close of ``slot`` the socket has not delivered.
+
+                A bar the history has goes on through the closed-bar cursor, the
+                slot's forming bar with it. A failed query is not an answer: the
+                slot keeps waiting for one, past the schedule at the provider's
+                backoff. The next query is scheduled either way.
+
+                :param slot: Open of the awaited slot.
+                :return: ``True`` when the subscription counts as dead: consecutive
+                    closes with trades came from the history and not the socket.
+                """
+                nonlocal probe_next_ms, probe_answered, probe_failures, history_close_streak
+                try:
+                    accepted = await _query_history(None)
+                except Exception as exc:
+                    probe_failures += 1
+                    log = logger.warning if _warn_this_attempt(probe_failures) else logger.debug
+                    log("missed close of ts=%d: history query failed (attempt %d): %s",
+                        slot, probe_failures, exc)
+                    accepted = []
+                else:
+                    if accepted is None:
+                        return False
+                    probe_answered = True
+                now_ms = time.time() * 1000.0
+                upcoming = [at for at in _probe_times(slot) if at > now_ms]
+                if upcoming:
+                    probe_next_ms = upcoming[0]
+                elif probe_answered:
+                    probe_next_ms = float("inf")
+                else:
+                    probe_next_ms = now_ms + _backoff_delay(provider, probe_failures) * 1000.0
+                if not accepted:
+                    return False
+                logger.info("missed close: %d closed bar(s) from history, newest ts=%d",
+                            len(accepted), accepted[-1].timestamp)
+                for history_bar in accepted:
+                    if socket_seen_ts is not None and socket_seen_ts >= history_bar.timestamp:
+                        # The socket was alive for this slot, its close was only late
+                        history_close_streak = 0
+                    elif history_bar.volume > 0.0:
+                        history_close_streak += 1
+                if history_close_streak < _STALE_HISTORY_CLOSES:
+                    return False
+                history_close_streak = 0
+                return True
 
             # Startup gap: the warmup download stopped at
             # ``last_historical_timestamp`` and the stream only delivers from
             # now on, so every bar that closed while the subscription was
             # coming up belongs to neither side. Ask the provider for them
             # before the first live bar, so the strategy sees one unbroken
-            # series. Providers that cannot query history return nothing and
-            # keep the previous behaviour.
+            # series. A failed query is retried: no live bar is handed on over
+            # the hole. Providers that cannot query history return nothing.
             if (last_historical_timestamp is not None and tf_ms > 0
                     and history_query is not None):
                 elapsed_ms = time.time() * 1000.0 - last_historical_timestamp
                 # A whole bar must have closed past the warmup before anything
                 # can be missing.
                 if elapsed_ms >= 2 * tf_ms:
-                    try:
-                        recovered_count = await _fill_from_history(None)
-                    except Exception as exc:
-                        # Recovery is best-effort: a bot that refuses to start
-                        # because a history query failed is worse than one that
-                        # starts with a logged hole.
-                        recovered_count = 0
-                        broker_warning(
-                            "startup gap recovery failed: %s — starting anyway,"
-                            " any bar missed during subscribe stays missing",
-                            exc,
-                        )
-                    if recovered_count:
+                    gap_attempts = 0
+                    while True:
+                        try:
+                            gap_bars = await _query_history(None)
+                            break
+                        except Exception as gap_error:
+                            gap_attempts += 1
+                            gap_delay = _backoff_delay(provider, gap_attempts)
+                            gap_log = (broker_warning if _warn_this_attempt(gap_attempts)
+                                       else logger.debug)
+                            gap_log("startup gap recovery failed (attempt %d): %s — retrying"
+                                    " in %.1fs, the live stream waits for the gap",
+                                    gap_attempts, gap_error, gap_delay)
+                            if await _stop_within(gap_delay):
+                                return
+                    if gap_bars is None:
+                        return
+                    if gap_bars:
                         broker_info(
                             "startup gap: recovered %d closed bar(s) between "
                             "the warmup history and the live stream",
-                            recovered_count,
+                            len(gap_bars),
                         )
 
             # Later fills on a consumer's request run through the same splice
@@ -1398,6 +1579,7 @@ def live_ohlcv_generator(
                 ``except Exception`` and kill the live iterator.
                 """
                 nonlocal market_open_state, last_real_update, outage_started
+                nonlocal history_close_streak
                 while not stop_event.is_set():
                     # Session-gate: when the market is in a known-closed
                     # window (e.g. FX weekend), do not churn through
@@ -1453,12 +1635,7 @@ def live_ohlcv_generator(
                     _report('reconnecting', attempts, offline_s, connection_error)
                     if await _await_or_stop(provider.on_disconnect()):
                         return attempts, True
-                    # The exponent is clamped so the power stays a small int;
-                    # the delay saturates at ``max_reconnect_delay`` anyway.
-                    delay = min(
-                        provider.reconnect_delay * (2 ** min(attempts - 1, 16)),
-                        provider.max_reconnect_delay,
-                    )
+                    delay = _backoff_delay(provider, attempts)
                     if delay > 0.0:
                         try:
                             await asyncio.wait_for(
@@ -1496,6 +1673,36 @@ def live_ohlcv_generator(
                         )
                         connection_error = reconn_err
                         continue
+                    # Reconnect gap: the bars that closed while the socket was
+                    # down go on before any socket bar of the new subscription.
+                    # A query that fails leaves the gap unanswered, so the
+                    # stream must not go on over it: another reconnect round.
+                    if core_recovery:
+                        try:
+                            recovered = await _query_history(None)
+                        except Exception as fill_err:
+                            log = (
+                                logger.warning
+                                if _warn_this_attempt(attempts)
+                                else logger.debug
+                            )
+                            log(
+                                "Reconnect gap fill failed (attempt %d, offline %.0fs): %s",
+                                attempts,
+                                time.time() - (outage_started or time.time()),
+                                fill_err,
+                            )
+                            connection_error = fill_err
+                            continue
+                        if recovered is None:
+                            return attempts, True
+                        if recovered:
+                            broker_info(
+                                "reconnect gap: recovered %d closed bar(s) missed "
+                                "while the feed was down",
+                                len(recovered),
+                            )
+                        history_close_streak = 0
                     # Give the freshly (re)subscribed feed a full
                     # staleness window to deliver before the liveness
                     # watchdog may declare it dead again.
@@ -1526,43 +1733,83 @@ def live_ohlcv_generator(
                         break
                     continue
 
+                # Missed-close probe: ask the history for the awaited slot's
+                # close once its query is due. Only while the query can run
+                # (connected, slot in session), so a probe that cannot run does
+                # not shorten the wait below.
+                probe_due_ms = float("inf")
+                awaited_slot = _awaited_slot() if boundary_watchdog else None
+                if core_recovery:
+                    _sync_probe(awaited_slot)
+                    if (awaited_slot is not None and provider.is_connected
+                            and _market_open_at(awaited_slot)):
+                        probe_due_ms = probe_next_ms
+                    if awaited_slot is not None and time.time() * 1000.0 >= probe_due_ms:
+                        if await _probe_missed_close(awaited_slot):
+                            pending_connection_error = ConnectionError(
+                                f"stale subscription: {_STALE_HISTORY_CLOSES} consecutive "
+                                f"closes came from the history, none from the socket"
+                            )
+                        continue
+
                 # Cap the per-iteration wait at 2 s for the existing
                 # is_connected healthcheck cadence; if a missed-bar
-                # deadline falls sooner, shorten the wait so synthesis
-                # fires promptly when the WS goes idle.
-                if boundary_watchdog and last_closed_bar is not None:
-                    boundary_deadline_ms = (
-                        last_closed_bar.timestamp + 2 * tf_ms + bar_grace_ms
-                    )
-                    boundary_remaining = (
-                        boundary_deadline_ms - time.time() * 1000.0
-                    ) / 1000.0
-                else:
-                    boundary_remaining = float("inf")
-                effective_timeout = min(2.0, max(0.05, boundary_remaining))
+                # deadline or a probe falls sooner, shorten the wait so the
+                # watchdog fires promptly when the WS goes idle. A slot that
+                # waits for its history answer leaves the deadline to the probe.
+                next_due_ms = probe_due_ms
+                if (awaited_slot is not None
+                        and not (core_recovery and not probe_answered)):
+                    next_due_ms = min(next_due_ms, awaited_slot + tf_ms + bar_grace_ms)
+                effective_timeout = min(
+                    2.0, max(0.05, (next_due_ms - time.time() * 1000.0) / 1000.0))
+
+                # A held update goes on once the slot it waited behind is settled,
+                # or once the awaited slot is in a closed session, which is never
+                # settled: the same bypass a fresh socket update gets below.
+                replay: OHLCV | None = None
+                if (held_updates and awaited_slot is not None
+                        and (held_updates[0].timestamp <= awaited_slot
+                             or not _market_open_at(awaited_slot))):
+                    replay = held_updates.pop(0)
+                # While updates are held, a busy socket must not starve the
+                # watchdog, which only runs when a read times out: once the
+                # history has answered for the awaited slot and its deadline
+                # passed, the slot is settled before the socket is read again.
+                settle_now = (
+                    replay is None and bool(held_updates) and probe_answered
+                    and awaited_slot is not None
+                    and time.time() * 1000.0 >= awaited_slot + tf_ms + bar_grace_ms)
 
                 try:
-                    bar_update = await asyncio.wait_for(
-                        provider.watch_ohlcv(watch_symbol, timeframe),
-                        timeout=effective_timeout,
-                    )
-                    last_real_update = time.time()
-                    if reconnect_attempts:
-                        # Data-level recovery marker: ``Reconnected
-                        # successfully`` above only proves the socket came
-                        # back, not that data flows again (a reconnect can
-                        # succeed onto a feed that stays silent). This is
-                        # the line that closes an outage in the log, so it
-                        # is WARNING like the failure lines it answers.
-                        logger.warning(
-                            "Live feed restored after %d reconnect attempt(s)"
-                            " (offline %.0fs)",
-                            reconnect_attempts,
-                            time.time() - (outage_started or time.time()),
+                    if settle_now:
+                        raise asyncio.TimeoutError
+                    if replay is not None:
+                        bar_update = replay
+                    else:
+                        bar_update = await asyncio.wait_for(
+                            provider.watch_ohlcv(watch_symbol, timeframe),
+                            timeout=effective_timeout,
                         )
-                        outage_started = None
-                        _report('live')
-                    reconnect_attempts = 0
+                        last_real_update = time.time()
+                        if reconnect_attempts:
+                            # Data-level recovery marker: ``Reconnected
+                            # successfully`` above only proves the socket came
+                            # back, not that data flows again (a reconnect can
+                            # succeed onto a feed that stays silent). This is
+                            # the line that closes an outage in the log, so it
+                            # is WARNING like the failure lines it answers.
+                            logger.warning(
+                                "Live feed restored after %d reconnect attempt(s)"
+                                " (offline %.0fs)",
+                                reconnect_attempts,
+                                time.time() - (outage_started or time.time()),
+                            )
+                            outage_started = None
+                            _report('live')
+                        reconnect_attempts = 0
+                        if socket_seen_ts is None or bar_update.timestamp > socket_seen_ts:
+                            socket_seen_ts = bar_update.timestamp
 
                     # Filter duplicates from the historical phase. Strict
                     # ``<`` for closed bars too: see module docstring on
@@ -1574,6 +1821,21 @@ def live_ohlcv_generator(
                         ts = bar_update.timestamp
                         if ts < last_historical_timestamp:
                             continue
+
+                    # An update of a later slot while the awaited slot is not
+                    # settled waits behind it (see ``held_updates``). A slot in a
+                    # closed session is never settled: the first bar after the
+                    # reopen goes on as before.
+                    if (core_recovery and awaited_slot is not None
+                            and bar_update.timestamp > awaited_slot
+                            and _market_open_at(awaited_slot)):
+                        if (not bar_update.is_closed and held_updates
+                                and not held_updates[-1].is_closed
+                                and held_updates[-1].timestamp == bar_update.timestamp):
+                            held_updates[-1] = bar_update
+                        else:
+                            held_updates.append(bar_update)
+                        continue
 
                     # In-stream dedup against the boundary watchdog:
                     # if a real ``ohlc.event`` arrives late (past
@@ -1593,6 +1855,7 @@ def live_ohlcv_generator(
                     if bar_update.is_closed:
                         last_closed_bar = bar_update
                         synth_streak = 0
+                        history_close_streak = 0
                         # A real close for this slot (or a newer one)
                         # supersedes the tracked forming bar — drop it so
                         # the watchdog never re-finalises an already-closed
@@ -1629,10 +1892,8 @@ def live_ohlcv_generator(
                         put_t0 = time.monotonic()
                         bar_queue.put(bar_update)
                         put_ms = (time.monotonic() - put_t0) * 1000.0
-                        catching_up = (
-                            time.time() * 1000.0 - bar_update.timestamp
-                            > 2 * tf_ms + bar_grace_ms
-                        )
+                        catching_up = is_catch_up(bar_update.timestamp, tf_seconds,
+                                                  time.time() * 1000.0)
                         lagging = put_ms > 100.0 or (
                             qsize_before > 50 and not catching_up
                         )
@@ -1687,17 +1948,19 @@ def live_ohlcv_generator(
                             bar_queue.put_nowait(bar_update)
 
                 except asyncio.TimeoutError:
-                    # Boundary watchdog: if the next-bar close has passed
-                    # by more than ``bar_grace`` without a real WS bar,
-                    # synthesise a zero-volume filler. Emits exactly one
-                    # missed bar per timeout; the next iteration re-checks
-                    # against ``time.time()`` and either fills the next
-                    # gap or waits for a real push.
-                    if (boundary_watchdog and last_closed_bar is not None
+                    # Boundary watchdog: if the awaited slot's close has
+                    # passed by more than the grace without a real WS bar,
+                    # settle the slot: finalize its forming bar, or emit a
+                    # zero-volume filler, or none when the venue's history
+                    # has no bar for an idle slot. Settles exactly one slot
+                    # per timeout; the next iteration re-checks against
+                    # ``time.time()`` and either settles the next slot or
+                    # waits for a real push.
+                    if (awaited_slot is not None
                             and time.time() * 1000.0
-                            >= last_closed_bar.timestamp
-                            + 2 * tf_ms + bar_grace_ms):
-                        synth_ts = last_closed_bar.timestamp + tf_ms
+                            >= awaited_slot + tf_ms + bar_grace_ms):
+                        assert last_closed_bar is not None
+                        synth_ts = awaited_slot
                         # Session-gate: never synthesise a bar for a slot
                         # that the symbol's opening_hours calendar marks
                         # as closed. Without this gate the framework would
@@ -1797,6 +2060,26 @@ def live_ohlcv_generator(
                             # the next iteration's top-of-loop dispatch
                             # drives the reconnect path.
                             continue
+                        # The history has not answered for this slot yet (every
+                        # query failed, or none could run): a slot the venue may
+                        # well have a bar for is neither finalized nor filled.
+                        # The probe goes on at the provider's backoff, and a
+                        # dead feed still reconnects, whose gap fill answers.
+                        if core_recovery and (probe_slot != synth_ts or not probe_answered):
+                            if not provider.is_connected:
+                                pending_connection_error = ConnectionError(
+                                    "Provider reports disconnected state"
+                                )
+                            elif (feed_stale_after is not None
+                                    and time.time() - last_real_update
+                                    >= feed_stale_after
+                                    and _market_open_now()):
+                                pending_connection_error = ConnectionError(
+                                    f"feed stale: no data from provider for "
+                                    f"{time.time() - last_real_update:.0f}s "
+                                    f"during open session"
+                                )
+                            continue
                         # Real-data finalisation: if the provider already
                         # delivered a forming bar for exactly this slot,
                         # close it with its accumulated OHLCV instead of
@@ -1860,6 +2143,15 @@ def live_ohlcv_generator(
                                 f"{time.time() - last_real_update:.0f}s "
                                 f"during open session"
                             )
+                            continue
+                        # An idle slot on a venue whose history has no bar for
+                        # it: no bar here either, so the stream is the series a
+                        # restart replays from the history. The watchdog moves
+                        # on to the next slot; the cursor and ``bar_index`` stay.
+                        if not history_has_idle_bars:
+                            empty_slot_ts = synth_ts
+                            logger.debug("idle slot ts=%d left empty: the venue's history "
+                                         "has no bar for a slot without trades", synth_ts)
                             continue
                         last_close = last_closed_bar.close
                         # The ask side freezes the same way as the bid side

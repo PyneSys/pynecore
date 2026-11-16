@@ -86,6 +86,7 @@ from .security import (
     same_calendar,
 )
 from .live_ltf_collector import LiveLtfCollector
+from .live_timing import close_grace_seconds
 from .plugin.live_provider import LiveProviderPlugin, PluginSymbol
 from .security_mp import apply_child_run_env
 
@@ -1039,10 +1040,7 @@ def security_process_main(
             syminfo = live_provider.update_symbol_info()
 
         tf_seconds = _in_seconds(data_source.timeframe)
-        # Mirror ``live_runner.bar_grace`` — 15..30s tracks how long an
-        # exchange typically lags between bar close and WS publish, scaled
-        # to the bar period (sub-15s windows would race against jitter).
-        live_bar_grace_seconds = max(15.0, min(tf_seconds * 0.5, 30.0))
+        live_bar_grace_seconds = close_grace_seconds(tf_seconds)
         time_to = datetime.now(UTC)
         warmup_horizon_ms = int(time_to.timestamp() * 1000)
         time_from = _warmup_start(data_source.time_from, data_source.timeframe, time_to)

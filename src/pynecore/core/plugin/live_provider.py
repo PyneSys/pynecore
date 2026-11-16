@@ -170,6 +170,36 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
     covers the dead-feed case.
     """
 
+    history_has_idle_bars: bool = True
+    """Whether the venue's history has a bar for a slot without trades.
+
+    Decides what the boundary watchdog does with a slot that got neither a close
+    nor a single update by its deadline. ``True``: the history returns a
+    zero-volume bar for such a slot, so the stream emits the same bar (a
+    zero-volume filler at the previous close). ``False``: the history has no bar
+    there, so the stream emits none either and ``bar_index`` does not step, the
+    same series a restart would replay from the history.
+    """
+
+    history_publish_lag: float = 10.0
+    """Seconds after a bar's close until :meth:`backfill_closed_bars` returns it.
+
+    The framework asks the history for a close the stream missed no earlier than
+    this long after the scheduled close, so a quiet market costs a few queries per
+    bar instead of one per poll.
+    """
+
+    core_stream_recovery: bool = False
+    """Whether the framework recovers the running stream's missed closes from history.
+
+    When ``True``, the framework queries :meth:`backfill_closed_bars` for a close
+    the socket has not delivered by :attr:`history_publish_lag` past the bar's
+    close, fills the gap after every reconnect before the stream goes on, and
+    reconnects when consecutive closes came only from the history. A provider that
+    recovers missed closes inside its own :meth:`watch_ohlcv` and reconnect
+    handling keeps it ``False``, so one slot is not recovered twice.
+    """
+
     # --- Connection lifecycle ---
 
     @abstractmethod
@@ -208,9 +238,8 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
         :return: An :class:`OHLCV` with ``is_closed=True`` for a final bar, ``False`` for intra-bar updates.
         """
 
-    # --- Startup gap recovery ---
+    # --- Closed-bar gap recovery ---
 
-    # noinspection PyMethodMayBeStatic
     async def backfill_closed_bars(
             self, symbol: str, timeframe: str, since_ms: int,
     ) -> list[OHLCV]:
@@ -223,11 +252,18 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
         the subscription comes up and splices the result between the warmup and
         the stream. A slow handshake is enough to lose a bar — measured on a
         live cTrader lane, a 20 s subscribe silently dropped one M1 bar while
-        the same run on Bybit (1 s subscribe) lost none.
+        the same run on Bybit (1 s subscribe) lost none. With
+        :attr:`core_stream_recovery` it is also called after every reconnect
+        and for a close the socket missed, and a consumer may request it at
+        any time, so it must be a pure query: any number of calls, in any
+        order, leave the provider's state as it was.
 
         Implementations should return only bars that are genuinely closed,
         strictly after ``since_ms``, in ascending timestamp order. Returning
         the still-forming bar would hand the strategy a partial bar as final.
+        An empty list is the venue's answer that it has no such bar; a query
+        the venue did not answer must raise instead. The framework retries a
+        raised query and does not go on over the gap meanwhile.
 
         The default returns nothing, which keeps the historical behaviour for
         providers that cannot query history on the live connection.
@@ -250,7 +286,6 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
 
     # --- Shutdown hooks ---
 
-    # noinspection PyMethodMayBeStatic
     async def can_shutdown(self) -> bool:
         """
         Whether the provider is ready to shut down.

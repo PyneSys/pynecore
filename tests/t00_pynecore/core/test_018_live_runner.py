@@ -2348,16 +2348,31 @@ def __test_startup_gap_drops_stale_and_unclosed_recovered_bars__():
     assert [bar.timestamp for bar in catchup + live] == [3000, 4000]
 
 
-def __test_startup_gap_failure_does_not_stop_the_run__():
-    """A failed history query logs and continues — it must not strand the bot."""
-    provider = _BackfillProvider(
-        [_make_ohlcv(4000, close=400.0)], [], failure=RuntimeError("history down"),
+class _FlakyBackfillProvider(_BackfillProvider):
+    """Provider whose history query fails a number of times before it answers."""
+
+    def __init__(self, bar_updates: list[OHLCV], recovered: list[OHLCV], failing_calls: int):
+        super().__init__(bar_updates, recovered, failure=RuntimeError("history down"))
+        self._failing_calls = failing_calls
+
+    async def backfill_closed_bars(self, symbol: str, timeframe: str,
+                                   since_ms: int) -> list[OHLCV]:
+        if len(self.backfill_calls) >= self._failing_calls:
+            self._failure = None
+        return await super().backfill_closed_bars(symbol, timeframe, since_ms)
+
+
+def __test_startup_gap_failure_is_retried_before_the_live_stream__():
+    """A failed history query is retried; no live bar goes on over the unanswered gap"""
+    provider = _FlakyBackfillProvider(
+        [_make_ohlcv(4000, close=400.0)], [_make_ohlcv(2000, close=200.0)], failing_calls=2,
     )
 
     catchup, live = _drain(provider, "BTC/USDT", "1D",
                            last_historical_timestamp=1000)
 
-    assert [bar.timestamp for bar in catchup + live] == [4000]
+    assert [bar.timestamp for bar in catchup + live] == [2000, 4000]
+    assert provider.backfill_calls == [("BTC/USDT", "1D", 1000)] * 3
 
 
 def __test_startup_gap_skipped_when_no_full_bar_could_have_closed__():
