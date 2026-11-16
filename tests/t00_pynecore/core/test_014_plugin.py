@@ -252,7 +252,7 @@ def __test_plugin_symbol_is_picklable__():
     ps = PluginSymbol(
         provider_name="cc",
         symbol="EURUSD",
-        timeframe="1h",
+        timeframe="60",
         config=cfg,
     )
     blob = pickle.dumps(ps)

@@ -2,7 +2,7 @@
 Async/sync bridge for live data streaming.
 
 Runs a LiveProviderPlugin's async watch_ohlcv() in a background thread
-and yields OHLCV objects to the synchronous ScriptRunner via queue.Queue.
+and yields OHLCV objects to the synchronous ScriptRunner via queue.SimpleQueue.
 
 Serial startup: ``live_ohlcv_generator()`` starts the background thread
 **and blocks until ``provider.connect()`` succeeds** before returning.
@@ -26,6 +26,15 @@ empties, ``LIVE_TRANSITION`` is yielded inline; the script_runner flips
 to live mode and every subsequent bar runs against an unsuppressed
 strategy.
 
+Gap fill: closed bars a provider returns from its history
+(:meth:`LiveProviderPlugin.backfill_closed_bars`) enter the stream through the
+same closed-bar cursor as the socket's closes — a closed bar is handed on only
+when it is newer than every closed bar handed on before it. The startup gap
+between the warmup history and the subscription is filled this way, and so is
+any later fill a consumer requests through :class:`ClosedBarBackfill`, so a
+history bar and the socket's close of the same or a neighbouring slot reach the
+consumer once and in order, whichever arrives first.
+
 Dedup: the duplicate-filter for ``last_historical_timestamp`` uses
 **strict** less-than for both closed bars and intra-bar updates. The
 plugin contract is that ``download_ohlcv`` returns fully-closed bars
@@ -45,9 +54,10 @@ import sys
 import time
 import threading
 from collections.abc import Callable, Coroutine, Generator
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime
-from queue import Queue, Empty, Full
+from queue import Queue, SimpleQueue, Empty
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -61,7 +71,7 @@ from pynecore.core.session import is_in_session, is_point_in_session
 from pynecore.lib.timeframe import _in_seconds
 
 __all__ = ['live_ohlcv_generator', 'download_warmup_in_memory', 'LiveBarStreamer', 'FeedStatus',
-           'LiveStop']
+           'LiveStop', 'ClosedBarBackfill']
 
 
 class LiveStop:
@@ -109,6 +119,65 @@ class LiveStop:
                 self._wakers.remove(wake)
 
 
+class ClosedBarBackfill:
+    """A request line into a running live stream's closed-bar gap fill.
+
+    :func:`live_ohlcv_generator` fills the gap between the warmup history and the
+    subscription from the provider's history at startup. A consumer that misses a
+    close later — a ``request.security`` round whose target bar the venue publishes
+    late — asks for the same fill again through this object, from any thread. The
+    stream runs the query on its own event loop and splices the result through its
+    closed-bar cursor, so the bars reach the stream's own output once and in order
+    next to the socket's closes; the request only reports how many of them passed.
+
+    The stream binds the object while it runs (:meth:`attach`) and releases it when it
+    ends (:meth:`detach`); between the two :meth:`request` returns ``None``.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._fill: Callable[[int | None], Coroutine[Any, Any, int]] | None = None
+
+    def attach(self, loop: asyncio.AbstractEventLoop,
+               fill: Callable[[int | None], Coroutine[Any, Any, int]]) -> None:
+        """Bind the stream that serves the requests.
+
+        :param loop: The event loop the stream's provider runs on.
+        :param fill: ``(since_ms) -> accepted count``: the stream's gap fill.
+        """
+        with self._lock:
+            self._loop = loop
+            self._fill = fill
+
+    def detach(self) -> None:
+        """Release the stream; later requests return ``None``."""
+        with self._lock:
+            self._loop = None
+            self._fill = None
+
+    def request(self, since_ms: int | None) -> 'Future[int] | None':
+        """Ask the stream for the closed bars after ``since_ms``.
+
+        :param since_ms: Open of the newest closed bar the consumer holds, ``None``
+            when it holds none. The query starts after the newer of this and the
+            stream's own cursor.
+        :return: The pending fill, resolving to the number of bars the stream handed
+            on; ``None`` while no stream is bound.
+        """
+        with self._lock:
+            loop, fill = self._loop, self._fill
+        if loop is None or fill is None:
+            return None
+        query = fill(since_ms)
+        try:
+            return asyncio.run_coroutine_threadsafe(query, loop)
+        except RuntimeError:
+            # The loop closed between the bind check and the submission
+            query.close()
+            return None
+
+
 @dataclass(frozen=True)
 class FeedStatus:
     """A state change of a live feed, reported by :func:`live_ohlcv_generator`.
@@ -144,22 +213,44 @@ class LiveBarStreamer:
     :func:`request.security_lower_tf` carries the forming bar as the developing
     last element of its intrabar window. The warmup→live transition sentinel is
     dropped (the subprocess does not switch modes mid-run).
+
+    A close the stream is late with can be asked for from the provider's history
+    (:meth:`request_backfill`); the bars it recovers come through the same queue,
+    behind the stream's closed-bar cursor.
     """
 
     def __init__(self, provider: LiveProviderPlugin, symbol: str, timeframe: str,
                  *, syminfo: SymInfo | None = None,
-                 last_historical_timestamp: int | None = None):
+                 last_historical_timestamp: int | None = None,
+                 boundary_watchdog: bool = True):
+        """
+        :param provider: The stream's provider instance.
+        :param symbol: Symbol in provider-specific format.
+        :param timeframe: Timeframe in TradingView format.
+        :param syminfo: The symbol's metadata, for the session-gated parts of the stream.
+        :param last_historical_timestamp: Open of the newest bar the caller already holds.
+        :param boundary_watchdog: Let the stream close a slot it received no close for
+            (:func:`live_ohlcv_generator`); ``False`` when the caller asks the history
+            for a late close (:meth:`request_backfill`) instead.
+        """
         self._provider = provider
         self._symbol = symbol
         self._timeframe = timeframe
         self._syminfo = syminfo
         self._last_historical_timestamp = last_historical_timestamp
-        self._queue: Queue[OHLCV] = Queue()
+        self._boundary_watchdog = boundary_watchdog
+        # Closed bars, and ``None`` as a wake-up without a bar (a finished gap
+        # fill): it ends a ``wait_for_bars`` early with an empty batch.
+        self._queue: Queue[OHLCV | None] = Queue()
+        self._backfill = ClosedBarBackfill()
         # Latest still-forming bar, overwritten in place by the drain thread and
         # read by the subprocess via ``peek_developing_bar``. A single reference
         # assignment/read is atomic under the GIL, so no lock is needed.
         self._developing: OHLCV | None = None
         self._stopped = threading.Event()
+        # Wakes the stream's consumer, which the drain thread is parked in, so
+        # :meth:`stop` ends the stream instead of racing the running generator.
+        self._live_stop = LiveStop()
         self._gen: Generator[OHLCV, None, None] | None = None
         self._thread: threading.Thread | None = None
         # Captures an exception raised by the upstream generator so the
@@ -179,6 +270,9 @@ class LiveBarStreamer:
             timeframe=self._timeframe,
             syminfo=self._syminfo,
             last_historical_timestamp=self._last_historical_timestamp,
+            stop=self._live_stop,
+            backfill=self._backfill,
+            boundary_watchdog=self._boundary_watchdog,
         )
         thread = threading.Thread(
             target=self._drain, daemon=True, name=f"sec-stream-{self._symbol}",
@@ -227,9 +321,11 @@ class LiveBarStreamer:
         out: list[OHLCV] = []
         while True:
             try:
-                out.append(self._queue.get_nowait())
+                bar = self._queue.get_nowait()
             except Empty:
                 break
+            if bar is not None:
+                out.append(bar)
         if not out and self._drain_error is not None:
             err = self._drain_error
             # Single-shot raise so a re-tried call (e.g. after restart)
@@ -265,6 +361,9 @@ class LiveBarStreamer:
         first one arrives so a single call still returns the full batch.
         Re-raises a captured drain error using the same single-shot
         semantics as :meth:`pop_new_closed_bars`.
+
+        A finished :meth:`request_backfill` ends the wait early, possibly with an
+        empty batch, so an empty result does not mean the timeout passed.
         """
         out: list[OHLCV] = []
         try:
@@ -275,28 +374,51 @@ class LiveBarStreamer:
                 self._drain_error = None
                 raise err
             return out
-        out.append(first)
+        if first is not None:
+            out.append(first)
         while True:
             try:
-                out.append(self._queue.get_nowait())
+                bar = self._queue.get_nowait()
             except Empty:
                 break
+            if bar is not None:
+                out.append(bar)
         return out
+
+    def request_backfill(self, since_ms: int | None) -> 'Future[int] | None':
+        """Ask the provider's history for the closed bars after ``since_ms``.
+
+        The recovered bars arrive through :meth:`wait_for_bars` like the stream's
+        own closes; a bar the stream has already delivered, or delivers first, is
+        not delivered twice. The fill's completion wakes a pending
+        :meth:`wait_for_bars`.
+
+        :param since_ms: Open of the newest closed bar the caller holds, ``None``
+            when it holds none.
+        :return: The pending fill, resolving to the number of bars it delivered;
+            ``None`` while the stream is not connected.
+        """
+        future = self._backfill.request(since_ms)
+        if future is not None:
+            future.add_done_callback(self._wake_on_fill)
+        return future
+
+    def _wake_on_fill(self, _future: 'Future[int]') -> None:
+        self._queue.put(None)
 
     def stop(self) -> None:
         """Signal the drain thread to exit and close the upstream generator.
 
-        The drain thread is typically parked inside ``next(self._gen)`` at
-        this point. Calling ``self._gen.close()`` from a *different* thread
-        while the generator is suspended on a ``yield`` is supported, but
-        if the runtime considers the generator to be executing on the drain
-        side (race with the moment a bar is being yielded), CPython raises
-        ``ValueError: generator already executing``. The drain thread will
-        eventually return on its own once ``self._stopped`` is observed, so
-        swallow the race here and rely on the ``join`` below to finish
-        cleanup.
+        The drain thread is typically parked inside ``next(self._gen)``, in the
+        stream's wait for its next update, where ``self._gen.close()`` from this
+        thread only raises ``ValueError: generator already executing``. The
+        :class:`LiveStop` wakes that wait, the stream ends and tears itself down,
+        and the drain loop returns. The close is kept for a generator suspended
+        on a ``yield``; its race is swallowed and the ``join`` below finishes
+        the cleanup.
         """
         self._stopped.set()
+        self._live_stop.set()
         if self._gen is not None:
             try:
                 self._gen.close()
@@ -580,12 +702,14 @@ def live_ohlcv_generator(
         on_interrupt: Callable[[], None] | None = None,
         on_feed_status: Callable[[FeedStatus], None] | None = None,
         stop: LiveStop | None = None,
+        backfill: ClosedBarBackfill | None = None,
+        boundary_watchdog: bool = True,
 ) -> Generator[OHLCV, None, None]:
     """
     Bridge async watch_ohlcv() to a sync Generator[OHLCV, None, None].
 
     Spawns a background thread running asyncio, collects OHLCV objects
-    via queue.Queue, and yields them including intra-bar updates.
+    via queue.SimpleQueue, and yields them including intra-bar updates.
 
     The background thread is started **eagerly** at call time, not on
     first ``next()`` — so the WS subscription is open during warmup and
@@ -643,6 +767,18 @@ def live_ohlcv_generator(
     :param stop: Ends the iterator when set, from any thread, the same way the stream
                  ends on its own: no :class:`KeyboardInterrupt`, the teardown runs. The
                  updates still queued are dropped.
+    :param backfill: Bound to the stream while it is connected, so a consumer can ask for
+                     the closed bars after its newest one from the provider's history
+                     (:meth:`LiveProviderPlugin.backfill_closed_bars`). They are spliced in
+                     through the same closed-bar cursor as the startup gap and the socket's
+                     closes.
+    :param boundary_watchdog: Close a slot the stream received no close for once its
+                              grace is over: the forming bar is finalized, an idle slot
+                              gets a zero-volume filler. ``False`` for a consumer that
+                              recovers a missed close itself through ``backfill`` (a live
+                              ``request.security`` context): there a close that is only
+                              late must not be replaced by a filler before the history
+                              has it. The feed-liveness checks run either way.
     :return: Iterator yielding OHLCV objects (both closed and intra-bar) interleaved
              with a single ``LIVE_TRANSITION`` sentinel marking the warmup→live boundary.
     """
@@ -660,7 +796,14 @@ def live_ohlcv_generator(
     # ``_INTRA_BAR_SOFT_CAP`` below) so advisory ticks cannot pile up
     # ahead of closed bars when the consumer lags. The closed-bar
     # ``broker_warning`` in the put path below flags any consumer lag.
-    bar_queue: Queue[OHLCV | BaseException] = Queue()
+    # A ``SimpleQueue``, because the consumer's wait is where a Ctrl-C lands: its
+    # ``get`` blocks in C, so a KeyboardInterrupt, or a repeated one raised while
+    # the first is still unwinding, leaves it at once. ``Queue.get`` waits on a
+    # ``threading.Condition`` written in Python, and an interrupt between its
+    # release and reacquire of the queue's lock ends the ``with`` block on a lock
+    # it no longer holds: ``RuntimeError: release unlocked lock`` replaces the
+    # KeyboardInterrupt and the run dies with a traceback instead of stopping.
+    bar_queue: SimpleQueue[OHLCV | BaseException] = SimpleQueue()
     stop_event = threading.Event()
     # Loop-side mirror of ``stop_event`` so an ``await`` running on the broker
     # loop (the reconnect ``connect()`` / ``on_reconnect()`` handshake) can be
@@ -978,14 +1121,15 @@ def live_ohlcv_generator(
         # synth. Cleared when a closed bar supersedes its slot or once it
         # has been finalised.
         last_forming_bar: OHLCV | None = None
-        # Newest slot the boundary watchdog closed itself (from the forming
-        # bar or as a V=0 synth), and the newest one whose late intra-bar
-        # updates were already reported. A feed that stalls past the grace
-        # and then flushes its backlog delivers that slot's ticks after the
-        # watchdog settled it (live: bybit cycle 402, 2026-11-12, ~90 s of
-        # silence on ETHUSDT.P): they are dropped here as late, not handed to
-        # the consumer as a provider mis-stamping its forming bar.
-        watchdog_settled_ts: int | None = None
+        # Newest slot the framework closed without the stream's close event —
+        # the boundary watchdog (from the forming bar or as a V=0 synth) or the
+        # history gap fill — and the newest one whose late intra-bar updates
+        # were already reported. A feed that stalls past the grace and then
+        # flushes its backlog delivers that slot's ticks after it was settled
+        # (live: bybit cycle 402, 2026-11-12, ~90 s of silence on ETHUSDT.P):
+        # they are dropped here as late, not handed to the consumer as a
+        # provider mis-stamping its forming bar.
+        settled_ts: int | None = None
         late_ticks_reported_ts: int | None = None
         # Tracks whether the last observed market state was open. Flips to
         # False on the first synth-skip in a closed period (emits a single
@@ -1118,6 +1262,82 @@ def live_ohlcv_generator(
             _report('live')
             last_real_update = time.time()
 
+            history_query = getattr(provider, "backfill_closed_bars", None)
+
+            def _splice_closed(bars: list[OHLCV], since_ms: int) -> int:
+                """Hand on the closed history bars the stream has not, in order.
+
+                The one entry point of history bars into the stream, and the
+                closed-bar cursor the socket's closes are checked against too: a
+                bar passes only when it is closed, newer than ``since_ms``, the
+                warmup history and every closed bar handed on before it. A
+                history bar and the socket's close of the same slot can come in
+                either order — whichever arrives first is the slot's close, the
+                other is dropped — and a slot the cursor already passed is never
+                handed on behind a newer one. A slot settled this way also ends
+                its forming bar: late ticks of it are dropped like after the
+                boundary watchdog. Runs without an ``await``, so the socket loop
+                cannot interleave with it.
+
+                :param bars: The provider's answer, in any order.
+                :param since_ms: The bar open the query asked after.
+                :return: The number of bars handed on.
+                """
+                nonlocal last_closed_bar, last_forming_bar, settled_ts, synth_streak
+                accepted = 0
+                for history_bar in sorted(bars, key=lambda b: b.timestamp):
+                    if not history_bar.is_closed or history_bar.timestamp <= since_ms:
+                        continue
+                    if (last_historical_timestamp is not None
+                            and history_bar.timestamp <= last_historical_timestamp):
+                        continue
+                    if (last_closed_bar is not None
+                            and history_bar.timestamp <= last_closed_bar.timestamp):
+                        continue
+                    last_closed_bar = history_bar
+                    settled_ts = history_bar.timestamp
+                    synth_streak = 0
+                    if (last_forming_bar is not None
+                            and history_bar.timestamp >= last_forming_bar.timestamp):
+                        last_forming_bar = None
+                    bar_queue.put(history_bar)
+                    accepted += 1
+                return accepted
+
+            async def _fill_from_history(since_ms: int | None) -> int:
+                """Query the provider for the closed bars after the cursor and splice them.
+
+                The query starts after the newest of ``since_ms``, the warmup
+                history and the stream's last closed bar: everything up to that
+                is already on its way to the consumer. Raced against the
+                shutdown signal, so a stalled history query cannot keep a stop
+                waiting. A provider failure propagates to the caller.
+
+                :param since_ms: Open of the newest closed bar the consumer holds,
+                    ``None`` when it holds none.
+                :return: The number of bars handed on.
+                """
+                query = history_query
+                if query is None:
+                    return 0
+                floors = [stamp for stamp in (
+                    since_ms, last_historical_timestamp,
+                    None if last_closed_bar is None else last_closed_bar.timestamp,
+                ) if stamp is not None]
+                if not floors:
+                    return 0
+                floor = max(floors)
+                recovered: list[OHLCV] = []
+
+                async def _run_query(
+                        run: Callable[[str, str, int], Coroutine[Any, Any, list[OHLCV]]],
+                ) -> None:
+                    recovered.extend(await run(watch_symbol, timeframe, floor))
+
+                if await _await_or_stop(_run_query(query)):
+                    return 0
+                return _splice_closed(recovered, floor)
+
             # Startup gap: the warmup download stopped at
             # ``last_historical_timestamp`` and the stream only delivers from
             # now on, so every bar that closed while the subscription was
@@ -1125,57 +1345,34 @@ def live_ohlcv_generator(
             # before the first live bar, so the strategy sees one unbroken
             # series. Providers that cannot query history return nothing and
             # keep the previous behaviour.
-            backfill_closed_bars = getattr(provider, "backfill_closed_bars", None)
             if (last_historical_timestamp is not None and tf_ms > 0
-                    and backfill_closed_bars is not None):
+                    and history_query is not None):
                 elapsed_ms = time.time() * 1000.0 - last_historical_timestamp
                 # A whole bar must have closed past the warmup before anything
                 # can be missing.
                 if elapsed_ms >= 2 * tf_ms:
-                    recovered: list[OHLCV] = []
-
-                    async def _run_backfill(
-                            query: Callable[[str, str, int], Coroutine[Any, Any, list[OHLCV]]],
-                            since_ms: int,
-                    ) -> None:
-                        recovered.extend(await query(watch_symbol, timeframe, since_ms))
-
-                    # Raced against the shutdown signal: a stalled history
-                    # query must not keep a stop waiting for the whole join
-                    # timeout. A stop that wins abandons the query, and the
-                    # main loop below exits on ``stop_event`` at once.
                     try:
-                        await _await_or_stop(_run_backfill(
-                            backfill_closed_bars, last_historical_timestamp))
+                        recovered_count = await _fill_from_history(None)
                     except Exception as exc:
                         # Recovery is best-effort: a bot that refuses to start
                         # because a history query failed is worse than one that
                         # starts with a logged hole.
-                        recovered.clear()
+                        recovered_count = 0
                         broker_warning(
                             "startup gap recovery failed: %s — starting anyway,"
                             " any bar missed during subscribe stays missing",
                             exc,
                         )
-                    recovered_count = 0
-                    for recovered_bar in recovered:
-                        if (not recovered_bar.is_closed
-                                or recovered_bar.timestamp
-                                <= last_historical_timestamp):
-                            continue
-                        if (last_closed_bar is not None
-                                and recovered_bar.timestamp
-                                <= last_closed_bar.timestamp):
-                            continue
-                        last_closed_bar = recovered_bar
-                        bar_queue.put(recovered_bar)
-                        recovered_count += 1
                     if recovered_count:
                         broker_info(
                             "startup gap: recovered %d closed bar(s) between "
                             "the warmup history and the live stream",
                             recovered_count,
                         )
+
+            # Later fills on a consumer's request run through the same splice
+            if backfill is not None:
+                backfill.attach(asyncio.get_running_loop(), _fill_from_history)
 
             # Broker mode: attach the Order Sync Engine's event stream as
             # a background task so OrderEvents land in its queue without
@@ -1333,7 +1530,7 @@ def live_ohlcv_generator(
                 # is_connected healthcheck cadence; if a missed-bar
                 # deadline falls sooner, shorten the wait so synthesis
                 # fires promptly when the WS goes idle.
-                if last_closed_bar is not None:
+                if boundary_watchdog and last_closed_bar is not None:
                     boundary_deadline_ms = (
                         last_closed_bar.timestamp + 2 * tf_ms + bar_grace_ms
                     )
@@ -1458,14 +1655,14 @@ def live_ohlcv_generator(
                             )
                             backpressure_reported = False
                             backpressure_peak = 0
-                    elif (watchdog_settled_ts is not None
-                            and bar_update.timestamp <= watchdog_settled_ts):
-                        if late_ticks_reported_ts != watchdog_settled_ts:
-                            late_ticks_reported_ts = watchdog_settled_ts
+                    elif (settled_ts is not None
+                            and bar_update.timestamp <= settled_ts):
+                        if late_ticks_reported_ts != settled_ts:
+                            late_ticks_reported_ts = settled_ts
                             broker_info(
                                 "late intra-bar updates for ts=%d after the "
-                                "boundary watchdog closed it — dropped (the "
-                                "feed delivered them past the bar's close)",
+                                "framework closed it — dropped (the feed "
+                                "delivered them past the bar's close)",
                                 bar_update.timestamp,
                             )
                     else:
@@ -1487,10 +1684,7 @@ def live_ohlcv_generator(
                         # unbounded guarantee while intra-bar growth
                         # stays bounded.
                         if bar_queue.qsize() < _INTRA_BAR_SOFT_CAP:
-                            try:
-                                bar_queue.put_nowait(bar_update)
-                            except Full:
-                                pass
+                            bar_queue.put_nowait(bar_update)
 
                 except asyncio.TimeoutError:
                     # Boundary watchdog: if the next-bar close has passed
@@ -1499,7 +1693,7 @@ def live_ohlcv_generator(
                     # missed bar per timeout; the next iteration re-checks
                     # against ``time.time()`` and either fills the next
                     # gap or waits for a real push.
-                    if (last_closed_bar is not None
+                    if (boundary_watchdog and last_closed_bar is not None
                             and time.time() * 1000.0
                             >= last_closed_bar.timestamp
                             + 2 * tf_ms + bar_grace_ms):
@@ -1621,7 +1815,7 @@ def live_ohlcv_generator(
                                 and last_forming_bar.timestamp == synth_ts):
                             finalized = last_forming_bar._replace(is_closed=True)
                             last_closed_bar = finalized
-                            watchdog_settled_ts = finalized.timestamp
+                            settled_ts = finalized.timestamp
                             last_forming_bar = None
                             synth_streak = 0
                             broker_info(
@@ -1684,7 +1878,7 @@ def live_ohlcv_generator(
                                 last_ask.close),
                         )
                         last_closed_bar = synth
-                        watchdog_settled_ts = synth.timestamp
+                        settled_ts = synth.timestamp
                         # Explicit log marker so the V=0 in the next
                         # OHLCV line is unambiguously framework synth,
                         # not a provider-side closed bar whose
@@ -1725,7 +1919,8 @@ def live_ohlcv_generator(
                     elif feed_stale_after is not None:
                         # Feed-liveness watchdog on the regular polling
                         # path (covers the pre-first-bar case too, where
-                        # the boundary watchdog is not armed yet). The
+                        # the boundary watchdog is not armed yet, and a
+                        # stream without the boundary watchdog). The
                         # staleness clock pauses while the market is
                         # closed: silence is legitimate there, and at
                         # reopen the feed gets a fresh window.
@@ -1752,6 +1947,8 @@ def live_ohlcv_generator(
         except Exception as e:
             bar_queue.put(e)
         finally:
+            if backfill is not None:
+                backfill.detach()
             if engine_task is not None and not engine_task.done():
                 engine_task.cancel()
                 try:

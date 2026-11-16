@@ -54,6 +54,7 @@ import copy
 import logging
 import os
 import pickle
+import signal
 import sys
 import threading
 import traceback
@@ -77,6 +78,7 @@ from .security_shm import (
 )
 from .error_location import coded, site_of
 from .errors import PyneError, RUNTIME_ROOTS
+from ..errorcodes import ProviderUnavailableError
 from .security import (
     BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_CLOSED_FROM_FEED, DEV_BATCH_DEVELOPING,
     actual_bar_close,
@@ -84,12 +86,13 @@ from .security import (
     same_calendar,
 )
 from .live_ltf_collector import LiveLtfCollector
-from .plugin.live_provider import PluginSymbol
+from .plugin.live_provider import LiveProviderPlugin, PluginSymbol
 from .security_mp import apply_child_run_env
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
     # noinspection PyProtectedMember
     from multiprocessing.connection import _ConnectionBase
     from multiprocessing.process import BaseProcess
@@ -147,6 +150,19 @@ def _start_parent_death_watchdog() -> None:
                      name="sec-parent-watchdog").start()
 
 
+def _leave_interrupt_to_the_chart() -> None:
+    """Ignore ``SIGINT`` in this security process.
+
+    Ctrl-C reaches the whole process group, this child included, but the chart owns
+    its shutdown: it sets ``stop_event`` and joins, terminating a child that does not
+    leave in time. A KeyboardInterrupt here would only kill the child mid-round and
+    print its traceback over the chart's own stop. A call outside a process started
+    through :mod:`multiprocessing` changes nothing.
+    """
+    if parent_process() is not None:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 # Warmup window for cross-symbol live security contexts. 500 bars matches the
 # chart-side default in ``pyne run`` (``--from -500``); enough to seed any
 # reasonable indicator without burning REST budget on excess history.
@@ -154,6 +170,91 @@ _DEFAULT_WARMUP_BARS = 500
 
 
 # noinspection PyProtectedMember
+def _warmup_start(chart_from: datetime | None, timeframe: str, time_to: datetime) -> datetime:
+    """Where a live security context's REST warmup starts.
+
+    The earlier of the chart's own history start and :data:`_DEFAULT_WARMUP_BARS`
+    bars of the context's timeframe before ``time_to``: a lower-timeframe context
+    still covers the whole chart history, and a higher-timeframe one gets a depth of
+    its own instead of the few bars the chart window holds (a daily context on a
+    50-bar hourly chart would otherwise start with no closed day at all).
+
+    :param chart_from: The chart's history start; naive means UTC. ``None`` when the
+        chart passed none.
+    :param timeframe: The context's timeframe.
+    :param time_to: The end of the warmup window, timezone-aware.
+    :return: The warmup start, timezone-aware.
+    """
+    from pynecore.lib.timeframe import _in_seconds
+    own_depth = time_to - timedelta(seconds=_in_seconds(timeframe) * _DEFAULT_WARMUP_BARS)
+    if chart_from is None:
+        return own_depth
+    if chart_from.tzinfo is None:
+        chart_from = chart_from.replace(tzinfo=UTC)
+    return min(chart_from, own_depth)
+
+
+def _download_warmup(provider: LiveProviderPlugin, data_source: PluginSymbol,
+                     time_from: datetime, time_to: datetime) -> 'list[OHLCV]':
+    """A live security context's REST warmup, its failure reported as the provider's.
+
+    The download is the first request for the context's own symbol AND timeframe, so
+    it is where a venue turns down a combination the chart never asked for (a 3-hour
+    candle on a venue without one). Raised raw, that ends the run as an internal
+    error; the user has to learn which provider, symbol and timeframe failed.
+
+    :param provider: The context's provider instance.
+    :param data_source: The context's live data source.
+    :param time_from: Start of the warmup window.
+    :param time_to: End of the warmup window.
+    :return: The warmup bars, oldest first.
+    :raises ProviderUnavailableError: When the download fails.
+    """
+    from .live_runner import download_warmup_in_memory
+    try:
+        return download_warmup_in_memory(provider, time_from, time_to)
+    except PyneError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any provider failure, reported with its context
+        reason = (str(exc) or type(exc).__name__).rstrip('.')
+        raise ProviderUnavailableError(
+            provider=data_source.provider_name,
+            why=(f"downloading {data_source.symbol} at timeframe "
+                 f"{data_source.timeframe} for request.security failed: {reason}"),
+        ) from exc
+
+
+def _drop_forming_rest_tail(bar_buffer: 'list[OHLCV]', rest_tail_ts: int | None,
+                            refined_tail_ts: float | None, horizon_ms: int,
+                            calendar: BarCalendar, timeframe: str) -> int | None:
+    """Take the REST warmup's still-forming last bar out of a live context's buffer.
+
+    The REST warmup may end on the bar still forming at the download. The closed
+    path runs every buffered bar up to the round's target as closed, so that tail
+    would be consumed with its download-time prices on the round that confirms its
+    period whenever the chart's close outruns this context's own stream close of
+    the bar. Without it in the buffer, that round waits for the stream close. A
+    tail the catch-up drain already replaced with its stream close is final and
+    stays, and so does a tail whose scheduled close the download already reached.
+
+    :param bar_buffer: The context's warmup buffer, oldest first; trimmed in place.
+    :param rest_tail_ts: Open of the REST warmup's last bar, ``None`` without one.
+    :param refined_tail_ts: Open of the tail the catch-up drain replaced with its
+        stream close, ``None`` when it replaced none.
+    :param horizon_ms: The warmup download's end instant in epoch ms.
+    :param calendar: The context's own trading calendar.
+    :param timeframe: The context's own timeframe.
+    :return: Open of the buffer's last REST bar after the trim, ``None`` without one.
+    """
+    if (bar_buffer and rest_tail_ts is not None
+            and bar_buffer[-1].timestamp == rest_tail_ts
+            and rest_tail_ts != refined_tail_ts
+            and actual_bar_close(rest_tail_ts, 0, calendar, timeframe) > horizon_ms):
+        bar_buffer.pop()
+        return bar_buffer[-1].timestamp if bar_buffer else None
+    return rest_tail_ts
+
+
 def _run_rate_source_loop(
         sec_id: str,
         data_source: 'PluginSymbol',
@@ -172,10 +273,8 @@ def _run_rate_source_loop(
     :class:`~pynecore.core.currency.CurrencyRateProvider` can read it as the live FX rate.
     """
     from .plugin import load_plugin
-    from .plugin.live_provider import LiveProviderPlugin
-    from .live_runner import download_warmup_in_memory, LiveBarStreamer
+    from .live_runner import LiveBarStreamer
     from .security_shm import write_result, write_na
-    from pynecore.lib.timeframe import _in_seconds
 
     provider_cls = load_plugin(data_source.provider_name)
     if not issubclass(provider_cls, LiveProviderPlugin):
@@ -200,14 +299,8 @@ def _run_rate_source_loop(
     else:
         syminfo = provider.update_symbol_info()
 
-    tf_seconds = _in_seconds(data_source.timeframe)
     time_to = datetime.now(UTC)
-    if data_source.time_from is not None:
-        time_from = data_source.time_from
-        if time_from.tzinfo is None:
-            time_from = time_from.replace(tzinfo=UTC)
-    else:
-        time_from = time_to - timedelta(seconds=tf_seconds * _DEFAULT_WARMUP_BARS)
+    time_from = _warmup_start(data_source.time_from, data_source.timeframe, time_to)
 
     # Start the WS streamer *before* the REST warmup download so the
     # subscription is open while warmup is in flight. If we downloaded
@@ -223,7 +316,7 @@ def _run_rate_source_loop(
         last_historical_timestamp=None,
     )
     live_streamer.start()
-    bar_buffer = download_warmup_in_memory(provider, time_from, time_to)
+    bar_buffer = _download_warmup(provider, data_source, time_from, time_to)
     last_warmup_ts = bar_buffer[-1].timestamp if bar_buffer else None
     # Drain anything the WS already queued and dedupe against warmup.
     # Streaming continues; later ``pop_new_closed_bars()`` calls only
@@ -326,6 +419,8 @@ def _collect_in_period_intrabars(
         wait_for_bars: 'Callable[[float], list[OHLCV]]',
         ingest: 'Callable[[OHLCV], None]',
         *,
+        retry: '_LateCloseRetry | None' = None,
+        stopped: 'Callable[[], bool] | None' = None,
         now: 'Callable[[], float] | None' = None,
 ) -> 'tuple[list[OHLCV], int]':
     """Collect a chart period's closed intrabars, blocking (bounded) for a lagging
@@ -341,6 +436,13 @@ def _collect_in_period_intrabars(
     they arrive — unless a later-period bar is already buffered, which means the
     final intrabar is genuinely gone (a provider gap) and waiting would only burn
     the grace. Warmup is a no-op here (its bars are already buffered).
+
+    A window published for a closed chart bar is history, so a final intrabar the
+    venue publishes after the grace must still make it in: with a ``retry`` the
+    wait goes on past the grace, querying the provider's history, until the final
+    intrabar arrives from either side or the evidence budget is spent, exactly as
+    a closed ``request.security`` round does (:func:`_read_round_bar`). A later
+    intrabar arriving instead is the gap above, and ends the wait at once.
 
     The clock (``now``) and the streamer wait/ingest are injected so the loop is
     deterministically testable without real time; ``now`` defaults to
@@ -359,6 +461,10 @@ def _collect_in_period_intrabars(
     :param wait_for_bars: ``(timeout) -> list[OHLCV]`` blocking wait on the
         streamer, up to ``timeout`` seconds.
     :param ingest: ``(bar) -> None`` appends a streamer bar into ``bar_buffer``.
+    :param retry: The history retry that extends the wait past the grace, ``None``
+        to end it there.
+    :param stopped: ``() -> bool``: the run is shutting down, stop waiting. Checked
+        at least every :data:`_ROUND_WAIT_SLICE_SECONDS`.
     :param now: ``() -> float`` monotonic clock; defaults to ``time.monotonic``.
     :return: ``(collected, next_idx)`` — the in-period intrabars and the advanced
         cursor.
@@ -368,6 +474,7 @@ def _collect_in_period_intrabars(
     collected: 'list[OHLCV]' = []
     final_open = period_end_exclusive - ltf_span_ms
     deadline = now() + grace_seconds
+    budget_deadline: float | None = None
     while True:
         while next_idx < len(bar_buffer):
             _b = bar_buffer[next_idx]
@@ -390,17 +497,247 @@ def _collect_in_period_intrabars(
                 period_end_exclusive,
             )
             break
-        _remaining = deadline - now()
-        if _remaining <= 0:
-            logger.warning(
-                "Live LTF period ending %d ms incomplete after %.0fs grace; "
-                "publishing without the final intrabar",
-                period_end_exclusive, grace_seconds,
-            )
+        if stopped is not None and stopped():
             break
-        for _sb in wait_for_bars(_remaining):
+        t = now()
+        if t < deadline:
+            wake_at = deadline
+        else:
+            if retry is None:
+                logger.warning(
+                    "Live LTF period ending %d ms incomplete after %.0fs grace; "
+                    "publishing without the final intrabar",
+                    period_end_exclusive, grace_seconds,
+                )
+                break
+            if budget_deadline is None:
+                budget_deadline = retry.deadline(deadline)
+            if t >= budget_deadline:
+                retry.give_up(final_open)
+                break
+            wake_at = min(retry.step(t), budget_deadline)
+        if stopped is not None:
+            wake_at = min(wake_at, t + _ROUND_WAIT_SLICE_SECONDS)
+        for _sb in wait_for_bars(max(0.0, wake_at - t)):
             ingest(_sb)
     return collected, next_idx
+
+
+# Evidence budget of a late close: how long, from the round's start, a live
+# context keeps waiting for a round target's closed bar the stream has not
+# delivered, retrying the provider's history while it waits. Venues publish a
+# closed bar to their history API a few seconds after the close as a rule, but
+# lags of up to ~90 s were measured (cTrader trendbars), so the floor sits well
+# past that: 120 s, the cTrader plugin's own hole-evidence window. A longer bar
+# can afford a longer wait — the chart waits along, and a quarter of the bar is
+# a bounded share of its period — but past ten minutes a missing close is no
+# longer a late publication but a hole or an outage the feed's own reconnect
+# machinery handles, and the chart should not sit on it any longer.
+_CLOSE_EVIDENCE_FLOOR_SECONDS = 120.0
+_CLOSE_EVIDENCE_CAP_SECONDS = 600.0
+_CLOSE_EVIDENCE_BAR_SHARE = 0.25
+# Pause between two history queries that found nothing, doubling from the first
+# up to the last: a query a second at first, as the bar is most likely to appear
+# right after the grace, then a few per minute.
+_CLOSE_RETRY_FIRST_DELAY = 2.0
+_CLOSE_RETRY_MAX_DELAY = 30.0
+# Upper bound of one stream wait slice while a round waits for its bar: how long
+# it sits before it re-checks the shutdown. Waking on the stop itself would need a
+# thread parked on the multiprocessing stop event, and a waiter that dies with its
+# process without leaving the wait (a daemon thread at exit) makes the chart's
+# ``set()`` of that event block forever.
+_ROUND_WAIT_SLICE_SECONDS = 1.0
+
+
+# noinspection PyProtectedMember
+def _close_evidence_budget(timeframe: str) -> float:
+    """The evidence budget of a late close on a context of ``timeframe``, in seconds.
+
+    :param timeframe: The context's own timeframe.
+    :return: A quarter of the bar, held between the floor and the cap.
+    """
+    from pynecore.lib.timeframe import _in_seconds
+    return min(max(_in_seconds(timeframe) * _CLOSE_EVIDENCE_BAR_SHARE,
+                   _CLOSE_EVIDENCE_FLOOR_SECONDS), _CLOSE_EVIDENCE_CAP_SECONDS)
+
+
+class _LateCloseRetry:
+    """History retry of a live context's round target whose close the stream is late with.
+
+    Once the stream grace of a round is spent without the round's next bar, the
+    context asks the provider's history for the closed bars after its newest one
+    (:meth:`~pynecore.core.live_runner.LiveBarStreamer.request_backfill`), one query at a
+    time, with a growing pause between queries that found nothing. The recovered bars
+    and any close the socket delivers meanwhile reach the round through the same stream
+    queue, so whichever comes first ends the wait. A lower-timeframe window waits the
+    same way for its final intrabar (:func:`_collect_in_period_intrabars`).
+
+    The evidence budget runs from the start of the round that first missed a close,
+    and stays spent until a closed bar arrives again: on a feed that delivers nothing
+    at all every later round would otherwise wait out the whole budget anew and the
+    chart would fall further behind with every bar. The warning that the budget ran
+    out is given once per such hole.
+    """
+
+    __slots__ = ('_request', '_grace', '_budget', '_warn', '_hole_started', '_warned',
+                 '_pending', '_next_request_at', '_delay')
+
+    def __init__(self, request: 'Callable[[], Future[int] | None]', grace_seconds: float,
+                 budget_seconds: float, warn: 'Callable[[int, float], None]') -> None:
+        """
+        :param request: Starts a history fill, ``None`` when none can be started now.
+        :param grace_seconds: The stream grace that precedes the retry in a round.
+        :param budget_seconds: The evidence budget, counted from the round's start.
+        :param warn: ``(target_time, budget_seconds)``: reports a spent budget.
+        """
+        self._request = request
+        self._grace = grace_seconds
+        self._budget = budget_seconds
+        self._warn = warn
+        self._hole_started: float | None = None
+        self._warned = False
+        self._pending: 'Future[int] | None' = None
+        self._next_request_at: float | None = None
+        self._delay = _CLOSE_RETRY_FIRST_DELAY
+
+    def bar_arrived(self) -> None:
+        """A closed bar reached the context: the hole, if any, is over."""
+        self._hole_started = None
+        self._warned = False
+        self._next_request_at = None
+        self._delay = _CLOSE_RETRY_FIRST_DELAY
+
+    def deadline(self, grace_deadline: float) -> float:
+        """The instant the retry gives up, for a round whose grace ends at ``grace_deadline``.
+
+        :param grace_deadline: The ``now()`` instant the round's stream grace ends.
+        :return: The ``now()`` instant the evidence budget is spent.
+        """
+        if self._hole_started is None:
+            self._hole_started = grace_deadline - self._grace
+        return self._hole_started + self._budget
+
+    def give_up(self, target_time: int) -> None:
+        """The budget is spent: report it, once per hole.
+
+        :param target_time: The round's target.
+        """
+        if not self._warned:
+            self._warned = True
+            self._warn(target_time, self._budget)
+
+    def step(self, t: float) -> float:
+        """Settle a finished query and start the next one when it is due.
+
+        :param t: The current ``now()`` instant.
+        :return: The ``now()`` instant this needs to run again at, at the latest; a
+            query in flight wakes the stream wait itself when it finishes.
+        """
+        pending = self._pending
+        next_request_at = self._next_request_at
+        if pending is not None:
+            if not pending.done():
+                return float('inf')
+            self._pending = None
+            if not pending.cancelled():
+                error = pending.exception()
+                if error is not None:
+                    logger.debug("late close history query failed: %s", error)
+            next_request_at = self._schedule_next(t)
+        elif next_request_at is None or t >= next_request_at:
+            self._pending = self._request()
+            if self._pending is not None:
+                return float('inf')
+            next_request_at = self._schedule_next(t)
+        return next_request_at
+
+    def _schedule_next(self, t: float) -> float:
+        self._next_request_at = t + self._delay
+        self._delay = min(self._delay * 2.0, _CLOSE_RETRY_MAX_DELAY)
+        return self._next_request_at
+
+
+def _read_round_bar(
+        read_bar: 'Callable[[int], OHLCV | None]',
+        idx: int,
+        target_time: int,
+        run_close: int | None,
+        deadline: float | None,
+        wait_for_bars: 'Callable[[float], list[OHLCV]] | None',
+        ingest: 'Callable[[OHLCV], None]',
+        *,
+        retry: _LateCloseRetry | None = None,
+        stopped: 'Callable[[], bool] | None' = None,
+        now: 'Callable[[], float] | None' = None,
+) -> 'OHLCV | None':
+    """Read a closed round's next bar, blocking (bounded) for a lagging stream close.
+
+    In cross-symbol live mode the requested symbol's closed bar may reach this
+    context's stream a few seconds after the chart's own close. While a bar with
+    an open at or before ``target_time`` can still come, a missing bar is waited
+    for until ``deadline``, ingesting the bars the stream delivers. The next bar
+    opens no earlier than the scheduled close of the bar the round ran last, so
+    once that close lies past the target no later bar belongs to the round,
+    whether the target is a bar open or a lower-timeframe cutoff that ends a
+    millisecond before a boundary. A missing bar then ends the round at once
+    instead of holding it, and the chart's next round with it, for the rest of
+    the grace.
+
+    A closed chart bar is history once published, so a close the venue publishes
+    after the grace must still make it into this round: with a ``retry`` the wait
+    goes on past ``deadline``, querying the provider's history, until the bar
+    arrives from either side or the evidence budget is spent. A later bar arriving
+    instead means the target has no bar at all (no trades in its period), so the
+    round ends at once with it, exactly as within the grace.
+
+    The clock (``now``) and the streamer wait/ingest are injected so the wait is
+    deterministically testable without real time; ``now`` defaults to
+    :func:`time.monotonic`.
+
+    :param read_bar: ``(idx) -> OHLCV | None`` reads the context's bar at ``idx``.
+    :param idx: Index of the bar to read.
+    :param target_time: The round's target: the latest bar open the round runs.
+    :param run_close: Scheduled close (exclusive, epoch ms) of the bar the round
+        ran last, ``None`` before its first bar.
+    :param deadline: ``now()`` instant the stream grace ends at, ``None`` for no wait.
+    :param wait_for_bars: ``(timeout) -> list[OHLCV]`` blocking wait on the
+        streamer, up to ``timeout`` seconds; it may return early and empty.
+        ``None`` without a streamer.
+    :param ingest: ``(bar) -> None`` appends a streamer bar to the buffer that
+        ``read_bar`` reads.
+    :param retry: The history retry that extends the wait past the grace, ``None``
+        to end it there.
+    :param stopped: ``() -> bool``: the run is shutting down, stop waiting. Checked
+        at least every :data:`_ROUND_WAIT_SLICE_SECONDS`.
+    :param now: ``() -> float`` monotonic clock; defaults to ``time.monotonic``.
+    :return: The bar, or ``None`` when the round has no further bar.
+    """
+    if now is None:
+        now = monotonic
+    target_reached = run_close is not None and run_close > target_time
+    budget_deadline: float | None = None
+    while True:
+        bar = read_bar(idx)
+        if bar is not None or target_reached or deadline is None or wait_for_bars is None:
+            return bar
+        if stopped is not None and stopped():
+            return None
+        t = now()
+        if t < deadline:
+            wake_at = deadline
+        else:
+            if retry is None:
+                return None
+            if budget_deadline is None:
+                budget_deadline = retry.deadline(deadline)
+            if t >= budget_deadline:
+                retry.give_up(target_time)
+                return None
+            wake_at = min(retry.step(t), budget_deadline)
+        if stopped is not None:
+            wake_at = min(wake_at, t + _ROUND_WAIT_SLICE_SECONDS)
+        for _bar in wait_for_bars(max(0.0, wake_at - t)):
+            ingest(_bar)
 
 
 def _heikinashi_step(prev_open: float | None, prev_close: float | None,
@@ -592,6 +929,7 @@ def security_process_main(
     """
     # Safety net first: exit if the parent is hard-killed (see the watchdog docstring).
     _start_parent_death_watchdog()
+    _leave_interrupt_to_the_chart()
 
     # Before anything reads a switch — the import hook below already consults
     # ``PYNE_NO_SECURITY_SLICE``. The child's own later writes still win, which
@@ -657,18 +995,21 @@ def security_process_main(
     # land a few seconds after the chart symbol's close, and the chart
     # process already advanced ``last_confirmed`` for this period — without
     # blocking here the loop would emit ``na`` and never get re-signaled.
-    # Set when the live cross-symbol path is initialised below.
+    # A close later than this is asked from the provider's history
+    # (``live_close_retry``). Set when the live cross-symbol path is
+    # initialised below.
     live_bar_grace_seconds: float = 0.0
     # Warmup horizon (ms): the instant the REST warmup ended. The live LTF-window
     # path uses it to drop a still-forming warmup tail bar. Set in the live branch.
     warmup_horizon_ms: int = 0
     # Timestamp of a warmup tail bar a WS close refined in place (live path only).
     ws_refined_tail_ts: float | None = None
+    # History retry of a closed round's target past the stream grace (live path only).
+    live_close_retry: _LateCloseRetry | None = None
 
     if isinstance(data_source, PluginSymbol):
         # Live cross-symbol path: own provider + warmup download + WS stream.
         from .plugin import load_plugin
-        from .plugin.live_provider import LiveProviderPlugin
         from . import live_runner
         from pynecore.lib.timeframe import _in_seconds
 
@@ -704,25 +1045,24 @@ def security_process_main(
         live_bar_grace_seconds = max(15.0, min(tf_seconds * 0.5, 30.0))
         time_to = datetime.now(UTC)
         warmup_horizon_ms = int(time_to.timestamp() * 1000)
-        if data_source.time_from is not None:
-            time_from = data_source.time_from
-            if time_from.tzinfo is None:
-                time_from = time_from.replace(tzinfo=UTC)
-        else:
-            time_from = time_to - timedelta(seconds=tf_seconds * _DEFAULT_WARMUP_BARS)
+        time_from = _warmup_start(data_source.time_from, data_source.timeframe, time_to)
 
         # Start the WS streamer *before* the REST warmup so the subscription
         # is open while warmup is in flight. If we downloaded first, any bar
         # closing in the (REST-done → WS-connected) window would be lost.
         # ``last_historical_timestamp=None`` because warmup hasn't run yet;
         # the post-warmup catch-up below dedupes against the warmup tail.
+        # A close the stream is late with comes from the history retry
+        # (``live_close_retry``), so the stream must not settle the slot with a
+        # filler or a finalized forming bar before that retry has run.
         live_streamer = streamer = live_runner.LiveBarStreamer(
             live_provider, data_source.symbol, data_source.timeframe,
             syminfo=syminfo,
             last_historical_timestamp=None,
+            boundary_watchdog=False,
         )
         streamer.start()
-        bar_buffer = live_runner.download_warmup_in_memory(live_provider, time_from, time_to)
+        bar_buffer = _download_warmup(live_provider, data_source, time_from, time_to)
         last_warmup_ts = bar_buffer[-1].timestamp if bar_buffer else None
         # Equal-timestamp WS closes refine the warmup tail — providers whose
         # REST window includes the currently forming candle deliver the true
@@ -741,6 +1081,23 @@ def security_process_main(
         else:
             bar_buffer.extend(streamer.pop_new_closed_bars())
         reader = None
+
+        context_symbol, context_timeframe = data_source.symbol, data_source.timeframe
+
+        def _request_close_backfill() -> 'Future[int] | None':
+            return streamer.request_backfill(bar_buffer[-1].timestamp if bar_buffer else None)
+
+        def _warn_late_close(target: int, budget: float) -> None:
+            logger.warning(
+                "request.security context %s: the closed %s bar of %s for its round target "
+                "%s arrived neither from the stream nor from the provider's history within "
+                "%.0fs; the round completes without it",
+                sec_id, context_timeframe, context_symbol,
+                datetime.fromtimestamp(target / 1000, UTC).isoformat(), budget)
+
+        live_close_retry = _LateCloseRetry(
+            _request_close_backfill, live_bar_grace_seconds,
+            _close_evidence_budget(context_timeframe), _warn_late_close)
     else:
         # File mode (backtest, same-symbol live with HTF aggregator).
         ohlcv_path = data_source
@@ -1226,6 +1583,8 @@ def security_process_main(
     # the WS was subscribed before the REST warmup ran, so the initial batch may
     # overlap the warmup tail (replace it) and anything older is a duplicate.
     def _ingest_streamer_bar(_bar: 'OHLCV') -> None:
+        if live_close_retry is not None:
+            live_close_retry.bar_arrived()
         if last_warmup_ts is None:
             bar_buffer.append(_bar)
         elif _bar.timestamp == last_warmup_ts and bar_buffer:
@@ -1252,6 +1611,12 @@ def security_process_main(
         if reader is not None:
             return len(real_index_map) if real_index_map is not None else reader.size
         return len(bar_buffer)
+
+    # The window path below trims its own forming tail
+    if not is_ltf and live_streamer is not None and isinstance(data_source, PluginSymbol):
+        last_warmup_ts = _drop_forming_rest_tail(
+            bar_buffer, last_warmup_ts, ws_refined_tail_ts, warmup_horizon_ms,
+            own_calendar, own_timeframe)
 
     # ── Live LTF-window machinery (request.security_lower_tf on a streaming
     # source) ──────────────────────────────────────────────────────────────
@@ -1365,12 +1730,14 @@ def security_process_main(
             # Collect not-yet-consumed closed intrabars up to the period end
             # (future-period bars are deferred). On a confirmed chart bar the
             # published array must be the FULL closed period, so wait (bounded)
-            # for the final in-period intrabar if the streamer lags — a no-op
-            # during warmup, where the REST bars are already buffered.
+            # for the final in-period intrabar if the streamer lags, then ask the
+            # provider's history for it until the evidence budget is spent — a
+            # no-op during warmup, where the REST bars are already buffered.
             collected, ltf_next_idx = _collect_in_period_intrabars(
                 bar_buffer, ltf_next_idx, period_end_exclusive, ltf_span_ms,
                 chart_developing, live_bar_grace_seconds,
                 _streamer.wait_for_bars, _ingest_streamer_bar,
+                retry=live_close_retry, stopped=stop_event.is_set,
             )
 
             developing_bar: 'OHLCV | None' = None
@@ -1958,7 +2325,9 @@ def security_process_main(
                 # a few seconds after the chart symbol's close. The chart side
                 # has already advanced ``last_confirmed = target_time`` and will
                 # not re-signal this period, so we must block briefly until the
-                # bar arrives instead of falling through to ``write_na``.
+                # bar arrives instead of falling through to ``write_na``. Past the
+                # stream grace the wait goes on with history queries, bounded by
+                # the evidence budget (:class:`_LateCloseRetry`).
                 bars_run = False
                 # File-backed LTF: values written while replaying feed bars that
                 # CLOSE at or before the chart bar's period start (cold start
@@ -1974,28 +2343,14 @@ def security_process_main(
                 grace_deadline: float | None = None
                 if live_streamer is not None:
                     grace_deadline = monotonic() + live_bar_grace_seconds
+                run_close: int | None = None
                 while True:
-                    ohlcv_file_bar = _read_bar(current_bar)
+                    ohlcv_file_bar = _read_round_bar(
+                        _read_bar, current_bar, target_time, run_close, grace_deadline,
+                        live_streamer.wait_for_bars if live_streamer is not None else None,
+                        _ingest_streamer_bar, retry=live_close_retry,
+                        stopped=stop_event.is_set)
                     if ohlcv_file_bar is None:
-                        if grace_deadline is not None and live_streamer is not None:
-                            remaining = grace_deadline - monotonic()
-                            if remaining > 0:
-                                # Block on the streamer queue for the new bar.
-                                # ``_read_bar`` only consults the streamer when
-                                # ``current_bar >= len(bar_buffer)``, so any
-                                # bars returned here are appended to the buffer
-                                # via ``_read_bar`` on the next iteration.
-                                new_bars = live_streamer.wait_for_bars(remaining)
-                                if new_bars:
-                                    for _bar in new_bars:
-                                        if last_warmup_ts is None:
-                                            bar_buffer.append(_bar)
-                                        elif (_bar.timestamp == last_warmup_ts
-                                                and bar_buffer):
-                                            bar_buffer[-1] = _bar
-                                        elif _bar.timestamp > last_warmup_ts:
-                                            bar_buffer.append(_bar)
-                                    continue
                         break
                     # A UTC->tz datetime roundtrip preserves the instant, so the
                     # raw timestamp is already the answer
@@ -2005,8 +2360,9 @@ def security_process_main(
 
                     next_open = _bar_open_at(current_bar + 1)
                     sec_ctx.bar_open = bar_time_ms
-                    sec_ctx.bar_close = actual_bar_close(
+                    bar_close = actual_bar_close(
                         bar_time_ms, next_open, own_calendar, own_timeframe)
+                    sec_ctx.bar_close = bar_close
                     sec_ctx.frontier = _capped_frontier(_next_frontier(
                         next_open, _bar_open_at(current_bar + 2) if next_open else 0))
                     sec_ctx.developing = False
@@ -2049,6 +2405,7 @@ def security_process_main(
                         ltf_prefix_len = ltf_buffer_len()  # noqa - non-None when is_ltf
                     current_bar += 1
                     bars_run = True
+                    run_close = bar_close
 
                 if bars_run:
                     snap = _ensure_snapshot()
@@ -2165,7 +2522,9 @@ def run_security_process(*args: Any, failure_conn: '_ConnectionBase | None' = No
     The chart's death watcher sees only the exit code. The exception that ends
     the child goes out through ``failure_conn``, the write end of a one-way pipe
     whose read end the watcher drains after the reap, so the chart's error names
-    it. The traceback itself still goes to stderr, as for any process.
+    it. The traceback of any other failure still goes to stderr, as for any
+    process; a coded error handed over this way exits with code 1 and no
+    traceback, since the chart reports it in full.
 
     :param args: :func:`security_process_main`'s positional arguments.
     :param failure_conn: Write end of this child's failure pipe, or None.
@@ -2176,11 +2535,20 @@ def run_security_process(*args: Any, failure_conn: '_ConnectionBase | None' = No
     except SystemExit:
         raise
     except BaseException as exc:
+        handed_over = False
         if failure_conn is not None:
             # Best effort: a chart that is already gone cannot read the report,
             # and nothing about writing it may replace the exception itself
             with contextlib.suppress(Exception):
-                failure_conn.send(_failure_report(exc))
+                report = _failure_report(exc)
+                failure_conn.send(report)
+                handed_over = isinstance(report, PyneError)
+        if handed_over:
+            # The chart raises this coded error itself, located, on its own bar.
+            # The process traceback multiprocessing prints for an exception would
+            # only repeat it above that message; the exit code still tells the
+            # death watcher that the child failed.
+            sys.exit(1)
         raise
     finally:
         if failure_conn is not None:

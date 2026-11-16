@@ -107,7 +107,6 @@ def __test_two_live_htf_contexts_do_not_deadlock__(script_path, module_key, symi
     from pathlib import Path
 
     from pynecore.core.script_runner import ScriptRunner, LIVE_TRANSITION
-    from pynecore.types.na import NA
 
     sys.modules.pop(Path(__file__).stem, None)
     sys.modules.pop(module_key, None)
@@ -137,16 +136,6 @@ def __test_two_live_htf_contexts_do_not_deadlock__(script_path, module_key, symi
         # ``(h - 1) // 2``.
         k = (hour - 1) // 2
         if k < 0:
-            continue
-        if hour == _N_HIST:
-            # MEASURED: the first bar after LIVE_TRANSITION reports ``na`` for a
-            # same-symbol HTF context even without any dependency (reproduced
-            # with a single plain context). That belongs to the live HTF
-            # transport, not to the dependent-peer machinery this file guards;
-            # what matters here is that BOTH contexts behave the same and that
-            # the run keeps going.
-            assert isinstance(a, NA) == isinstance(b, NA), \
-                f"hour {hour}: a={a} and b={b} disagree at the live transition"
             continue
         assert a == __test_helper_close(2 * k + 1), \
             f"hour {hour}: a={a} != {__test_helper_close(2 * k + 1)}"

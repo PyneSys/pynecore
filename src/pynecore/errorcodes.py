@@ -1059,6 +1059,14 @@ SECURITY_NOT_REWRITTEN = Code(
     '`{function}` runs only where the transform rewrote it; call it directly in a `@pyne` module.',
     ('function',),
 )
+LIVE_SECURITY_SYMBOL = Code(
+    'R0055',
+    'error',
+    'Symbol of a live request.security unavailable',
+    '`request.security` asks for {symbol}, which the `{provider}` provider cannot serve as '
+    '`{native}`: {why}.',
+    ('symbol', 'provider', 'native', 'why'),
+)
 
 
 class EdgeSyntaxError(PyneSyntaxError):
@@ -2270,6 +2278,14 @@ class SecurityNotRewrittenError(PyneError, RuntimeError):
         super().__init__(function=function)
 
 
+class LiveSecuritySymbolError(PyneError, ValueError):
+    """R0055: Symbol of a live request.security unavailable"""
+    code = LIVE_SECURITY_SYMBOL
+
+    def __init__(self, *, symbol: object, provider: object, native: object, why: object) -> None:
+        super().__init__(symbol=symbol, provider=provider, native=native, why=why)
+
+
 #: Every reported code by its code.
 ALL: dict[str, Code] = {c.code: c for c in (
     EDGE_SYNTAX, EDGE_PYTHON_BUILTIN, EDGE_LAMBDA, EDGE_ASSERT_MESSAGE, EDGE_SUBSCRIPT_ASSIGNMENT,
@@ -2307,7 +2323,7 @@ ALL: dict[str, Code] = {c.code: c for c in (
     ARGUMENT_ORDER, MATRIX_HOLDS_NA, INVALID_OPTION, NA_OBJECT_FIELD, NA_OBJECT_COPY,
     SYMINFO_MEMBER_MISSING, DATA_FILE_UNREADABLE, SCRIPT_NOT_RUNNABLE, FILE_NOT_FOUND,
     PROVIDER_UNAVAILABLE, CALL_ARGUMENTS, SERIES_SUBSCRIPT, ARGUMENT_OUT_OF_RANGE, EXPORT_MISUSE,
-    SECURITY_NOT_REWRITTEN,
+    SECURITY_NOT_REWRITTEN, LIVE_SECURITY_SYMBOL,
 )}
 
 #: The exception class of every reported code, by its code.
@@ -2353,5 +2369,5 @@ EXCEPTIONS: dict[str, type[PyneError]] = {c.code.code: c for c in (
     InvalidOptionError, NaObjectFieldError, NaObjectCopyError, SyminfoMemberMissingError,
     DataFileUnreadableError, ScriptNotRunnableError, MissingFileError, ProviderUnavailableError,
     CallArgumentsError, SeriesSubscriptError, ArgumentOutOfRangeError, ExportMisuseError,
-    SecurityNotRewrittenError,
+    SecurityNotRewrittenError, LiveSecuritySymbolError,
 )}

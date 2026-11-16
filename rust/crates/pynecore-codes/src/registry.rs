@@ -1460,6 +1460,16 @@ pub static SECURITY_NOT_REWRITTEN: super::Code = super::Code {
     fix: None,
 };
 
+/// R0055: Symbol of a live request.security unavailable
+pub static LIVE_SECURITY_SYMBOL: super::Code = super::Code {
+    code: "R0055",
+    severity: super::Severity::Error,
+    title: "Symbol of a live request.security unavailable",
+    message: "`request.security` asks for {symbol}, which the `{provider}` provider cannot serve as `{native}`: {why}.",
+    params: &["symbol", "provider", "native", "why"],
+    fix: None,
+};
+
 /// Every reported code, sorted by `code`.
 pub static ALL: &[&super::Code] = &[
     &EDGE_SYNTAX,
@@ -1608,6 +1618,7 @@ pub static ALL: &[&super::Code] = &[
     &ARGUMENT_OUT_OF_RANGE,
     &EXPORT_MISUSE,
     &SECURITY_NOT_REWRITTEN,
+    &LIVE_SECURITY_SYMBOL,
 ];
 
 /// The codes a compiled script's run raises (`R`, `I`), sorted by `code`: a
@@ -1668,4 +1679,5 @@ pub static RUNTIME: &[&super::Code] = &[
     &ARGUMENT_OUT_OF_RANGE,
     &EXPORT_MISUSE,
     &SECURITY_NOT_REWRITTEN,
+    &LIVE_SECURITY_SYMBOL,
 ];

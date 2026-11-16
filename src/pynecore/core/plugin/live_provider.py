@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, TypeVar
 
 from pynecore.types.ohlcv import OHLCV
 
-from .provider import ProviderPlugin
+from .provider import ProviderPlugin, canonical_timeframe
 
 if TYPE_CHECKING:
     from ..syminfo import SymInfo
@@ -62,7 +62,8 @@ class PluginSymbol:
                          (e.g. ``"capitalcom"``).
     :ivar symbol: Plugin-native symbol (e.g. ``"EURUSD"``); already passed
                   through :meth:`ProviderPlugin.resolve_symbol`.
-    :ivar timeframe: Timeframe in TradingView format (e.g. ``"1D"``).
+    :ivar timeframe: Timeframe in TradingView format (e.g. ``"1D"``), stored with
+                     its multiplier (``"D"`` becomes ``"1D"``).
     :ivar config: Pre-loaded plugin config dataclass instance. The chart
                   process runs :func:`~pynecore.core.config.ensure_config` once and hands the
                   resulting instance to every subprocess via spawn args —
@@ -105,6 +106,11 @@ class PluginSymbol:
     syminfo: 'SymInfo | None' = None
     is_rate_source: bool = False
     ohlcv_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        # Pine accepts a bare unit (``"D"``), the providers' timeframe tables do not
+        if self.timeframe:
+            object.__setattr__(self, 'timeframe', canonical_timeframe(self.timeframe))
 
 
 class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta):

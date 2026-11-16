@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import importlib.util
+import itertools
 import os
 import shutil
 import sys
@@ -39,7 +40,7 @@ from pynecore.core.data_path import with_data_extension
 from pynecore.core.drawing_snapshot import DrawingSnapshot
 from pynecore.errorcodes import (InvalidDataError, InvalidOptionError, InvalidTimeframeError,
                             MissingFileError, NotAvailableError, ProviderUnavailableError,
-                            ResourceLimitError,
+                            LiveSecuritySymbolError, ResourceLimitError,
                             ScriptNotRunnableError, SecurityDataMissingError,
                             SecurityTimeframeHigherError)
 from pynecore.core.error_location import located
@@ -2018,18 +2019,38 @@ class ScriptRunner:
         """Whether the chart bar opened at ``candle`` was still forming when the history was
         downloaded.
 
-        Measured against :attr:`~ScriptRunner._history_as_of` with the chart timeframe's
-        nominal length, not against the clock at execution: a bar whose period ended during
-        the warmup still holds the partial data of the download. A timeframe without a fixed
-        length counts as still forming.
+        Measured against :attr:`~ScriptRunner._history_as_of`, not against the clock at
+        execution: a bar whose period ended during the warmup still holds the partial data
+        of the download. The bar ends at its scheduled close on the chart's calendar (a
+        month at the month's end, a session-bound bar at the session's end), not after the
+        timeframe's nominal length. An unparseable timeframe counts as still forming.
 
         :param candle: The bar to check.
         :return: ``True`` when the downloaded bar may hold partial data.
         """
-        period_seconds = _try_in_seconds(self.syminfo.period)
+        period = self.syminfo.period
+        period_seconds = _try_in_seconds(period)
         if not period_seconds:
             return True
-        return candle.timestamp + period_seconds * 1000 > self._history_as_of
+        # No scheduled close lies past twice the nominal length (a month is at most
+        # 31 days of a nominal ~30.4), so only the last bars need the calendar
+        if candle.timestamp + 2 * period_seconds * 1000 <= self._history_as_of:
+            return False
+        from .security import actual_bar_close, chart_bar_calendar
+        scheduled_close = actual_bar_close(
+            candle.timestamp, 0, chart_bar_calendar(self.syminfo, self.tz), period)
+        return scheduled_close > self._history_as_of
+
+    def _downloaded_partial(self, candle: OHLCV) -> bool:
+        """Whether ``candle`` is a downloaded history bar that may hold partial data.
+
+        A bar after the downloaded history came from the live stream, closed.
+
+        :param candle: The bar to check.
+        :return: ``True`` for a downloaded bar still forming at the download.
+        """
+        return ((self.last_bar_time is None or candle.timestamp <= self.last_bar_time)
+                and self._bar_open_at_download(candle))
 
     def _process_orders(self, position) -> None:
         """Run one order-processing step.
@@ -3822,6 +3843,22 @@ class ScriptRunner:
                         next_item = next(ohlcv_iterator, LIVE_TRANSITION)
                         caught_up_close = True
 
+                # The bar the live feed goes on forming (see the order suppression
+                # below): the downloaded history's partial last bar, which no catch-up
+                # close replaced.
+                forming_tail = (is_live and next_item is LIVE_TRANSITION
+                                and not caught_up_close
+                                and self._downloaded_partial(candle))
+                # Whether the NEXT bar is that forming tail, which makes this one the
+                # last confirmed history bar. Only a partial next bar needs the item
+                # after it, so the extra peek happens at the end of the history at most.
+                next_is_forming_tail = False
+                if (is_live and next_item is not LIVE_TRANSITION
+                        and self._downloaded_partial(next_item)):
+                    after_next = next(ohlcv_iterator, LIVE_TRANSITION)
+                    next_is_forming_tail = after_next is LIVE_TRANSITION
+                    ohlcv_iterator = itertools.chain([after_next], ohlcv_iterator)
+
                 # --- Script-level higher timeframe ---
                 # The body runs once per COMPLETED HTF bar, on the chart bar whose
                 # close instant reaches the period end. Every other chart bar only
@@ -3871,7 +3908,10 @@ class ScriptRunner:
                 # Last bar detection
                 if is_live:
                     barstate.islast = False
-                    barstate.islastconfirmedhistory = (next_item is LIVE_TRANSITION)
+                    # The last CONFIRMED history bar: the one before a forming tail
+                    barstate.islastconfirmedhistory = (
+                        next_is_forming_tail
+                        or (next_item is LIVE_TRANSITION and not forming_tail))
                 elif stf is not None:
                     # The script's last bar is the last HTF bar that COMPLETES
                     # inside the chart feed — not the chart's own last bar, which
@@ -3924,15 +3964,18 @@ class ScriptRunner:
                 # Order processing is what normally empties the per-bar closed-trade
                 # buffer, so the skipped bar clears it itself: otherwise it would
                 # yield and export the previous bar's closes a second time.
-                if (is_live and next_item is LIVE_TRANSITION
-                        and not lib._strategy_suppressed
-                        and not caught_up_close
-                        and (self.last_bar_time is None
-                             or candle.timestamp <= self.last_bar_time)
-                        and self._bar_open_at_download(candle)):
+                if forming_tail and not lib._strategy_suppressed:
                     lib._strategy_suppressed = True
                     if is_strat and position:
                         position.new_closed_trades.clear()
+                # The same partial bar is not confirmed either: its period has not
+                # ended, so a ``request.security`` context must read it as of the
+                # download, like a realtime tick, instead of confirming the
+                # context bars its scheduled close would reach. MEASURED live on
+                # BINANCE:BTC/USDT@60: a lookahead_off ``"240"`` context exposed the
+                # forming 12:00-16:00 bar's download-time close as closed on the
+                # 15:00 bar, and its realtime ticks kept reading it.
+                barstate.isconfirmed = not forming_tail
 
                 # Intra-bar re-execution path: snapshot, process orders, run the
                 # body again per node (CEHT) or per fill (COOF)
@@ -4060,8 +4103,6 @@ class ScriptRunner:
                 first_live_update = next(ohlcv_iterator, None)
 
             if first_live_update is not None:
-                import itertools
-
                 # Seed with the last warmup bar's timestamp so that an
                 # incoming live update with the same timestamp (common when
                 # ``download_ohlcv`` returned the still-open current bar)
@@ -5424,7 +5465,14 @@ class ScriptRunner:
             # No explicit mapping — fall back to chart-provider resolution
             # in live mode.
             if self._chart_provider_instance is not None and self._chart_provider_name:
-                native_symbol = self._chart_provider_instance.resolve_symbol(symbol)
+                # The chart's own symbol is the chart's instrument: its
+                # ``PREFIX:TICKER`` is no symbol the provider knows (ccxt's
+                # ``BINANCE:BTCUSDT`` names the spot and the perpetual market alike)
+                chart_native = getattr(self._chart_provider_instance, 'provider_symbol', None)
+                if chart_native and symbol == f"{self.syminfo.prefix}:{self.syminfo.ticker}":
+                    native_symbol = chart_native
+                else:
+                    native_symbol = self._chart_provider_instance.resolve_symbol(symbol)
                 result[sec_id] = PluginSymbol(
                     provider_name=self._chart_provider_name,
                     symbol=native_symbol,
@@ -5538,9 +5586,15 @@ class ScriptRunner:
                     config=entry.config,
                 )
                 syminfo = provider.update_symbol_info()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 if not ignore_invalid:
-                    raise
+                    if isinstance(exc, PyneError):
+                        raise
+                    pine_symbol = (sec_contexts or {}).get(sec_id, {}).get('symbol') \
+                        or entry.symbol
+                    raise LiveSecuritySymbolError(
+                        symbol=pine_symbol, provider=entry.provider_name, native=entry.symbol,
+                        why=(str(exc) or type(exc).__name__).rstrip('.')) from exc
                 # ``ignore_invalid_symbol=True``: downgrade to the
                 # backtest-mode "no data" sentinel so the rest of the
                 # pipeline treats this context as ignored.

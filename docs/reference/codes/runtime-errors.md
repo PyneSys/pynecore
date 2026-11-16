@@ -962,6 +962,27 @@ has no such rewrite; neither has a function holding the call that is called
 through a value (`h = f; h()`), so its one context is written twice on a bar.
 Write the calls directly, by name, in the `@pyne` module.
 
+<a id="R0055"></a>
+
+## R0055: Symbol of a live request.security unavailable
+
+| Severity | PyneCore raises |
+|----------|-----------------|
+| error    | `ValueError`    |
+
+Message:
+
+```text
+`request.security` asks for {symbol}, which the `{provider}` provider cannot serve as `{native}`: {why}.
+```
+
+A live run reads every `request.security()` symbol from the chart's provider.
+A TradingView-style symbol is translated to the provider's own with the
+`symbol_map` of the provider's config (`config/plugins/<provider>.toml`) or with
+the workdir's `config/symbol_map.toml`; a symbol neither maps is passed on as
+written. Map the symbol to the provider's own, or pass
+`ignore_invalid_symbol = true` to get `na` instead of this error.
+
 <a id="I0004"></a>
 
 ## I0004: Internal error

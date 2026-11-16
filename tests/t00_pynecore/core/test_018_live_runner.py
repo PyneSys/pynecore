@@ -9,7 +9,8 @@ from datetime import UTC, datetime, time as datetime_time, timedelta
 
 import pytest
 
-from pynecore.core.live_runner import FeedStatus, live_ohlcv_generator, LiveBarStreamer
+from pynecore.core.live_runner import (ClosedBarBackfill, FeedStatus, live_ohlcv_generator,
+                                       LiveBarStreamer)
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.core.syminfo import SymInfo, SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
@@ -2407,3 +2408,196 @@ def __test_live_stop_abandons_a_stalled_startup_backfill__():
     assert time.monotonic() - started < 5.0
     assert [item for item in items if item is not LIVE_TRANSITION] == []
     assert not provider.is_connected
+
+
+# --- One closed-bar cursor for history and socket bars ---------------------
+
+_SPLICE_MINUTE = (int(time.time() * 1000) // 60_000) * 60_000
+# Slots near the wall clock, so the boundary watchdog stays out of the picture
+_S0, _S1, _S2, _S3 = (_SPLICE_MINUTE - 120_000 + i * 60_000 for i in range(4))
+
+
+class _SplicedVenue(MockLiveProvider):
+    """A venue whose socket and history the test drives one event at a time.
+
+    :meth:`push_and_settle` returns once the stream has processed the pushed bar
+    (it is waiting for the next one); with ``hold_history`` the history query
+    answers only when :meth:`release_history` is called.
+    """
+
+    def __init__(self, answer: list[OHLCV], *, hold_history: bool = False):
+        super().__init__([])
+        self.feed_timeout_bars = None
+        self.answer = answer
+        self.history_calls: list[int] = []
+        self.history_called = threading.Event()
+        self._hold_history = hold_history
+        self._gate: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._socket: asyncio.Queue | None = None
+        self._cond = threading.Condition()
+        self._delivered = 0
+        self._waiting_after = -1
+
+    async def connect(self):
+        self._loop = asyncio.get_running_loop()
+        self._socket = asyncio.Queue()
+        self._gate = asyncio.Event()
+        self._connected = True
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
+        assert self._socket is not None
+        with self._cond:
+            self._waiting_after = self._delivered
+            self._cond.notify_all()
+        bar = await self._socket.get()
+        with self._cond:
+            self._delivered += 1
+        return bar
+
+    async def backfill_closed_bars(self, _symbol: str, _timeframe: str,
+                                   since_ms: int) -> list[OHLCV]:
+        self.history_calls.append(since_ms)
+        self.history_called.set()
+        if self._hold_history:
+            assert self._gate is not None
+            await self._gate.wait()
+        return list(self.answer)
+
+    def push(self, bar: OHLCV) -> None:
+        assert self._loop is not None and self._socket is not None
+        self._loop.call_soon_threadsafe(self._socket.put_nowait, bar)
+
+    def push_and_settle(self, bar: OHLCV) -> None:
+        with self._cond:
+            expected = self._delivered + 1
+        self.push(bar)
+        with self._cond:
+            assert self._cond.wait_for(lambda: self._waiting_after >= expected, timeout=5.0)
+
+    def release_history(self) -> None:
+        assert self._loop is not None and self._gate is not None
+        self._loop.call_soon_threadsafe(self._gate.set)
+
+
+def _closed_until(stream, end_ts: int) -> list[OHLCV]:
+    """The closed bars a stream yields up to and including the one opening at ``end_ts``"""
+    closed: list[OHLCV] = []
+    for item in stream:
+        if item is LIVE_TRANSITION or not item.is_closed:
+            continue
+        closed.append(item)
+        if item.timestamp == end_ts:
+            break
+    stream.close()
+    return closed
+
+
+_REST_BOTH = [_make_ohlcv(_S1, close=901.0), _make_ohlcv(_S2, close=902.0)]
+_REST_LATER = [_make_ohlcv(_S2, close=902.0)]
+
+
+@pytest.mark.parametrize("order, answer, expected", [
+    # The history answers first: its bars are the slots' closes
+    (("rest", "s1", "s2"), _REST_BOTH, [(_S1, 901.0), (_S2, 902.0)]),
+    (("s1", "rest", "s2"), _REST_BOTH, [(_S1, 101.0), (_S2, 902.0)]),
+    (("s1", "s2", "rest"), _REST_BOTH, [(_S1, 101.0), (_S2, 102.0)]),
+    # The history skips S1: once S2 is handed on, S1 can no longer follow it
+    (("rest", "s1", "s2"), _REST_LATER, [(_S2, 902.0)]),
+    (("s1", "rest", "s2"), _REST_LATER, [(_S1, 101.0), (_S2, 902.0)]),
+    (("s1", "s2", "rest"), _REST_LATER, [(_S1, 101.0), (_S2, 102.0)]),
+])
+def __test_requested_fill_and_socket_share_one_cursor__(order, answer, expected):
+    """A requested history fill and the socket's closes, in every arrival order
+
+    The consumer gets strictly ascending closes, each slot once; whichever close
+    of a slot arrives first is the one handed on.
+    """
+    provider = _SplicedVenue(answer)
+    backfill = ClosedBarBackfill()
+    stream = live_ohlcv_generator(provider, "BTC/USDT", "1", backfill=backfill)
+    socket_bars = {"s1": _make_ohlcv(_S1, close=101.0), "s2": _make_ohlcv(_S2, close=102.0)}
+    for event in order:
+        if event == "rest":
+            fill = backfill.request(_S0)
+            assert fill is not None
+            fill.result(timeout=5.0)
+        else:
+            provider.push_and_settle(socket_bars[event])
+    provider.push(_make_ohlcv(_S3, close=103.0))
+
+    closed = _closed_until(stream, _S3)
+
+    stamps = [bar.timestamp for bar in closed]
+    assert stamps == sorted(set(stamps)), "out of order or duplicated"
+    assert [(bar.timestamp, bar.close) for bar in closed] == expected + [(_S3, 103.0)]
+    assert backfill.request(_S0) is None, "the fill outlived its stream"
+
+
+def __test_requested_fill_starts_after_the_stream_cursor__():
+    """The query asks after the newest close the stream already handed on"""
+    provider = _SplicedVenue([])
+    backfill = ClosedBarBackfill()
+    stream = live_ohlcv_generator(provider, "BTC/USDT", "1", backfill=backfill)
+    provider.push_and_settle(_make_ohlcv(_S1, close=101.0))
+    fill = backfill.request(_S0)
+    assert fill is not None and fill.result(timeout=5.0) == 0
+    provider.push(_make_ohlcv(_S3, close=103.0))
+    _closed_until(stream, _S3)
+    assert provider.history_calls == [_S1]
+
+
+@pytest.mark.parametrize("socket_during_query", [True, False])
+@pytest.mark.parametrize("answer, expected", [
+    (_REST_BOTH, [(_S1, 901.0), (_S2, 902.0)]),
+    ([_make_ohlcv(_S1, close=901.0)], [(_S1, 901.0), (_S2, 102.0)]),
+])
+def __test_startup_gap_and_socket_share_one_cursor__(socket_during_query, answer, expected):
+    """The startup gap fill with socket closes of the same slots, early or late
+
+    Socket bars that arrive while the startup query runs wait in the socket until
+    the fill is spliced; either way each slot reaches the consumer once, in order.
+    """
+    provider = _SplicedVenue(answer, hold_history=True)
+    stream = live_ohlcv_generator(provider, "BTC/USDT", "1", last_historical_timestamp=_S0 - 60_000)
+    assert provider.history_called.wait(5.0)
+    socket_bars = [_make_ohlcv(_S1, close=101.0), _make_ohlcv(_S2, close=102.0)]
+    if socket_during_query:
+        for bar in socket_bars:
+            provider.push(bar)
+        provider.release_history()
+    else:
+        provider.release_history()
+        for bar in socket_bars:
+            provider.push_and_settle(bar)
+    provider.push(_make_ohlcv(_S3, close=103.0))
+
+    closed = _closed_until(stream, _S3)
+
+    stamps = [bar.timestamp for bar in closed]
+    assert stamps == sorted(set(stamps)), "out of order or duplicated"
+    assert [(bar.timestamp, bar.close) for bar in closed] == expected + [(_S3, 103.0)]
+    assert provider.history_calls == [_S0 - 60_000]
+
+
+def __test_late_ticks_of_a_history_settled_slot_are_dropped__():
+    """A forming tick of a slot the history already closed never reaches the consumer"""
+    provider = _SplicedVenue([_make_ohlcv(_S1, close=901.0)])
+    backfill = ClosedBarBackfill()
+    stream = live_ohlcv_generator(provider, "BTC/USDT", "1", backfill=backfill)
+    fill = backfill.request(_S0)
+    assert fill is not None and fill.result(timeout=5.0) == 1
+    provider.push(_make_ohlcv(_S1, close=950.0, is_closed=False))
+    provider.push(_make_ohlcv(_S2, close=102.0, is_closed=False))
+    provider.push(_make_ohlcv(_S2, close=102.0))
+
+    seen: list[tuple[int, bool]] = []
+    for item in stream:
+        if item is LIVE_TRANSITION:
+            continue
+        seen.append((item.timestamp, item.is_closed))
+        if item.timestamp == _S2 and item.is_closed:
+            break
+    stream.close()
+
+    assert seen == [(_S1, True), (_S2, False), (_S2, True)]

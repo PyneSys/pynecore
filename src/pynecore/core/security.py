@@ -596,11 +596,13 @@ class SecurityState:
     # ``dev_skip`` decision (0 before the first one).
     dev_period_start: int = 0
 
-    # ``Lookahead.ON``: set once the one-time historical prefill in
-    # ``__sec_signal__`` has replayed the child's own ``.ohlcv`` bars that
-    # closed before the first containing period. The developing transport
-    # never reads that file, so without the prefill the child's HTF series
-    # would begin at the chart's first bar.
+    # Set once the one-time historical prefill in ``__sec_signal__`` has
+    # replayed the child's own ``.ohlcv`` bars that closed before the first
+    # containing period. The developing transport never reads that file, so
+    # without the prefill the child's HTF series would begin at the chart's
+    # first bar. A context the closed-only flow serves first (lookahead_off and
+    # lookahead_last_closed history) reads its feed there, so the flag is set
+    # on that path too and the live transport never prefills it again.
     htf_prefilled: bool = False
 
     # Set by ``__sec_signal__`` when an LTF chart bar precedes the feed (see
@@ -805,7 +807,11 @@ def _get_confirmed_time(state: SecurityState, chart_time: int,
         return state.last_confirmed
 
     if state.same_timeframe:
-        # A chart bar and its same-time security bar close at the same instant.
+        # A chart bar and its same-time security bar close at the same instant,
+        # so a developing round (its tick lies inside the chart bar) confirms
+        # nothing new: the security bar is still forming as well.
+        if round_tick:
+            return state.last_confirmed
         return chart_time
 
     resampler = state.resampler
@@ -2716,6 +2722,14 @@ def create_chart_protocol(
             # Historical OFF / LAST_CLOSED warmup falls through to the
             # closed-only flow below; the aggregator state has already advanced
             # so the live transition starts with the correct in-progress HTF bar.
+            # That flow reads the child's own feed up to every period it
+            # confirms, which is the prefill's whole job: at the live transition
+            # there is nothing left before the containing period that the closed
+            # steps do not deliver. A prefill there would be a round that runs no
+            # bar, and such a round publishes ``na``. MEASURED live on
+            # BINANCE:BTC/USDT@60 with a ``"D"`` context: yesterday's close
+            # turned into ``na`` from the first realtime tick of the day on.
+            state.htf_prefilled = True
 
         # Closed-only flow (historical / lookahead_off / lookahead_last_closed)
         target_time = _get_confirmed_time(
@@ -4125,6 +4139,34 @@ class BarCalendar:
     grid_mode: str | None = None
 
 
+def chart_bar_calendar(chart_syminfo: 'SymInfo | None', tz: ZoneInfo | None) -> BarCalendar:
+    """
+    The chart's own trading schedule, built from its ``SymInfo``.
+
+    :param chart_syminfo: The chart symbol's ``SymInfo``, ``None`` when unknown.
+    :param tz: The chart's timezone, used when the ``SymInfo`` names none (or one
+        that does not parse).
+    :return: The chart's calendar; without a ``SymInfo``, one with no schedule.
+    """
+    if chart_syminfo is None:
+        return BarCalendar(tz=tz)
+    from .resampler import grid_mode
+    cal_tz = tz
+    if chart_syminfo.timezone:
+        try:
+            cal_tz = parse_timezone(chart_syminfo.timezone)
+        except (ValueError, KeyError):
+            cal_tz = tz
+    return BarCalendar(
+        tz=cal_tz,
+        opening_hours=tuple(chart_syminfo.opening_hours or ()),
+        session_starts=tuple(chart_syminfo.session_starts or ()),
+        corrections=chart_syminfo.session_corrections or None,
+        grid_mode=grid_mode(chart_syminfo.type, chart_syminfo.opening_hours,
+                            chart_syminfo.prefix),
+    )
+
+
 def _day_hours(day: date, cal: BarCalendar) -> 'list[SymInfoInterval]':
     """The intervals effective on one calendar date: its correction, or the template.
 
@@ -4664,22 +4706,7 @@ def setup_security_states(
     # close and of the ``same_calendar`` test every D/W/M peer's as-of extension
     # is gated on.
     from .resampler import grid_mode
-    chart_calendar = BarCalendar(tz=tz)
-    if chart_syminfo is not None:
-        chart_cal_tz = tz
-        if chart_syminfo.timezone:
-            try:
-                chart_cal_tz = parse_timezone(chart_syminfo.timezone)
-            except (ValueError, KeyError):
-                chart_cal_tz = tz
-        chart_calendar = BarCalendar(
-            tz=chart_cal_tz,
-            opening_hours=tuple(chart_syminfo.opening_hours or ()),
-            session_starts=tuple(chart_syminfo.session_starts or ()),
-            corrections=chart_syminfo.session_corrections or None,
-            grid_mode=grid_mode(chart_syminfo.type, chart_syminfo.opening_hours,
-                                chart_syminfo.prefix),
-        )
+    chart_calendar = chart_bar_calendar(chart_syminfo, tz)
 
     sec_ids = list(contexts.keys())
     sync_block = SyncBlock(sec_ids)

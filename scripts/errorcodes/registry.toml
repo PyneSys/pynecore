@@ -663,6 +663,21 @@ through a value (`h = f; h()`), so its one context is written twice on a bar.
 Write the calls directly, by name, in the `@pyne` module.
 """
 
+[R0055]
+name = "live_security_symbol"
+severity = "error"
+title = "Symbol of a live request.security unavailable"
+message = "`request.security` asks for {symbol}, which the `{provider}` provider cannot serve as `{native}`: {why}."
+python = "ValueError"
+explanation = """
+A live run reads every `request.security()` symbol from the chart's provider.
+A TradingView-style symbol is translated to the provider's own with the
+`symbol_map` of the provider's config (`config/plugins/<provider>.toml`) or with
+the workdir's `config/symbol_map.toml`; a symbol neither maps is passed on as
+written. Map the symbol to the provider's own, or pass
+`ignore_invalid_symbol = true` to get `na` instead of this error.
+"""
+
 [I0004]
 name = "internal_error"
 severity = "error"

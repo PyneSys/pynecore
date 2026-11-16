@@ -60,6 +60,20 @@ def __test_confirmed_time_same_tf__(log):
     assert result == 2000
 
 
+def __test_confirmed_time_same_tf_developing__(log):
+    """A developing round of a same-timeframe context confirms nothing new.
+
+    The security bar opening with the chart bar closes with it, so a tick inside
+    the chart bar keeps the last confirmed bar instead of the forming one.
+    """
+    state = _make_state(timeframe="5", same_timeframe=True)
+    state.last_confirmed = 1000
+
+    assert _get_confirmed_time(state, 2000, round_tick=2500) == 1000
+    # The chart bar's close confirms its own security bar
+    assert _get_confirmed_time(state, 2000) == 2000
+
+
 def __test_confirmed_time_htf_mid_period__(log):
     """Mid-period chart bars target the previous HTF period's open"""
     state = _make_state(timeframe="1D", chart_off=_CHART_OFF_5M)

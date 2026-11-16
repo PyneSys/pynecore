@@ -9,6 +9,8 @@ import tomllib
 from pynecore.core.plugin import override, ProviderError, Broker
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession, tick_grid
+# noinspection PyProtectedMember
+from pynecore.lib.timeframe import _in_seconds, _process_tf
 from ..types.ohlcv import OHLCV
 
 if TYPE_CHECKING:
@@ -67,6 +69,25 @@ _DEFAULT_MINTICK: float = 1e-8
 
 def add_space_before_uppercase(s):
     return re.sub(r'(?<!^)([A-Z])', r' \1', s)
+
+
+def _scheduled_close_ms(open_ms: int, timeframe: str) -> int:
+    """The scheduled close of a 24/7 candle opening at ``open_ms``.
+
+    A monthly candle closes at the start of the month after its calendar months;
+    every other timeframe has a fixed length.
+
+    :param open_ms: The candle's open, Unix milliseconds.
+    :param timeframe: Timeframe in TradingView format.
+    :return: The close, Unix milliseconds (exclusive).
+    """
+    modifier, multiplier = _process_tf(timeframe)
+    if modifier == 'M':
+        opened = datetime.fromtimestamp(open_ms / 1000, UTC)
+        months = opened.year * 12 + opened.month - 1 + multiplier
+        closes = datetime(months // 12, months % 12 + 1, 1, tzinfo=UTC)
+        return int(closes.timestamp() * 1000)
+    return open_ms + _in_seconds(timeframe) * 1000
 
 
 @dataclass
@@ -312,6 +333,42 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         return self.symbol or symbol
 
     @override
+    def resolve_symbol(self, pine_key: str) -> str:
+        """
+        Translate a TradingView symbol of this exchange to its CCXT market.
+
+        After the symbol maps of :meth:`ProviderPlugin.resolve_symbol`, a key
+        written as TradingView does (``"BINANCE:ETHUSDT"``) is looked up by the
+        exchange's market id. The id names the spot and the perpetual market
+        alike, so the TradingView convention decides: a ``.P`` suffix is the
+        perpetual (swap) market, no suffix the spot market. A key of another
+        exchange, a key with a unified CCXT symbol (``"BINANCE:ETH/USDT"``) and
+        an id the exchange does not list are returned unchanged.
+
+        :param pine_key: Symbol as written in the Pine script.
+        :return: ``"<exchange>:<CCXT symbol>"``, or the mapped or unchanged key.
+        """
+        import ccxt
+        native = super().resolve_symbol(pine_key)
+        if native != pine_key:
+            return native
+        prefix, sep, market_id = pine_key.partition(':')
+        if not sep or '/' in market_id or prefix.lower() != self._client.id:
+            return pine_key
+        market_type = 'spot'
+        if market_id.endswith('.P'):
+            market_id = market_id[:-2]
+            market_type = 'swap'
+        try:
+            self._client.load_markets()
+        except ccxt.BaseError:
+            return pine_key
+        for market in self._client.markets_by_id.get(market_id) or ():
+            if market.get('type') == market_type:
+                return f"{self._client.id}:{market['symbol']}"
+        return pine_key
+
+    @override
     def get_list_of_symbols(self, *args, **kwargs) -> list[str]:
         """Get list of symbols."""
         import ccxt
@@ -506,13 +563,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         tt: datetime = time_to.replace(tzinfo=None)
 
         if limit is None:
-            assert self._client.id
-            limit_config = _KNOWN_LIMITS.get(self._client.id, 100)
-
-            if isinstance(limit_config, dict):
-                limit = limit_config.get(self.xchg_timeframe, limit_config.get('default', 100))
-            else:
-                limit = limit_config
+            limit = self._chunk_limit(self.xchg_timeframe)
 
         try:
             while tf < tt:
@@ -570,6 +621,17 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
 
         if on_progress:
             on_progress(tt)
+
+    def _chunk_limit(self, xchg_timeframe: str) -> int:
+        """Candles to ask for in one ``fetch_ohlcv`` call on this exchange.
+
+        :param xchg_timeframe: Timeframe in CCXT format.
+        :return: The exchange's known per-request cap, 100 when unknown.
+        """
+        limit_config = _KNOWN_LIMITS.get(self._client.id or '', 100)
+        if isinstance(limit_config, dict):
+            return limit_config.get(xchg_timeframe, limit_config.get('default', 100))
+        return limit_config
 
     # --- LiveProviderPlugin methods ---
 
@@ -674,6 +736,15 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                     and timestamp != self._last_bar_timestamp):
                 assert self._last_bar_ohlcv is not None
                 closed_bar = self._last_bar_ohlcv._replace(is_closed=True)
+                # The update that opens the next candle may carry the previous
+                # candle's final trades too: its record in the same batch is newer
+                # than the last update seen of it
+                for row in reversed(candles[:-1]):
+                    if int(row[0]) == self._last_bar_timestamp:
+                        closed_bar = closed_bar._replace(
+                            open=float(row[1]), high=float(row[2]), low=float(row[3]),
+                            close=float(row[4]), volume=float(row[5]))
+                        break
                 self._last_bar_timestamp = timestamp
                 self._last_bar_ohlcv = current_ohlcv
                 return closed_bar
@@ -681,3 +752,57 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             self._last_bar_timestamp = timestamp
             self._last_bar_ohlcv = current_ohlcv
             return current_ohlcv
+
+    @override
+    async def backfill_closed_bars(
+            self, symbol: str, timeframe: str, since_ms: int,
+    ) -> list[OHLCV]:
+        """Fetch the candles that closed after ``since_ms`` from the exchange's REST API.
+
+        Walks the window in chunks of the exchange's per-request cap, the way
+        :meth:`download_ohlcv` does, until it reaches the candle still forming:
+        that one, and anything newer, is left to the stream. A candle is closed once
+        its scheduled close lies in the past. The query runs on the live async client,
+        on the stream's own event loop, so no worker thread is involved and every
+        request is bounded by the client's own ``timeout``.
+
+        :param symbol: Symbol in CCXT format (e.g. "BTC/USDT").
+        :param timeframe: Timeframe in TradingView format.
+        :param since_ms: Opening of the last bar the framework already holds.
+        :return: Closed candles strictly after ``since_ms``, ascending, possibly empty.
+        """
+        client = self._async_client
+        if client is None:
+            return []
+        xchg_tf = self.to_exchange_timeframe(timeframe)
+        limit = self._chunk_limit(xchg_tf)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        recovered: list[OHLCV] = []
+        cursor = since_ms + 1
+        while _scheduled_close_ms(cursor, timeframe) <= now_ms:
+            rows: list[list[Any]] = await client.fetch_ohlcv(symbol, xchg_tf, since=cursor,
+                                                             limit=limit)
+            newest: int | None = None
+            reached_forming = False
+            for row in sorted(rows or [], key=lambda r: int(r[0])):
+                # CCXT candle timestamps are Unix milliseconds, the OHLCV unit
+                timestamp = int(row[0])
+                newest = timestamp
+                if timestamp <= since_ms or (recovered and timestamp <= recovered[-1].timestamp):
+                    continue
+                if _scheduled_close_ms(timestamp, timeframe) > now_ms:
+                    reached_forming = True
+                    break
+                recovered.append(OHLCV(
+                    timestamp=timestamp,
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                    is_closed=True,
+                ))
+            if reached_forming or newest is None or newest < cursor:
+                break
+            cursor = newest + 1
+        return recovered

@@ -29,6 +29,10 @@ def main():
         strategy.close("A")
     if barstate.islastconfirmedhistory:
         strategy.entry("B", strategy.long)
+    # Only the partial run of a still-forming last warmup bar is a history bar that
+    # is not confirmed: an order it placed would fill on that bar's earlier prices
+    if barstate.ishistory and not barstate.isconfirmed:
+        strategy.entry("C", strategy.long)
     plot(strategy.closedtrades, 'closed')
     plot(strategy.position_size, 'pos')
 
@@ -111,7 +115,12 @@ def __test_forming_last_warmup_bar_places_no_order__(script_path, module_key, sy
     plots = __test_helper_last_bars(results)
     # The earlier warmup bars still traded
     assert plots['closed'] == 1
-    assert plots['pos'] == 0
+    # The bar before the forming one is the last confirmed history bar: its entry
+    # fills at the open of the bar the live feed goes on forming. The forming bar's
+    # own partial run placed nothing.
+    assert plots['pos'] == 1
+    assert [t.entry_id for t in runner.script.position.open_trades] == ["B"]
+    assert runner.script.position.open_trades[0].entry_price == pytest.approx(110.0)
     # The suppressed bar does not repeat the previous bar's close
     assert sum(len(t) for _, _, t in results) == 1
 
@@ -165,11 +174,14 @@ def __test_period_ended_during_warmup_keeps_partial_bar_suppressed__(script_path
                                   history_as_of=partial_ts + 60 * 1000)
     results = list(runner.run_iter())
 
-    # The partial run's entry would fill at the bar's own open, before it was placed
-    assert not runner.script.position.open_trades
+    # The partial run's entry would fill at the bar's own open, before it was placed.
+    # The only open trade is the last confirmed bar's entry, filled at that open.
+    open_trades = runner.script.position.open_trades
+    assert [t.entry_id for t in open_trades] == ["B"]
+    assert open_trades[0].entry_price == pytest.approx(100.0)
     plots = __test_helper_last_bars(results)
     assert plots['closed'] == 1
-    assert plots['pos'] == 0
+    assert plots['pos'] == 1
 
 
 def __test_history_trades_rejected_outside_live_paper__(script_path, module_key, syminfo):

@@ -18,6 +18,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def canonical_timeframe(timeframe: str) -> str:
+    """
+    Spell a TradingView timeframe with an explicit multiplier (``"D"`` -> ``"1D"``).
+
+    Pine accepts a bare unit, but the providers' timeframe tables and the OHLCV
+    file period only know the multiplied form, so one timeframe has one spelling.
+
+    :param timeframe: Timeframe in TradingView format (``"D"``, ``"1D"``, ``"60"``).
+    :return: The same timeframe with its multiplier (``"1D"``, ``"1D"``, ``"60"``).
+    """
+    modifier, multiplier = _process_tf(timeframe)
+    return f"{multiplier}{modifier}" if modifier else str(multiplier)
+
+
 class Broker(NamedTuple):
     """A selectable broker / exchange of a :attr:`~ProviderPlugin.multi_broker` provider.
 
@@ -59,6 +73,12 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
 
     symbol: str | None = None
     """Symbol of the provider."""
+
+    provider_symbol: str | None = None
+    """The symbol exactly as the instance was constructed with: the symbol part of
+    its provider string. A plugin may reshape :attr:`symbol` (split off the
+    exchange or the broker); a new instance constructed with this one addresses
+    the same instrument."""
 
     timeframe: str | None = None
     """Timeframe of the provider."""
@@ -147,18 +167,17 @@ class ProviderPlugin(Plugin[ConfigT], metaclass=ABCMeta):
         :param config: Pre-loaded config dataclass instance.
         """
         self.symbol = symbol
+        self.provider_symbol = symbol
         self.timeframe = timeframe
         self.xchg_timeframe = self.to_exchange_timeframe(timeframe) if timeframe else None
         if ohlcv_dir:
             assert symbol and timeframe
             ohlcv_path = self.get_ohlcv_path(symbol, timeframe, ohlcv_dir)
             self.ohlcv_path: Path | None = ohlcv_path
-            # The written file declares its period with an explicit multiplier
-            # ('D' -> '1D'), so the same timeframe always maps to one file period.
-            # noinspection PyProtectedMember
-            modifier, multiplier = _process_tf(timeframe)
-            period = f"{multiplier}{modifier}" if modifier else str(multiplier)
-            self.ohlcv_file: OHLCVWriter | None = OHLCVWriter(ohlcv_path, period)
+            # The written file declares its period with an explicit multiplier,
+            # so the same timeframe always maps to one file period.
+            self.ohlcv_file: OHLCVWriter | None = OHLCVWriter(ohlcv_path,
+                                                              canonical_timeframe(timeframe))
         else:
             self.ohlcv_path = None
             self.ohlcv_file = None

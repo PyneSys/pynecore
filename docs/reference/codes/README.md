@@ -76,6 +76,7 @@ check each name their errors by code, so the code in a message leads here.
 | [R0052](runtime-errors.md#R0052) | error    | Argument out of range                         |
 | [R0053](runtime-errors.md#R0053) | error    | Export used wrongly                           |
 | [R0054](runtime-errors.md#R0054) | error    | request.security called outside the transform |
+| [R0055](runtime-errors.md#R0055) | error    | Symbol of a live request.security unavailable |
 | [I0004](runtime-errors.md#I0004) | error    | Internal error                                |
 
 ## [Pyne Code Rules](pyne-code-rules.md)
