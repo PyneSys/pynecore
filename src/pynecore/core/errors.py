@@ -6,7 +6,7 @@ run has located it, the bar it stopped on and the line of the script that
 raised it. :meth:`PyneError.report` writes the one line a run prints for it,
 in the form ``pyneaot run`` writes it too::
 
-    bar 12 (2024-01-02 03:04 UTC): R0010 at Pine line 7: <message>
+    bar 12 (2024-01-02 03:04 UTC): R0010 at /scripts/my_script.py:7:5: <message>
 """
 
 import os
@@ -72,9 +72,11 @@ class Code(NamedTuple):
 class SiteLoc(NamedTuple):
     """Where in the script's code an error was raised.
 
-    The location is data, the host writes it: a local run names the file it ran
-    (:meth:`__str__`), the web editor the module's tab, and every host the Pine
-    line when there is one. A compiled run's location has the same fields.
+    The location is data, the host writes it: a local run names the Pyne code
+    file it ran (:meth:`__str__`), the web editor the module's tab. The Pine
+    line is for a host that ran the Pine source (:meth:`place`): one that ran
+    the Pyne code names the Pyne code's line. A compiled run's location has the
+    same fields.
     """
     #: The module: :data:`MAIN_MODULE` for the script, a library's import name.
     module: str
@@ -87,9 +89,18 @@ class SiteLoc(NamedTuple):
     #: The line of the Pine Script source :attr:`path` was compiled from.
     pine_line: int | None = None
 
-    def __str__(self) -> str:
-        if self.pine_line is not None:
+    def place(self, pine: bool = False) -> str:
+        """The location as a run prints it.
+
+        :param pine: The run started from the Pine source: name its line when the
+            sourcemap knows it.
+        :return: ``Pine line N``, or the Pyne code's ``file:line:column``.
+        """
+        if pine and self.pine_line is not None:
             return f"Pine line {self.pine_line}"
+        return str(self)
+
+    def __str__(self) -> str:
         if self.col is None:
             return f"{self.path}:{self.line}"
         return f"{self.path}:{self.line}:{self.col}"
@@ -216,13 +227,18 @@ class PyneError(Exception):
         params = ', '.join(f"{k}={v!r}" for k, v in self.params.items())
         return f"{type(self).__name__}({params})"
 
-    def report(self) -> str:
+    def report(self, pine: bool = False) -> str:
         """The line a run prints for the error: the bar, when it is known, the
         code, the location, the message, and a note when the code of a
-        ``request.security`` context raised it."""
+        ``request.security`` context raised it.
+
+        :param pine: The run started from the Pine source, so the location is its
+            line when the sourcemap knows it (:meth:`SiteLoc.place`).
+        :return: The report line.
+        """
         text = self.code.code
         if self.at is not None:
-            text += f" at {self.at}"
+            text += f" at {self.at.place(pine)}"
         text += f": {self.message}"
         if self.in_security:
             text += " (in a `request.security` context)"
@@ -273,9 +289,14 @@ class PyneSyntaxError(PyneError, SyntaxError):
         state = {k: v for k, v in self.__dict__.items() if k != 'params'}
         return _rebuild_syntax, (type(self), self.params, state, self.location)
 
-    def report(self) -> str:
+    def report(self, pine: bool = False) -> str:
         """The line a run prints for the error: the code, the place in the
-        source, when it is known, and the message."""
+        source, when it is known, and the message.
+
+        :param pine: Unused: the rule is broken in the Pyne code, which is the
+            place named even when the run started from the Pine source.
+        :return: The report line.
+        """
         text = self.code.code
         if self.filename is not None:
             text += f" at {self.filename}:{self.lineno}"

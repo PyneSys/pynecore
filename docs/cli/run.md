@@ -306,11 +306,13 @@ When the script stops with an error that has a code (see
 on, the code, where in the script, and the message.
 
 ```
-Error: bar 5 (2023-06-13 21:00 UTC): R0005 at Pine line 4: stopped at five
+Error: bar 5 (2023-06-13 21:00 UTC): R0005 at scripts/my_script.py:12:5: stopped at five
 ```
 
-The location is the Pine Script line when the script was compiled from Pine and the compile's
-sourcemap (`<script>.py.map`) is beside it, otherwise the Pyne code's `file:line:column`. An
+The location is the Pyne code's `file:line:column`. When you run the `.pine` source, it is the
+Pine Script line instead (`R0005 at Pine line 4: ...`), as long as the compile's sourcemap
+(`<script>.py.map`) is beside the code and matches it. Running the compiled `.py` names the line
+of the `.py`, even when the `.pine` source is next to it. An
 error raised by the code of a `request.security()` context ends with
 `` (in a `request.security` context) ``.
 

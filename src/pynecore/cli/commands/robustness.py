@@ -498,7 +498,7 @@ def robustness(
         if data is None:
             secho("Missing argument DATA (or use --from-trades).", fg="red", err=True)
             raise Exit(1)
-        resolved = resolve_script(script, api_key)
+        resolved, _ = resolve_script(script, api_key)
         stem = resolved.stem
         with _backtest_session(resolved, data, time_from, time_to, timeframe,
                                security) as session:

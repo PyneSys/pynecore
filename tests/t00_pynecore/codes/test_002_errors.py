@@ -90,7 +90,8 @@ def __test_bar_time_text_writes_seconds_only_when_there_are__(ms: int, text: str
 
 
 def __test_report_names_the_bar_the_code_and_the_location__():
-    """The report line of a run, the Pyne location when there is no Pine line"""
+    """The report line of a run: the Pyne location, the Pine line only for a run of the Pine
+    source"""
     error = errorcodes.DivisionByZeroError()
     assert error.report() == 'R0001: Division by zero.'
     error.bar_index, error.bar_time = 7, 1704164640000
@@ -98,6 +99,11 @@ def __test_report_names_the_bar_the_code_and_the_location__():
     assert error.report() == 'bar 7 (2024-01-02 03:04 UTC): R0001 at /s/script.py:12:5: ' \
                              'Division by zero.'
     error.at = SiteLoc('main', '/s/script.py', 12, 5, pine_line=3)
+    assert error.report() == 'bar 7 (2024-01-02 03:04 UTC): R0001 at /s/script.py:12:5: ' \
+                             'Division by zero.'
     error.in_security = True
-    assert error.report() == 'bar 7 (2024-01-02 03:04 UTC): R0001 at Pine line 3: ' \
-                             'Division by zero. (in a `request.security` context)'
+    assert error.report(pine=True) == 'bar 7 (2024-01-02 03:04 UTC): R0001 at Pine line 3: ' \
+                                      'Division by zero. (in a `request.security` context)'
+    error.at = SiteLoc('main', '/s/script.py', 12, 5)
+    assert error.report(pine=True) == 'bar 7 (2024-01-02 03:04 UTC): R0001 at /s/script.py:12:5: ' \
+                                      'Division by zero. (in a `request.security` context)'

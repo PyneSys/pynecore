@@ -666,7 +666,7 @@ def _print_data_requirements(requirements: DataRequirements, script_name: str) -
     console.print("\n".join(lines), markup=False, highlight=False)
 
 
-def resolve_script(script: Path, api_key: str | None) -> Path:
+def resolve_script(script: Path, api_key: str | None) -> tuple[Path, bool]:
     """
     Find a script by name or path and compile it when it is Pine Script.
 
@@ -676,7 +676,8 @@ def resolve_script(script: Path, api_key: str | None) -> Path:
 
     :param script: Script name or path
     :param api_key: PyneSys API key overriding the configuration file
-    :return: The ``.py`` script to run
+    :return: The ``.py`` script to run, and whether it was found as the ``.pine`` source,
+             so an error names the Pine line
     :raises Exit: When the script does not exist or the configuration is invalid
     """
     # Expand script path
@@ -695,8 +696,10 @@ def resolve_script(script: Path, api_key: str | None) -> Path:
         secho(f"Error: {MissingFileError(path=str(script)).report()}", fg="red", err=True)
         raise Exit(1)
 
+    from_pine = script.suffix == ".pine"
+
     # Handle .pine files - compile them first
-    if script.suffix == ".pine":
+    if from_pine:
         # Read api.toml configuration
         api_config = {}
         try:
@@ -751,7 +754,7 @@ def resolve_script(script: Path, api_key: str | None) -> Path:
                       err=True)
                 raise Exit(1)
 
-    return script
+    return script, from_pine
 
 
 def resolve_data(data: str, time_from: str | None, *,
@@ -1153,7 +1156,7 @@ def run(
     Supports CSV, TXT, JSON, and OHLCV data files. Non-OHLCV files are automatically converted.
     """  # noqa
 
-    script = resolve_script(script, api_key)
+    script, from_pine = resolve_script(script, api_key)
 
     # --- Data resolution: provider string or file path ---
     provider_mode = is_provider_string(data)
@@ -1795,7 +1798,7 @@ def run(
             # The script's own error: one line, as `pyneaot run` writes it
             if show_traceback:
                 console.print_exception(show_locals=False)
-            secho(f"Error: {e.report()}", err=True, fg=colors.RED)
+            secho(f"Error: {e.report(pine=from_pine)}", err=True, fg=colors.RED)
             raise Exit(1)
         except Exception as e:
             error = internal(e)
