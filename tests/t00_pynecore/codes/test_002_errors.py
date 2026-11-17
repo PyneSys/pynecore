@@ -7,6 +7,8 @@ import builtins
 import importlib
 import pickle
 import re
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -31,6 +33,21 @@ def _vectors() -> list[tuple[float, str]]:
 def __test_format_arg_writes_the_shared_vectors__(value: float, text: str):
     """A number is written as the Rust ``format_arg`` writes it"""
     assert format_arg(value) == text
+
+
+@pytest.mark.parametrize('module', [
+    'pynecore.core.errors', 'pynecore.errorcodes', 'pynecore.core.syminfo',
+    'pynecore.core.live_runner',
+])
+def __test_error_modules_import_first_in_a_fresh_interpreter__(module: str):
+    """The error modules are under the library: importing one first must not need it loaded
+
+    A module that pulls the type package in from here closes an import cycle through
+    the library, which only shows when nothing loaded the library before.
+    """
+    result = subprocess.run([sys.executable, '-c', f'import {module}'],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def __test_format_arg_writes_pine_values__():

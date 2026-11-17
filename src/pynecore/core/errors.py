@@ -17,8 +17,6 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, ClassVar, NamedTuple, TypeVar
 
-from ..types.na import NA
-
 __all__ = ['Code', 'SiteLoc', 'SyntaxLocation', 'PyneError', 'PyneSyntaxError', 'RUNTIME_ROOTS',
            'MAIN_MODULE', 'MODULE_ID', 'format_arg', 'bar_time_text', 'user_traceback']
 
@@ -133,7 +131,10 @@ def format_arg(value: Any) -> str:
         return format(Decimal(repr(value)), 'f')
     if isinstance(value, str):
         return value
-    if isinstance(value, NA):
+    # An ``NA`` is told by its type slot, not by its class: this module is under
+    # every other one, and importing the type package from here closes an import
+    # cycle through the library (types -> lib -> errorcodes -> this module).
+    if hasattr(type(value), '__pyne_na_type__'):
         return 'na'
     return str(value)
 

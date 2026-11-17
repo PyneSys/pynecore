@@ -1953,9 +1953,12 @@ def live_ohlcv_generator(
                     and awaited_slot is not None and _history_settled(awaited_slot)
                     and time.time() * 1000.0 >= _slot_close(awaited_slot) + bar_grace_ms)
 
+                # A zero timeout ends the read before it starts, which hands this
+                # pass to the watchdog below without taking an update off the socket
+                if settle_now:
+                    effective_timeout = 0.0
+
                 try:
-                    if settle_now:
-                        raise asyncio.TimeoutError
                     if replay is not None:
                         bar_update = replay
                     else:

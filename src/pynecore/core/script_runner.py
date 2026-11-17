@@ -4163,14 +4163,14 @@ class ScriptRunner:
                 live_clock = self._live_clock
 
                 # noinspection PyProtectedMember
-                def _latch_catch_up(update: OHLCV) -> None:
+                def _latch_catch_up(update: OHLCV, latch_tf: str) -> None:
                     """Close or open the trade latch by how late ``update`` is processed.
 
                     :param update: The live update about to run.
+                    :param latch_tf: The chart timeframe the latch measures lateness on.
                     """
-                    assert catch_up_tf
                     rule = is_catch_up if update.is_closed else is_stale_update
-                    late = rule(update.timestamp, catch_up_tf, live_clock())
+                    late = rule(update.timestamp, latch_tf, live_clock())
                     if late == lib._strategy_suppressed:
                         return
                     lib._strategy_suppressed = late
@@ -4340,7 +4340,7 @@ class ScriptRunner:
                         lib._viz_seq.clear()
                         lib._plot_ids.clear()
                         if catch_up_tf:
-                            _latch_catch_up(candle)
+                            _latch_catch_up(candle, catch_up_tf)
                         if run_on_every_tick:
                             # Broker sync runs before the script so orders queued by the
                             # previous tick dispatch now, and async fills from watch_orders
@@ -4365,7 +4365,7 @@ class ScriptRunner:
                         # ── Subsequent intra-bar tick ──
                         sub_bars.append(candle)
                         if catch_up_tf:
-                            _latch_catch_up(candle)
+                            _latch_catch_up(candle, catch_up_tf)
                         if run_on_every_tick:
                             if var_snapshot and var_snapshot.has_vars:
                                 var_snapshot.restore()
@@ -4391,7 +4391,7 @@ class ScriptRunner:
                         # ── Bar close ──
                         last_confirmed_timestamp = candle.timestamp
                         if catch_up_tf:
-                            _latch_catch_up(candle)
+                            _latch_catch_up(candle, catch_up_tf)
                         if is_new_bar:
                             sub_bars = []
                             if var_snapshot and var_snapshot.has_vars:
