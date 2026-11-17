@@ -195,6 +195,30 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
     late into a hole.
     """
 
+    history_revises_before_lag: bool = False
+    """Whether the history returns a fresh bar before its final values.
+
+    ``True`` for a venue whose history answers with a slot right at its close and
+    revises the bar's values afterwards, within :attr:`history_publish_lag`. The
+    framework then takes no bar from an answer asked earlier than the lag past the
+    bar's close: it asks again once the lag is over. ``False`` (the default): a bar
+    the history returns is final whenever it is asked, so a later slot's bar can also
+    prove an earlier one empty before the lag ends.
+    """
+
+    stream_closes_match_history: bool = True
+    """Whether the stream's closed bar of a slot carries the history's values.
+
+    ``False`` for a venue whose socket candle is built from another price feed than
+    its history (a throttled quote stream, for example), so a close from the socket
+    can differ from the bar a restart replays from :meth:`backfill_closed_bars`. The
+    framework then takes every closed bar from the history, asked once
+    :attr:`history_publish_lag` has passed, and treats the socket's close as the
+    slot's last forming update. The stream's boundary watchdog hands that update on
+    as the close when the history has not delivered the bar by the close's
+    deadline. Without a history query the socket's closes go on as they are.
+    """
+
     # --- Connection lifecycle ---
 
     @abstractmethod

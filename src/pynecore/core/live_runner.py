@@ -36,7 +36,13 @@ history bar and the socket's close of the same or a neighbouring slot reach the
 consumer once and in order, whichever arrives first. A stream that closes its own
 slots fills the gap after every reconnect and a close its socket missed the same
 way. A history query that fails is retried; the stream does not hand on a later
-bar over a gap the venue has not answered for.
+bar over a gap the venue has not answered for. On a venue that revises a fresh
+history bar (:attr:`LiveProviderPlugin.history_revises_before_lag`) a history bar
+is taken only from a query asked at least the publish lag after its close, and on
+a venue whose socket candle is not the history's
+(:attr:`LiveProviderPlugin.stream_closes_match_history`) every close comes from
+the history, the socket's close standing in only when the history has not
+delivered the bar by the close's deadline.
 
 Dedup: the duplicate-filter for ``last_historical_timestamp`` uses
 **strict** less-than for both closed bars and intra-bar updates. The
@@ -1120,6 +1126,8 @@ def live_ohlcv_generator(
     # so a duck-typed provider gets the base class's values.
     history_has_idle_bars = bool(getattr(provider, "history_has_idle_bars", True))
     publish_lag_ms = float(getattr(provider, "history_publish_lag", 10.0)) * 1000.0
+    stream_closes_final = bool(getattr(provider, "stream_closes_match_history", True))
+    history_revises = bool(getattr(provider, "history_revises_before_lag", False))
 
     # Feed-liveness watchdog threshold: how long ``watch_ohlcv`` may stay
     # silent during an open session before the feed is declared dead and a
@@ -1328,6 +1336,11 @@ def live_ohlcv_generator(
         # life here: a venue can feed them from another subscription than the
         # closes (Capital.com builds them from quotes).
         history_close_streak = 0
+        # Newest slot whose socket close was taken as its last forming update, on a
+        # venue whose socket candle is not the history's (``stream_closes_final``
+        # false): the slot's close comes from the history, the socket's values are
+        # the fallback at the deadline.
+        stream_close_ts: int | None = None
         # Scan of a closed session for its reopen: the awaited slot the scan
         # started from and the slot it has reached (see ``_awaited_slot``).
         reopen_scan_from: int | None = None
@@ -1430,12 +1443,16 @@ def live_ohlcv_generator(
             An empty answer is the venue's "no bar" only for a query asked at least
             the publish lag after the slot's close; an earlier one may just predate
             the bar. A slot with a forming bar is finalized from it at the deadline
-            instead, which any answer allows.
+            instead, which any answer allows. A slot the socket closed although its
+            close is taken from the history needs no answer: its socket close is the
+            bar the deadline hands on when the history has not delivered it.
 
             :param slot: Open of the awaited slot.
             :return: ``True`` when a missing bar no longer has to be waited for.
             """
             forming = last_forming_bar is not None and last_forming_bar.timestamp == slot
+            if forming and stream_close_ts == slot:
+                return True
             return probe_answered and probe_slot == slot and (probe_after_lag or forming)
 
         async def _connect_with_initial_backoff() -> None:
@@ -1546,13 +1563,18 @@ def live_ohlcv_generator(
 
             history_query = getattr(provider, "backfill_closed_bars", None)
 
-            def _splice_closed(bars: list[OHLCV], since_ms: int) -> list[OHLCV]:
+            def _splice_closed(bars: list[OHLCV], since_ms: int,
+                               asked_ms: float) -> list[OHLCV]:
                 """Hand on the closed history bars the stream has not, in order.
 
                 The one entry point of history bars into the stream, and the
                 closed-bar cursor the socket's closes are checked against too: a
                 bar passes only when it is closed, newer than ``since_ms``, the
-                warmup history and every closed bar handed on before it. A
+                warmup history and every closed bar handed on before it — and, on a
+                venue that revises a fresh bar
+                (:attr:`~LiveProviderPlugin.history_revises_before_lag`), asked for
+                at least the publish lag after its close: earlier it may still
+                change, so it is asked for again later. A
                 history bar and the socket's close of the same slot can come in
                 either order — whichever arrives first is the slot's close, the
                 other is dropped — and a slot the cursor already passed is never
@@ -1563,6 +1585,7 @@ def live_ohlcv_generator(
 
                 :param bars: The provider's answer, in any order.
                 :param since_ms: The bar open the query asked after.
+                :param asked_ms: When the query was asked, epoch ms.
                 :return: The bars handed on, ascending.
                 """
                 nonlocal last_closed_bar, last_forming_bar, settled_ts, synth_streak
@@ -1570,6 +1593,10 @@ def live_ohlcv_generator(
                 for history_bar in sorted(bars, key=lambda b: b.timestamp):
                     if not history_bar.is_closed or history_bar.timestamp <= since_ms:
                         continue
+                    # Every later bar closed later still
+                    if (history_revises
+                            and _slot_close(history_bar.timestamp) + publish_lag_ms > asked_ms):
+                        break
                     if closed_floor is not None and history_bar.timestamp <= closed_floor:
                         continue
                     if (last_closed_bar is not None
@@ -1647,6 +1674,7 @@ def live_ohlcv_generator(
                 floor = _history_floor(since_ms)
                 if floor is None:
                     return []
+                asked_ms = time.time() * 1000.0
                 recovered: list[OHLCV] = []
 
                 async def _run_query(
@@ -1656,7 +1684,7 @@ def live_ohlcv_generator(
 
                 if await _await_or_stop(_run_query(query)):
                     return None
-                return _splice_closed(recovered, floor)
+                return _splice_closed(recovered, floor, asked_ms)
 
             async def _fill_from_history(since_ms: int | None) -> int:
                 """Splice the closed history bars after ``since_ms`` and the cursor.
@@ -1699,7 +1727,7 @@ def live_ohlcv_generator(
                 published_ms = _slot_close(newest) + publish_lag_ms
                 return published_ms if published_ms > asked_ms else None
 
-            async def _probe_missed_close(slot: int) -> bool:
+            async def _probe_missed_close(slot: int) -> str | None:
                 """Ask the history for the close of ``slot`` the socket has not delivered.
 
                 A bar the history has goes on through the closed-bar cursor, the
@@ -1747,16 +1775,20 @@ def live_ohlcv_generator(
                     probe_next_ms = float("inf")
                 else:
                     probe_next_ms = retry_ms
-                if not accepted:
+                # A slot the socket closed, on a venue whose closes come from the
+                # history, was not missed: its history bar is the expected close
+                missed = [history_bar for history_bar in accepted
+                          if stream_close_ts is None or history_bar.timestamp > stream_close_ts]
+                if not missed:
                     return None
                 # broker_info, not the module logger: an operator (and the live
                 # lab's repair count) must see every bar the socket missed.
                 broker_info("missed close: %d closed bar(s) from history, ts=%d..%d",
-                            len(accepted), accepted[0].timestamp, accepted[-1].timestamp)
+                            len(missed), missed[0].timestamp, missed[-1].timestamp)
                 # One step per answer, however many bars it carried: a backlog
                 # fetched in one go is one missed delivery. A close the socket
                 # delivers late, after the history, ends the streak when it arrives.
-                if any(history_bar.volume > 0.0 for history_bar in accepted):
+                if any(history_bar.volume > 0.0 for history_bar in missed):
                     history_close_streak += 1
                 if history_close_streak < _STALE_HISTORY_CLOSES:
                     return None
@@ -2196,6 +2228,21 @@ def live_ohlcv_generator(
                         history_close_streak = 0
                         continue
 
+                    # The socket's candle is not the history's: the slot's close
+                    # comes from the history, asked once the venue published it,
+                    # and this close is the slot's last forming update — the bar
+                    # the deadline hands on when the history has not delivered it.
+                    # Only where the history is asked for the slot: the awaited
+                    # slot's probe, or the consumer's own fill from its base; the
+                    # first close of a stream with neither goes on as it is.
+                    if (bar_update.is_closed and not stream_closes_final
+                            and history_query is not None
+                            and (awaited_slot is not None if boundary_watchdog
+                                 else _history_floor(None) is not None)):
+                        history_close_streak = 0
+                        stream_close_ts = bar_update.timestamp
+                        bar_update = bar_update._replace(is_closed=False)
+
                     if bar_update.is_closed:
                         last_closed_bar = bar_update
                         synth_streak = 0
@@ -2445,13 +2492,24 @@ def live_ohlcv_generator(
                             settled_ts = finalized.timestamp
                             last_forming_bar = None
                             synth_streak = 0
-                            broker_info(
-                                "idle-bar finalized forming bar: ts=%d "
-                                "close=%s vol=%s (real accumulated data; no "
-                                "close event arrived before boundary)",
-                                finalized.timestamp, finalized.close,
-                                finalized.volume,
-                            )
+                            if stream_close_ts == finalized.timestamp:
+                                # broker_warning: the bar may differ from the one
+                                # a restart replays from the history
+                                broker_warning(
+                                    "close of ts=%d not in the history by its "
+                                    "deadline: the socket's close goes on "
+                                    "(close=%s vol=%s)",
+                                    finalized.timestamp, finalized.close,
+                                    finalized.volume,
+                                )
+                            else:
+                                broker_info(
+                                    "idle-bar finalized forming bar: ts=%d "
+                                    "close=%s vol=%s (real accumulated data; no "
+                                    "close event arrived before boundary)",
+                                    finalized.timestamp, finalized.close,
+                                    finalized.volume,
+                                )
                             bar_queue.put(finalized)
                             continue
                         # Dead feed during an open session: reconnect instead

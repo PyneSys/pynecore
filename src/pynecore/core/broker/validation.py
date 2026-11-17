@@ -285,9 +285,10 @@ def validate_plugin_contract(
     - **Live feed declarations** — ``backfill_closed_bars`` must be
       overridden (the inherited default reads as "the venue has no bar" for
       every missed close), ``history_publish_lag`` must be a positive finite
-      number, ``history_has_idle_bars`` a bool and ``feed_timeout_bars``
+      number, ``history_has_idle_bars``, ``history_revises_before_lag`` and
+      ``stream_closes_match_history`` bools and ``feed_timeout_bars``
       ``None`` or a positive int: the live stream decides from them what a
-      missing close means.
+      missing close means and which source a closed bar comes from.
     - **PositionPort surface** — a non-``None``
       :attr:`~BrokerPlugin.position_port` must
       carry the full port surface the core
@@ -438,6 +439,11 @@ def validate_plugin_contract(
             ("history_has_idle_bars",
              "True (the venue's history has a zero-volume bar for a slot without "
              "trades) or False (it has none)"),
+            ("history_revises_before_lag",
+             "True (the venue's history returns a fresh bar before its final "
+             "values) or False"),
+            ("stream_closes_match_history",
+             "True (the socket's closed bar carries the history's values) or False"),
     ):
         declared = getattr(plugin, attribute)
         if not isinstance(declared, bool):

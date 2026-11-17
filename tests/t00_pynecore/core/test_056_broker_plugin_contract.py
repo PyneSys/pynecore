@@ -413,6 +413,16 @@ def __test_history_has_idle_bars_must_be_a_bool__(idle):
     assert len(errors) == 1 and 'history_has_idle_bars' in errors[0]
 
 
+@pytest.mark.parametrize('attribute', ['history_revises_before_lag',
+                                       'stream_closes_match_history'])
+@pytest.mark.parametrize('value', [None, 1, 'yes'])
+def __test_history_source_declarations_must_be_bools__(attribute, value):
+    plugin = _ConformingPlugin()
+    setattr(plugin, attribute, value)
+    errors, _ = validate_plugin_contract(plugin)
+    assert len(errors) == 1 and attribute in errors[0]
+
+
 @pytest.mark.parametrize('bars', [0, -3, 2.5, True])
 def __test_feed_timeout_bars_invalid_declarations_rejected__(bars):
     plugin = _ConformingPlugin()

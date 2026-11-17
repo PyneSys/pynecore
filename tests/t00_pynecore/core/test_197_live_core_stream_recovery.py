@@ -11,6 +11,7 @@ over the gap. A slot that had no trades gets the bar the venue's history has for
 zero-volume filler, or none on a venue whose history skips such slots.
 """
 import asyncio
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -52,7 +53,11 @@ class _Venue:
     returns the bars of :attr:`~_Venue.history` after the requested open, and fails while
     :attr:`~_Venue.history_failures` is positive. With ``publish_delay`` a bar shows up
     in the history only that many seconds after its close, like a venue that publishes
-    its closes late.
+    its closes late. With ``stream_closes_final`` false the socket's candle is not the
+    history's
+    (:attr:`~LiveProviderPlugin.stream_closes_match_history`),
+    with ``revises`` the history revises a fresh bar within the lag
+    (:attr:`~LiveProviderPlugin.history_revises_before_lag`).
     """
 
     reconnect_delay = 0.01
@@ -60,9 +65,12 @@ class _Venue:
     feed_timeout_bars = None
 
     def __init__(self, scripts: list[list[OHLCV | BaseException]], *, idle_bars: bool = True,
-                 publish_lag: float = 0.0, publish_delay: float | None = None):
+                 publish_lag: float = 0.0, publish_delay: float | None = None,
+                 stream_closes_final: bool = True, revises: bool = False):
         self.history_has_idle_bars = idle_bars
         self.history_publish_lag = publish_lag
+        self.stream_closes_match_history = stream_closes_final
+        self.history_revises_before_lag = revises
         self.publish_delay = publish_delay
         self.scripts = scripts
         self.history: list[OHLCV] = []
@@ -809,3 +817,82 @@ def __test_monthly_stream_awaits_the_next_calendar_month__(monkeypatch):
             assert venue.history_calls == []
         finally:
             consumer.close()
+
+
+def __test_a_socket_close_not_matching_the_history_is_replaced_by_the_history_bar__(caplog):
+    """On a venue whose socket candle is not the history's, the close comes from the history
+
+    The socket's close of the slot never reaches the consumer as a closed bar; the
+    slot's closed bar is the history's, asked once the publish lag past the close is
+    over. It is the expected close, not a missed one.
+    """
+    lag = 0.4
+    last = _now_ms() - 2 * _TF_MS + 300
+    s1 = last + _TF_MS
+    venue = _Venue([[_bar(last), _bar(s1, 150.0, volume=3.0)]], publish_lag=lag,
+                   stream_closes_final=False)
+    venue.set_history([_bar(s1, 155.0, volume=12.0)])
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        consumer = _Consumer(venue)
+        try:
+            assert consumer.wait_for(lambda: len(consumer.closed) >= 2, timeout=10.0)
+            closed = consumer.closed[1]
+            assert (closed.timestamp, closed.close, closed.volume) == (s1, 155.0, 12.0)
+            assert (s1, 150.0, True) not in consumer.update_keys()
+            due = (s1 + _TF_MS) / 1000.0 + lag
+            assert venue.history_calls[0][0] >= due - 0.05, "the history was asked before the lag"
+        finally:
+            consumer.close()
+    assert "missed close" not in caplog.text
+
+
+def __test_the_socket_close_stands_in_when_the_history_does_not_answer__(caplog):
+    """A slot whose history query keeps failing is closed with the socket's close at the deadline
+
+    The stream does not stand on a slot the socket closed: the socket's values are a
+    real close, only possibly not the history's, and the operator is told so.
+    """
+    last = (_now_ms() // _TF_MS) * _TF_MS - 4 * _TF_MS
+    s1 = last + _TF_MS
+    venue = _Venue([[_bar(last), _bar(s1, 150.0, volume=3.0)]], stream_closes_final=False)
+    venue.set_history([], failures=1_000_000)
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        consumer = _Consumer(venue)
+        try:
+            assert consumer.wait_for(lambda: len(consumer.closed) >= 2, timeout=10.0)
+            closed = consumer.closed[1]
+            assert (closed.timestamp, closed.close, closed.volume) == (s1, 150.0, 3.0)
+        finally:
+            consumer.close()
+    assert f"close of ts={s1} not in the history by its deadline" in caplog.text
+
+
+def __test_a_history_bar_asked_before_the_publish_lag_is_asked_again__():
+    """On a venue that revises a fresh bar, one returned before the lag past its close is not taken
+
+    The venue may still change it: the reconnect gap fill right after the close gets
+    the slot with its early values, and the bar handed on is the one asked for once
+    the lag is over.
+    """
+    lag = 1.5
+    last = _now_ms() - 2 * _TF_MS - 50
+    s1 = last + _TF_MS
+    venue = _Venue([[_bar(last), ConnectionError("socket dropped")], []], publish_lag=lag,
+                   revises=True)
+    venue.set_history([_bar(s1, 140.0, volume=5.0)])
+    revise = threading.Timer(
+        max(0.0, (s1 + _TF_MS) / 1000.0 + 0.7 - time.time()),
+        lambda: venue.set_history([_bar(s1, 145.0, volume=11.0)]))
+    revise.start()
+    consumer = _Consumer(venue)
+    try:
+        assert venue.wait_for(lambda: venue.connects >= 2)
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 1)
+        assert venue.history_calls[0][0] < (s1 + _TF_MS) / 1000.0 + 0.7, \
+            "the reconnect gap was not asked before the revision"
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2, timeout=10.0)
+        closed = consumer.closed[1]
+        assert (closed.timestamp, closed.close, closed.volume) == (s1, 145.0, 11.0)
+    finally:
+        revise.cancel()
+        consumer.close()

@@ -129,6 +129,20 @@ trading depends on `update_symbol_info()` upholding these invariants:
   same filler bar. `False`: the stream emits none and `bar_index` does
   not step — the series a restart would replay from the history. Measure
   it on the venue; do not assume it.
+- **`history_revises_before_lag`** — `True` when the history returns a
+  fresh bar right at its close and changes its values afterwards, within
+  `history_publish_lag`. The stream then takes no bar from an answer asked
+  earlier than the lag past the bar's close, and asks again later.
+  Default `False`. Poll the history every second after a few closes and
+  watch whether the newest bar changes.
+- **`stream_closes_match_history`** — `False` when the socket's closed
+  bar is built from another price feed than the history (a throttled
+  quote stream, for example), so its values can differ from the bar a
+  restart replays. The stream then takes every closed bar from the
+  history once `history_publish_lag` has passed, and the socket's close
+  stands in only when the history has not answered by the close's
+  deadline. Default `True`. Compare a few hundred socket closes with the
+  history bars of the same slots before declaring `True`.
 - **Error taxonomy:** subclass your plugin's expected failures from
   `ProviderError`; mark transient ones (connectivity drops, broker
   maintenance, socket timeouts) as `TransientProviderError` or set
@@ -975,6 +989,8 @@ turns the machine-checkable slice of this guide into fail-fast errors:
 | Inherited `backfill_closed_bars()` (every missed close reads "no bar")  | error    |
 | `history_publish_lag` not a positive finite number                      | error    |
 | `history_has_idle_bars` not a `bool`                                    | error    |
+| `history_revises_before_lag` not a `bool`                               | error    |
+| `stream_closes_match_history` not a `bool`                              | error    |
 | `feed_timeout_bars` neither `None` nor a positive `int`                 | error    |
 | No `watch_orders()` stream (poll-only, no disappearance channel)        | warning  |
 | Inherited `execute_cancel_with_outcome` (all cancels `UNKNOWN`)         | warning  |
