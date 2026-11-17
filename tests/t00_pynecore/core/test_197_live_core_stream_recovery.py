@@ -568,11 +568,27 @@ def __test_forming_bar_after_the_reconnect_is_finalized_at_the_deadline__():
         consumer.close()
 
 
+# A publish lag shorter than the one-minute timeframe's 30 s close grace, as on a venue
+# whose history has a close before the stream gives up on the socket's.
+_FAST_LAG = 10.0
+
+
+def _two_answer_slots() -> tuple[int, int, int]:
+    """Opens of the newest closed bar and of the two slots after it, both closed.
+
+    The history has published the first slot's close; the second one's lag ends
+    ``_LATE_PUBLISH_IN`` seconds from now. With ``publish_delay`` just under the lag
+    the history hands the two closes on in two answers.
+    """
+    s2_close = _now_ms() - int((_FAST_LAG - _LATE_PUBLISH_IN) * 1000)
+    s2 = s2_close - _TF_MS
+    return s2 - 2 * _TF_MS, s2 - _TF_MS, s2
+
+
 def __test_closes_only_from_history_reconnect_the_subscription__():
-    """Two closes with trades the socket showed nothing of: the subscription is renewed"""
-    last = _now_ms() - 3 * _TF_MS - 40_000
-    s1, s2 = last + _TF_MS, last + 2 * _TF_MS
-    venue = _Venue([[_bar(last)]])
+    """Two closes with trades in a row from the history, none from the socket: a reconnect"""
+    last, s1, s2 = _two_answer_slots()
+    venue = _Venue([[_bar(last)]], publish_lag=_FAST_LAG, publish_delay=_FAST_LAG - 1.0)
     venue.set_history([_bar(s1, 101.0), _bar(s2, 102.0)])
     consumer = _Consumer(venue)
     try:
@@ -583,11 +599,48 @@ def __test_closes_only_from_history_reconnect_the_subscription__():
         consumer.close()
 
 
+def __test_forming_updates_do_not_prove_the_close_subscription_alive__():
+    """The socket shows every slot forming but never closes one: still a reconnect
+
+    A venue can feed the forming bar from another subscription than the closes, so
+    only a close from the socket tells that the close subscription works.
+    """
+    last, s1, s2 = _two_answer_slots()
+    venue = _Venue([[_bar(last), _bar(s1, 101.0, is_closed=False),
+                     _bar(s2, 102.0, is_closed=False)]],
+                   publish_lag=_FAST_LAG, publish_delay=_FAST_LAG - 1.0)
+    venue.set_history([_bar(s1, 101.0), _bar(s2, 102.5)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+        assert [(bar.timestamp, bar.close) for bar in consumer.closed] == [
+            (last, 100.0), (s1, 101.0), (s2, 102.5)]
+        assert venue.wait_for(lambda: venue.connects >= 2)
+    finally:
+        consumer.close()
+
+
 def __test_late_socket_closes_do_not_count_as_a_dead_subscription__():
-    """The socket showed the slots' trades, only their closes were late: no reconnect"""
+    """The socket delivers a close after the history did: the subscription is alive"""
+    last, s1, s2 = _two_answer_slots()
+    venue = _Venue([[_bar(last)]], publish_lag=_FAST_LAG, publish_delay=_FAST_LAG - 1.0)
+    venue.set_history([_bar(s1, 101.0), _bar(s2, 102.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
+        venue.push(_bar(s1, 101.0))
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+        assert consumer.stamps() == [last, s1, s2]
+        assert not venue.wait_for(lambda: venue.connects >= 2, timeout=1.0)
+    finally:
+        consumer.close()
+
+
+def __test_a_backlog_in_one_history_answer_is_one_missed_delivery__():
+    """Several closes fetched in one answer, then a socket close: no reconnect"""
     last = _now_ms() - 3 * _TF_MS - 40_000
     s1, s2, s3 = last + _TF_MS, last + 2 * _TF_MS, last + 3 * _TF_MS
-    venue = _Venue([[_bar(s2, 102.0, is_closed=False), _bar(last)]])
+    venue = _Venue([[_bar(last)]])
     venue.set_history([_bar(s1, 101.0), _bar(s2, 102.0)])
     consumer = _Consumer(venue)
     try:
@@ -596,6 +649,60 @@ def __test_late_socket_closes_do_not_count_as_a_dead_subscription__():
         assert consumer.wait_for(lambda: len(consumer.closed) >= 4)
         assert consumer.stamps() == [last, s1, s2, s3]
         assert venue.connects == 1
+    finally:
+        consumer.close()
+
+
+def __test_first_close_after_a_session_break_comes_from_history__():
+    """The socket misses the first close after the reopen: the history has it
+
+    The slot after the last in-session bar is in the closed session and has no close
+    to wait for; once the session has reopened, its first slot is the awaited one.
+    """
+    last = (_now_ms() // _TF_MS) * _TF_MS - 4 * _TF_MS
+    s1, s2, s3 = last + _TF_MS, last + 2 * _TF_MS, last + 3 * _TF_MS
+    # A daily one-minute break at s1: each day's session runs from s2 overnight to s1
+    reopen = datetime.fromtimestamp(s2 / 1000.0, tz=UTC).time()
+    break_start = datetime.fromtimestamp(s1 / 1000.0, tz=UTC).time()
+    syminfo = _make_syminfo([SymInfoInterval(day=d, start=reopen, end=break_start)
+                             for d in range(7)])
+    venue = _Venue([[_bar(last)]], idle_bars=False)
+    venue.set_history([_bar(s2, 102.0)])
+    consumer = _Consumer(venue, syminfo=syminfo)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2), \
+            "the first close after the reopen was never asked from the history"
+        venue.push(_bar(s3, 103.0))
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+        assert [(bar.timestamp, bar.close) for bar in consumer.closed] == [
+            (last, 100.0), (s2, 102.0), (s3, 103.0)]
+    finally:
+        consumer.close()
+
+
+class _DroppingVenue(_Venue):
+    """A venue whose first connection goes down under its first history query."""
+
+    async def backfill_closed_bars(self, symbol: str, timeframe: str,
+                                   since_ms: int) -> list[OHLCV]:
+        if self.connects == 1:
+            self._connected = False
+            raise ConnectionError("connection lost under the history query")
+        return await super().backfill_closed_bars(symbol, timeframe, since_ms)
+
+
+def __test_startup_gap_reconnects_when_the_connection_drops_under_the_query__():
+    """A connection lost during the startup gap query is renewed, then the gap is filled"""
+    last = _now_ms() - 3 * _TF_MS
+    s1 = last + _TF_MS
+    venue = _DroppingVenue([[], []])
+    venue.set_history([_bar(s1, 101.0)])
+    consumer = _Consumer(venue, last_historical_timestamp=last)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 1), \
+            "the startup gap query was retried on a dead connection forever"
+        assert consumer.stamps()[0] == s1
+        assert venue.connects == 2
     finally:
         consumer.close()
 
