@@ -335,6 +335,8 @@ def _run_rate_source_loop(
                 bar_buffer.append(_bar)
     else:
         bar_buffer.extend(live_streamer.pop_new_closed_bars())
+    # An outage before the stream's first close is filled from the warmup's end
+    live_streamer.set_history_base(last_warmup_ts)
 
     try:
         current_bar = 0
@@ -1078,6 +1080,8 @@ def security_process_main(
                     bar_buffer.append(_bar)
         else:
             bar_buffer.extend(streamer.pop_new_closed_bars())
+        # An outage before the stream's first close is filled from the warmup's end
+        streamer.set_history_base(last_warmup_ts)
         reader = None
 
         context_symbol, context_timeframe = data_source.symbol, data_source.timeframe
@@ -1308,7 +1312,6 @@ def security_process_main(
     lib._lib_semaphore = True
     lib._in_security = True
 
-    # noinspection PyProtectedMember
     def _run_script_main():
         """Mirror the chart's ``_run_libs_and_main``: imported library mains
         initialize their exported-function proxies, so they must run before the

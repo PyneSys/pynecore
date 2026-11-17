@@ -98,9 +98,9 @@ class _Context:
     """The closed-round read of a live context, wired the way the child wires it."""
 
     def __init__(self, venue: _Venue, *, buffer: list[OHLCV] | None = None,
-                 boundary_watchdog: bool = False):
+                 boundary_watchdog: bool = False, timeframe: str = "1"):
         self.venue = venue
-        self.streamer = LiveBarStreamer(venue, "X", "1",  # type: ignore[arg-type]
+        self.streamer = LiveBarStreamer(venue, "X", timeframe,  # type: ignore[arg-type]
                                         boundary_watchdog=boundary_watchdog)
         self.buffer: list[OHLCV] = [_bar(_T0, 100.0)] if buffer is None else buffer
         self.warnings: list[tuple[int, float]] = []
@@ -284,6 +284,166 @@ def __test_boundary_watchdog_settles_the_late_close_from_the_history__():
     """The same feed through a stream with the boundary watchdog: its probe gets the close"""
     bar = __test_helper_overdue_target(boundary_watchdog=True)
     assert bar is not None and (bar.close, bar.volume) == (111.0, 1.0)
+
+
+class _DroppingVenue(_Venue):
+    """A venue whose socket a pushed exception drops; the new socket's first close is ``first``"""
+
+    def __init__(self, answer: list[OHLCV], first: OHLCV):
+        super().__init__(answer)
+        self.first = first
+        self.connects = 0
+        self.up = threading.Event()
+
+    async def connect(self):
+        await super().connect()
+        self.connects += 1
+        self.up.set()
+        if self.connects == 2:
+            assert self._socket is not None
+            self._socket.put_nowait(self.first)
+
+    async def watch_ohlcv(self, _symbol: str, _timeframe: str) -> OHLCV:
+        assert self._socket is not None
+        item = await self._socket.get()
+        if isinstance(item, BaseException):
+            self._connected = False
+            raise item
+        return item
+
+
+def __test_security_stream_fills_the_gap_of_an_outage__():
+    """The bars that closed while the socket was down come before its first close after it
+
+    Without the fill, the new socket's close would move the closed-bar cursor past
+    the gap, and the context would never see the bars of the outage.
+    """
+    s0 = _T0 - 4 * _MINUTE_MS
+    s1, s2, s3 = s0 + _MINUTE_MS, s0 + 2 * _MINUTE_MS, s0 + 3 * _MINUTE_MS
+    venue = _DroppingVenue([_bar(s1, 101.0), _bar(s2, 102.0), _bar(s3, 103.0)],
+                           first=_bar(s3, 103.0))
+    with _Context(venue, buffer=[]) as ctx:
+        venue.push(_bar(s0, 100.0))
+        first, _took = ctx.read_round(s0)
+        assert first is not None and first.timestamp == s0
+        venue.push(ConnectionError("dropped"))  # type: ignore[arg-type]
+        settle_by = time.monotonic() + 5.0
+        while len(ctx.buffer) < 4 and time.monotonic() < settle_by:
+            for streamed in ctx.streamer.wait_for_bars(0.2):
+                ctx.ingest(streamed)
+    assert venue.connects == 2
+    assert [b.timestamp for b in ctx.buffer] == [s0, s1, s2, s3]
+    assert [b.close for b in ctx.buffer] == [100.0, 101.0, 102.0, 103.0]
+
+
+def __test_outage_before_the_first_close_fills_from_the_warmup__():
+    """The socket drops before its first close: the warmup's end marks where the gap starts
+
+    The stream has no closed-bar cursor of its own yet; without the warmup's end it
+    could not ask the history, and the new socket's close would skip the gap.
+    """
+    s0 = _T0 - 4 * _MINUTE_MS
+    s1, s2, s3 = s0 + _MINUTE_MS, s0 + 2 * _MINUTE_MS, s0 + 3 * _MINUTE_MS
+    venue = _DroppingVenue([_bar(s1, 101.0), _bar(s2, 102.0), _bar(s3, 103.0)],
+                           first=_bar(s3, 103.0))
+    with _Context(venue, buffer=[_bar(s0, 100.0)]) as ctx:
+        ctx.streamer.set_history_base(s0)
+        assert venue.up.wait(5.0)
+        venue.push(ConnectionError("dropped"))  # type: ignore[arg-type]
+        settle_by = time.monotonic() + 5.0
+        while len(ctx.buffer) < 4 and time.monotonic() < settle_by:
+            for streamed in ctx.streamer.wait_for_bars(0.2):
+                ctx.ingest(streamed)
+    assert venue.connects == 2
+    assert [b.timestamp for b in ctx.buffer] == [s0, s1, s2, s3]
+
+
+def __test_reconnect_during_the_warmup_waits_for_its_end__():
+    """The socket drops and comes back while the context still downloads its warmup
+
+    Nothing marks where the gap starts yet, so the stream hands on nothing, the new
+    socket's close included, until the warmup's end is reported; then the gap comes
+    first. Without the wait, that close would move the stream past the gap for good.
+    """
+    s0 = _T0 - 4 * _MINUTE_MS
+    s1, s2, s3 = s0 + _MINUTE_MS, s0 + 2 * _MINUTE_MS, s0 + 3 * _MINUTE_MS
+    venue = _DroppingVenue([_bar(s1, 101.0), _bar(s2, 102.0), _bar(s3, 103.0)],
+                           first=_bar(s3, 103.0))
+    with _Context(venue, buffer=[_bar(s0, 100.0)]) as ctx:
+        assert venue.up.wait(5.0)
+        venue.up.clear()
+        venue.push(ConnectionError("dropped"))  # type: ignore[arg-type]
+        assert venue.up.wait(5.0)
+        assert ctx.streamer.wait_for_bars(0.3) == []
+        assert venue.history_calls == []
+        ctx.streamer.set_history_base(s0)
+        settle_by = time.monotonic() + 5.0
+        while len(ctx.buffer) < 4 and time.monotonic() < settle_by:
+            for streamed in ctx.streamer.wait_for_bars(0.2):
+                ctx.ingest(streamed)
+    assert venue.connects == 2
+    assert [b.timestamp for b in ctx.buffer] == [s0, s1, s2, s3]
+    assert [b.close for b in ctx.buffer] == [100.0, 101.0, 102.0, 103.0]
+
+
+def __test_shutdown_ends_the_wait_for_the_warmup__():
+    """A stop while the reconnect waits for the warmup's end tears the stream down"""
+    venue = _DroppingVenue([], first=_bar(_T1, 111.0))
+    with _Context(venue):
+        assert venue.up.wait(5.0)
+        venue.up.clear()
+        venue.push(ConnectionError("dropped"))  # type: ignore[arg-type]
+        assert venue.up.wait(5.0)
+        started = time.monotonic()
+    # A stop that missed the wait would leave the stop's join to its 5 s timeout
+    assert time.monotonic() - started < 3.0
+    assert venue.history_calls == []
+
+
+_SECOND_MS = 1_000
+
+
+class _PublishingVenue(_DroppingVenue):
+    """A dropping venue whose history has a closed bar only ``history_publish_lag`` after its close"""
+
+    history_publish_lag = 3.0
+
+    async def backfill_closed_bars(self, _symbol: str, _timeframe: str,
+                                   since_ms: int) -> list[OHLCV]:
+        self.history_calls.append(since_ms)
+        now_ms = time.time() * 1000.0
+        lag_ms = self.history_publish_lag * 1000.0
+        return [bar for bar in self.answer if bar.timestamp + _SECOND_MS + lag_ms <= now_ms]
+
+
+def __test_reconnect_before_the_history_publishes_asks_again__():
+    """The reconnect comes before the history has the bars of the outage
+
+    The first answer has none of them, which is no evidence yet. The fill asks again
+    once the history has published the newest slot that closed before the reconnect,
+    and those bars come before the new socket's close.
+    """
+    now_ms = int(time.time() * 1000)
+    s2 = now_ms - _SECOND_MS - 200
+    s1, s0 = s2 - _SECOND_MS, s2 - 2 * _SECOND_MS
+    venue = _PublishingVenue([_bar(s0, 100.0), _bar(s1, 101.0), _bar(s2, 102.0)],
+                             first=_bar(s2, 102.0))
+    with _Context(venue, buffer=[], timeframe="1S") as ctx:
+        assert venue.up.wait(5.0)
+        venue.push(_bar(s0, 100.0))
+        first, _took = ctx.read_round(s0)
+        assert first is not None and first.timestamp == s0
+        venue.push(ConnectionError("dropped"))  # type: ignore[arg-type]
+        # The history publishes s1 about 1.8 s from now, s2 about 2.8 s
+        assert time.time() * 1000.0 < s1 + _SECOND_MS + venue.history_publish_lag * 1000.0
+        settle_by = time.monotonic() + 8.0
+        while len(ctx.buffer) < 3 and time.monotonic() < settle_by:
+            for streamed in ctx.streamer.wait_for_bars(0.2):
+                ctx.ingest(streamed)
+    assert venue.connects == 2
+    assert len(venue.history_calls) >= 2
+    assert [b.timestamp for b in ctx.buffer] == [s0, s1, s2]
+    assert [b.close for b in ctx.buffer] == [100.0, 101.0, 102.0]
 
 
 def __test_arriving_bar_ends_the_hole__():
