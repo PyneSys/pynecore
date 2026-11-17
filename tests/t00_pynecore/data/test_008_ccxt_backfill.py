@@ -161,3 +161,18 @@ def __test_monthly_close_follows_the_calendar__():
     assert scheduled_close_ms(december, "3M") == int(
         datetime(2026, 3, 1, tzinfo=UTC).timestamp() * 1000)
     assert scheduled_close_ms(february, "60") == february + 3_600_000
+
+
+def __test_previous_open_is_the_inverse_of_the_scheduled_close__():
+    """The bar before a monthly one opens a calendar month earlier, also across a year"""
+    from datetime import datetime, UTC
+    from pynecore.core.live_timing import previous_open_ms, scheduled_close_ms
+
+    january = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp() * 1000)
+    december = int(datetime(2025, 12, 1, tzinfo=UTC).timestamp() * 1000)
+    assert previous_open_ms(january, "1M") == december
+    assert previous_open_ms(january, "3M") == int(
+        datetime(2025, 10, 1, tzinfo=UTC).timestamp() * 1000)
+    assert previous_open_ms(january, "60") == january - 3_600_000
+    for timeframe in ("1", "240", "1D", "1M", "3M"):
+        assert scheduled_close_ms(previous_open_ms(january, timeframe), timeframe) == january

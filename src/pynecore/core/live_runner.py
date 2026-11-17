@@ -50,6 +50,9 @@ treats the same-timestamp first live update as a continuation of the
 last warmup bar — it seeds ``last_bar_timestamp`` from
 ``last_warmup_timestamp``, so ``bar_index`` does not double-bump and
 the bar simply gets one more execution with the refined OHLC values.
+When the caller tells when the history was downloaded (``history_as_of``)
+and the last warmup bar was still forming then, its close is awaited like
+any other slot's: the history supplies it when the socket does not.
 """
 import asyncio
 import logging
@@ -69,7 +72,9 @@ from pynecore.types.ohlcv import OHLCV, AskOHLC
 from pynecore.core.plugin import is_retryable_provider_error
 from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION
-from pynecore.core.live_timing import close_grace_seconds, is_catch_up, scheduled_close_ms
+from pynecore.core.live_timing import (
+    close_grace_seconds, is_catch_up, previous_open_ms, scheduled_close_ms,
+)
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.core.session import is_in_session, is_point_in_session
 # noinspection PyProtectedMember
@@ -724,6 +729,7 @@ def live_ohlcv_generator(
         syminfo: SymInfo | None = None,
         *,
         last_historical_timestamp: int | None = None,
+        history_as_of: int | None = None,
         shutdown_timeout: float = 120.0,
         event_loop: asyncio.AbstractEventLoop | None = None,
         engine_event_stream: Coroutine[Any, Any, Any] | None = None,
@@ -761,6 +767,11 @@ def live_ohlcv_generator(
                     behaviour where idle synth and reconnect fire on
                     every timeout.
     :param last_historical_timestamp: Timestamp of the last historical bar to avoid duplicates.
+    :param history_as_of: Unix milliseconds no later than the moment the historical bars were
+                          downloaded. A last historical bar whose period had not ended by
+                          then holds partial data: the stream delivers its close like any
+                          other slot's, from the history when the socket misses it.
+                          ``None`` takes the last historical bar as complete.
     :param shutdown_timeout: Max seconds to wait for graceful shutdown. 0 = wait forever.
     :param event_loop: Optional externally-owned event loop. When supplied, the background
                        thread runs the async loop on it via ``run_until_complete`` instead
@@ -1014,6 +1025,25 @@ def live_ohlcv_generator(
         """
         return scheduled_close_ms(slot, timeframe)
 
+    # The warmup history's last bar was still forming when it was downloaded: its
+    # close is yet to come, so its slot is the first one the stream closes and a
+    # history bar of it is not a duplicate. Otherwise the first slot is the one
+    # after it.
+    warmup_tail_forming = (
+        last_historical_timestamp is not None and history_as_of is not None
+        and _slot_close(last_historical_timestamp) > history_as_of)
+    # Closed bars opening at or before this are in the warmup history
+    closed_floor: int | None = None
+    # Open of the first slot whose close the stream has to deliver
+    first_live_slot: int | None = None
+    if last_historical_timestamp is not None:
+        if warmup_tail_forming:
+            closed_floor = previous_open_ms(last_historical_timestamp, timeframe)
+            first_live_slot = last_historical_timestamp
+        else:
+            closed_floor = last_historical_timestamp
+            first_live_slot = _slot_close(last_historical_timestamp)
+
     # In-stream recovery of missed closes from the venue's history runs only on a
     # stream that closes its own slots: without the boundary watchdog the
     # consumer recovers a missed close itself (``backfill``). Read with defaults
@@ -1219,10 +1249,9 @@ def live_ohlcv_generator(
         probe_answered = False
         probe_after_lag = False
         probe_failures = 0
-        # Open of the warmup history's last bar when the stream waits for the slot
-        # after it before the first close: set once the subscription is up, on a
-        # stream with the boundary watchdog whose next slot is in session.
-        warmup_slot_base: int | None = None
+        # The slot the stream waits for before the first close (``first_live_slot``):
+        # set once the subscription is up, on a stream with the boundary watchdog.
+        warmup_awaited: int | None = None
         # Run of consecutive closes with trades the history delivered while the
         # socket delivered no close at all, not even a late one (see
         # ``_STALE_HISTORY_CLOSES``). Forming updates do not count as a sign of
@@ -1255,9 +1284,9 @@ def live_ohlcv_generator(
         def _awaited_slot() -> int | None:
             """Open of the slot whose close the stream waits for.
 
-            Before the first close it is the slot after the warmup history's last
-            bar (``warmup_slot_base``), so a bar the startup fill could not get yet
-            is awaited like any other.
+            Before the first close it is the first slot the warmup history does not
+            hold closed (``warmup_awaited``), so a bar the startup fill could not get
+            yet is awaited like any other.
 
             A slot in a closed session has no close to wait for. Once the session
             after it has opened, the first slot of that session is the awaited one:
@@ -1270,14 +1299,13 @@ def live_ohlcv_generator(
             """
             nonlocal reopen_scan_from, reopen_scan_at
             if last_closed_bar is not None:
-                base = last_closed_bar.timestamp
-            elif warmup_slot_base is not None:
-                base = warmup_slot_base
+                slot = _slot_close(last_closed_bar.timestamp)
+            elif warmup_awaited is not None:
+                slot = warmup_awaited
             else:
                 return None
-            if empty_slot_ts is not None and empty_slot_ts > base:
-                base = empty_slot_ts
-            slot = _slot_close(base)
+            if empty_slot_ts is not None and empty_slot_ts >= slot:
+                slot = _slot_close(empty_slot_ts)
             if _market_open_at(slot):
                 return slot
             # The scan resumes where the last call left it, so a long closed
@@ -1472,8 +1500,7 @@ def live_ohlcv_generator(
                 for history_bar in sorted(bars, key=lambda b: b.timestamp):
                     if not history_bar.is_closed or history_bar.timestamp <= since_ms:
                         continue
-                    if (last_historical_timestamp is not None
-                            and history_bar.timestamp <= last_historical_timestamp):
+                    if closed_floor is not None and history_bar.timestamp <= closed_floor:
                         continue
                     if (last_closed_bar is not None
                             and history_bar.timestamp <= last_closed_bar.timestamp):
@@ -1505,7 +1532,7 @@ def live_ohlcv_generator(
                 if query is None:
                     return []
                 floors = [stamp for stamp in (
-                    since_ms, last_historical_timestamp,
+                    since_ms, closed_floor,
                     None if last_closed_bar is None else last_closed_bar.timestamp,
                 ) if stamp is not None]
                 if not floors:
@@ -1764,11 +1791,10 @@ def live_ohlcv_generator(
             # before the first live bar, so the strategy sees one unbroken
             # series. A failed query is retried: no live bar is handed on over
             # the hole. Providers that cannot query history return nothing.
-            if last_historical_timestamp is not None and history_query is not None:
-                # A whole bar must have closed past the warmup before anything
-                # can be missing.
-                if (time.time() * 1000.0
-                        >= _slot_close(_slot_close(last_historical_timestamp))):
+            if first_live_slot is not None and history_query is not None:
+                # A bar must have closed past the warmup's closed bars before
+                # anything can be missing.
+                if time.time() * 1000.0 >= _slot_close(first_live_slot):
                     gap_attempts = 0
                     while True:
                         try:
@@ -1804,11 +1830,12 @@ def live_ohlcv_generator(
                         )
 
             # A bar the startup fill could not get yet (younger than the history's
-            # publish lag) is awaited like a missed close: the slot after the warmup
-            # is the awaited one until the first close. When that slot is in a
-            # closed session, the first slot after the reopen is awaited instead.
-            if boundary_watchdog and last_historical_timestamp is not None:
-                warmup_slot_base = last_historical_timestamp
+            # publish lag) is awaited like a missed close: the first slot the warmup
+            # does not hold closed is the awaited one until the first close. When
+            # that slot is in a closed session, the first slot after the reopen is
+            # awaited instead.
+            if boundary_watchdog:
+                warmup_awaited = first_live_slot
 
             # Later fills on a consumer's request run through the same splice
             if backfill is not None:

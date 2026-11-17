@@ -944,6 +944,7 @@ def open_live_stream(history: ProviderHistory, *, last_historical_timestamp: int
         timeframe=timeframe,
         syminfo=history.syminfo,
         last_historical_timestamp=last_historical_timestamp,
+        history_as_of=history.as_of_ts,
         shutdown_timeout=shutdown_timeout,
         event_loop=event_loop,
         raise_on_connect_failure=raise_on_connect_failure,

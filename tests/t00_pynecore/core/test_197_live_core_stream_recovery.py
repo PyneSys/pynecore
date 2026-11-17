@@ -680,6 +680,42 @@ def __test_first_close_after_a_session_break_comes_from_history__():
         consumer.close()
 
 
+def __test_close_of_a_warmup_bar_forming_at_download_comes_from_history__():
+    """The warmup's last bar was still forming when downloaded and the socket misses its close
+
+    Its slot is the first one the stream closes: the history's bar of it is handed on
+    under the warmup bar's own timestamp, before any later update.
+    """
+    tail = _now_ms() - _TF_MS - 40_000
+    s1 = tail + _TF_MS
+    venue = _Venue([[_bar(s1, 102.0, is_closed=False)]])
+    venue.set_history([_bar(tail, 101.0)])
+    consumer = _Consumer(venue, last_historical_timestamp=tail,
+                         history_as_of=tail + _TF_MS // 2)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.updates) >= 2)
+        assert consumer.update_keys() == [(tail, 101.0, True), (s1, 102.0, False)]
+        assert all(since == tail - _TF_MS for _, since in venue.history_calls)
+    finally:
+        consumer.close()
+
+
+def __test_a_warmup_bar_complete_at_download_is_not_asked_again__():
+    """The warmup's last bar had closed before the download: the history starts after it"""
+    tail = _now_ms() - 2 * _TF_MS - 40_000
+    s1 = tail + _TF_MS
+    venue = _Venue([[]])
+    venue.set_history([_bar(tail, 101.0), _bar(s1, 102.0)])
+    consumer = _Consumer(venue, last_historical_timestamp=tail,
+                         history_as_of=tail + _TF_MS + 1_000)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 1)
+        assert consumer.stamps()[0] == s1
+        assert all(since >= tail for _, since in venue.history_calls)
+    finally:
+        consumer.close()
+
+
 class _DroppingVenue(_Venue):
     """A venue whose first connection goes down under its first history query."""
 

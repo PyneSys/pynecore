@@ -10,7 +10,8 @@ from datetime import datetime, UTC
 # noinspection PyProtectedMember
 from pynecore.lib.timeframe import _in_seconds, _process_tf
 
-__all__ = ['close_grace_seconds', 'is_catch_up', 'is_stale_update', 'scheduled_close_ms']
+__all__ = ['close_grace_seconds', 'is_catch_up', 'is_stale_update', 'previous_open_ms',
+           'scheduled_close_ms']
 
 
 def scheduled_close_ms(open_ms: int, timeframe: str) -> int:
@@ -30,6 +31,25 @@ def scheduled_close_ms(open_ms: int, timeframe: str) -> int:
         closes = datetime(months // 12, months % 12 + 1, 1, tzinfo=UTC)
         return int(closes.timestamp() * 1000)
     return open_ms + _in_seconds(timeframe) * 1000
+
+
+def previous_open_ms(open_ms: int, timeframe: str) -> int:
+    """Return the open of the bar before the one opening at ``open_ms``.
+
+    The inverse of :func:`scheduled_close_ms`: a monthly bar's predecessor opens its
+    months earlier on the UTC calendar, every other timeframe has a fixed length.
+
+    :param open_ms: The bar's open, Unix milliseconds.
+    :param timeframe: Timeframe in TradingView format.
+    :return: The previous bar's open, Unix milliseconds.
+    """
+    modifier, multiplier = _process_tf(timeframe)
+    if modifier == 'M':
+        opened = datetime.fromtimestamp(open_ms / 1000, UTC)
+        months = opened.year * 12 + opened.month - 1 - multiplier
+        previous = opened.replace(year=months // 12, month=months % 12 + 1)
+        return int(previous.timestamp() * 1000)
+    return open_ms - _in_seconds(timeframe) * 1000
 
 
 def close_grace_seconds(tf_seconds: float) -> float:
