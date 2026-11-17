@@ -501,23 +501,42 @@ def __test_reconnect_fills_the_outage_before_the_new_subscription__():
         consumer.close()
 
 
-def __test_failed_reconnect_fill_is_another_reconnect_round__():
-    """A reconnect whose gap query fails does not go live: it reconnects and asks again"""
+def __test_failed_reconnect_fill_is_retried_on_the_new_connection__():
+    """A reconnect whose gap query fails does not go live: it asks again, without reconnecting"""
     # The outage's slot closes just now and the next one is forming: no slot is
     # overdue yet, so only the reconnect asks the history
     last = _now_ms() - 2 * _TF_MS
     s1, s2 = last + _TF_MS, last + 2 * _TF_MS
     forming = _bar(s2, 102.0, is_closed=False)
-    venue = _Venue([[_bar(last), ConnectionError("socket dropped")], [forming], [forming]],
+    venue = _Venue([[_bar(last), ConnectionError("socket dropped")], [forming]],
                    publish_lag=60.0)
-    venue.set_history([_bar(s1, 101.0)], failures=1)
+    venue.set_history([_bar(s1, 101.0)], failures=3)
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.updates) >= 3)
+        assert consumer.update_keys() == [
+            (last, 100.0, True), (s1, 101.0, True), (s2, 102.0, False)]
+        assert venue.connects == 2, "a working connection was renewed for a failed history query"
+        assert [since for _, since in venue.history_calls] == [last] * 4
+    finally:
+        consumer.close()
+
+
+def __test_reconnect_fill_on_a_connection_lost_again_is_another_reconnect_round__():
+    """The connection drops under the reconnect's gap query: it reconnects, then fills"""
+    last = _now_ms() - 2 * _TF_MS
+    s1, s2 = last + _TF_MS, last + 2 * _TF_MS
+    forming = _bar(s2, 102.0, is_closed=False)
+    venue = _DroppingVenue(
+        [[_bar(last), ConnectionError("socket dropped")], [forming], [forming]],
+        publish_lag=60.0, drop_on_connect=2)
+    venue.set_history([_bar(s1, 101.0)])
     consumer = _Consumer(venue)
     try:
         assert consumer.wait_for(lambda: len(consumer.updates) >= 3)
         assert consumer.update_keys() == [
             (last, 100.0, True), (s1, 101.0, True), (s2, 102.0, False)]
         assert venue.connects == 3
-        assert [since for _, since in venue.history_calls] == [last, last]
     finally:
         consumer.close()
 
@@ -717,11 +736,16 @@ def __test_a_warmup_bar_complete_at_download_is_not_asked_again__():
 
 
 class _DroppingVenue(_Venue):
-    """A venue whose first connection goes down under its first history query."""
+    """A venue one of whose connections goes down under a history query on it."""
+
+    def __init__(self, scripts: list[list[OHLCV | BaseException]], *,
+                 drop_on_connect: int = 1, **kwargs):
+        super().__init__(scripts, **kwargs)
+        self.drop_on_connect = drop_on_connect
 
     async def backfill_closed_bars(self, symbol: str, timeframe: str,
                                    since_ms: int) -> list[OHLCV]:
-        if self.connects == 1:
+        if self.connects == self.drop_on_connect:
             self._connected = False
             raise ConnectionError("connection lost under the history query")
         return await super().backfill_closed_bars(symbol, timeframe, since_ms)

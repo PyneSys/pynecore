@@ -1748,23 +1748,47 @@ def live_ohlcv_generator(
                     # Reconnect gap: the bars that closed while the socket was
                     # down go on before any socket bar of the new subscription.
                     # A query that fails leaves the gap unanswered, so the
-                    # stream must not go on over it: another reconnect round.
+                    # stream must not go on over it. The query is retried on
+                    # the connection that just came up: renewing a working
+                    # connection would not answer it, and costs the venue
+                    # requests a throttled history is short of. Only a
+                    # connection lost again is another reconnect round.
                     if boundary_watchdog:
-                        try:
-                            recovered = await _query_history(None)
-                        except Exception as fill_err:
-                            log = (
-                                logger.warning
-                                if _warn_this_attempt(attempts)
-                                else logger.debug
-                            )
-                            log(
-                                "Reconnect gap fill failed (attempt %d, offline %.0fs): %s",
-                                attempts,
-                                time.time() - (outage_started or time.time()),
-                                fill_err,
-                            )
-                            connection_error = fill_err
+                        recovered: list[OHLCV] | None = None
+                        fill_attempts = 0
+                        connection_lost = False
+                        while True:
+                            try:
+                                recovered = await _query_history(None)
+                                break
+                            except Exception as fill_err:
+                                if not provider.is_connected:
+                                    log = (
+                                        logger.warning
+                                        if _warn_this_attempt(attempts)
+                                        else logger.debug
+                                    )
+                                    log(
+                                        "Reconnect gap fill failed (attempt %d, "
+                                        "offline %.0fs): %s",
+                                        attempts,
+                                        time.time() - (outage_started or time.time()),
+                                        fill_err,
+                                    )
+                                    connection_error = fill_err
+                                    connection_lost = True
+                                    break
+                                fill_attempts += 1
+                                fill_delay = _backoff_delay(provider, fill_attempts)
+                                fill_log = (broker_warning
+                                            if _warn_this_attempt(fill_attempts)
+                                            else logger.debug)
+                                fill_log("reconnect gap recovery failed (attempt %d): %s — "
+                                         "retrying in %.1fs, the live stream waits for the gap",
+                                         fill_attempts, fill_err, fill_delay)
+                                if await _stop_within(fill_delay):
+                                    return attempts, True
+                        if connection_lost:
                             continue
                         if recovered is None:
                             return attempts, True
