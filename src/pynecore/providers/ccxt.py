@@ -9,8 +9,7 @@ import tomllib
 from pynecore.core.plugin import override, ProviderError, Broker
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession, tick_grid
-# noinspection PyProtectedMember
-from pynecore.lib.timeframe import _in_seconds, _process_tf
+from pynecore.core.live_timing import scheduled_close_ms
 from ..types.ohlcv import OHLCV
 
 if TYPE_CHECKING:
@@ -73,25 +72,6 @@ _DEFAULT_MINTICK: float = 1e-8
 
 def add_space_before_uppercase(s):
     return re.sub(r'(?<!^)([A-Z])', r' \1', s)
-
-
-def _scheduled_close_ms(open_ms: int, timeframe: str) -> int:
-    """The scheduled close of a 24/7 candle opening at ``open_ms``.
-
-    A monthly candle closes at the start of the month after its calendar months;
-    every other timeframe has a fixed length.
-
-    :param open_ms: The candle's open, Unix milliseconds.
-    :param timeframe: Timeframe in TradingView format.
-    :return: The close, Unix milliseconds (exclusive).
-    """
-    modifier, multiplier = _process_tf(timeframe)
-    if modifier == 'M':
-        opened = datetime.fromtimestamp(open_ms / 1000, UTC)
-        months = opened.year * 12 + opened.month - 1 + multiplier
-        closes = datetime(months // 12, months % 12 + 1, 1, tzinfo=UTC)
-        return int(closes.timestamp() * 1000)
-    return open_ms + _in_seconds(timeframe) * 1000
 
 
 @dataclass
@@ -160,12 +140,6 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
     # on every quiet stretch; 30 bars keeps the dead-feed safety net while
     # making false positives rare.
     feed_timeout_bars = 30
-
-    # The stream has no gap recovery of its own and ``backfill_closed_bars`` is a
-    # pure REST query, so the framework recovers missed closes and reconnect gaps.
-    # A trade-built candle closes only with the next trade, which on a quiet pair
-    # can come long after the bar's close: there the history delivers the close.
-    core_stream_recovery = True
 
     @classmethod
     @override
@@ -790,7 +764,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         recovered: list[OHLCV] = []
         cursor = since_ms + 1
-        while _scheduled_close_ms(cursor, timeframe) <= now_ms:
+        while scheduled_close_ms(cursor, timeframe) <= now_ms:
             rows: list[list[Any]] = await client.fetch_ohlcv(symbol, xchg_tf, since=cursor,
                                                              limit=limit)
             newest: int | None = None
@@ -801,7 +775,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 newest = timestamp
                 if timestamp <= since_ms or (recovered and timestamp <= recovered[-1].timestamp):
                     continue
-                if _scheduled_close_ms(timestamp, timeframe) > now_ms:
+                if scheduled_close_ms(timestamp, timeframe) > now_ms:
                     reached_forming = True
                     break
                 recovered.append(OHLCV(

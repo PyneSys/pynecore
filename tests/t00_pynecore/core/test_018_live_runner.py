@@ -2329,7 +2329,9 @@ def __test_startup_gap_bars_are_spliced_before_the_live_stream__():
                            last_historical_timestamp=1000)
 
     assert [bar.timestamp for bar in catchup + live] == [2000, 3000, 4000]
-    assert provider.backfill_calls == [("BTC/USDT", "1D", 1000)]
+    # One startup query; the later ones ask for the overdue slots after the cursor
+    assert provider.backfill_calls[0] == ("BTC/USDT", "1D", 1000)
+    assert all(since >= 3000 for _, _, since in provider.backfill_calls[1:])
 
 
 def __test_startup_gap_drops_stale_and_unclosed_recovered_bars__():
@@ -2372,7 +2374,9 @@ def __test_startup_gap_failure_is_retried_before_the_live_stream__():
                            last_historical_timestamp=1000)
 
     assert [bar.timestamp for bar in catchup + live] == [2000, 4000]
-    assert provider.backfill_calls == [("BTC/USDT", "1D", 1000)] * 3
+    # Three startup queries; the later ones ask for the overdue slots after the cursor
+    assert provider.backfill_calls[:3] == [("BTC/USDT", "1D", 1000)] * 3
+    assert all(since >= 2000 for _, _, since in provider.backfill_calls[3:])
 
 
 def __test_startup_gap_skipped_when_no_full_bar_could_have_closed__():
@@ -2427,9 +2431,16 @@ def __test_live_stop_abandons_a_stalled_startup_backfill__():
 
 # --- One closed-bar cursor for history and socket bars ---------------------
 
-_SPLICE_MINUTE = (int(time.time() * 1000) // 60_000) * 60_000
-# Slots near the wall clock, so the boundary watchdog stays out of the picture
-_S0, _S1, _S2, _S3 = (_SPLICE_MINUTE - 120_000 + i * 60_000 for i in range(4))
+def _splice_slots() -> tuple[int, int, int, int]:
+    """Four consecutive one-minute slots, the third of them forming now.
+
+    Taken when the test starts, so the slot the stream awaits is not overdue while
+    the test runs: the missed-close probe and the boundary watchdog stay out of the
+    picture.
+    """
+    minute = (int(time.time() * 1000) // 60_000) * 60_000
+    s0, s1, s2, s3 = (minute - 120_000 + i * 60_000 for i in range(4))
+    return s0, s1, s2, s3
 
 
 class _SplicedVenue(MockLiveProvider):
@@ -2508,19 +2519,30 @@ def _closed_until(stream, end_ts: int) -> list[OHLCV]:
     return closed
 
 
-_REST_BOTH = [_make_ohlcv(_S1, close=901.0), _make_ohlcv(_S2, close=902.0)]
-_REST_LATER = [_make_ohlcv(_S2, close=902.0)]
+# History answers and expected closes as (slot index in ``_splice_slots``, close)
+_REST_BOTH = [(1, 901.0), (2, 902.0)]
+_REST_LATER = [(2, 902.0)]
+
+
+def _slot_bars(slots: tuple[int, ...], closes: list[tuple[int, float]]) -> list[OHLCV]:
+    """Closed bars of the indexed slots"""
+    return [_make_ohlcv(slots[index], close=close) for index, close in closes]
+
+
+def _slot_keys(slots: tuple[int, ...], closes: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    """Timestamp and close of the indexed slots"""
+    return [(slots[index], close) for index, close in closes]
 
 
 @pytest.mark.parametrize("order, answer, expected", [
     # The history answers first: its bars are the slots' closes
-    (("rest", "s1", "s2"), _REST_BOTH, [(_S1, 901.0), (_S2, 902.0)]),
-    (("s1", "rest", "s2"), _REST_BOTH, [(_S1, 101.0), (_S2, 902.0)]),
-    (("s1", "s2", "rest"), _REST_BOTH, [(_S1, 101.0), (_S2, 102.0)]),
+    (("rest", "s1", "s2"), _REST_BOTH, [(1, 901.0), (2, 902.0)]),
+    (("s1", "rest", "s2"), _REST_BOTH, [(1, 101.0), (2, 902.0)]),
+    (("s1", "s2", "rest"), _REST_BOTH, [(1, 101.0), (2, 102.0)]),
     # The history skips S1: once S2 is handed on, S1 can no longer follow it
-    (("rest", "s1", "s2"), _REST_LATER, [(_S2, 902.0)]),
-    (("s1", "rest", "s2"), _REST_LATER, [(_S1, 101.0), (_S2, 902.0)]),
-    (("s1", "s2", "rest"), _REST_LATER, [(_S1, 101.0), (_S2, 102.0)]),
+    (("rest", "s1", "s2"), _REST_LATER, [(2, 902.0)]),
+    (("s1", "rest", "s2"), _REST_LATER, [(1, 101.0), (2, 902.0)]),
+    (("s1", "s2", "rest"), _REST_LATER, [(1, 101.0), (2, 102.0)]),
 ])
 def __test_requested_fill_and_socket_share_one_cursor__(order, answer, expected):
     """A requested history fill and the socket's closes, in every arrival order
@@ -2528,44 +2550,47 @@ def __test_requested_fill_and_socket_share_one_cursor__(order, answer, expected)
     The consumer gets strictly ascending closes, each slot once; whichever close
     of a slot arrives first is the one handed on.
     """
-    provider = _SplicedVenue(answer)
+    s0, s1, s2, s3 = slots = _splice_slots()
+    provider = _SplicedVenue(_slot_bars(slots, answer))
     backfill = ClosedBarBackfill()
     stream = live_ohlcv_generator(provider, "BTC/USDT", "1", backfill=backfill)
-    socket_bars = {"s1": _make_ohlcv(_S1, close=101.0), "s2": _make_ohlcv(_S2, close=102.0)}
+    socket_bars = {"s1": _make_ohlcv(s1, close=101.0), "s2": _make_ohlcv(s2, close=102.0)}
     for event in order:
         if event == "rest":
-            fill = backfill.request(_S0)
+            fill = backfill.request(s0)
             assert fill is not None
             fill.result(timeout=5.0)
         else:
             provider.push_and_settle(socket_bars[event])
-    provider.push(_make_ohlcv(_S3, close=103.0))
+    provider.push(_make_ohlcv(s3, close=103.0))
 
-    closed = _closed_until(stream, _S3)
+    closed = _closed_until(stream, s3)
 
     stamps = [bar.timestamp for bar in closed]
     assert stamps == sorted(set(stamps)), "out of order or duplicated"
-    assert [(bar.timestamp, bar.close) for bar in closed] == expected + [(_S3, 103.0)]
-    assert backfill.request(_S0) is None, "the fill outlived its stream"
+    assert [(bar.timestamp, bar.close) for bar in closed] == (
+        _slot_keys(slots, expected) + [(s3, 103.0)])
+    assert backfill.request(s0) is None, "the fill outlived its stream"
 
 
 def __test_requested_fill_starts_after_the_stream_cursor__():
     """The query asks after the newest close the stream already handed on"""
+    s0, s1, s2, _s3 = _splice_slots()
     provider = _SplicedVenue([])
     backfill = ClosedBarBackfill()
     stream = live_ohlcv_generator(provider, "BTC/USDT", "1", backfill=backfill)
-    provider.push_and_settle(_make_ohlcv(_S1, close=101.0))
-    fill = backfill.request(_S0)
+    provider.push_and_settle(_make_ohlcv(s1, close=101.0))
+    fill = backfill.request(s0)
     assert fill is not None and fill.result(timeout=5.0) == 0
-    provider.push(_make_ohlcv(_S3, close=103.0))
-    _closed_until(stream, _S3)
-    assert provider.history_calls == [_S1]
+    provider.push(_make_ohlcv(s2, close=102.0))
+    _closed_until(stream, s2)
+    assert provider.history_calls == [s1]
 
 
 @pytest.mark.parametrize("socket_during_query", [True, False])
 @pytest.mark.parametrize("answer, expected", [
-    (_REST_BOTH, [(_S1, 901.0), (_S2, 902.0)]),
-    ([_make_ohlcv(_S1, close=901.0)], [(_S1, 901.0), (_S2, 102.0)]),
+    (_REST_BOTH, [(1, 901.0), (2, 902.0)]),
+    ([(1, 901.0)], [(1, 901.0), (2, 102.0)]),
 ])
 def __test_startup_gap_and_socket_share_one_cursor__(socket_during_query, answer, expected):
     """The startup gap fill with socket closes of the same slots, early or late
@@ -2573,10 +2598,11 @@ def __test_startup_gap_and_socket_share_one_cursor__(socket_during_query, answer
     Socket bars that arrive while the startup query runs wait in the socket until
     the fill is spliced; either way each slot reaches the consumer once, in order.
     """
-    provider = _SplicedVenue(answer, hold_history=True)
-    stream = live_ohlcv_generator(provider, "BTC/USDT", "1", last_historical_timestamp=_S0 - 60_000)
+    s0, s1, s2, s3 = slots = _splice_slots()
+    provider = _SplicedVenue(_slot_bars(slots, answer), hold_history=True)
+    stream = live_ohlcv_generator(provider, "BTC/USDT", "1", last_historical_timestamp=s0 - 60_000)
     assert provider.history_called.wait(5.0)
-    socket_bars = [_make_ohlcv(_S1, close=101.0), _make_ohlcv(_S2, close=102.0)]
+    socket_bars = [_make_ohlcv(s1, close=101.0), _make_ohlcv(s2, close=102.0)]
     if socket_during_query:
         for bar in socket_bars:
             provider.push(bar)
@@ -2585,34 +2611,36 @@ def __test_startup_gap_and_socket_share_one_cursor__(socket_during_query, answer
         provider.release_history()
         for bar in socket_bars:
             provider.push_and_settle(bar)
-    provider.push(_make_ohlcv(_S3, close=103.0))
+    provider.push(_make_ohlcv(s3, close=103.0))
 
-    closed = _closed_until(stream, _S3)
+    closed = _closed_until(stream, s3)
 
     stamps = [bar.timestamp for bar in closed]
     assert stamps == sorted(set(stamps)), "out of order or duplicated"
-    assert [(bar.timestamp, bar.close) for bar in closed] == expected + [(_S3, 103.0)]
-    assert provider.history_calls == [_S0 - 60_000]
+    assert [(bar.timestamp, bar.close) for bar in closed] == (
+        _slot_keys(slots, expected) + [(s3, 103.0)])
+    assert provider.history_calls == [s0 - 60_000]
 
 
 def __test_late_ticks_of_a_history_settled_slot_are_dropped__():
     """A forming tick of a slot the history already closed never reaches the consumer"""
-    provider = _SplicedVenue([_make_ohlcv(_S1, close=901.0)])
+    s0, s1, s2, _s3 = _splice_slots()
+    provider = _SplicedVenue([_make_ohlcv(s1, close=901.0)])
     backfill = ClosedBarBackfill()
     stream = live_ohlcv_generator(provider, "BTC/USDT", "1", backfill=backfill)
-    fill = backfill.request(_S0)
+    fill = backfill.request(s0)
     assert fill is not None and fill.result(timeout=5.0) == 1
-    provider.push(_make_ohlcv(_S1, close=950.0, is_closed=False))
-    provider.push(_make_ohlcv(_S2, close=102.0, is_closed=False))
-    provider.push(_make_ohlcv(_S2, close=102.0))
+    provider.push(_make_ohlcv(s1, close=950.0, is_closed=False))
+    provider.push(_make_ohlcv(s2, close=102.0, is_closed=False))
+    provider.push(_make_ohlcv(s2, close=102.0))
 
     seen: list[tuple[int, bool]] = []
     for item in stream:
         if item is LIVE_TRANSITION:
             continue
         seen.append((item.timestamp, item.is_closed))
-        if item.timestamp == _S2 and item.is_closed:
+        if item.timestamp == s2 and item.is_closed:
             break
     stream.close()
 
-    assert seen == [(_S1, True), (_S2, False), (_S2, True)]
+    assert seen == [(s1, True), (s2, False), (s2, True)]

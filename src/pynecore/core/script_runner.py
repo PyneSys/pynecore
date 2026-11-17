@@ -4157,8 +4157,9 @@ class ScriptRunner:
                 # lagging consumer's backlog) is no live edge either. ``None`` when
                 # the latch does not apply (an indicator, paper trading on the
                 # history) or the timeframe has no fixed period.
-                catch_up_tf = (_try_in_seconds(str(self.syminfo.period))
-                               if is_strat and not self._live_history_trades else None)
+                catch_up_tf = (str(self.syminfo.period)
+                               if is_strat and not self._live_history_trades
+                               and _try_in_seconds(str(self.syminfo.period)) else None)
                 live_clock = self._live_clock
 
                 # noinspection PyProtectedMember

@@ -260,7 +260,7 @@ def __test_helper_overdue_target(boundary_watchdog: bool) -> OHLCV | None:
     """The round's bar for a target long overdue, after the previous close came via the socket.
 
     The socket's close arms the stream's closed-bar cursor, and the target's close
-    lies minutes in the past, so a boundary watchdog would settle it at once.
+    lies minutes in the past, so a stream with the boundary watchdog settles it at once.
     """
     s0 = _T0 - 4 * _MINUTE_MS
     s1 = s0 + _MINUTE_MS
@@ -280,10 +280,10 @@ def __test_security_stream_leaves_a_late_close_to_the_history__():
     assert bar is not None and (bar.close, bar.volume) == (111.0, 1.0)
 
 
-def __test_boundary_watchdog_would_settle_the_late_close__():
-    """The same feed through a stream with the boundary watchdog: a zero-volume filler"""
+def __test_boundary_watchdog_settles_the_late_close_from_the_history__():
+    """The same feed through a stream with the boundary watchdog: its probe gets the close"""
     bar = __test_helper_overdue_target(boundary_watchdog=True)
-    assert bar is not None and (bar.close, bar.volume) == (100.0, 0.0)
+    assert bar is not None and (bar.close, bar.volume) == (111.0, 1.0)
 
 
 def __test_arriving_bar_ends_the_hole__():

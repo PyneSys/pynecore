@@ -1,22 +1,23 @@
 """
 Closed-bar recovery of the chart's live stream, owned by the framework.
 
-A provider with ``core_stream_recovery`` has the close its socket missed asked from its
-history once the venue has published it, the gap of an outage filled after every
-reconnect before the new subscription's bars, and the subscription reconnected once
-closes keep coming only from the history. A history query that fails is never taken
-for "no bar": the stream waits for an answer instead of going on over the gap. A slot
-that had no trades gets the bar the venue's history has for it: a zero-volume filler,
-or none on a venue whose history skips such slots.
+The chart's stream has the close its socket missed asked from the provider's history
+once the venue has published it, the gap of an outage filled after every reconnect
+before the new subscription's bars, and the subscription reconnected once closes keep
+coming only from the history. A forming bar seen before an outage is not taken for the
+slot's close: the history or a fresh socket close settles it. A history query that
+fails is never taken for "no bar": the stream waits for an answer instead of going on
+over the gap. A slot that had no trades gets the bar the venue's history has for it: a
+zero-volume filler, or none on a venue whose history skips such slots.
 """
 import asyncio
 import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
-import pytest
-
+from pynecore.core import live_runner
 from pynecore.core.live_runner import LiveStop, live_ohlcv_generator
 from pynecore.core.script_runner import LIVE_TRANSITION
 from pynecore.core.syminfo import SymInfo, SymInfoInterval
@@ -49,18 +50,20 @@ class _Venue:
     The socket hands out its script's items in order (an exception is raised from
     ``watch_ohlcv``), then stays silent while the connection looks healthy. The history
     returns the bars of :attr:`~_Venue.history` after the requested open, and fails while
-    :attr:`~_Venue.history_failures` is positive.
+    :attr:`~_Venue.history_failures` is positive. With ``publish_delay`` a bar shows up
+    in the history only that many seconds after its close, like a venue that publishes
+    its closes late.
     """
 
     reconnect_delay = 0.01
     max_reconnect_delay = 0.05
     feed_timeout_bars = None
 
-    def __init__(self, scripts: list[list[OHLCV | BaseException]], *, core_recovery: bool = True,
-                 idle_bars: bool = True, publish_lag: float = 0.0):
-        self.core_stream_recovery = core_recovery
+    def __init__(self, scripts: list[list[OHLCV | BaseException]], *, idle_bars: bool = True,
+                 publish_lag: float = 0.0, publish_delay: float | None = None):
         self.history_has_idle_bars = idle_bars
         self.history_publish_lag = publish_lag
+        self.publish_delay = publish_delay
         self.scripts = scripts
         self.history: list[OHLCV] = []
         self.history_failures = 0
@@ -109,6 +112,10 @@ class _Venue:
             if failing:
                 self.history_failures -= 1
             answer = [bar for bar in self.history if bar.timestamp > since_ms]
+            if self.publish_delay is not None:
+                now = time.time()
+                answer = [bar for bar in answer
+                          if (bar.timestamp + _TF_MS) / 1000.0 + self.publish_delay <= now]
             self._cond.notify_all()
         if failing:
             raise ConnectionError("history endpoint down")
@@ -145,13 +152,14 @@ class _Venue:
 class _Consumer:
     """Pulls a live stream on its own thread and records the updates and closed bars it yields."""
 
-    def __init__(self, venue: _Venue, **kwargs):
+    def __init__(self, venue: _Venue, timeframe: str = "1", **kwargs):
         self.stop = LiveStop()
         self.closed: list[OHLCV] = []
         self.updates: list[OHLCV] = []
+        self.live = False
         self.error: BaseException | None = None
         self._cond = threading.Condition()
-        self._stream = live_ohlcv_generator(venue, "BTC/USDT", "1", stop=self.stop,
+        self._stream = live_ohlcv_generator(venue, "BTC/USDT", timeframe, stop=self.stop,
                                             shutdown_timeout=5.0, **kwargs)
         self._thread = threading.Thread(target=self._pull, daemon=True)
         self._thread.start()
@@ -160,6 +168,9 @@ class _Consumer:
         try:
             for item in self._stream:
                 if item is LIVE_TRANSITION:
+                    with self._cond:
+                        self.live = True
+                        self._cond.notify_all()
                     continue
                 with self._cond:
                     self.updates.append(item)
@@ -316,8 +327,7 @@ def __test_a_held_close_after_a_session_break_goes_on_once_the_gap_is_filled__()
         consumer.close()
 
 
-@pytest.mark.parametrize("core_recovery", [True, False])
-def __test_idle_slots_stay_empty_on_a_venue_without_idle_bars__(core_recovery):
+def __test_idle_slots_stay_empty_on_a_venue_without_idle_bars__():
     """No filler where the venue's history has no bar: the cursor waits for the next real close
 
     Each overdue slot costs at most one query, and the watchdog does not spin on a
@@ -325,11 +335,10 @@ def __test_idle_slots_stay_empty_on_a_venue_without_idle_bars__(core_recovery):
     """
     last = _now_ms() - 4 * _TF_MS - 40_000
     next_real = last + 4 * _TF_MS
-    venue = _Venue([[_bar(last)]], core_recovery=core_recovery, idle_bars=False)
+    venue = _Venue([[_bar(last)]], idle_bars=False)
     consumer = _Consumer(venue)
     try:
-        if core_recovery:
-            assert venue.wait_for(lambda: len(venue.history_calls) >= 3)
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 3)
         # The three overdue slots are settled; the fourth closes later
         baseline = venue.watch_calls
         assert not venue.wait_for(lambda: venue.watch_calls > baseline + 10, timeout=1.0), \
@@ -338,8 +347,138 @@ def __test_idle_slots_stay_empty_on_a_venue_without_idle_bars__(core_recovery):
         assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
         assert consumer.stamps() == [last, next_real]
         assert all(bar.volume > 0.0 for bar in consumer.closed)
-        assert len(venue.history_calls) == (3 if core_recovery else 0)
+        assert len(venue.history_calls) == 3
         assert all(since == last for _, since in venue.history_calls)
+    finally:
+        consumer.close()
+
+
+# A publish lag longer than the one-minute timeframe's 30 s close grace, and a slot
+# whose close the history publishes ``_LATE_PUBLISH_IN`` seconds from now: its
+# deadline is over, the end of the publish lag is just ahead.
+_SLOW_LAG = 45.0
+_LATE_PUBLISH_IN = 1.5
+
+
+def _slow_venue_slot() -> tuple[int, float]:
+    """Open of the newest closed bar and the moment the next slot's lag ends, in epoch s."""
+    s1_close = _now_ms() - int((_SLOW_LAG - _LATE_PUBLISH_IN) * 1000)
+    return s1_close - 2 * _TF_MS, s1_close / 1000.0 + _SLOW_LAG
+
+
+def _until(moment: float) -> float:
+    """Seconds left until ``moment`` (epoch s), with a margin for the stream's own pace."""
+    return max(0.0, moment - time.time() - 0.2)
+
+
+def __test_slow_history_bar_is_awaited_and_later_updates_wait_behind_it__():
+    """A slot without a forming bar waits out the publish lag, not just the close grace
+
+    The history answers empty at the deadline, before the venue published the close.
+    That is not "no bar": the slot waits, the later slot's updates are held behind it,
+    and once the lag is over the history's bar goes on, then the held update.
+    """
+    last, lag_end = _slow_venue_slot()
+    s1, s2 = last + _TF_MS, last + 2 * _TF_MS
+    venue = _Venue([[_bar(last), _bar(s2, 102.0, is_closed=False),
+                     _bar(s2, 103.0, is_closed=False)]],
+                   idle_bars=False, publish_lag=_SLOW_LAG, publish_delay=_SLOW_LAG - 1.0)
+    venue.set_history([_bar(s1, 101.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 1)
+        assert not consumer.wait_for(lambda: len(consumer.updates) > 1,
+                                     timeout=_until(lag_end)), \
+            "the slot was settled on an answer asked before the venue published its close"
+        assert consumer.wait_for(lambda: len(consumer.updates) >= 3)
+        assert consumer.update_keys() == [
+            (last, 100.0, True), (s1, 101.0, True), (s2, 103.0, False)]
+        assert venue.history_calls[-1][0] >= lag_end - 0.05
+        assert len(venue.history_calls) <= 3, "the history is flooded while the slot waits"
+    finally:
+        consumer.close()
+
+
+def __test_slow_history_without_the_bar_after_the_lag_leaves_a_hole__():
+    """An empty answer asked after the publish lag is final: the slot stays empty
+
+    On a venue without idle bars the held update of the next slot then goes on, and
+    so does that slot's close.
+    """
+    last, lag_end = _slow_venue_slot()
+    s2 = last + 2 * _TF_MS
+    venue = _Venue([[_bar(last), _bar(s2, 103.0, is_closed=False)]],
+                   idle_bars=False, publish_lag=_SLOW_LAG)
+    consumer = _Consumer(venue)
+    try:
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 1)
+        assert not consumer.wait_for(lambda: len(consumer.updates) > 1,
+                                     timeout=_until(lag_end)), \
+            "the slot was left empty before the venue published its close"
+        assert consumer.wait_for(lambda: len(consumer.updates) >= 2)
+        assert consumer.update_keys() == [(last, 100.0, True), (s2, 103.0, False)]
+        venue.push(_bar(s2, 104.0))
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
+        assert consumer.stamps() == [last, s2]
+        assert len(venue.history_calls) <= 3, "the history is flooded while the slot waits"
+    finally:
+        consumer.close()
+
+
+def __test_slow_history_still_finalizes_a_forming_bar_at_the_deadline__():
+    """A slot with a forming bar is closed from its ticks at the deadline, not the lag's end"""
+    s1_close = _now_ms() - 31_000
+    last, s1 = s1_close - 2 * _TF_MS, s1_close - _TF_MS
+    venue = _Venue([[_bar(last), _bar(s1, 150.0, volume=3.0, is_closed=False)]],
+                   idle_bars=False, publish_lag=_SLOW_LAG, publish_delay=_SLOW_LAG - 1.0)
+    venue.set_history([_bar(s1, 155.0, volume=12.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
+        finalized = consumer.closed[1]
+        assert (finalized.timestamp, finalized.close, finalized.volume) == (s1, 150.0, 3.0)
+        assert time.time() < s1_close / 1000.0 + _SLOW_LAG - 5.0
+        assert len(venue.history_calls) == 1
+    finally:
+        consumer.close()
+
+
+def __test_a_later_history_bar_proves_the_hole_before_the_lag__():
+    """The history's bar of a later slot settles the awaited slot as empty at once
+
+    With a publish lag longer than the timeframe, the venue publishing the next slot's
+    close is the evidence that the awaited slot has no bar, long before its own lag ends.
+    """
+    lag = 90.0
+    s1_close = _now_ms() - 65_000
+    last, s2 = s1_close - 2 * _TF_MS, s1_close
+    venue = _Venue([[_bar(last)]], idle_bars=False, publish_lag=lag)
+    venue.set_history([_bar(s2, 102.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
+        assert consumer.stamps() == [last, s2]
+        assert venue.history_calls[0][0] < s1_close / 1000.0 + lag - 10.0
+    finally:
+        consumer.close()
+
+
+def __test_startup_awaits_a_bar_the_history_has_not_published_yet__():
+    """A bar the startup fill cannot get yet is awaited, not skipped by the first live update"""
+    warmup_last, lag_end = _slow_venue_slot()
+    s1, s2 = warmup_last + _TF_MS, warmup_last + 2 * _TF_MS
+    venue = _Venue([[_bar(s2, 102.0, is_closed=False)]],
+                   idle_bars=False, publish_lag=_SLOW_LAG, publish_delay=_SLOW_LAG - 1.0)
+    venue.set_history([_bar(s1, 101.0)])
+    consumer = _Consumer(venue, last_historical_timestamp=warmup_last)
+    try:
+        assert venue.wait_for(lambda: len(venue.history_calls) >= 2)
+        assert not consumer.wait_for(lambda: len(consumer.updates) > 0,
+                                     timeout=_until(lag_end)), \
+            "a live update went on over a slot the history had not published yet"
+        assert consumer.wait_for(lambda: len(consumer.updates) >= 2)
+        assert consumer.update_keys() == [(s1, 101.0, True), (s2, 102.0, False)]
+        assert all(since == warmup_last for _, since in venue.history_calls)
     finally:
         consumer.close()
 
@@ -379,6 +518,52 @@ def __test_failed_reconnect_fill_is_another_reconnect_round__():
             (last, 100.0, True), (s1, 101.0, True), (s2, 102.0, False)]
         assert venue.connects == 3
         assert [since for _, since in venue.history_calls] == [last, last]
+    finally:
+        consumer.close()
+
+
+def __test_forming_bar_from_before_an_outage_is_not_the_slots_close__():
+    """An outage inside a bar: the slot waits for the history, not the partial bar
+
+    The forming bar the socket showed before it dropped holds only the ticks seen until
+    then. Past the deadline the slot is not finalized from it: it waits out the publish
+    lag like a slot without a forming bar, and the venue's bar is its close.
+    """
+    last, lag_end = _slow_venue_slot()
+    s1 = last + _TF_MS
+    venue = _Venue([[_bar(last), _bar(s1, 150.0, volume=3.0, is_closed=False),
+                     ConnectionError("socket dropped")], []],
+                   publish_lag=_SLOW_LAG, publish_delay=_SLOW_LAG - 1.0)
+    venue.set_history([_bar(s1, 155.0, volume=12.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert venue.wait_for(lambda: venue.connects >= 2 and len(venue.history_calls) >= 2)
+        assert not consumer.wait_for(lambda: len(consumer.closed) > 1,
+                                     timeout=_until(lag_end)), \
+            "the slot was closed from the forming bar seen before the outage"
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
+        recovered = consumer.closed[1]
+        assert (recovered.timestamp, recovered.close, recovered.volume) == (s1, 155.0, 12.0)
+    finally:
+        consumer.close()
+
+
+def __test_forming_bar_after_the_reconnect_is_finalized_at_the_deadline__():
+    """A forming bar the new subscription delivers is tracked again and closes the slot"""
+    s1_close = _now_ms() - 31_000
+    last, s1 = s1_close - 2 * _TF_MS, s1_close - _TF_MS
+    venue = _Venue([[_bar(last), _bar(s1, 150.0, volume=3.0, is_closed=False),
+                     ConnectionError("socket dropped")],
+                    [_bar(s1, 151.0, volume=5.0, is_closed=False)]],
+                   publish_lag=_SLOW_LAG, publish_delay=_SLOW_LAG - 1.0)
+    venue.set_history([_bar(s1, 155.0, volume=12.0)])
+    consumer = _Consumer(venue)
+    try:
+        assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
+        finalized = consumer.closed[1]
+        assert (finalized.timestamp, finalized.close, finalized.volume) == (s1, 151.0, 5.0)
+        assert time.time() < s1_close / 1000.0 + _SLOW_LAG - 5.0
+        assert venue.connects == 2
     finally:
         consumer.close()
 
@@ -427,3 +612,33 @@ def __test_startup_gap_failure_waits_until_stopped__():
     assert time.monotonic() - started < 5.0
     assert consumer.closed == []
     assert not venue.is_connected
+
+
+def _utc_ms(year: int, month: int, day: int, hour: int = 0) -> int:
+    return int(datetime(year, month, day, hour, tzinfo=UTC).timestamp() * 1000)
+
+
+def __test_monthly_stream_awaits_the_next_calendar_month__(monkeypatch):
+    """A monthly stream awaits the slot opening on the 1st of the next month
+
+    The average month the timeframe's length stands for ends on the 31st of a long
+    month, so a slot computed from it would hold every update of the real next month
+    behind a slot that never comes. Checked after a closed bar and after the warmup.
+    """
+    now_ms = _utc_ms(2026, 11, 17, 12)
+    clock_offset = now_ms / 1000.0 - time.time()
+    monkeypatch.setattr(live_runner, "time", SimpleNamespace(
+        time=lambda: time.time() + clock_offset, monotonic=time.monotonic))
+    october, november = _utc_ms(2026, 10, 1), _utc_ms(2026, 11, 1)
+    for script, warmup_last in (([_bar(october)], None), ([], october)):
+        venue = _Venue([script])
+        consumer = _Consumer(venue, "1M", last_historical_timestamp=warmup_last)
+        try:
+            # Pushed once live: a forming bar queued during the warmup catch-up is dropped
+            assert consumer.wait_for(lambda: consumer.live and len(consumer.closed) == len(script))
+            venue.push(_bar(november, 101.0, is_closed=False))
+            assert consumer.wait_for(lambda: (november, 101.0, False) in consumer.update_keys()), \
+                "the next month's forming bar was held behind a slot that does not exist"
+            assert venue.history_calls == []
+        finally:
+            consumer.close()

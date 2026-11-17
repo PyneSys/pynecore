@@ -151,15 +151,13 @@ def __test_rollover_closes_with_the_final_record_of_the_batch__():
 
 def __test_monthly_close_follows_the_calendar__():
     """A monthly candle closes at the start of the next month, not after 30.4 days"""
-    pytest.importorskip("ccxt")
     from datetime import datetime, UTC
-    # noinspection PyProtectedMember
-    from pynecore.providers.ccxt import _scheduled_close_ms
+    from pynecore.core.live_timing import scheduled_close_ms
 
     february = int(datetime(2026, 2, 1, tzinfo=UTC).timestamp() * 1000)
-    assert _scheduled_close_ms(february, "1M") == int(
+    assert scheduled_close_ms(february, "1M") == int(
         datetime(2026, 3, 1, tzinfo=UTC).timestamp() * 1000)
     december = int(datetime(2025, 12, 1, tzinfo=UTC).timestamp() * 1000)
-    assert _scheduled_close_ms(december, "3M") == int(
+    assert scheduled_close_ms(december, "3M") == int(
         datetime(2026, 3, 1, tzinfo=UTC).timestamp() * 1000)
-    assert _scheduled_close_ms(february, "60") == february + 3_600_000
+    assert scheduled_close_ms(february, "60") == february + 3_600_000

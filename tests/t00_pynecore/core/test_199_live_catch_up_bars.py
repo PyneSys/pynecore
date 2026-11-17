@@ -12,6 +12,7 @@ import sys
 import textwrap
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import cast
 
@@ -30,6 +31,7 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 from pynecore.core.broker.position import BrokerPosition
+from pynecore.core.live_timing import is_catch_up, is_stale_update
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.script_runner import LIVE_TRANSITION, ScriptRunner
 from pynecore.core.syminfo import SymInfo
@@ -40,11 +42,11 @@ __test_helper_MINUTE = 60_000
 __test_helper_T0 = 29_383_333 * __test_helper_MINUTE
 
 
-def __test_helper_syminfo() -> SymInfo:
-    """A one-minute crypto symbol: catch-up starts 150 s after a bar's open."""
+def __test_helper_syminfo(period: str = "1") -> SymInfo:
+    """A crypto symbol, one-minute by default: catch-up starts 150 s after a bar's open."""
     return SymInfo(
         prefix="TEST", ticker="BTCUSDT", description="Test", currency="USDT",
-        basecurrency="BTC", period="1", type="crypto", mintick=0.01, pricescale=100.0,
+        basecurrency="BTC", period=period, type="crypto", mintick=0.01, pricescale=100.0,
         pointvalue=1.0, mincontract=0.00001, timezone="UTC", volumetype="base",
         opening_hours=[], session_starts=[], session_ends=[],
     )
@@ -172,9 +174,10 @@ class MockBroker:
 
 
 def __test_helper_broker_runner(script_path: Path, plugin: MockBroker,
-                                feed: Iterator, clock: list[float]) -> ScriptRunner:
+                                feed: Iterator, clock: list[float],
+                                period: str = "1") -> ScriptRunner:
     return ScriptRunner(script_path=script_path, ohlcv_iter=feed,
-                        syminfo=__test_helper_syminfo(),
+                        syminfo=__test_helper_syminfo(period),
                         broker_plugin=cast(BrokerPlugin, plugin), live=True,
                         live_clock=lambda: clock[0])
 
@@ -435,6 +438,77 @@ def __test_a_stale_update_closes_the_latch_again__(tmp_path):
 
     assert entries["fresh"] == 0
     assert entries["stale"] == 0
+
+
+def __test_helper_month_open(year: int, month: int) -> int:
+    return int(datetime(year, month, 1, tzinfo=UTC).timestamp() * 1000)
+
+
+def __test_helper_month_bar(open_ms: int, closed: bool = True) -> OHLCV:
+    return OHLCV(timestamp=open_ms, open=50_000.0, high=50_005.0, low=49_995.0,
+                 close=50_000.0, volume=1.0, is_closed=closed)
+
+
+def __test_monthly_updates_trade_until_the_calendar_close__(tmp_path):
+    """The last day of a 31-day month is still the live edge of a monthly bar"""
+    script_path = __test_helper_write_script(tmp_path, "catch_up_monthly", '''\
+        """
+        @pyne
+        """
+        from pynecore.lib import barstate, script, strategy
+
+        @script.strategy("Catch-up monthly", calc_on_every_tick=True)
+        def main():
+            if barstate.isrealtime:
+                strategy.entry("L", strategy.long, qty=1.0, limit=40_000.0)
+    ''')
+    plugin = MockBroker()
+    clock = [0.0]
+    entries: dict[str, int] = {}
+
+    def observe(name: str) -> Callable[[], None]:
+        return lambda: entries.__setitem__(name, len(plugin.entry_calls))
+
+    october = __test_helper_month_open(2026, 10)
+    october_31 = int(datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp() * 1000)
+
+    def feed() -> Iterator:
+        yield __test_helper_month_bar(__test_helper_month_open(2026, 8))
+        yield __test_helper_month_bar(__test_helper_month_open(2026, 9))
+        yield LIVE_TRANSITION
+        # October's forming bar on its last day: past the average month (30.4 days)
+        # after its open, yet half a day before its close on November 1
+        clock[0] = float(october_31)
+        yield __test_helper_month_bar(october, closed=False)
+        observe("first update")()
+        clock[0] = float(october_31 + 3_600_000)
+        yield __test_helper_month_bar(october, closed=False)
+        observe("second update")()
+
+    runner = __test_helper_broker_runner(script_path, plugin, feed(), clock, period="1M")
+    runner.script.calc_on_every_tick = True
+
+    list(runner.run_iter())
+
+    # The first update places the order, the next one syncs it to the venue
+    assert entries["first update"] == 0
+    assert entries["second update"] == 1
+
+
+def __test_monthly_catch_up_follows_the_calendar__():
+    """Freshness of a monthly bar is measured from its calendar close, not the average month"""
+    october = __test_helper_month_open(2026, 10)
+    november = __test_helper_month_open(2026, 11)
+    december = __test_helper_month_open(2026, 12)
+    grace_ms = 30_000
+
+    assert not is_stale_update(october, "1M", november - 1)
+    assert not is_stale_update(october, "1M", november + grace_ms)
+    assert is_stale_update(october, "1M", november + grace_ms + 1)
+
+    # A closed October bar is fresh until November could still close on time
+    assert not is_catch_up(october, "1M", december + grace_ms)
+    assert is_catch_up(october, "1M", december + grace_ms + 1)
 
 
 _PAPER_SCRIPT = '''\

@@ -186,18 +186,13 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
 
     The framework asks the history for a close the stream missed no earlier than
     this long after the scheduled close, so a quiet market costs a few queries per
-    bar instead of one per poll.
-    """
-
-    core_stream_recovery: bool = False
-    """Whether the framework recovers the running stream's missed closes from history.
-
-    When ``True``, the framework queries :meth:`backfill_closed_bars` for a close
-    the socket has not delivered by :attr:`history_publish_lag` past the bar's
-    close, fills the gap after every reconnect before the stream goes on, and
-    reconnects when consecutive closes came only from the history. A provider that
-    recovers missed closes inside its own :meth:`watch_ohlcv` and reconnect
-    handling keeps it ``False``, so one slot is not recovered twice.
+    bar instead of one per poll. It is also the line between "not yet" and "none":
+    an empty answer means the venue has no bar for a slot only when the query was
+    asked at least this long after the slot's close. A slot without a forming bar
+    therefore waits up to this long for the history; one with a forming bar is
+    finalized from it at the close's deadline. Declare the longest delay the venue
+    shows, not the typical one: a lag set too short turns a bar the venue publishes
+    late into a hole.
     """
 
     # --- Connection lifecycle ---
@@ -252,16 +247,22 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
         the subscription comes up and splices the result between the warmup and
         the stream. A slow handshake is enough to lose a bar — measured on a
         live cTrader lane, a 20 s subscribe silently dropped one M1 bar while
-        the same run on Bybit (1 s subscribe) lost none. With
-        :attr:`core_stream_recovery` it is also called after every reconnect
-        and for a close the socket missed, and a consumer may request it at
-        any time, so it must be a pure query: any number of calls, in any
-        order, leave the provider's state as it was.
+        the same run on Bybit (1 s subscribe) lost none. It is also called
+        after every reconnect and for a close the socket missed, and a consumer
+        may request it at any time, so it must be a pure query: any number of
+        calls, in any order, leave the provider's state as it was. A provider
+        therefore recovers no missed close inside its own :meth:`watch_ohlcv`
+        or reconnect handling: the framework does it, and one slot is not
+        recovered twice.
 
         Implementations should return only bars that are genuinely closed,
         strictly after ``since_ms``, in ascending timestamp order. Returning
         the still-forming bar would hand the strategy a partial bar as final.
-        An empty list is the venue's answer that it has no such bar; a query
+        The bars must come in the venue's own order of publishing: a later bar
+        returned while an earlier slot is missing tells the framework the
+        earlier slot has no bar. An empty list is the venue's answer that it has
+        no such bar yet; the framework takes it as final for a slot only once
+        :attr:`history_publish_lag` has passed since the slot's close. A query
         the venue did not answer must raise instead. The framework retries a
         raised query and does not go on over the gap meanwhile.
 
