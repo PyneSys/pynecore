@@ -17,6 +17,9 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
 
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
@@ -29,12 +32,21 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
-from pynecore.core.broker.exceptions import ExchangeRateLimitError
+from pynecore.core.broker.exceptions import (
+    ExchangeRateLimitError,
+    OrderDispositionUnknownError,
+)
 from pynecore.core.broker.idempotency import KIND_ENTRY, KIND_ENTRY_STOP
 from pynecore.core.broker.position import BrokerPosition
+from pynecore.core.broker.run_identity import RunIdentity
+from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
     ENTRY_STOP_STATE_ARMED,
     ENTRY_STOP_STATE_CANCEL_PENDING,
+    ENTRY_STOP_STATE_MARKET_PENDING,
+    create_entry_order_row,
 )
 from pynecore.core.broker.sync_engine import OrderSyncEngine
 from pynecore.lib.strategy import Order, _order_type_entry
@@ -460,3 +472,179 @@ def __test_modify_both_set_amends_watch_stop_level__():
     assert watch is not None
     assert watch.state == ENTRY_STOP_STATE_ARMED
     assert watch.stop_level == 1.20
+
+
+# === A stop-fired MARKET whose earlier send is unanswered ====================
+
+
+class _Crash(BaseException):
+    """The process dies inside the venue call."""
+
+
+@dataclass
+class _JournalBroker(_FakeBroker):
+    """Fake broker that writes the persist-first rows a real plugin writes."""
+    store_ctx: RunContext | None = None
+    crash_on_market: bool = False
+
+    async def execute_entry(self, envelope) -> list[ExchangeOrder]:
+        intent = envelope.intent
+        market = intent.order_type == OrderType.MARKET
+        coid = envelope.client_order_id(KIND_ENTRY_STOP if intent.stop_fired_market
+                                        else KIND_ENTRY)
+        assert self.store_ctx is not None
+        create_entry_order_row(
+            self.store_ctx, coid=coid, symbol=intent.symbol, side=intent.side,
+            qty=intent.qty, intent_key=intent.intent_key, pine_entry_id=intent.pine_id,
+            kind=ENTRY_KIND_POSITION if market else ENTRY_KIND_WORKING,
+            order_type=intent.order_type.value)
+        if market and self.crash_on_market:
+            self.entries.append((intent, envelope))
+            raise _Crash()
+        orders = await super().execute_entry(envelope)
+        self.store_ctx.upsert_order(coid, state='confirmed', exchange_order_id=orders[0].id)
+        return orders
+
+
+def _identity() -> RunIdentity:
+    return RunIdentity(strategy_id='entry-stop', symbol=SYMBOL, timeframe='60',
+                       account_id='test-account', label=None)
+
+
+def _journal_engine(ctx: RunContext, **broker_kwargs) -> tuple[OrderSyncEngine, _JournalBroker]:
+    broker = _JournalBroker(_caps(idempotency=CapabilityLevel.PARTIAL_NATIVE),
+                            store_ctx=ctx, **broker_kwargs)
+    engine = OrderSyncEngine(broker, BrokerPosition(), SYMBOL, run_tag=ctx.run_tag,
+                             mintick=0.0001, store_ctx=ctx)
+    return engine, broker
+
+
+@pytest.mark.parametrize('outcome', ['unresolved', 'landed', 'refused'])
+def __test_restart_sends_a_stop_fired_market_again_only_if_the_first_did_not_land__(
+        tmp_path: Path, outcome: str,
+) -> None:
+    """The process died inside the stop-fired MARKET send; the venue does not
+    refuse a duplicate id, so the restart may not simply send it again.
+
+    While the earlier send is unanswered nothing goes out. Once it is known
+    to have landed the stop won with that order; once the venue is known to
+    have refused it, the MARKET goes out.
+    """
+    with BrokerStore(tmp_path / 'broker.sqlite', plugin_name='Test') as store:
+        before = store.open_run(_identity(), script_source='// entry stop')
+        engine, broker = _journal_engine(before, crash_on_market=True)
+        _arm(engine, _both_set_entry())
+        with pytest.raises(_Crash):
+            engine._drive_entry_stop_triggers(last_price=1.185)
+        market_coid = broker.entries[-1][1].client_order_id(KIND_ENTRY_STOP)
+        before.close()
+
+        ctx = store.open_run(_identity(), script_source='// entry stop')
+        engine, broker = _journal_engine(ctx)
+        watch = engine._entry_stop_engine.get_watch("Long")
+        assert watch is not None and watch.state == ENTRY_STOP_STATE_MARKET_PENDING
+
+        engine._drive_entry_stop_triggers(last_price=None)
+        assert broker.entries == []
+        assert engine._entry_stop_engine.get_watch("Long") is not None
+
+        if outcome == 'landed':
+            ctx.upsert_order(market_coid, state='confirmed', exchange_order_id='ex-landed',
+                             filled_qty=1.0)
+        elif outcome == 'refused':
+            ctx.upsert_order(market_coid, state='rejected')
+            ctx.close_order(market_coid)
+        engine._drive_entry_stop_triggers(last_price=None)
+
+        if outcome == 'unresolved':
+            assert broker.entries == []
+            assert engine._entry_stop_engine.get_watch("Long") is not None
+        elif outcome == 'landed':
+            assert broker.entries == []
+            assert engine._entry_stop_engine.get_watch("Long") is None
+            assert engine.order_mapping["Long"] == ['ex-landed']
+        else:
+            assert [i.stop_fired_market for i, _env in broker.entries] == [True]
+            assert engine._entry_stop_engine.get_watch("Long") is None
+        ctx.close()
+
+
+def __test_an_unanswered_stop_fired_market_is_not_sent_again_in_process__(
+        tmp_path: Path,
+) -> None:
+    """The same rule holds without a restart: a lost answer parks the row, and
+    the next tick does not send the MARKET a second time."""
+    with BrokerStore(tmp_path / 'broker.sqlite', plugin_name='Test') as store:
+        ctx = store.open_run(_identity(), script_source='// entry stop')
+        engine, broker = _journal_engine(ctx)
+        _arm(engine, _both_set_entry())
+        broker.entries.clear()
+
+        async def lost_answer(envelope) -> list[ExchangeOrder]:
+            intent = envelope.intent
+            coid = envelope.client_order_id(KIND_ENTRY_STOP)
+            create_entry_order_row(
+                ctx, coid=coid, symbol=intent.symbol, side=intent.side, qty=intent.qty,
+                intent_key=intent.intent_key, pine_entry_id=intent.pine_id,
+                kind=ENTRY_KIND_POSITION, order_type='market')
+            broker.entries.append((intent, envelope))
+            ctx.set_order_state(coid, 'disposition_unknown')
+            raise OrderDispositionUnknownError('reply lost', client_order_id=coid)
+
+        broker.execute_entry = lost_answer  # type: ignore[method-assign]
+        engine._drive_entry_stop_triggers(last_price=1.185)
+        engine._drive_entry_stop_triggers(last_price=1.19)
+
+        assert len(broker.entries) == 1
+        watch = engine._entry_stop_engine.get_watch("Long")
+        assert watch is not None and watch.state == ENTRY_STOP_STATE_MARKET_PENDING
+        ctx.close()
+
+
+def __test_a_stop_fired_market_resent_under_a_fresh_id_is_verified_under_that_id__(
+        tmp_path: Path,
+) -> None:
+    """The earlier process's MARKET send was resolved as rejected and its
+    envelope dropped, so the retry goes out under a fresh client order id.
+    That id is persisted on the watch before the POST: when the retry's own
+    answer is lost, the next tick verifies the retry and does not send it a
+    second time."""
+    with BrokerStore(tmp_path / 'broker.sqlite', plugin_name='Test') as store:
+        before = store.open_run(_identity(), script_source='// entry stop')
+        engine, broker = _journal_engine(before, crash_on_market=True)
+        _arm(engine, _both_set_entry())
+        with pytest.raises(_Crash):
+            engine._drive_entry_stop_triggers(last_price=1.185)
+        first_coid = broker.entries[-1][1].client_order_id(KIND_ENTRY_STOP)
+        before.close()
+
+        ctx = store.open_run(_identity(), script_source='// entry stop')
+        engine, broker = _journal_engine(ctx)
+        engine._current_bar_ts_ms = 3_600_000
+        ctx.upsert_order(first_coid, state='rejected')
+        ctx.close_order(first_coid)
+        ctx.record_resolution(first_coid, 'rejected')
+        engine._consume_plugin_resolutions()
+
+        async def lost_answer(envelope) -> list[ExchangeOrder]:
+            intent = envelope.intent
+            coid = envelope.client_order_id(KIND_ENTRY_STOP)
+            create_entry_order_row(
+                ctx, coid=coid, symbol=intent.symbol, side=intent.side, qty=intent.qty,
+                intent_key=intent.intent_key, pine_entry_id=intent.pine_id,
+                kind=ENTRY_KIND_POSITION, order_type='market')
+            broker.entries.append((intent, envelope))
+            ctx.set_order_state(coid, 'disposition_unknown')
+            raise OrderDispositionUnknownError('reply lost', client_order_id=coid)
+
+        broker.execute_entry = lost_answer  # type: ignore[method-assign]
+        engine._drive_entry_stop_triggers(last_price=None)
+        engine._drive_entry_stop_triggers(last_price=None)
+
+        assert len(broker.entries) == 1
+        retry_coid = broker.entries[0][1].client_order_id(KIND_ENTRY_STOP)
+        assert retry_coid != first_coid
+        watch = engine._entry_stop_engine.get_watch("Long")
+        assert watch is not None and watch.state == ENTRY_STOP_STATE_MARKET_PENDING
+        assert watch.market_coid == retry_coid
+        ctx.close()

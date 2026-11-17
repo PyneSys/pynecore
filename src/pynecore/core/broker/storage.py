@@ -53,7 +53,7 @@ from typing import Any, Final
 from pynecore.core._file_io import ProcessLifetimeLock
 from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
-from pynecore.core.broker.store_helpers import STATE_REJECTED
+from pynecore.core.broker.store_helpers import PENDING_DISPATCH_STATES, STATE_REJECTED
 
 __all__ = [
     'BrokerStore',
@@ -974,7 +974,11 @@ class BrokerStore:
 
         After the commit the new instance records its ``run_instance_id`` in
         the owner lock's tag. :meth:`RunContext.close` releases the lock, and
-        so does :meth:`close` for every run left open.
+        so does :meth:`close` for every run left open. The adopted rows whose
+        dispatch was still pending are the new context's inherited
+        dispatches (:meth:`RunContext.is_inherited_dispatch`): the new
+        instance has written nothing yet, so every pending row it holds now
+        was left by an earlier process.
 
         :param identity: Logical identity of the run
             (strategy, symbol, ...).
@@ -1010,7 +1014,28 @@ class BrokerStore:
             run_tag=run_tag,
             _store=self,
             _owner_lock=owner_lock,
+            _inherited_dispatches=self._pending_dispatch_coids(run_instance_id),
         )
+
+    # noinspection SqlResolve
+    def _pending_dispatch_coids(self, run_instance_id: int) -> set[str]:
+        """Client order ids of an instance's live rows whose dispatch is pending.
+
+        :param run_instance_id: The instance whose rows are read.
+        :return: The ids of its live rows in a
+            :data:`~pynecore.core.broker.store_helpers.PENDING_DISPATCH_STATES`
+            state.
+        """
+        states = sorted(PENDING_DISPATCH_STATES)
+        placeholders = ','.join('?' * len(states))
+        with self.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT client_order_id FROM orders "
+                "WHERE run_instance_id = ? AND closed_ts_ms IS NULL "
+                f"  AND state IN ({placeholders})",
+                (run_instance_id, *states),
+            ).fetchall()
+        return {row['client_order_id'] for row in rows}
 
     def _open_run_inside_lock(
             self,
@@ -1575,6 +1600,49 @@ class RunContext:
     # Owner lock of the run (see :meth:`BrokerStore.open_run`); it may not
     # hold the lock when another instance or the file system kept it.
     _owner_lock: ProcessLifetimeLock | None = field(default=None, repr=False, compare=False)
+    # Client order ids of the pending dispatches an earlier process left
+    # (see :meth:`is_inherited_dispatch`).
+    _inherited_dispatches: set[str] = field(default_factory=set, repr=False, compare=False)
+
+    # --- Inherited dispatches -----------------------------------------------
+
+    def is_inherited_dispatch(self, client_order_id: str) -> bool:
+        """Whether a dispatch row was left pending by an earlier process of the run.
+
+        A row is inherited when this instance adopted it at
+        :meth:`BrokerStore.open_run` in a
+        :data:`~pynecore.core.broker.store_helpers.PENDING_DISPATCH_STATES`
+        state, and no dispatch of this process has written it since
+        (:meth:`release_inherited_dispatch`). Nothing of this process waits
+        for such a row's answer: its send, if it went out at all, belonged to
+        a process that is gone. A pending row this process wrote is either
+        mid-flight or waits for the engine's own retry.
+
+        The answer says nothing about the row's current state; a caller
+        that needs a still-pending row reads it.
+
+        :param client_order_id: The row's client order id.
+        :return: Whether the row is an inherited dispatch.
+        """
+        return client_order_id in self._inherited_dispatches
+
+    def inherited_dispatch_ids(self) -> frozenset[str]:
+        """Client order ids of every inherited dispatch (:meth:`is_inherited_dispatch`).
+
+        :return: The ids; empty when the run inherited no pending dispatch.
+        """
+        return frozenset(self._inherited_dispatches)
+
+    def release_inherited_dispatch(self, client_order_id: str) -> None:
+        """Hand an inherited dispatch row over to this process.
+
+        Called when a dispatch of this process writes the row afresh (the
+        persist-first write of a new send under the same client order id):
+        from then on the row tracks this process's own send.
+
+        :param client_order_id: The row's client order id.
+        """
+        self._inherited_dispatches.discard(client_order_id)
 
     # --- Composite writes ---------------------------------------------------
 

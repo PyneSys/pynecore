@@ -14,10 +14,14 @@ from pynecore.core.broker.models import (
     ExchangeCapabilities,
 )
 from pynecore.core.broker.disappearance import MISSING_PENDING_EXTRA
-from pynecore.core.broker.exceptions import VenueWritesQuarantinedError
+from pynecore.core.broker.exceptions import (
+    BrokerManualInterventionError,
+    VenueWritesQuarantinedError,
+)
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
-from pynecore.core.broker.validation import validate_plugin_contract
+from pynecore.core.broker.sync_engine import OrderSyncEngine
+from pynecore.core.broker.validation import validate_plugin_contract, validate_plugin_ports
 from pynecore.core.plugin.broker import BrokerPlugin
 
 
@@ -79,6 +83,9 @@ class _ConformingPlugin(BrokerPlugin):
         return False
 
     async def watch_ohlcv(self, symbol, timeframe):
+        raise AssertionError("not used by the contract probe")
+
+    async def backfill_closed_bars(self, symbol, timeframe, since_ms):
         raise AssertionError("not used by the contract probe")
 
     # --- BrokerPlugin abstracts + contract overrides ---
@@ -343,6 +350,81 @@ def __test_position_port_surface_checked__():
     plugin.position_port = _CompletePort()
     errors, _ = validate_plugin_contract(plugin)
     assert errors == []
+
+
+def __test_port_set_after_the_startup_probe_is_checked_by_the_engine__():
+    """A plugin wires its ports in ``connect()``, after the startup probe ran:
+    the engine probes a port the first time it sees it, and only then."""
+    class _HalfPort:
+        async def fetch_raw_positions(self, symbol):
+            return []
+
+    class _Engine:
+        _check_plugin_ports = OrderSyncEngine._check_plugin_ports
+
+        def __init__(self, broker):
+            self._broker = broker
+            self._checked_ports = (None, None)
+
+    plugin = _ConformingPlugin()
+    assert validate_plugin_contract(plugin)[0] == []      # no port yet at startup
+    engine = _Engine(plugin)
+    engine._check_plugin_ports()
+
+    plugin.position_port = _HalfPort()
+    assert any('close_leg' in e for e in validate_plugin_ports(plugin))
+    with pytest.raises(BrokerManualInterventionError, match='close_leg'):
+        engine._check_plugin_ports()
+
+    sound = _Engine(plugin)
+    plugin.position_port = _CompletePort()
+    sound._check_plugin_ports()
+    calls = []
+    plugin.get_capabilities = lambda: calls.append(1) or _caps()
+    sound._check_plugin_ports()                           # same port: not probed again
+    assert calls == []
+
+
+# === Live feed declarations ===
+
+
+def __test_inherited_backfill_closed_bars_rejected__():
+    """The inherited history query answers "no bar" for every missed close."""
+    class _NoHistory(_ConformingPlugin):
+        backfill_closed_bars = BrokerPlugin.backfill_closed_bars
+
+    errors, _ = validate_plugin_contract(_NoHistory())
+    assert len(errors) == 1 and 'backfill_closed_bars' in errors[0]
+
+
+@pytest.mark.parametrize('lag', [0, -1.0, float('nan'), float('inf'), None, True, '10'])
+def __test_history_publish_lag_invalid_declarations_rejected__(lag):
+    plugin = _ConformingPlugin()
+    plugin.history_publish_lag = lag
+    errors, _ = validate_plugin_contract(plugin)
+    assert len(errors) == 1 and 'history_publish_lag' in errors[0]
+
+
+@pytest.mark.parametrize('idle', [None, 1, 'yes'])
+def __test_history_has_idle_bars_must_be_a_bool__(idle):
+    plugin = _ConformingPlugin()
+    plugin.history_has_idle_bars = idle
+    errors, _ = validate_plugin_contract(plugin)
+    assert len(errors) == 1 and 'history_has_idle_bars' in errors[0]
+
+
+@pytest.mark.parametrize('bars', [0, -3, 2.5, True])
+def __test_feed_timeout_bars_invalid_declarations_rejected__(bars):
+    plugin = _ConformingPlugin()
+    plugin.feed_timeout_bars = bars
+    errors, _ = validate_plugin_contract(plugin)
+    assert len(errors) == 1 and 'feed_timeout_bars' in errors[0]
+
+
+def __test_feed_watchdog_may_be_disabled__():
+    plugin = _ConformingPlugin()
+    plugin.feed_timeout_bars = None
+    assert validate_plugin_contract(plugin)[0] == []
 
 
 # === SpotInventoryPort surface ===

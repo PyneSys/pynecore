@@ -36,6 +36,11 @@ from pynecore.core.broker.disappearance import (
     RESUME_FIRST_ABSENCE_WINDOW_S,
 )
 from pynecore.core.broker.exceptions import OrderDispositionUnknownError
+from pynecore.core.broker.parked_dispatch import (
+    ParkedDispatchResolver,
+    ParkedOutcome,
+    ParkedVerdict,
+)
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.protection_guard import (
     PROTECTION_LEVELS_EXTRA,
@@ -43,7 +48,7 @@ from pynecore.core.broker.protection_guard import (
     ProtectionLevels,
 )
 from pynecore.core.broker.run_identity import RunIdentity
-from pynecore.core.broker.storage import BrokerStore, RunContext
+from pynecore.core.broker.storage import BrokerStore, OrderRow, RunContext
 from pynecore.core.broker import sync_engine as sync_engine_module
 from pynecore.core.broker.sync_engine import OrderSyncEngine
 from pynecore.cli.app import app_state
@@ -57,6 +62,7 @@ from pynecore.core.broker.models import (
     ExchangeOrder,
     ExchangePosition,
     ExitIntent,
+    LegType,
     OrderEvent,
     OrderStatus,
     OrderType,
@@ -65,8 +71,11 @@ from pynecore.core.broker.software_partial_bracket_engine import (
     PartialBracketLeg,
 )
 from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
     LEG_KIND_SL_PARTIAL,
     LEG_STATE_ARMED,
+    STATE_DISPOSITION_UNKNOWN,
+    create_entry_order_row,
 )
 from pynecore.lib.strategy import Order, _order_type_entry
 from pynecore.types.strategy import (
@@ -1627,6 +1636,174 @@ def __test_plugin_resolution_rejected_post_restart_uses_fresh_envelope__(
             "duplicate of the rejected submission"
         )
         ctx_b.close()
+
+
+# === Restart: an earlier process's unresolved entry send ====================
+
+
+def _crashed_send(store: BrokerStore, *, park: bool) -> str:
+    """An earlier process sent entry ``L`` and crashed before the venue answered.
+
+    The persist-first row stays pending and the envelope anchor stays. With
+    ``park`` the dispatch reported its unknown disposition and was parked
+    before the crash.
+
+    :return: The client order id of that send.
+    """
+    ctx = _open_ctx(store)
+    coid = DispatchEnvelope(
+        intent=SimpleNamespace(pine_id="L"),  # type: ignore[arg-type]
+        run_tag=ctx.run_tag, bar_ts_ms=BAR_TS, retry_seq=0,
+    ).client_order_id('e')
+    ctx.record_envelope("L", BAR_TS, 0)
+    create_entry_order_row(ctx, coid=coid, symbol=SYMBOL, side="buy", qty=1.0,
+                           intent_key="L", pine_entry_id="L",
+                           kind=ENTRY_KIND_POSITION, order_type="market")
+    if park:
+        ctx.set_order_state(coid, STATE_DISPOSITION_UNKNOWN)
+        ctx.record_park(coid, "L")
+    ctx.close()
+    return coid
+
+
+def _engine_after_restart(
+        ctx: RunContext, idempotency: CapabilityLevel,
+) -> tuple[OrderSyncEngine, _MockBroker]:
+    broker = _MockBroker(capabilities=ExchangeCapabilities(idempotency=idempotency))
+    engine, pos = _mk_engine(broker, ctx)
+    pos.entry_orders["L"] = Order("L", 1.0, order_type=_order_type_entry)
+    return engine, broker
+
+
+@pytest.mark.parametrize('idempotency', [CapabilityLevel.PARTIAL_NATIVE,
+                                         CapabilityLevel.SOFTWARE])
+@pytest.mark.parametrize('park', [False, True], ids=['crash_before_answer', 'parked'])
+def __test_restart_holds_an_entry_behind_its_unresolved_inherited_send__(
+        tmp_path: Path, park: bool, idempotency: CapabilityLevel,
+) -> None:
+    """A venue that does not refuse a duplicate id gets no second send of it.
+
+    The re-emitted entry rebuilds the crashed send's client order id from the
+    persisted anchor. On a venue that does not refuse the duplicate itself
+    (``PARTIAL_NATIVE``, or ``SOFTWARE`` without a client id at all) that
+    send would open a second position if the first one landed, so the entry
+    is held, and the inherited row gets a park of its own. Once the venue
+    lookup rejects it, the engine drops the anchor and sends the entry under
+    a fresh id.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid = _crashed_send(store, park=park)
+        ctx = _open_ctx(store)
+        engine, broker = _engine_after_restart(ctx, idempotency)
+
+        engine.sync(BAR_TS + 3_600_000)
+        engine.sync(BAR_TS + 7_200_000)
+
+        assert broker.entry_calls == []
+        assert "L" not in engine.active_intents
+        assert set(ctx.replay()[1]) == {coid}
+
+        async def absent(_row: OrderRow) -> ParkedVerdict:
+            return ParkedVerdict(ParkedOutcome.ABSENT)
+
+        resolver = ParkedDispatchResolver(
+            venue="Mock", log=logging.getLogger(__name__), grace_s=0.0,
+            misses_to_reject=1, clock=lambda: 4_000_000_000.0)
+        assert asyncio.run(resolver.resolve(ctx, absent)) == [coid]
+
+        engine.sync(BAR_TS + 10_800_000)
+
+        assert len(broker.entry_calls) == 1
+        assert broker.entry_calls[0].client_order_id('e') != coid
+        assert broker.entry_calls[0].bar_ts_ms == BAR_TS + 10_800_000
+        ctx.close()
+
+
+def __test_a_held_entry_is_reminded_while_the_hold_stands__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A hold no plugin resolves is reported again at an interval, not only once."""
+    clock = [1000.0]
+    monkeypatch.setattr(sync_engine_module.time, 'monotonic', lambda: clock[0])
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        _crashed_send(store, park=False)
+        ctx = _open_ctx(store)
+        engine, broker = _engine_after_restart(ctx, CapabilityLevel.SOFTWARE)
+
+        def held_warnings() -> int:
+            return sum(1 for r in caplog.records
+                       if r.levelname == "WARNING" and "held: an earlier process" in r.getMessage())
+
+        with caplog.at_level(logging.INFO):
+            engine.sync(BAR_TS + 3_600_000)
+            clock[0] += 60.0
+            engine.sync(BAR_TS + 7_200_000)
+            assert held_warnings() == 1
+            clock[0] += sync_engine_module._HELD_DISPATCH_REMINDER_S
+            engine.sync(BAR_TS + 10_800_000)
+            assert held_warnings() == 2
+        assert broker.entry_calls == []
+        ctx.close()
+
+
+@pytest.mark.parametrize('park', [False, True], ids=['crash_before_answer', 'parked'])
+def __test_a_parked_entry_reported_filled_loses_its_park__(
+        tmp_path: Path, park: bool,
+) -> None:
+    """A filled order never reappears in ``get_open_orders``: its park goes with the fill.
+
+    Whichever path recovered the fill (here an inherited send whose fill the
+    plugin's reconcile delivered), the engine stops asking the venue for it.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid = _crashed_send(store, park=park)
+        ctx = _open_ctx(store)
+        engine, broker = _engine_after_restart(ctx, CapabilityLevel.PARTIAL_NATIVE)
+        engine.sync(BAR_TS + 3_600_000)
+        assert coid in engine.pending_verification or coid in ctx.replay()[1]
+
+        engine._route_event(OrderEvent(  # noqa: SLF001
+            order=ExchangeOrder(
+                id="xchg-filled", symbol=SYMBOL, side="buy", order_type=OrderType.MARKET,
+                qty=1.0, filled_qty=1.0, remaining_qty=0.0, price=None,
+                stop_price=None, average_fill_price=100.0, status=OrderStatus.FILLED,
+                timestamp=time.time(), fee=0.0, fee_currency="", client_order_id=coid,
+            ),
+            event_type='filled', fill_price=100.0, fill_qty=1.0,
+            timestamp=time.time(), pine_id="L", leg_type=LegType.ENTRY,
+        ))
+
+        assert coid not in ctx.replay()[1]
+        asked: list[str | None] = []
+
+        async def get_open_orders(symbol=None):
+            asked.append(symbol)
+            return []
+
+        broker.get_open_orders = get_open_orders  # type: ignore[method-assign]
+        engine.sync(BAR_TS + 7_200_000)
+        assert asked == []
+        ctx.close()
+
+
+def __test_restart_sends_again_where_the_venue_refuses_a_duplicate_id__(
+        tmp_path: Path,
+) -> None:
+    """A ``NATIVE`` venue answers the second send with the first order itself.
+
+    Nothing is held there: the same client order id goes out at once, and
+    the venue's duplicate refusal adopts a send that landed.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid = _crashed_send(store, park=False)
+        ctx = _open_ctx(store)
+        engine, broker = _engine_after_restart(ctx, CapabilityLevel.NATIVE)
+
+        engine.sync(BAR_TS + 3_600_000)
+
+        assert [e.client_order_id('e') for e in broker.entry_calls] == [coid]
+        assert ctx.replay()[1] == {}
+        ctx.close()
 
 
 # === Stale-run cleanup ====================================================

@@ -62,7 +62,9 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
     VenueWritesQuarantinedError,
 )
+from pynecore.core.broker.validation import validate_plugin_ports
 from pynecore.core.plugin import ProviderError, is_retryable_provider_error
+from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.broker.interrupt_guard import critical_section
 from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
@@ -156,6 +158,11 @@ from pynecore.core.broker.one_way_emulator import (
     CloseFanResult,
     OneWayEmulator,
 )
+from pynecore.core.broker.parked_dispatch import (
+    awaits_venue_answer,
+    inherited_dispatch_in_flight,
+    park_inherited_dispatches,
+)
 from pynecore.core.broker.storage import (
     EnvelopeRecord,
     OrderRow,
@@ -184,6 +191,8 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_STOP_STATE_ARMED,
     ENTRY_STOP_STATE_CANCEL_PENDING,
     ENTRY_STOP_STATE_MARKET_PENDING,
+    STATE_REJECTED,
+    STATE_SUBMITTED,
     create_engine_trigger_partial_leg_row,
     create_entry_stop_watch_row,
     iter_active_bracket_ownerships,
@@ -198,7 +207,7 @@ from pynecore.types.strategy import (
 
 if TYPE_CHECKING:
     from pynecore.core.broker.position import BrokerPosition, ProvisionalClose
-    from pynecore.core.plugin.broker import BrokerPlugin, PositionPort
+    from pynecore.core.plugin.broker import PositionPort
     from pynecore.lib.strategy import Order
 
 __all__ = ['OrderSyncEngine']
@@ -754,6 +763,13 @@ _REVERSAL_CLOSE_STALE_SYNCS = 3
 #: stream), so an earlier retry would mostly re-hit the same decline.
 _CLOSE_DECLINE_RETRY_S = 60.0
 
+#: Interval between the reminders that a send is still held behind an earlier
+#: send of the same dispatch whose outcome the venue has not answered. A plugin
+#: that resolves such sends settles them within its own absence window (minutes
+#: at most); a hold still standing after ten minutes is worth telling the
+#: operator again, without repeating the line on every sync.
+_HELD_DISPATCH_REMINDER_S = 600.0
+
 #: How long a spot close stays withheld behind a pre-cleared exit leg the
 #: venue reported filled while that fill has not reached the book. The
 #: inventory catch-up books such a fill within a few reconcile passes even
@@ -786,6 +802,9 @@ _INFO_SKIP_REASONS = frozenset({
     'spot_full_close_pre_clear',
     'pre_clear_leg_fill_pending',
     'pre_clear_leg_filled',
+    # An entry held behind an earlier process's unresolved send of it; the
+    # hold itself is reported as a WARNING, then reminded periodically.
+    'inherited_dispatch_unresolved',
 })
 
 
@@ -1284,6 +1303,20 @@ class OrderSyncEngine:
         # preflighted against the projected aggregate signed position — see
         # :meth:`_enforce_short_gate`.
         self._short_selling_supported = caps.short_selling.is_supported
+        # Every venue that does not itself refuse a duplicate client order id
+        # executes a second send of a dispatch whose first send may have
+        # landed as a second order. There the entries an earlier process left
+        # unresolved are parked at startup and hold their intent back until
+        # the plugin's resolver settles them
+        # (:func:`~pynecore.core.broker.parked_dispatch.inherited_dispatch_in_flight`),
+        # and a stop-fired MARKET is not sent again while its earlier send is
+        # unanswered. A ``NATIVE`` venue answers the second send with the
+        # first order itself.
+        self._hold_inherited_dispatches = (
+            caps.idempotency is not CapabilityLevel.NATIVE)
+        # Held sends already reported: the monotonic times of the first and
+        # the last report (see :data:`_HELD_DISPATCH_REMINDER_S`).
+        self._held_dispatch_reported: dict[str, tuple[float, float]] = {}
         # §2.6 broker-native fail-safe worst-SL manager (Slice A.7).
         # Like the partial-bracket state machine it is always
         # constructed — the dispatch path is the one that decides
@@ -1333,6 +1366,10 @@ class OrderSyncEngine:
         # via the port, so unlike the sync sibling replays it cannot run inline
         # in ``__init__``.
         self._one_way_replay_done: bool = False
+        # The plugin ports the contract probe has already seen
+        # (``position_port``, ``spot_inventory_port``); see
+        # :meth:`_check_plugin_ports`.
+        self._checked_ports: tuple[object, object] = (None, None)
         # Set on the first ``sync`` after the replays above: rebuilds the
         # persistent Pine-side ``strategy.exit`` bracket orders the previous run
         # armed (one-way ownership ledger + engine-trigger partial legs) into
@@ -2179,6 +2216,12 @@ class OrderSyncEngine:
         self._restart_entry_scan_done: bool = False
         if store_ctx is not None:
             self._restore_quarantine(store_ctx)
+            if self._hold_inherited_dispatches:
+                for coid in park_inherited_dispatches(store_ctx):
+                    _log.warning(
+                        "inherited dispatch %s was left unresolved by an earlier "
+                        "process; parked until the venue lookup resolves it", coid,
+                    )
             envelopes, pending = store_ctx.replay()
             self._persisted_envelope_anchors = dict(envelopes)
             pending = self._absorb_journal_retry_rows(pending)
@@ -3372,6 +3415,32 @@ class OrderSyncEngine:
             self._reconstruct_pine_bracket_state()
             self._pine_bracket_reconstruct_done = True
 
+    def _check_plugin_ports(self) -> None:
+        """Probe the plugin's ports the first time each one is seen.
+
+        A plugin sets :attr:`~pynecore.core.plugin.broker.BrokerPlugin.position_port`
+        and :attr:`~pynecore.core.plugin.broker.BrokerPlugin.spot_inventory_port`
+        once it knows the account, which is after the startup contract probe
+        ran, so the probe never saw them. A port that fails the check stops
+        the bot before the engine drives anything through it. Only a real
+        plugin is probed: a state-only test double carries just the port
+        members its scenario drives.
+
+        :raises BrokerManualInterventionError: When a port violates its
+            contract.
+        """
+        seen = (getattr(self._broker, 'position_port', None),
+                getattr(self._broker, 'spot_inventory_port', None))
+        if all(port is checked for port, checked in zip(seen, self._checked_ports)):
+            return
+        self._checked_ports = seen
+        if not isinstance(self._broker, BrokerPlugin):
+            return
+        errors = validate_plugin_ports(self._broker)
+        if errors:
+            raise BrokerManualInterventionError(
+                "broker plugin contract violation(s): " + " | ".join(errors))
+
     @critical_section
     def sync(self, bar_ts_ms: int, *, last_price: float | None = None) -> None:
         """Run one diff/dispatch cycle.
@@ -3398,6 +3467,7 @@ class OrderSyncEngine:
         # exits the bar loop via its ``finally`` block instead of letting
         # the engine silently keep iterating.
         self.raise_if_halted()
+        self._check_plugin_ports()
         # Re-replay persisted anchors at the start of every sync to keep
         # the in-memory caches aligned with the journal. The runner's
         # pre-sync refresh races with the broker plugin's ``connect()``
@@ -8139,6 +8209,38 @@ class OrderSyncEngine:
             self._retry_forced_cancels()
             self._reconcile_short_gate_after_fill()
 
+    def _unpark_filled_entry(self, event: OrderEvent) -> None:
+        """Retire the park of an entry dispatch the venue reports fully filled.
+
+        A complete fill proves the parked send landed, and a filled order
+        never reappears in ``get_open_orders``, so the park would only make
+        :meth:`_verify_pending_dispatches` ask the venue for it on every sync
+        until the next restart. This holds for a park of this process and for
+        one an earlier process left (or :func:`~pynecore.core.broker.parked_dispatch.park_inherited_dispatches`
+        gave an inherited row), whichever path recovered the fill. A partial
+        fill leaves the park: the residual still works, and the verification
+        promotes its order id. Only an entry's ``'new'`` park is retired; the
+        fill itself is booked by the caller as usual.
+
+        :param event: A ``'filled'`` order event.
+        """
+        coid = event.order.client_order_id
+        if not coid or event.leg_type is not LegType.ENTRY:
+            return
+        envelope = self._pending_verification.get(coid)
+        if envelope is not None:
+            if not isinstance(envelope.intent, EntryIntent):
+                return
+            del self._pending_verification[coid]
+        else:
+            record = self._persisted_pending_anchors.get(coid)
+            if record is None or record.dispatch_kind != 'new':
+                return
+            del self._persisted_pending_anchors[coid]
+        if self._store_ctx is not None:
+            self._store_ctx.record_unpark(coid)
+        _log.info("parked entry dispatch %s filled at the venue; park retired", coid)
+
     def _route_event(self, event: OrderEvent) -> None:
         # Generic ``event %s`` arrival logging happens in
         # :meth:`run_event_stream` so the timestamp + ``bar_index`` reflect
@@ -8294,6 +8396,8 @@ class OrderSyncEngine:
                     event.order.id,
                 )
                 return
+            if t == 'filled':
+                self._unpark_filled_entry(event)
             # Late close leg of an entry the external-flatten clear already
             # retired (:meth:`reconcile`): its exposure left the book when
             # the clear ran, so booking the fill now would walk an empty
@@ -13819,9 +13923,11 @@ class OrderSyncEngine:
         * ``cancel_pending`` — re-drive the (idempotent) leg-scoped LIMIT
           cancel and the hard disposition gate. Reached on the same tick as a
           fresh cross, on a retry after an UNKNOWN cancel, or on restart.
-        * ``stop_market_pending`` — re-dispatch the (idempotent) MARKET.
-          Reached only on restart after the cancel was confirmed but the
-          process died before the market settled.
+        * ``stop_market_pending`` — re-dispatch the MARKET under its persisted
+          id once its earlier send is settled
+          (:meth:`_earlier_stop_market_send_settled`). Reached on a retry
+          after an unknown market disposition, or on restart after the cancel
+          was confirmed but the process died before the market settled.
 
         Price-independent states (``cancel_pending`` / ``stop_market_pending``)
         are driven even when ``last_price`` is ``None`` so restart recovery is
@@ -13910,14 +14016,69 @@ class OrderSyncEngine:
         # provably gone with no fill — safe to fire the market.
         self._fire_entry_stop_market(pine_id)
 
+    def _earlier_stop_market_send_settled(self, pine_id: str, market_coid: str | None) -> bool:
+        """Whether a stop-fired MARKET may be sent again after an earlier send of it.
+
+        A watch in ``stop_market_pending`` already sent its MARKET once (or
+        crashed around the send). On a venue that refuses a duplicate client
+        order id the repeat is harmless: the venue answers it with the first
+        order. On any other venue a first send that landed makes the repeat a
+        second position, so the plugin's journal row of the earlier send
+        decides:
+
+        * no row, a ``submitted`` row this process wrote (the send failed
+          before it left), or a row the venue refused (closed ``rejected``,
+          nothing filled) — the earlier send did not land: send again;
+        * a row whose answer is still open
+          (:func:`~pynecore.core.broker.parked_dispatch.awaits_venue_answer`)
+          — hold until the plugin's resolver settles it, reported like a
+          held entry;
+        * any other row — the earlier send landed, so the stop won with that
+          order: the watch settles and nothing is sent.
+
+        :param pine_id: The watch's Pine entry id.
+        :param market_coid: The client order id of the earlier send.
+        :return: Whether the MARKET may be sent now.
+        """
+        if (not self._hold_inherited_dispatches or self._store_ctx is None
+                or market_coid is None):
+            return True
+        row = self._store_ctx.get_order(market_coid)
+        if row is None:
+            return True
+        if row.closed_ts_ms is None and awaits_venue_answer(self._store_ctx, row):
+            self._report_held_dispatch(
+                market_coid,
+                f"entry-stop {pine_id!r} market held: its earlier send {market_coid} "
+                f"is unanswered by the venue; it is sent again only if the venue "
+                f"never took it")
+            return False
+        if row.state == STATE_SUBMITTED and row.closed_ts_ms is None:
+            return True
+        if row.state == STATE_REJECTED and row.filled_qty <= 0.0:
+            return True
+        _blog_info(
+            "entry-stop %r: the earlier market send %s landed (state %s); no "
+            "second market sent", pine_id, market_coid, row.state,
+        )
+        if row.exchange_order_id:
+            self._order_mapping[pine_id] = [row.exchange_order_id]
+        self._entry_stop_engine.mark_stop_won(pine_id)
+        return False
+
     def _fire_entry_stop_market(self, pine_id: str) -> None:
         """Dispatch the stop-fired MARKET order for a both-set entry.
 
         The deterministic :data:`KIND_ENTRY_STOP` client-order-id is persisted
-        BEFORE the POST (via ``confirm_limit_cancelled_fire_market``) so a
-        crash-restart re-dispatches the SAME id and the broker dedups it —
-        never a double-open. On restart a watch already in
-        ``stop_market_pending`` re-enters here and re-fires idempotently.
+        BEFORE the POST (via ``confirm_limit_cancelled_fire_market``), so a
+        retry, in this process or after a restart, re-enters here from
+        ``stop_market_pending`` with the SAME id. A venue that refuses a
+        duplicate id answers that repeat with the first order; on any other
+        venue the repeat goes out only once the earlier send provably did not
+        land (:meth:`_earlier_stop_market_send_settled`), never a double-open.
+        A retry whose envelope was rebuilt under a fresh id (the earlier send
+        was resolved as rejected) persists that id on the watch before its
+        POST, so every later retry verifies the send actually in flight.
         """
         watch = self._entry_stop_engine.get_watch(pine_id)
         if watch is None:
@@ -13943,6 +14104,9 @@ class OrderSyncEngine:
             if self._entry_stop_engine.mark_aborted(
                     pine_id, reason='quarantine_blocked_market') is None:
                 self._entry_stop_engine.mark_stop_won(pine_id)
+            return
+        if (watch.state == ENTRY_STOP_STATE_MARKET_PENDING
+                and not self._earlier_stop_market_send_settled(pine_id, watch.market_coid)):
             return
         active = self._active_intents.get(pine_id)
         if isinstance(active, EntryIntent):
@@ -13985,14 +14149,25 @@ class OrderSyncEngine:
             self._entry_stop_engine.confirm_limit_cancelled_fire_market(
                 pine_id, market_coid=market_coid,
             )
+        elif market_coid != watch.market_coid:
+            # The earlier send was rejected and its envelope dropped (a
+            # plugin's ``'rejected'`` resolution), so this retry goes out
+            # under a fresh id. That id may carry an earlier send of its own,
+            # which gates the POST like the watch's id did; then it is
+            # persisted BEFORE the POST, so the next retry verifies this send
+            # and not the rejected one.
+            if not self._earlier_stop_market_send_settled(pine_id, market_coid):
+                return
+            self._entry_stop_engine.rebind_market_coid(pine_id, market_coid=market_coid)
         try:
             orders = self._run_async(
                 self._broker.execute_entry(market_envelope),
             )
         except OrderDispositionUnknownError as e:
             # The market POST timed out; it may or may not have landed. Stay
-            # stop_market_pending — the next tick re-fires with the SAME
-            # deterministic coid, which the broker dedups, so no double-open.
+            # stop_market_pending — the next tick re-enters with the SAME
+            # deterministic coid, and :meth:`_earlier_stop_market_send_settled`
+            # decides whether it may go out again.
             _blog_warning(
                 "entry-stop %r market dispatch unknown disposition (coid=%s); "
                 "staying stop_market_pending for idempotent retry: %s",
@@ -19484,6 +19659,69 @@ class OrderSyncEngine:
             )
         return outcome
 
+    def _report_held_dispatch(self, coid: str, message: str) -> None:
+        """Report a send held behind an unanswered earlier send of the same dispatch.
+
+        The first report is a WARNING, and so is a reminder every
+        :data:`_HELD_DISPATCH_REMINDER_S` while the hold stands: a plugin
+        that never resolves such sends would otherwise hold the entry for the
+        whole run without a word after the first line.
+
+        :param coid: The client order id of the earlier send.
+        :param message: The report.
+        """
+        now = time.monotonic()
+        reported = self._held_dispatch_reported.get(coid)
+        if reported is None:
+            self._held_dispatch_reported[coid] = (now, now)
+            _blog_warning("%s", message)
+            return
+        first, last = reported
+        if now - last < _HELD_DISPATCH_REMINDER_S:
+            return
+        self._held_dispatch_reported[coid] = (first, now)
+        _blog_warning("%s (held for %.0f s)", message, now - first)
+
+    def _hold_behind_inherited_dispatch(self, intent: EntryIntent) -> None:
+        """Hold an entry back while an earlier process's send of it is unresolved.
+
+        After a restart the script emits the entry again, and the persisted
+        envelope anchor rebuilds the client order id the earlier process sent.
+        On a venue that does not refuse a duplicate client order id
+        (:attr:`~OrderSyncEngine._hold_inherited_dispatches`) that second send
+        becomes a second order when the first one did land, so the entry
+        waits until the plugin's resolver settles the inherited dispatch
+        (:func:`~pynecore.core.broker.parked_dispatch.inherited_dispatch_in_flight`):
+        a landed working order is promoted from its park and adopted, a
+        landed fill reaches the book through the plugin's reconcile, and a
+        rejected one releases the intent under a fresh client order id.
+
+        Runs before the envelope is built, so a held entry leaves nothing to
+        clean up, and the persisted anchor stays as it is.
+
+        :param intent: The entry about to be dispatched.
+        :raises OrderSkippedByPlugin: ``reason='inherited_dispatch_unresolved'``
+            while the entry is held; it does not count as a rejection, and the
+            next sync re-evaluates it.
+        """
+        if not self._hold_inherited_dispatches or self._store_ctx is None:
+            return
+        coid = inherited_dispatch_in_flight(self._store_ctx, intent.intent_key)
+        if coid is None:
+            return
+        self._report_held_dispatch(
+            coid, f"entry {format_intent_key(intent.intent_key)} held: an earlier "
+                  f"process sent it as {coid} and the venue's answer is still unknown; "
+                  f"it is dispatched once that send is resolved")
+        raise OrderSkippedByPlugin(
+            f"Entry {format_intent_key(intent.intent_key)} held: the inherited "
+            f"dispatch {coid} is unresolved; re-evaluating next sync.",
+            intent_key=intent.intent_key,
+            reason='inherited_dispatch_unresolved',
+            context={'symbol': intent.symbol, 'pine_id': intent.pine_id,
+                     'client_order_id': coid},
+        )
+
     def _dispatch_new(
             self, intent: Intent, *, _coid_spent_retry: int = 0, _reject_retry: int = 0,
     ) -> None:
@@ -19600,6 +19838,8 @@ class OrderSyncEngine:
                     'quarantine_reason': self._quarantine_reason,
                 },
             )
+        if isinstance(intent, EntryIntent):
+            self._hold_behind_inherited_dispatch(intent)
         # MARKET stop-and-reverse (TV parity): TV sizes a reversing market
         # entry at first order processing as ``qty + |opposite position|``
         # and executes it as one combined order. Live, the engine reaches

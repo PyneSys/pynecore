@@ -686,6 +686,8 @@ def create_entry_order_row(
     if existing is not None and existing.closed_ts_ms is not None:
         store.reopen_order(coid)
         store.upsert_order(coid, exchange_order_id=None, filled_qty=0.0)
+    # A row an earlier process left pending now tracks this process's send.
+    store.release_inherited_dispatch(coid)
     store.upsert_order(
         coid,
         symbol=symbol,

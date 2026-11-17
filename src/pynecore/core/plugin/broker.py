@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
@@ -40,6 +40,7 @@ from pynecore.core.broker.models import (
 )
 
 if TYPE_CHECKING:
+    from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
     from pynecore.core.broker.spot_inventory import SpotInventoryPort
     from pynecore.core.broker.storage import RunContext
     from pynecore.core.broker.models import (
@@ -437,6 +438,29 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     not wired it (state-only test paths); the plugin must guard accordingly.
 
     Signature: ``sink(symbol: str | None = None)``.
+    """
+
+    publish_native_failsafe_sl: 'Callable[[NativeBracketSnapshot], Awaitable[None]] | None' = None
+    """Optional actuator of the native fail-safe stop; a plugin defines it as a method.
+
+    A venue whose protection is a position attribute
+    (``tp_sl_bracket=NATIVE``) cannot carry one stop per partial exit, so
+    partial-quantity brackets run in the engine
+    (``partial_qty_bracket_exit=SOFTWARE``) and are only as alive as the bot
+    is. The
+    :class:`~pynecore.core.broker.native_failsafe_manager.NativeFailsafeManager`
+    therefore keeps one worst-case stop for the whole position on the venue,
+    and this coroutine writes it: ``async def publish_native_failsafe_sl(self,
+    snapshot)`` sets the position's protection to the snapshot (full
+    replacement) and returns, or raises when the venue did not take it. The
+    engine records a normal return as a successful write and any exception as
+    a failed one; the method must not report the outcome any other way.
+
+    The :class:`~pynecore.core.script_runner.ScriptRunner` wires it into the
+    engine when the plugin defines it. Left ``None``, the fail-safe is
+    state-only: nothing protects the position on the venue while the bot is
+    down. The write changes protection levels, so it follows the protection
+    guard's rules like any other.
     """
 
     on_inventory_conflict: str = "quarantine"

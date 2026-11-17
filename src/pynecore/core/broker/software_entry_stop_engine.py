@@ -187,6 +187,29 @@ class SoftwareEntryStopEngine:
         )
         return watch
 
+    def rebind_market_coid(
+            self, pine_id: str, *, market_coid: str,
+    ) -> EntryStopWatch | None:
+        """Record a new client-order-id for a ``stop_market_pending`` MARKET.
+
+        The MARKET keeps its persisted id across retries, unless its earlier
+        send was rejected and its envelope dropped: the retry then goes out
+        under a fresh id. Persisting that id BEFORE the POST makes the next
+        retry, in this process or after a restart, verify the send that is
+        actually in flight. Idempotent no-op when the watch is not
+        ``stop_market_pending`` or already carries ``market_coid``.
+        """
+        watch = self._watches.get(pine_id)
+        if (watch is None or watch.state != ENTRY_STOP_STATE_MARKET_PENDING
+                or watch.market_coid == market_coid):
+            return None
+        watch.market_coid = market_coid
+        self._transition(
+            watch, ENTRY_STOP_STATE_MARKET_PENDING,
+            close_row=False, market_coid=market_coid,
+        )
+        return watch
+
     def mark_stop_won(self, pine_id: str) -> EntryStopWatch | None:
         """``stop_market_pending`` → ``stop_won`` (terminal): the stop-fired
         MARKET dispatch landed. Idempotent no-op otherwise.

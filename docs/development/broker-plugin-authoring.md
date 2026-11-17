@@ -5,7 +5,7 @@ title: "Broker Plugin Authoring Guide"
 description: "Implement a PyneCore BrokerPlugin using the documented contract for live order handling. Review persistence requirements and the behavior broker authors must test."
 icon: "account_balance"
 date: "2026-07-12"
-lastmod: "2026-10-15"
+lastmod: "2026-11-17"
 draft: false
 toc: true
 categories: ["Development"]
@@ -102,6 +102,33 @@ trading depends on `update_symbol_info()` upholding these invariants:
   during an open session, the framework assumes a half-open socket / lost
   subscription and forces a reconnect cycle. Only set it to `None` when
   the venue's own liveness machinery genuinely covers the dead-feed case.
+- **Closed-bar recovery belongs to the framework, the history query to
+  you.** The live stream itself recovers a close the socket missed: at
+  startup (the bars that closed while the subscription came up), after
+  every reconnect, and for a single close that did not arrive. It does so
+  through `backfill_closed_bars(symbol, timeframe, since_ms)`, which you
+  must implement as a **pure query**: any number of calls in any order
+  leave the plugin's state as it was. Do not recover missed closes inside
+  `watch_ohlcv()` or your reconnect handling — one slot must not be
+  recovered twice. The answer has exact meaning:
+  - return only closed bars, strictly after `since_ms`, ascending, in the
+    venue's own order of publishing;
+  - an **empty list** is the venue's answer "no such bar"; a query the
+    venue **did not answer** must raise, and the stream then waits for
+    the gap instead of going on over it;
+  - `since_ms` is a bar open on the timeframe grid — never shift it by a
+    millisecond to make a comparison inclusive.
+- **`history_publish_lag`** — the longest delay after a bar's close until
+  the history returns that bar, in seconds. It is the line between "not
+  yet" and "none": an empty answer counts as "the venue has no bar for
+  this slot" only when asked at least this long after the slot's close.
+  Declare the longest delay you measured, not the typical one; a lag set
+  too short turns a late-published bar into a hole.
+- **`history_has_idle_bars`** — whether the venue's history has a
+  zero-volume bar for a slot without trades. `True`: the stream emits the
+  same filler bar. `False`: the stream emits none and `bar_index` does
+  not step — the series a restart would replay from the history. Measure
+  it on the venue; do not assume it.
 - **Error taxonomy:** subclass your plugin's expected failures from
   `ProviderError`; mark transient ones (connectivity drops, broker
   maintenance, socket timeouts) as `TransientProviderError` or set
@@ -518,10 +545,164 @@ recoverable paths recovering — the net only exists to make contract
 violations safe, not to be the plan. Centralise SDK-specific
 classification in `_map_exception()`.
 
+### A parked dispatch must be released, not only promoted
+
+After `OrderDispositionUnknownError` the engine parks the dispatch. Its
+own verification promotes an order that `get_open_orders()` echoes back,
+and a complete `filled` ENTRY event for the dispatch's client order id
+unparks it, whether the park is this process's or one an earlier process
+left (a `partially_filled` event keeps the park, so verification can still
+promote the rest). A dispatch that **never
+reached the venue** matches neither, so without your help it stays parked
+for the rest of the run: the entry never goes out again and every exit
+that depends on it is skipped.
+
+The rule that releases it lives in the core —
+`pynecore.core.broker.parked_dispatch.ParkedDispatchResolver` — and you
+supply only the venue question. Run `resolve(store_ctx, lookup)` at your
+reconcile cadence; `lookup(row)` answers for one parked row with a
+`ParkedVerdict`:
+
+| Outcome        | Meaning                                                    | What the core does                              |
+|----------------|------------------------------------------------------------|-------------------------------------------------|
+| `LANDED`       | The venue has the order working, or it executed            | Nothing; verification / the fill path unpark it |
+| `REFUSED`      | The venue has the order, dead, with nothing executed       | Rejects the row at once                         |
+| `ABSENT`       | A **complete** read of the venue does not know the order   | Rejects after enough consecutive absences       |
+| `INCONCLUSIVE` | The venue could not be read, or the read was truncated     | Nothing; the miss streak stays as it was        |
+
+Never report `ABSENT` from a failed or partial read: a wrong rejection
+makes the engine dispatch the intent again, and an order that did land
+then fills twice. If the venue indexes its order history late, pass
+`absent_after_s` so an absence only counts once the row is older than
+that lag. A rejected row is closed through the journal with a
+`'rejected'` resolution; the engine drops the park on its next sync and
+re-dispatches the intent.
+
+The same rule covers a dispatch an **earlier process** left pending. Your
+startup recovery may not be able to resolve such a row yet (the venue
+indexes the order late, or the read failed), and then the row has to stay
+pending — but it may be `submitted` rather than `disposition_unknown`, and
+it may have no park at all, because the crash came before the venue's
+answer. The store marks every row adopted pending at startup as inherited
+(`store_ctx.is_inherited_dispatch(coid)`; your own persist-first write
+under the same id, `create_entry_order_row`, hands it back to the running
+process), and the resolver looks inherited rows up in every pending state.
+A `submitted` row of the running process is never looked up: it is
+mid-flight, or the engine retries it itself.
+
+While such a row is unresolved, the script emitting the same entry again
+makes the engine rebuild the same client order id from the persisted
+envelope anchor. What happens next depends on your `idempotency`
+capability:
+
+| `idempotency`             | Second send under the same id                      | What the engine does                                          |
+|---------------------------|----------------------------------------------------|---------------------------------------------------------------|
+| `NATIVE`                  | The venue refuses it and you adopt the first order | Sends it at once                                              |
+| `PARTIAL_NATIVE`          | The venue executes it as a second order            | Parks the inherited entry rows at startup and holds the entry |
+| `SOFTWARE`, `UNSUPPORTED` | No id on the venue: a second, independent order    | Parks the inherited entry rows at startup and holds the entry |
+
+The hold is a skip with reason `inherited_dispatch_unresolved`: one WARNING
+when it starts, then a reminder every 10 minutes while it stands, so a held
+entry never goes unnoticed for a whole run.
+
+Your resolver pass releases it. `LANDED` lets the engine's verification
+adopt a working order from its park (record the venue refs on the row, so
+your reconcile can recover a fill), and a rejection drops the anchor, so the
+entry goes out under a fresh client order id. **Without a resolver pass the
+entry stays held for the whole run.** So every plugin whose `idempotency` is
+not `NATIVE` must provide:
+
+- a `resolve(store_ctx, lookup)` pass at its reconcile cadence that also
+  reaches inherited rows (the core selects them; you do not filter on
+  `disposition_unknown` yourself — use
+  `parked_dispatch.awaits_venue_answer(store_ctx, row)` if you walk rows of
+  your own);
+- a `lookup(row)` that answers from evidence the venue keeps of every
+  accepted write. A venue without a client order id cannot answer by id:
+  answer from a history that records every write causally (an activity or
+  deal log), report `ABSENT` only when one complete read covers the row's
+  whole life, and set `absent_after_s` to the longest publication lag you
+  measured for that history;
+- for `LANDED`, the same take-over your startup recovery uses, so the row
+  gets its venue id and a MARKET entry's fill reaches the engine as an
+  `OrderEvent` — never only a row update.
+
+If the venue cannot prove either outcome for a row (its history no longer
+reaches back to the row's dispatch), answer `INCONCLUSIVE` and log why: the
+entry stays held, which is the safe side. `pynecore-capitalcom` is the
+reference: rows with a `dealReference` are answered from the deal
+confirmation, all of them from `/history/activity` matched on epic,
+direction, size and a ±3 s window around the row's creation, with
+`absent_after_s=fill_report_grace_s` (the venue has published an activity
+61 s after its deal).
+
+The rule is the same for an entry whose stop fired while a both-set
+`strategy.entry` waited on its limit: the engine sends the stop-triggered
+MARKET under a client order id it persisted first. On a venue that is not
+`NATIVE`, a restart, or an unknown disposition inside the run, does not
+send that MARKET again until the journal row of its earlier send settles:
+a row still waiting for the venue holds it (with the same WARNING and
+reminders), a landed one settles the watch on that order without a second
+send, and only a send that provably did not land (no row, a refused row with
+nothing filled, or a `submitted` row of the running process) goes out
+again.
+
+A venue without a client order id may also resolve from evidence of its
+own outside the resolver and write the resolution itself with
+`store_ctx.record_resolution(coid, 'attached' | 'rejected')`
+(`pynecore-capitalcom` does this from the deal confirmation).
+
+### A fill you recover must reach the engine
+
+When your reconcile proves a fill the stream missed, emit it as an
+`OrderEvent` — never only correct your own rows. While the recovery is
+still running, override `fill_recovery_pending(entry_ids)` to say so if
+the default (the disappearance tracker's stamps) does not cover your
+case: the engine then holds its "someone else changed the position"
+verdict, for a bounded time, so your own exit is not booked as an
+external close.
+
 The general operational rule: **a thrown error stops the bot and strands
 the user.** Prefer keep-running behaviours (retry, observe, degrade) on
 every recoverable path; halt only when continuing could lose money
 (ambiguous writes, failed defensive recovery).
+
+## Optional hooks
+
+These are not abstract, so nothing forces you to notice them. Each one
+matters only for the venue shape it names.
+
+- **`publish_native_failsafe_sl(snapshot)`** — for a venue whose protection
+  is a position attribute (`tp_sl_bracket=NATIVE`) running engine-driven
+  partial brackets (`partial_qty_bracket_exit=SOFTWARE`). Those brackets
+  are only as alive as the bot, so the engine keeps one worst-case stop
+  for the whole position on the venue and calls this coroutine to write
+  it. Set the position's protection to the snapshot (full replacement)
+  and return, or raise when the venue did not take it; the engine records
+  a return as a successful write and any exception as a failed one. Left
+  undefined, the fail-safe is state-only and nothing protects the
+  position on the venue while the bot is down. The write changes
+  protection levels, so it follows the protection guard's rules (1b).
+- **`native_cancel_all_expected_sink`** — if `execute_cancel_all()` calls
+  one native bulk-cancel endpoint, call this sink **before** the venue
+  request. The bulk cancel bypasses the engine's per-order cancel
+  intents, so the `CANCELLED` pushes that follow would otherwise read as
+  external cancels and quarantine the bot. It is `None` on state-only
+  test paths; guard for that.
+- **`least_tradable_qty(price)`** — the smallest quantity one venue order
+  can trade. The position book never leaves a partially closed trade a
+  remainder below it while another trade is open, because no order could
+  close that remainder on its own. Override it when the venue has a
+  minimum order size and you support pyramiding; it is called while a
+  fill is booked, so it must not do I/O.
+- **`operator_resume_ts_ms`** — after an operator resume, a change the
+  venue made before this time is no intervention any more. The core
+  applies the boundary to the protection guard and the disappearance
+  tracker. A judge of your own must apply it too: pass the change's venue
+  time as `changed_at_ms` to `report_external_intervention()` (an
+  execution, a closing deal and an order amend all carry one), or, for a
+  judge without a change time, take its first view after the resume as
+  the new baseline.
 
 ## Hedging-mode accounts: `PositionPort`
 
@@ -791,10 +972,22 @@ turns the machine-checkable slice of this guide into fail-fast errors:
 | Spot port set with an invalid `on_inventory_conflict` policy            | error    |
 | Spot port set with a supported `short_selling` capability               | error    |
 | `account_id` still `"default"` after authentication                     | error    |
+| Inherited `backfill_closed_bars()` (every missed close reads "no bar")  | error    |
+| `history_publish_lag` not a positive finite number                      | error    |
+| `history_has_idle_bars` not a `bool`                                    | error    |
+| `feed_timeout_bars` neither `None` nor a positive `int`                 | error    |
 | No `watch_orders()` stream (poll-only, no disappearance channel)        | warning  |
 | Inherited `execute_cancel_with_outcome` (all cancels `UNKNOWN`)         | warning  |
 
-A conforming plugin produces zero findings — both reference plugins do.
+A plugin usually learns its account's mode only in `connect()` or on its
+first broker call, so it sets `position_port` / `spot_inventory_port`
+after the startup probe ran. The order sync engine therefore runs the
+port checks again (`validate_plugin_ports`) the first time it sees a
+port, and stops the bot before it drives anything through a port that
+fails them.
+
+A conforming plugin produces zero findings — all three reference plugins
+do, and each asserts it in its own test suite (`test_*_contract.py`).
 Everything the probe cannot check (incremental `fill_qty`, stable
 `fill_id`, client-id echo, actual disappearance detection quality) is on
 this guide's checklist instead.
@@ -834,6 +1027,15 @@ and reproduction workflow.
 - Contract-probe tests need real `BrokerPlugin` subclasses — the probe
   compares method identity against the base class, so duck-typed mocks
   do not register as overrides.
+- Assert the contract probe on the real plugin class: construct the
+  plugin offline and check that `validate_plugin_contract(plugin)` returns
+  no error, then wire each port the plugin can opt into and check
+  `validate_plugin_ports(plugin)` the same way.
+- Keep the set of functions that write a stop loss or a take profit
+  closed: a source-level test (`test_*_protection_write_sites.py` in the
+  reference plugins) fails when a new write site does not go through the
+  protection guard's entry points. An unguarded write is not caught by any
+  functional test — it shows up as a false quarantine on a live account.
 - Keep the plugin feature-complete: no `NotImplementedError` stubs on
   intent paths. If the venue cannot deliver a capability, declare it
   `UNSUPPORTED` and let startup validation refuse incompatible scripts.

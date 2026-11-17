@@ -21,7 +21,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.plugin.broker import BrokerPlugin
 
-__all__ = ['validate_at_startup', 'validate_plugin_contract']
+__all__ = ['validate_at_startup', 'validate_plugin_contract', 'validate_plugin_ports']
 
 #: Methods a :class:`~pynecore.core.plugin.broker.PositionPort` implementation
 #: must provide. Mirrors the Protocol surface — kept here as data so the
@@ -156,6 +156,91 @@ def validate_at_startup(
     return errors
 
 
+def _supports_short_selling(plugin: BrokerPlugin) -> bool:
+    """Whether the plugin validly declares a supported ``short_selling``."""
+    level = getattr(plugin.get_capabilities(), 'short_selling', None)
+    return isinstance(level, CapabilityLevel) and level.is_supported
+
+
+def validate_plugin_ports(plugin: BrokerPlugin) -> list[str]:
+    """
+    Probe the ports a broker plugin has opted into.
+
+    A plugin may set :attr:`~BrokerPlugin.position_port` and
+    :attr:`~BrokerPlugin.spot_inventory_port` only once it knows the account
+    (in ``connect()``, or on its first broker call), which is after the
+    startup probe ran. The
+    :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine` therefore runs
+    this check again whenever it sees a port it has not checked yet.
+
+    :param plugin: The broker plugin instance.
+    :return: Human-readable violations; empty when the ports are sound.
+    """
+    errors: list[str] = []
+    name = type(plugin).__name__
+
+    # --- PositionPort surface ---
+    port = plugin.position_port
+    if port is not None:
+        missing = [m for m in _POSITION_PORT_METHODS
+                   if not callable(getattr(port, m, None))]
+        if missing:
+            errors.append(
+                f"{name}.position_port opts into core one-way emulation but "
+                f"is missing PositionPort method(s): {', '.join(missing)}. "
+                f"The OneWayEmulator drives the plugin purely through this "
+                f"surface — implement all of them."
+            )
+
+    # --- SpotInventoryPort surface ---
+    spot_port = plugin.spot_inventory_port
+    if spot_port is not None:
+        missing: list[str] = [
+            m for m in _SPOT_INVENTORY_PORT_METHODS
+            if not callable(getattr(spot_port, m, None))
+        ]
+        missing.extend(
+            a for a in _SPOT_INVENTORY_PORT_ATTRS
+            if getattr(spot_port, a, None) is None
+        )
+        if missing:
+            errors.append(
+                f"{name}.spot_inventory_port opts into core spot inventory "
+                f"but is missing SpotInventoryPort member(s): "
+                f"{', '.join(missing)}. The SpotInventoryManager drives the "
+                f"venue purely through this surface — implement all of them."
+            )
+        if plugin.on_inventory_conflict not in ('quarantine', 'halt'):
+            errors.append(
+                f"{name}.on_inventory_conflict is "
+                f"{plugin.on_inventory_conflict!r} — must be 'quarantine' "
+                f"or 'halt' (the inventory-conflict policy set is narrower "
+                f"than on_unexpected_cancel by design)."
+            )
+        grace = getattr(spot_port, 'settlement_grace_s', None)
+        if (isinstance(grace, bool)
+                or not isinstance(grace, (int, float))
+                or not math.isfinite(grace)
+                or grace < 0):
+            errors.append(
+                f"{name}.spot_inventory_port.settlement_grace_s is "
+                f"{grace!r} — must be a finite non-negative real number "
+                f"(a NaN/inf grace would let a confirmed inventory "
+                f"conflict stay pending forever while trading continues)."
+            )
+        if _supports_short_selling(plugin):
+            errors.append(
+                f"{name} declares a spot_inventory_port AND a supported "
+                f"short_selling capability — the two are mutually "
+                f"exclusive. The spot ledger models long-only exposure "
+                f"(a negative base position cannot exist on a spot "
+                f"venue); a short-capable venue must not opt into core "
+                f"spot inventory."
+            )
+
+    return errors
+
+
 def validate_plugin_contract(
         plugin: BrokerPlugin,
         *,
@@ -197,6 +282,12 @@ def validate_plugin_contract(
       populated ``_account_id`` during authentication *before* the broker
       storage derives the run identity from it; a silent ``"default"``
       would collide every run of the account.
+    - **Live feed declarations** — ``backfill_closed_bars`` must be
+      overridden (the inherited default reads as "the venue has no bar" for
+      every missed close), ``history_publish_lag`` must be a positive finite
+      number, ``history_has_idle_bars`` a bool and ``feed_timeout_bars``
+      ``None`` or a positive int: the live stream decides from them what a
+      missing close means.
     - **PositionPort surface** — a non-``None``
       :attr:`~BrokerPlugin.position_port` must
       carry the full port surface the core
@@ -323,65 +414,42 @@ def validate_plugin_contract(
             f"disposition when the venue makes it readable."
         )
 
-    # --- PositionPort surface ---
-    port = plugin.position_port
-    if port is not None:
-        missing = [m for m in _POSITION_PORT_METHODS
-                   if not callable(getattr(port, m, None))]
-        if missing:
-            errors.append(
-                f"{name}.position_port opts into core one-way emulation but "
-                f"is missing PositionPort method(s): {', '.join(missing)}. "
-                f"The OneWayEmulator drives the plugin purely through this "
-                f"surface — implement all of them."
-            )
+    errors.extend(validate_plugin_ports(plugin))
 
-    # --- SpotInventoryPort surface ---
-    spot_port = plugin.spot_inventory_port
-    if spot_port is not None:
-        missing: list[str] = [
-            m for m in _SPOT_INVENTORY_PORT_METHODS
-            if not callable(getattr(spot_port, m, None))
-        ]
-        missing.extend(
-            a for a in _SPOT_INVENTORY_PORT_ATTRS
-            if getattr(spot_port, a, None) is None
+    # --- Live feed declarations ---
+    if not overridden('backfill_closed_bars'):
+        errors.append(
+            f"{name} does not override backfill_closed_bars(): the inherited "
+            f"default answers every history query with \"the venue has no "
+            f"bar\", so a close the stream missed is never recovered and the "
+            f"strategy trades on a series the venue's history does not have. "
+            f"Implement it as a pure query of the venue's closed bars."
         )
-        if missing:
-            errors.append(
-                f"{name}.spot_inventory_port opts into core spot inventory "
-                f"but is missing SpotInventoryPort member(s): "
-                f"{', '.join(missing)}. The SpotInventoryManager drives the "
-                f"venue purely through this surface — implement all of them."
-            )
-        if plugin.on_inventory_conflict not in ('quarantine', 'halt'):
-            errors.append(
-                f"{name}.on_inventory_conflict is "
-                f"{plugin.on_inventory_conflict!r} — must be 'quarantine' "
-                f"or 'halt' (the inventory-conflict policy set is narrower "
-                f"than on_unexpected_cancel by design)."
-            )
-        grace = getattr(spot_port, 'settlement_grace_s', None)
-        if (isinstance(grace, bool)
-                or not isinstance(grace, (int, float))
-                or not math.isfinite(grace)
-                or grace < 0):
-            errors.append(
-                f"{name}.spot_inventory_port.settlement_grace_s is "
-                f"{grace!r} — must be a finite non-negative real number "
-                f"(a NaN/inf grace would let a confirmed inventory "
-                f"conflict stay pending forever while trading continues)."
-            )
-        if ('short_selling' not in bad_fields
-                and caps.short_selling.is_supported):
-            errors.append(
-                f"{name} declares a spot_inventory_port AND a supported "
-                f"short_selling capability — the two are mutually "
-                f"exclusive. The spot ledger models long-only exposure "
-                f"(a negative base position cannot exist on a spot "
-                f"venue); a short-capable venue must not opt into core "
-                f"spot inventory."
-            )
+    lag = plugin.history_publish_lag
+    if (isinstance(lag, bool) or not isinstance(lag, (int, float))
+            or not math.isfinite(lag) or lag <= 0):
+        errors.append(
+            f"{name}.history_publish_lag is {lag!r} — must be a positive, "
+            f"finite number of seconds: the longest delay after a bar's close "
+            f"until the venue's history returns that bar."
+        )
+    # Read untyped: the check is whether the plugin declared another type
+    for attribute, meaning in (
+            ("history_has_idle_bars",
+             "True (the venue's history has a zero-volume bar for a slot without "
+             "trades) or False (it has none)"),
+    ):
+        declared = getattr(plugin, attribute)
+        if not isinstance(declared, bool):
+            errors.append(f"{name}.{attribute} is {declared!r} — must be {meaning}.")
+    feed_timeout = plugin.feed_timeout_bars
+    if feed_timeout is not None and (
+            isinstance(feed_timeout, bool) or not isinstance(feed_timeout, int)
+            or feed_timeout <= 0):
+        errors.append(
+            f"{name}.feed_timeout_bars is {feed_timeout!r} — must be None or "
+            f"a positive whole number of timeframe periods."
+        )
 
     # --- Lifecycle ---
     if require_account_id and plugin.account_id == "default":
