@@ -1341,6 +1341,13 @@ def live_ohlcv_generator(
         # false): the slot's close comes from the history, the socket's values are
         # the fallback at the deadline.
         stream_close_ts: int | None = None
+        # Slots the history settled before the socket's close of them arrived, on a
+        # venue whose closes come from the history. Such a venue's socket can run
+        # behind its history (Capital.com's whole feed drifts up to ~15 s behind
+        # real time), and a close it delivers late was not missed: a slot is
+        # reported as missed only when the history's next answer comes with the
+        # socket's close of it still not delivered.
+        history_ahead_ts: list[int] = []
         # Scan of a closed session for its reopen: the awaited slot the scan
         # started from and the slot it has reached (see ``_awaited_slot``).
         reopen_scan_from: int | None = None
@@ -1779,12 +1786,21 @@ def live_ohlcv_generator(
                 # history, was not missed: its history bar is the expected close
                 missed = [history_bar for history_bar in accepted
                           if stream_close_ts is None or history_bar.timestamp > stream_close_ts]
+                if stream_closes_final:
+                    reported = [history_bar.timestamp for history_bar in missed]
+                else:
+                    # Settled ahead of the socket: missed only if its close has not
+                    # come by the next answer (see ``history_ahead_ts``)
+                    reported = [ts for ts in history_ahead_ts if ts < slot]
+                    history_ahead_ts[:] = [ts for ts in history_ahead_ts if ts >= slot]
+                    history_ahead_ts.extend(history_bar.timestamp for history_bar in missed)
+                if reported:
+                    # broker_info, not the module logger: an operator (and the live
+                    # lab's repair count) must see every bar the socket missed.
+                    broker_info("missed close: %d closed bar(s) from history, ts=%d..%d",
+                                len(reported), reported[0], reported[-1])
                 if not missed:
                     return None
-                # broker_info, not the module logger: an operator (and the live
-                # lab's repair count) must see every bar the socket missed.
-                broker_info("missed close: %d closed bar(s) from history, ts=%d..%d",
-                            len(missed), missed[0].timestamp, missed[-1].timestamp)
                 # One step per answer, however many bars it carried: a backlog
                 # fetched in one go is one missed delivery. A close the socket
                 # delivers late, after the history, ends the streak when it arrives.
@@ -2226,6 +2242,8 @@ def live_ohlcv_generator(
                             and bar_update.timestamp <= last_closed_bar.timestamp):
                         # Still a close from the socket: the subscription is alive
                         history_close_streak = 0
+                        if bar_update.timestamp in history_ahead_ts:
+                            history_ahead_ts.remove(bar_update.timestamp)
                         continue
 
                     # The socket's candle is not the history's: the slot's close

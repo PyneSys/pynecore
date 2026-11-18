@@ -663,6 +663,47 @@ def __test_late_socket_closes_do_not_count_as_a_dead_subscription__():
         consumer.close()
 
 
+def __test_a_socket_close_later_than_the_history_is_no_missed_close__(caplog):
+    """On a venue whose closes come from the history, a socket lagging the history missed nothing
+
+    The history settles the slot first and the socket's close of it arrives after: the
+    socket delivered it, late, so no missed close is reported.
+    """
+    last, s1, s2 = _two_answer_slots()
+    venue = _Venue([[_bar(last)]], publish_lag=_FAST_LAG, publish_delay=_FAST_LAG - 1.0,
+                   stream_closes_final=False)
+    venue.set_history([_bar(s1, 101.0), _bar(s2, 102.0)])
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        consumer = _Consumer(venue)
+        try:
+            assert consumer.wait_for(lambda: len(consumer.closed) >= 2)
+            venue.push(_bar(s1, 101.0))
+            assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+            assert consumer.stamps() == [last, s1, s2]
+        finally:
+            consumer.close()
+    assert "missed close:" not in caplog.text
+
+
+def __test_a_socket_close_that_never_comes_is_a_missed_close__(caplog):
+    """On a venue whose closes come from the history, a slot the socket never closes is missed
+
+    The report waits for the history's next answer: by then a close the socket only
+    delivered late would have arrived.
+    """
+    last, s1, s2 = _two_answer_slots()
+    venue = _Venue([[_bar(last)]], publish_lag=_FAST_LAG, publish_delay=_FAST_LAG - 1.0,
+                   stream_closes_final=False)
+    venue.set_history([_bar(s1, 101.0), _bar(s2, 102.0)])
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        consumer = _Consumer(venue)
+        try:
+            assert consumer.wait_for(lambda: len(consumer.closed) >= 3)
+        finally:
+            consumer.close()
+    assert f"missed close: 1 closed bar(s) from history, ts={s1}..{s1}" in caplog.text
+
+
 def __test_a_backlog_in_one_history_answer_is_one_missed_delivery__():
     """Several closes fetched in one answer, then a socket close: no reconnect"""
     last = _now_ms() - 3 * _TF_MS - 40_000
