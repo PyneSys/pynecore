@@ -5,7 +5,7 @@ title: "request.security()"
 description: "Use request.security() to evaluate other symbols and timeframes in PyneCore. Prepare OHLCV files, provide security data mappings and write multi-context scripts."
 icon: "security"
 date: "2026-03-27"
-lastmod: "2026-10-25"
+lastmod: "2026-11-18"
 draft: false
 toc: true
 categories: ["Reference"]
@@ -257,6 +257,21 @@ intrabar carries a price from after the chart bar ended, so it is delivered on t
 chart bar instead, the one its close falls into. Nothing is lost or duplicated: every
 intrabar is delivered exactly once, but a chart bar in which no intrabar closes returns an
 empty array (`na` for the scalar form).
+
+### Live mode: a close that comes late
+
+In a live run a context with a feed of its own (another symbol, or the chart's symbol at a
+lower timeframe) gets its closed bars from the provider's live stream, and a venue may
+publish a closed bar late. A chart bar waits for the context's bar of its period: first a
+short grace for the stream, then, querying the provider's history, up to a budget that
+depends on the context's timeframe. The bar that arrives gives its real value; a later bar
+arriving instead means the period had no bar, the same as any period without trades; when
+nothing arrives within the budget, the chart bar gets `na` for it and the run logs one
+warning. A value once given to a chart bar is never revised, even if the missing bar
+arrives later, so a backtest run later on a history that holds that bar can differ there.
+The final intrabar of a lower-timeframe window is waited for the same way.
+The grace, the budget and how symbols and warmup are resolved in a live run are described
+in [Security Contexts in Live Mode](../advanced/live-mode.md#security-contexts-in-live-mode).
 
 ### Chart types (Heikin Ashi)
 

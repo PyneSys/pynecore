@@ -5,7 +5,7 @@ title: "Plugin System"
 description: "Extend PyneCore with Python entry-point plugins. Learn provider and broker class relationships, configuration files and how plugins add or extend CLI commands."
 icon: "extension"
 date: "2026-03-30"
-lastmod: "2026-07-19"
+lastmod: "2026-11-18"
 draft: false
 toc: true
 categories: ["Development"]
@@ -395,6 +395,27 @@ The contract behind those four members:
   subscription and forces a reconnect cycle.  Only set the attribute to
   `None` when the venue's own liveness machinery genuinely covers the
   dead-feed case.
+- **`backfill_closed_bars(symbol, timeframe, since_ms)` answers missed
+  closes.**  The framework recovers every closed bar the stream missed: the
+  ones that closed while the subscription came up, the ones of an outage
+  after a reconnect, and a single close that did not arrive (a live
+  `request.security()` context asks for it while a chart bar waits for that
+  context).  It does so through this query, which must return only closed
+  bars strictly after `since_ms`, in ascending order, and must leave the
+  plugin's state unchanged however often it is called.  An empty list means
+  the venue has no such bar; a query the venue did not answer must raise.
+  The default returns nothing, so a provider without it gets no recovery.
+  Declare `history_publish_lag`, the longest delay until the history
+  returns a closed bar.  The full contract is in the live layer
+  requirements of the [Broker Plugin Authoring Guide](./broker-plugin-authoring.md).
+- **`provider_symbol` keeps the symbol as constructed.**  The base class
+  sets it to the symbol part of the provider string; a plugin that reshapes
+  `symbol` (splits off the exchange or the broker) leaves it as it is.  A
+  live `request.security()` of the chart's own symbol at another timeframe
+  constructs a new instance with it, so it must address the same
+  instrument.  Every other symbol of a live `request.security()` goes
+  through `resolve_symbol()`: the `symbol_map` first, then the workdir's
+  global map, otherwise unchanged.
 - **Optional hooks**: `on_disconnect()` / `on_reconnect()` for custom
   reconnect behavior, and `can_shutdown()` — polled every second during
   graceful shutdown; return `False` to delay exit while cleanup (closing

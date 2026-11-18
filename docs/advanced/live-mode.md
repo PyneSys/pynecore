@@ -5,7 +5,7 @@ title: "Live Mode"
 description: "Run PyneCore scripts on live provider data after historical replay. Configure tick updates, persistent intrabar state, paper trading and broker order routing."
 icon: "stream"
 date: "2026-04-08"
-lastmod: "2026-11-14"
+lastmod: "2026-11-18"
 draft: false
 toc: true
 categories: ["Live Trading"]
@@ -179,6 +179,55 @@ too: it runs as a backtest, and the live phase continues it with the position it
 run never trades on history, so its record holds only what it really traded.  The last historical
 bar places no orders while its period was still open at the download, because the live feed goes
 on forming that bar.
+
+## Security Contexts in Live Mode
+
+In a live run, every `request.security()` context except the chart's own symbol at the
+chart's timeframe runs in a process of its own and downloads a warmup from the history of
+the chart's provider.  A context of another symbol, and the chart's own symbol at a lower
+timeframe, then follow the provider's live stream.  The chart's own symbol at a higher
+timeframe gets its closed live bars from the chart's own bars, aggregated to the context's
+timeframe.
+
+- **Symbol** — the chart's own symbol at another timeframe is read from the symbol of the
+  chart's provider string.  Any other symbol is translated to the provider's own with the
+  `symbol_map` of the provider's config (`config/plugins/<provider>.toml`), then with the
+  workdir's `config/symbol_map.toml`; a symbol neither maps is passed on as written.  A
+  symbol the provider cannot serve stops the run with
+  [R0055](../reference/codes/runtime-errors.md#R0055), or gives `na` with
+  `ignore_invalid_symbol = true`.
+- **Warmup** — the history starts at the earlier of the chart's own history start and 500
+  bars of the context's timeframe, so a higher-timeframe context gets a depth of its own,
+  not just the few bars the chart window holds.  A warmup that fails stops the run with
+  [R0049](../reference/codes/runtime-errors.md#R0049).
+- **Outage recovery** — after a reconnect the context's stream recovers the bars that closed
+  during the outage, the same way the chart's stream does (see
+  [Limitations](#limitations)).
+
+### A close that comes late
+
+A chart bar waits for the closed bar of its period of each context that follows the
+provider's stream.  The stream usually delivers it within seconds, but a venue may publish
+a closed bar late.  The chart bar first waits a grace for the stream: half the context's
+period, kept between 15 and 30 seconds.  Past the grace it goes on waiting and queries the
+provider's history for the bar at once, then again after each query that found nothing,
+with a pause of 2 seconds that doubles up to 30 seconds.  The wait is bounded by a budget
+of a quarter of the context's period, kept between 2 and 10 minutes and counted from the
+start of the chart bar's wait:
+
+| What arrives                                   | Result                                                          |
+|------------------------------------------------|-----------------------------------------------------------------|
+| The bar, from the stream or from the history   | The chart bar gets its real value                               |
+| A later bar from the history, without this one | The period had no bar: the same as any period without trades    |
+| Nothing within the budget                      | The chart bar completes with `na` for it, with one warning      |
+
+While the context's feed stays silent, the next chart bars wait only the grace, not the
+budget again, and give no new warning; the next closed bar that arrives re-arms the full
+budget.  A value once given to a chart bar is never revised, even if the missing bar
+arrives later: a chart bar never looks into the future.  A backtest run later, on a history
+that holds the bar the live wait missed, can therefore differ from the live run at that
+chart bar.  The final intrabar of a `request.security_lower_tf()` window is waited for the
+same way.
 
 ## Output
 
