@@ -2205,6 +2205,21 @@ class OrderSyncEngine:
         # persisted-logic ``strategy.cancel`` on the first post-restart bar has a
         # target. Populated by :meth:`_scan_live_entry_anchors_for_restart`.
         self._restart_live_entry_orders_by_id: dict[str, ExchangeOrder] = {}
+        # Every order the venue listed as open at the restart scan, keyed by
+        # its venue order id AND its client order id, valued by the venue
+        # order id: the proof :meth:`_bind_journal_exit_legs` binds a
+        # journaled exit leg only while it still rests on the venue.
+        self._restart_open_order_ids: dict[str, str] = {}
+        # Venue order id -> exit intent key of each whole-row exit leg a
+        # previous process armed and this one resumed the position with, but
+        # does not track: its exit is in no Pine book and no diff slot (the
+        # restarted script owns the book, see
+        # :meth:`_reconstruct_journal_exits_after_resume`). Bound by
+        # :meth:`_bind_journal_exit_legs`, so a ``cancelled`` push for the leg
+        # is judged instead of passing as an anonymous cancel; the engine's own
+        # cancel of the exit consumes its legs as expected echoes
+        # (:meth:`_expect_journal_exit_leg_cancels`).
+        self._journal_held_exit_legs: dict[str, str] = {}
         # Pine entry intents rebuilt by :meth:`_reconstruct_pine_entry_orders`
         # from a live broker working order the script has NOT re-declared this
         # run (keyed by ``pine_id``). The entry-orphan sweep in
@@ -9567,9 +9582,12 @@ class OrderSyncEngine:
                 # lookup above missed. This push merely echoes our OWN cancel —
                 # log it as such (one-shot) instead of the external fallback.
                 self._strategy_cancel_expected_ids.discard(event.order.id)
+                self._journal_held_exit_legs.pop(event.order.id, None)
                 _blog_info(
                     "strategy cancel confirmed (%s)", event,
                 )
+            elif event.order.id in self._journal_held_exit_legs:
+                self._judge_journal_held_leg_cancel(event)
             else:
                 _blog_info(
                     "external cancel observed (%s)", event,
@@ -10419,6 +10437,10 @@ class OrderSyncEngine:
             for order_id in ids:
                 self._native_cancel_all_expected_ids.add(order_id)
                 count += 1
+        for order_id in self._journal_held_exit_legs:
+            self._native_cancel_all_expected_ids.add(order_id)
+            count += 1
+        self._journal_held_exit_legs.clear()
         _blog_info(
             "native cancel-all: armed %d expected-cancel order id(s) (symbol=%r)",
             count, symbol,
@@ -15262,6 +15284,7 @@ class OrderSyncEngine:
         self._reconstruct_partial_bracket_exits()
         self._reconstruct_pine_entry_orders()
         self._reconstruct_journal_exits_after_resume()
+        self._bind_journal_exit_legs()
         # A book that is ALREADY flat at restart gets the same sweep the
         # flat close-fill runs: the prior process may have died between a
         # venue-side exit fill and the cancel of its OCA sibling, leaving
@@ -15438,6 +15461,109 @@ class OrderSyncEngine:
                 "the bot re-asserts it on the venue",
                 format_intent_key(key), tp_price, sl_price,
             )
+
+    def _bind_journal_exit_legs(self) -> None:
+        """Bind the live exit legs the restarted engine resumes its position with.
+
+        A script places ``strategy.exit`` once, on its signal bar, so after a
+        restart the exit the previous process armed is in no Pine book and no
+        diff slot: its TP / SL legs rest on the venue as journal rows only
+        (the restarted script owns the book). Unbound, a ``cancelled`` push
+        for such a leg matched no intent, and an external cancel of the
+        protection of the resumed position passed as an anonymous cancel with
+        no ``on_unexpected_cancel`` policy (measured live: bybit-inverse cycle
+        390, the intruder removed the take-profit of ``L-X`` 15 minutes after
+        the restart and no quarantine latched).
+
+        Every whole-row TP / SL leg row of this run whose order the restart
+        scan still found open on the venue, whose parent the book holds and
+        whose exit the engine does not already map is bound by its venue
+        order id to its exit intent key in
+        :attr:`~OrderSyncEngine._journal_held_exit_legs`. The legs stay where
+        they are; only their cancel pushes are judged. Pure-local: reads the
+        journal and the scan snapshot.
+        """
+        if self._store_ctx is None or not self._restart_open_order_ids:
+            return
+        held = {trade.entry_id for trade in self._position.open_trades}
+        mapped = {order_id for ids in self._order_mapping.values() for order_id in ids}
+        for row in self._store_ctx.iter_live_orders():
+            leg = self._journal_exit_leg(row)
+            if leg is None or row.from_entry is None:
+                continue
+            if row.from_entry not in held and ADOPTED_STARTUP_ENTRY_ID not in held:
+                continue
+            key = f"{leg[0]}{INTENT_KEY_SEP}{row.from_entry}"
+            if key in self._order_mapping:
+                continue
+            order_id = next((
+                self._restart_open_order_ids[ref]
+                for ref in (row.exchange_order_id, row.client_order_id)
+                if ref and ref in self._restart_open_order_ids
+            ), None)
+            if order_id is None or order_id in mapped:
+                continue
+            self._journal_held_exit_legs[order_id] = key
+        bound = set(self._journal_held_exit_legs.values())
+        if bound:
+            _blog_info(
+                "restart: bound %d live exit leg(s) of %s to the resumed position — "
+                "a cancel of them is judged",
+                len(self._journal_held_exit_legs),
+                ", ".join(sorted(format_intent_key(key) for key in bound)),
+            )
+
+    def _expect_journal_exit_leg_cancels(self, key: str) -> None:
+        """Mark the bound journal legs of exit ``key`` as cancelled by the engine itself.
+
+        Called once the engine's own cancel of the exit landed: the venue's
+        ``cancelled`` pushes for those legs then echo that cancel instead of
+        being judged as an external one.
+        """
+        for order_id, held_key in list(self._journal_held_exit_legs.items()):
+            if held_key == key:
+                del self._journal_held_exit_legs[order_id]
+                self._strategy_cancel_expected_ids.add(order_id)
+
+    def _judge_journal_held_leg_cancel(self, event: OrderEvent) -> None:
+        """Judge the ``cancelled`` push of a bound journal exit leg.
+
+        The same verdicts as for a leg of a tracked exit: a post-fill echo,
+        a cancel the venue names as its own (a reduce-only squeeze, an OCA
+        sibling, a cleared position), the reduce-only fallout of a bot close
+        in flight, and the OCA fallout of a sibling leg's fill in the same
+        drain batch are routine. Any other cancel took the protection of the
+        resumed position away behind the bot's back: the
+        ``on_unexpected_cancel`` policy applies.
+        """
+        order = event.order
+        key = self._journal_held_exit_legs.pop(order.id)
+        from_entry = key.partition(INTENT_KEY_SEP)[2]
+        reason: str | None = None
+        if order.qty > 0.0 and order.filled_qty >= order.qty - 1e-9:
+            reason = "a post-fill echo"
+        elif event.cancel_reason in VENUE_DRIVEN_CANCEL_REASONS:
+            reason = f"cancelled by the venue itself ({event.cancel_reason})"
+        elif order.reduce_only and (self._bot_close_in_flight_for(from_entry)
+                                    or self._bot_close_in_flight_for_symbol(self._symbol)):
+            reason = "reduce-only fallout of the bot's own close"
+        elif any(batch_event is not event
+                 and not isinstance(batch_event, _NativeCancelAllExpected)
+                 and batch_event.event_type in ('filled', 'partial')
+                 and self._filled_intent_key(batch_event) == key
+                 for batch_event in self._drain_batch):
+            reason = "OCA fallout of its sibling leg's fill"
+        if reason is not None:
+            _blog_info(
+                "resumed exit leg %s: %s — no intervention (%s)",
+                format_intent_key(key), reason, event,
+            )
+            return
+        _blog_error(
+            "unexpected cancel of resumed exit leg %s (%s)",
+            format_intent_key(key), event,
+        )
+        self._apply_unexpected_cancel_policy(event, key)
 
     def _cancel_untracked_journal_legs(self, key: str, intent: ExitIntent) -> bool:
         """Cancel the venue legs of an earlier dispatch of this exit before it goes out afresh.
@@ -18023,6 +18149,11 @@ class OrderSyncEngine:
         same pinned ``(bar_ts_ms, retry_seq)``, so they collapse to a single
         tuple and are NOT ambiguous.
 
+        Every listed order's ids also land in
+        :attr:`~OrderSyncEngine._restart_open_order_ids`: the proof that a
+        journaled exit leg still rests on the venue
+        (:meth:`_bind_journal_exit_legs`).
+
         After an operator resume the read is also the first proof that an
         order of the bot was still on the venue after the resume: a later
         cancel of it is not one the resume accepted
@@ -18044,8 +18175,13 @@ class OrderSyncEngine:
         wire_orders: list[tuple[str, int, str]] = []
         wire_order_id_by_coid: dict[str, str] = {}
         orders_by_id: dict[str, ExchangeOrder] = {}
+        open_order_ids: dict[str, str] = {}
         for order in orders:
             coid = order.client_order_id
+            if order.id:
+                open_order_ids[order.id] = order.id
+                if coid:
+                    open_order_ids[coid] = order.id
             if not coid:
                 continue
             parsed = parse_client_order_id(coid)
@@ -18094,6 +18230,7 @@ class OrderSyncEngine:
         self._restart_live_wire_entry_orders = wire_orders
         self._restart_live_wire_order_id_by_coid = wire_order_id_by_coid
         self._restart_live_entry_orders_by_id = orders_by_id
+        self._restart_open_order_ids = open_order_ids
         if adopted or wire_orders:
             _blog_info(
                 "restart entry-anchor scan: %d live entry order(s) available "
@@ -19618,6 +19755,7 @@ class OrderSyncEngine:
         for order_id in self._order_mapping.get(key, ()):
             if order_id:
                 self._strategy_cancel_expected_ids.add(order_id)
+        self._expect_journal_exit_leg_cancels(key)
         if not self._partial_bracket_engine.has_active_legs_for_intent(key):
             cancel = CancelIntent(
                 pine_id=old.pine_id, symbol=self._symbol, from_entry=old.from_entry,
@@ -24444,6 +24582,7 @@ class OrderSyncEngine:
             for order_id in self._order_mapping.get(old.intent_key, ()):
                 if order_id:
                     self._strategy_cancel_expected_ids.add(order_id)
+            self._expect_journal_exit_leg_cancels(old.intent_key)
             # §2.6.7 eager retire: that suppressed follow-up push is exactly
             # the event whose key-matched 'cancelled' branch would have
             # retired the parent's parked ``NativeStopState`` — with the

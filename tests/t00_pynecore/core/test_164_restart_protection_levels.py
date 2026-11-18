@@ -22,12 +22,14 @@ from pynecore.core.broker.idempotency import (
     build_client_order_id,
 )
 from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_REDUCE_ONLY,
     DispatchEnvelope,
     ExchangeCapabilities,
     ExchangeOrder,
     ExchangePosition,
     ExitIntent,
     INTENT_KEY_SEP,
+    OrderEvent,
     OrderStatus,
     OrderType,
     QuarantineKind,
@@ -988,6 +990,126 @@ def __test_a_plain_restart_rebuilds_no_undeclared_journaled_exit__(tmp_path: Pat
 
         assert broker.exit_calls == [] and broker.cancel_calls == []
         assert ("L-X", "L") not in engine._position.exit_orders  # noqa: SLF001
+        ctx.close()
+
+
+def _rest_journaled_legs(broker: _Broker, journaled: DispatchEnvelope) -> None:
+    """The venue still lists both legs of the journaled exit among its open orders."""
+    broker.open_orders = [ExchangeOrder(
+        id=f"xchg-{leg}", symbol=SYMBOL, side="sell", order_type=order_type, qty=1.0,
+        filled_qty=0.0, remaining_qty=1.0, price=price, stop_price=stop,
+        average_fill_price=None, status=OrderStatus.OPEN, timestamp=0.0, fee=0.0,
+        fee_currency="", reduce_only=True, client_order_id=journaled.client_order_id(kind),
+    ) for leg, kind, order_type, price, stop in (
+        ("tp", KIND_EXIT_TP, OrderType.LIMIT, 1.1200, None),
+        ("sl", KIND_EXIT_SL, OrderType.STOP, None, 1.0900),
+    )]
+
+
+def _leg_cancelled(leg: str, journaled: DispatchEnvelope, *,
+                   reason: str | None = None) -> OrderEvent:
+    """The venue's ``cancelled`` push for one leg of the journaled exit."""
+    kind = KIND_EXIT_TP if leg == "tp" else KIND_EXIT_SL
+    return OrderEvent(
+        order=ExchangeOrder(
+            id=f"xchg-{leg}", symbol=SYMBOL, side="sell", order_type=OrderType.STOP, qty=1.0,
+            filled_qty=0.0, remaining_qty=1.0, price=None, stop_price=None,
+            average_fill_price=None, status=OrderStatus.CANCELLED, timestamp=0.0, fee=0.0,
+            fee_currency="", reduce_only=True, client_order_id=journaled.client_order_id(kind),
+        ),
+        event_type="cancelled", fill_price=None, fill_qty=None, timestamp=0.0,
+        pine_id="L-X", from_entry="L", cancel_reason=reason,
+    )
+
+
+def _intervention_quarantines(store: BrokerStore) -> list:
+    return [q for q in store.open_quarantines()
+            if q.kind == QuarantineKind.EXTERNAL_INTERVENTION]
+
+
+def __test_a_cancel_of_a_resumed_positions_journaled_leg_after_a_plain_restart_is_an_intervention__(
+        tmp_path: Path) -> None:
+    """The restart binds the legs it resumes the position with: their cancel is judged.
+
+    Measured live: bybit-inverse cycle 390 -- the previous cycle armed ``L-X``
+    on its signal bar, the supervisor restarted the bot over the position, and
+    the intruder cancelled the take-profit. The restarted engine had no id of
+    the legs, logged the push as an anonymous external cancel, and no
+    quarantine latched over the bot's removed protection.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=False, declared=False)
+        _rest_journaled_legs(broker, journaled)
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+        assert broker.exit_calls == [] and broker.cancel_calls == []
+
+        engine._route_event(_leg_cancelled("tp", journaled))  # noqa: SLF001
+
+        assert engine.quarantined
+        assert len(_intervention_quarantines(store)) == 1
+        ctx.close()
+
+
+def __test_the_bots_own_sweep_of_a_journaled_leg_after_a_plain_restart_is_no_intervention__(
+        tmp_path: Path) -> None:
+    """The parent closed, the bot cancels the legs it left: their pushes echo its own cancel."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=False, declared=False)
+        _rest_journaled_legs(broker, journaled)
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        engine._cleanup_position_tracking("L")  # noqa: SLF001
+        assert [c.intent.pine_id for c in broker.cancel_calls] == ["L-X"]
+        for leg in ("tp", "sl"):
+            engine._route_event(_leg_cancelled(leg, journaled))  # noqa: SLF001
+
+        assert not engine.quarantined
+        assert _intervention_quarantines(store) == []
+        ctx.close()
+
+
+def __test_a_venue_driven_cancel_of_a_journaled_leg_after_a_plain_restart_is_no_intervention__(
+        tmp_path: Path) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=False, declared=False)
+        _rest_journaled_legs(broker, journaled)
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        engine._route_event(  # noqa: SLF001
+            _leg_cancelled("tp", journaled, reason=CANCEL_REASON_VENUE_REDUCE_ONLY))
+
+        assert not engine.quarantined
+        assert _intervention_quarantines(store) == []
+        ctx.close()
+
+
+def __test_an_exit_declared_afresh_over_bound_journaled_legs_replaces_them_as_its_own__(
+        tmp_path: Path) -> None:
+    """The replaced legs' cancel pushes are the bot's own, not an intervention."""
+    from pynecore.lib.strategy import Order, _order_type_close
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, broker, journaled = _restart_with_a_journaled_exit(
+            store, refs=("xchg-tp", "xchg-sl"), resumed=False, declared=False,
+            forget_envelope=True)
+        _rest_journaled_legs(broker, journaled)
+        engine.sync(BAR_TS + 60_000, last_price=1.1000)
+
+        broker.refs = ("xchg-tp-2", "xchg-sl-2")
+        engine._position.exit_orders[("L-X", "L")] = Order(  # noqa: SLF001
+            "L", -1.0, order_type=_order_type_close, exit_id="L-X",
+            limit=1.1300, stop=1.0950,
+        )
+        engine.sync(BAR_TS + 120_000, last_price=1.1000)
+        assert broker.calls == ["cancel", "exit"]
+        for leg in ("tp", "sl"):
+            engine._route_event(_leg_cancelled(leg, journaled))  # noqa: SLF001
+
+        assert not engine.quarantined
+        assert _intervention_quarantines(store) == []
         ctx.close()
 
 
