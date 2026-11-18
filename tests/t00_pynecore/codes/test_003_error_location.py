@@ -17,6 +17,7 @@ from pynecore import errorcodes, lib
 from pynecore.core.error_location import (INFINITY_TO_INT, NAN_TO_INT, _PACKAGE_ROOT, coded,
                                           internal, located, pine_line_for)
 from pynecore.core.errors import SiteLoc
+from pynecore.core.plugin import ProviderError
 from pynecore.core.security_process import _failure_report
 from pynecore.pynesys.api import CompileResponse
 from pynecore.pynesys.compiler import PyneComp
@@ -107,7 +108,8 @@ def __test_an_uncoded_error_of_the_runtime_is_i0004__():
 
 def __test_what_is_not_an_internal_error__(tmp_path: Path):
     """The script's own error, the standard library's, the machine's, a misspelled
-    name, a wrong argument, a broker API's and a coded one are no I0004"""
+    name, a wrong argument, a broker API's, a data provider's expected failure and a
+    coded one are no I0004"""
     runtime = os.path.join(_PACKAGE_ROOT, 'core', 'probe.py')
     assert internal(__test_helper_raised('raise KeyError("k")\n', tmp_path / 'script.py')) is None
     with pytest.raises(ValueError) as stdlib:
@@ -125,6 +127,12 @@ def __test_what_is_not_an_internal_error__(tmp_path: Path):
     assert internal(argument.value) is None
     assert internal(errorcodes.DivisionByZeroError()) is None
     assert internal(RuntimeError("no traceback")) is None
+    provider = os.path.join(_PACKAGE_ROOT, 'providers', 'probe.py')
+    unknown = 'raise ProviderError("Unknown symbol \'NOPE/XYZ\' on binance.")\n'
+    try:
+        exec(compile(unknown, provider, 'exec'), {'__name__': 'probe', 'ProviderError': ProviderError})
+    except ProviderError as e:
+        assert internal(e) is None
 
 
 def __test_located_keeps_a_location_the_error_already_has__():

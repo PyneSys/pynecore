@@ -23,6 +23,7 @@ from .. import errorcodes
 from ..transformers.call_inline import INLINE_SITES
 from .datetime import TimezoneNotFoundError
 from .errors import MODULE_ID, RUNTIME_ROOTS, PyneError, SiteLoc, user_traceback
+from .plugin import ProviderError
 
 __all__ = ['located', 'coded', 'internal', 'INTERNAL_ERROR_REPORT', 'site_of', 'pine_line_for', 'INFINITY_TO_INT', 'NAN_TO_INT']
 
@@ -55,11 +56,12 @@ _API_ROOTS = tuple(_PACKAGE_ROOT + os.path.join('core', d) + os.sep for d in ('b
 
 #: Exceptions the runtime raises for the machine, the environment or the
 #: script's own code, never for a failure of its own: the disk, the network,
-#: the time zone database, the stack, the memory, and a type error, which
-#: inside the library is almost always a wrong argument of hand-written Pyne
-#: code (``math.sqrt('x')``)
+#: the time zone database, the stack, the memory, a type error, which inside
+#: the library is almost always a wrong argument of hand-written Pyne code
+#: (``math.sqrt('x')``), and a data provider's expected, user-actionable
+#: failure (an unknown symbol, bad credentials), whatever provider raised it
 _NOT_INTERNAL: tuple[type[BaseException], ...] = (
-    OSError, RecursionError, MemoryError, TimezoneNotFoundError, TypeError)
+    OSError, RecursionError, MemoryError, TimezoneNotFoundError, TypeError, ProviderError)
 
 #: A holder of :data:`~pynecore.transformers.call_inline.INLINE_SITES` whose value is gone
 _MISSING = object()
@@ -155,7 +157,7 @@ def internal(exc: BaseException) -> PyneError | None:
     An ``AttributeError`` of a ``__getattr__`` is the answer to a name the
     script misspelled (``lib.foo``), a ``TypeError`` is a wrong argument of
     the script, and the other exceptions of :data:`_NOT_INTERNAL` are the
-    machine's; none of them is internal.
+    machine's or a data provider's expected failure; none of them is internal.
 
     :param exc: The exception.
     :return: The internal error, or None when ``exc`` has a code, or the
