@@ -1641,13 +1641,14 @@ def live_ohlcv_generator(
                 base = None if backfill is None else backfill.base
                 return None if base is None else previous_open_ms(base, timeframe)
 
-            async def _history_base_known() -> None:
+            async def _history_base_known(source: ClosedBarBackfill) -> None:
                 """Return once the consumer has reported its warmup's end.
 
                 The report is :meth:`~ClosedBarBackfill.set_base`, made on the
                 consumer's thread; it wakes this loop.
+
+                :param source: The stream's backfill the consumer reports to.
                 """
-                assert backfill is not None
                 loop = asyncio.get_running_loop()
                 known = asyncio.Event()
 
@@ -1658,11 +1659,11 @@ def live_ohlcv_generator(
                         # The loop closed: the stream is already gone
                         pass
 
-                backfill.add_base_waker(_wake)
+                source.add_base_waker(_wake)
                 try:
                     await known.wait()
                 finally:
-                    backfill.remove_base_waker(_wake)
+                    source.remove_base_waker(_wake)
 
             async def _query_history(since_ms: int | None) -> list[OHLCV] | None:
                 """Query the provider for the closed bars after the cursor and splice them.
@@ -1952,7 +1953,7 @@ def live_ohlcv_generator(
                     # then runs to the end of the wait.
                     if (backfill is not None and not backfill.has_base
                             and _history_floor(None) is None):
-                        if await _await_or_stop(_history_base_known()):
+                        if await _await_or_stop(_history_base_known(backfill)):
                             return attempts, True
                     gap_end_ms = time.time() * 1000.0
                     recovered: list[OHLCV] = []
