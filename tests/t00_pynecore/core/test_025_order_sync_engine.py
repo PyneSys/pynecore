@@ -8170,6 +8170,54 @@ def __test_a_fill_pushed_during_the_position_read_is_not_an_external_reduction__
     assert engine._shrink_observed is None
 
 
+def __test_a_dispatched_trigger_close_ahead_of_its_fill_is_no_external_reduction__(caplog):
+    """The venue shows our engine-trigger partial close before its fill event arrives.
+
+    Live (capitalcom cycle 439, 2026-11-18, twice): the partial TP close went out,
+    the reconcile of the same sync read the venue already reduced, and announced an
+    external reduction a moment before the close's own fill was booked. The trigger
+    close's mapping is retired at dispatch, so only its dispatch time tells that it
+    is our work in flight; once a fill is booked after it, or the fill-report grace
+    is over, it no longer is.
+    """
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    _list_resting_stops(b, engine, pos)
+    leg = PartialBracketLeg(
+        coid="leg-tp", symbol=SYMBOL, pine_id="L-X1", from_entry="L",
+        leg_kind=_LEG_KIND_TP_PARTIAL, leg_state=_LEG_STATE_TRIGGERING, side='sell',
+        qty=0.4, intent_key=f"L-X1{INTENT_KEY_SEP}L", parent_pine_entry_id="L",
+        parent_entry_dispatch_ref="ref-L", intent_partial_qty=0.4,
+        trigger_level=50_200.0, oca_group=None, oca_type=None,
+    )
+    engine._partial_bracket_engine.register_legs([leg])  # type: ignore[attr-defined]
+    engine._dispatch_partial_bracket_close(leg)  # type: ignore[attr-defined]
+    assert len(b.close_calls) == 1
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+
+    def notices() -> int:
+        return len([r for r in caplog.records
+                    if r.levelno == logging.WARNING
+                    and "confirming the external reduction" in r.getMessage()])
+
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+        assert notices() == 0
+        # No fill of it within the grace: the shrink is no longer explained by it.
+        engine._trigger_close_dispatched_monotonic -= (  # type: ignore[attr-defined]
+            EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+        engine._last_position_fill_monotonic -= (  # type: ignore[attr-defined]
+            EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+        engine.reconcile()
+    assert notices() == 1
+
+
 def __test_a_shrink_left_after_our_close_settles_is_reported_once__(caplog):
     """The shrink notice waits for our own work, then appears once, before the adoption."""
     from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S

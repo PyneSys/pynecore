@@ -1784,6 +1784,12 @@ class OrderSyncEngine:
         # gating the wait on ``_active_intents`` alone cleared the fresh
         # position instantly and left the venue leg unowned.
         self._last_position_fill_monotonic = 0.0
+        # ``monotonic()`` moment the latest engine-trigger partial close went
+        # out (:meth:`_dispatch_partial_bracket_close`). Its mapping is retired
+        # at dispatch (the leg state machine owns the close), so until a fill
+        # is booked after it, within the fill-report grace, only this tells
+        # that the close is our work in flight (:meth:`_position_work_in_flight`).
+        self._trigger_close_dispatched_monotonic = 0.0
 
         # Monotonic moment of the venue observation whose verdict a pending
         # fill recovery currently holds (:meth:`_fill_recovery_holds`), so the
@@ -7422,11 +7428,19 @@ class OrderSyncEngine:
         BEFORE reading the position: a fill pushed in between is on the venue
         and in the queue, yet not in the book (bybit-inverse cycle 337, an
         engine-trigger partial close's fill read as an external reduction).
+        An engine-trigger partial close counts until a fill is booked after
+        it, for at most the fill-report grace: its mapping is retired at
+        dispatch, and a venue can show the reduction before the fill event
+        reaches the queue at all (capitalcom cycle 439).
         """
         if (self._pending_verification or self._pending_defensive_close
                 or self._pending_reversal_opens
                 or self._pending_flip_surplus_closes
                 or not self._event_queue.empty()):
+            return True
+        dispatched = self._trigger_close_dispatched_monotonic
+        if (dispatched > self._last_position_fill_monotonic
+                and time.monotonic() - dispatched < self._fill_report_grace_s()):
             return True
         return any(
             isinstance(intent, CloseIntent) and self._order_mapping.get(key)
@@ -14548,6 +14562,7 @@ class OrderSyncEngine:
             )
         finally:
             self._native_failsafe_closing_parent = None
+        self._trigger_close_dispatched_monotonic = time.monotonic()
         # Retire the synthetic close identity now that the leg owns the
         # dispatch. ``_order_mapping`` / ``_envelopes`` keyed on
         # ``synth_pine_id`` are not consulted by any later engine path
