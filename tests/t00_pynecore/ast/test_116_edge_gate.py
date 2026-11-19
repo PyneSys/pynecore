@@ -185,6 +185,63 @@ def __test_pine_is_let_through__(snippet: str):
     assert not diags, [diag.message for diag in diags]
 
 
+@pytest.mark.parametrize("snippet,found", [
+    ('x = "\\N{DEGREE SIGN}"\n', [(0, 5, '\\N{DEGREE SIGN}')]),
+    # An escaped backslash, then the escape
+    ('x = "\\\\\\N{DEGREE SIGN}"\n', [(0, 7, '\\N{DEGREE SIGN}')]),
+    # An escaped quote does not end the literal
+    ('x = "\\"\\N{BULLET}"\n', [(0, 7, '\\N{BULLET}')]),
+    # Implicit concatenation over lines and a comment: every part is read
+    ('x = ("a"  # "\\N{BULLET}"\n     "b\\N{DEGREE SIGN}" \'\\N{BULLET}\')\n',
+     [(1, 7, '\\N{DEGREE SIGN}'), (1, 25, '\\N{BULLET}')]),
+    # A raw part has no escapes, the part after it has
+    ('x = r"\\N{x}" "\\N{BULLET}"\n', [(0, 14, '\\N{BULLET}')]),
+    ("x = u'''a\n\\N{BULLET}'''\n", [(1, 0, '\\N{BULLET}')]),
+    # The column is a byte offset, as the tree's are
+    ('x = "\u00e9" + "\\N{BULLET}"\n', [(0, 12, '\\N{BULLET}')]),
+    ('def f():\n    """deg \\N{DEGREE SIGN}"""\n    return 1\n', [(1, 11, '\\N{DEGREE SIGN}')]),
+    ('@udt\nclass C:\n    """\\N{BULLET}"""\n    x: int\n', [(2, 7, '\\N{BULLET}')]),
+    ('__all__ = ["\\N{BULLET}"]\n', [(0, 12, '\\N{BULLET}')]),
+    ('assert close > 0, "\\N{BULLET}"\n', [(0, 19, '\\N{BULLET}')]),
+])
+def __test_a_named_unicode_escape_is_reported_where_it_is_written__(
+        snippet: str, found: list[tuple[int, int, str]]):
+    """
+    ``\\N{NAME}`` has no Pine form: the escape is read from the source, since
+    the parsed value no longer shows how its character was written
+    """
+    first = HEAD.count('\n') + 1
+    diags = _gate(HEAD + snippet)
+    assert [(diag.line - first, diag.col, diag.end_line - first, diag.end_col)
+            for diag in diags] == [(line, col, line, col + len(text)) for line, col, text in found]
+    for diag, (_, _, text) in zip(diags, found):
+        assert diag.code == 'E0001' and _reasons([diag]) == ['edge-syntax']
+        assert diag.message == f'The named Unicode escape `{text}` is not allowed in the Pyne ' \
+                               f'Edge profile.'
+        assert diag.fix == 'write the character itself'
+
+
+@pytest.mark.parametrize("snippet", [
+    'x = "\u00b0"\n',
+    'x = "\\u00b0" + "\\U000000b0" + "\\xb0" + "\\260"\n',
+    'x = r"\\N{DEGREE SIGN}"\n',
+    'x = R"""\\N{x}"""\n',
+    'x = "\\\\N{DEGREE SIGN}"\n',
+    'x = "N{DEGREE SIGN}" + "\\n"\n',
+    '# "\\N{DEGREE SIGN}"\nx = 1\n',
+])
+def __test_a_character_written_any_other_way_is_let_through__(snippet: str):
+    diags = _gate(HEAD + snippet)
+    assert not diags, [diag.message for diag in diags]
+
+
+def __test_a_named_escape_in_an_f_string_is_the_f_string_finding__():
+    """The f-string is rejected whole: one construct, one finding"""
+    diags = _gate(HEAD + 'x = f"\\N{DEGREE SIGN}"\ny = "a" f"\\N{BULLET}"\n')
+    assert [diag.message for diag in diags] == [
+        'An f-string is not allowed in the Pyne Edge profile.'] * 2
+
+
 def __test_a_class_is_a_field_list__():
     diags = _gate(HEAD + 'class A(object):\n    x: int\n')
     assert diags[0].code == 'E0008' and 'base classes' in diags[0].message
@@ -510,6 +567,26 @@ def __test_the_structural_half_comes_first__(tmp_path, monkeypatch):
     with pytest.raises(EdgeSyntaxError) as caught:
         _compile(path)
     assert 'list literal' in str(caught.value) and caught.value.lineno == 9
+
+
+def __test_strict_rejects_a_named_unicode_escape_at_the_escape__(tmp_path, monkeypatch):
+    monkeypatch.setenv(STRICT_ENV, '1')
+    path = _write(tmp_path, 'edge_named_escape', EDGE_MODULE.replace(
+        '    a = getattr(close, "x")', '    a = "deg: \\N{DEGREE SIGN}"'))
+    with pytest.raises(EdgeSyntaxError) as caught:
+        _compile(path)
+    assert caught.value.lineno == 9 and caught.value.offset == 15
+    assert '`\\N{DEGREE SIGN}`' in str(caught.value)
+
+
+@pytest.mark.parametrize("marker", ['@pyne', '@pyne lib'])
+def __test_a_named_unicode_escape_outside_an_edge_module_is_accepted__(
+        tmp_path, monkeypatch, marker: str):
+    monkeypatch.setenv(STRICT_ENV, '1')
+    source = EDGE_MODULE.replace('@pyne edge', marker).replace(
+        '    a = getattr(close, "x")', '    a = "deg: \\N{DEGREE SIGN}"')
+    _compile(_write(tmp_path, 'named_escape_' + marker.replace('@pyne', 'pyne').replace(' ', '_'),
+                    source))
 
 
 def __test_the_dump_goes_to_stderr_in_any_mode__(tmp_path, monkeypatch, capsys):

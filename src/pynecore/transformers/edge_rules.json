@@ -45,6 +45,9 @@
     "NotEq",
     "NotIn"
   ],
+  "disallowed_string_escapes": [
+    "N"
+  ],
   "extras": {
     "dunder_names": [
       "__all__",
@@ -133,11 +136,11 @@
     "arg",
     "keyword"
   ],
-  "rules_version": "2026.11.1",
+  "rules_version": "2026.11.2",
   "unary_ops": [
     "Not",
     "UAdd",
     "USub"
   ],
-  "v": 2
+  "v": 3
 }

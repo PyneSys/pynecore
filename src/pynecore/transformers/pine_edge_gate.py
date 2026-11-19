@@ -15,8 +15,9 @@ spec's own ``EDGE_RULES_VERSION``. This module pins that version: a spec
 revision that is not re-extracted fails at import rather than gating against
 stale rules. What the data cannot express -- the structural rules: what a
 class may contain, which callee a bare name may be, where a ``lambda`` may
-stand, where a builtin-named lib read resolves -- is code here, and mirrors
-the IDE's checker rule for rule.
+stand, where a builtin-named lib read resolves, how a string literal's escapes
+are read from the source text -- is code here, and mirrors the IDE's checker
+rule for rule.
 
 Only an ``@pyne edge`` module is gated. PyneCore's own ``@pyne lib`` modules
 are the machines behind the lib, written in Python -- ``ta.py`` alone uses
@@ -47,7 +48,7 @@ __all__ = ['EDGE_RULES_VERSION', 'STRICT_ENV', 'DIAG_ENV', 'edge_rules', 'strict
 
 #: The profile revision this gate was written against. ``edge_rules.json``
 #: must carry the same one.
-EDGE_RULES_VERSION: Final = '2026.11.1'
+EDGE_RULES_VERSION: Final = '2026.11.2'
 
 #: ``1`` makes an edge module's first diagnostic an error, ``0`` never
 #: does; unset is ``0`` until the corpus is clean enough to flip the default.
@@ -203,6 +204,10 @@ class _Gate:
         self.class_decorators: frozenset[tuple[str, str]] = frozenset(
             (module, name) for module, name in rules['class_decorators'])
         self.builtin_calls: frozenset[str] = frozenset(rules['builtin_calls'])
+        self.string_escapes: frozenset[str] = frozenset(rules['disallowed_string_escapes'])
+        #: The source lines as bytes, split where the parser counts lines: the
+        #: tree's columns are UTF-8 byte offsets
+        self.source_lines: list[bytes] = source.encode('utf-8').splitlines()
         #: Lib name -> what it stands for, for the lib names Python's builtins
         #: would answer here: the collection drops every one a module-wide lib
         #: import binds (the lifter and the normalizer put it there)
@@ -336,7 +341,10 @@ class _Gate:
         kind = type(node).__name__
         if isinstance(node, _INERT):
             return
-        if kind == 'List' and id(node) in self.allowed_lists:
+        if isinstance(node, ast.List) and id(node) in self.allowed_lists:
+            # Its elements are string constants: only their escapes are left
+            for element in node.elts:
+                self._check_string(element)
             return
         if kind not in self.nodes and hasattr(node, 'lineno'):
             label = _NODE_LABELS.get(kind, f'`{kind}`')
@@ -373,9 +381,12 @@ class _Gate:
         elif isinstance(node, ast.ClassDef):
             self._check_ident(node, node.name)
             if self._is_protocol_shim(node):
-                # Only the ellipsis bodies are inert: the signatures still run
+                # Only the ellipsis bodies are inert: the signatures still run,
+                # and a docstring is a string literal like any other
                 for stmt in node.body:
-                    if isinstance(stmt, ast.FunctionDef):
+                    if isinstance(stmt, ast.Expr):
+                        self._check_string(stmt.value)
+                    elif isinstance(stmt, ast.FunctionDef):
                         self._visit(stmt.args)
                         if stmt.returns is not None:
                             self._visit(stmt.returns)
@@ -427,6 +438,8 @@ class _Gate:
                              'compare pairwise, joined with and')
             for op in node.ops:
                 self._check_op(node, op, self.cmp_ops)
+        elif isinstance(node, ast.Constant):
+            self._check_string(node)
         elif isinstance(node, (ast.For, ast.While)) and node.orelse:
             self._report(node.orelse[0], 'edge-syntax', EDGE_SYNTAX,
                          ("A loop's `else` clause",), 'put the code after the loop')
@@ -717,8 +730,23 @@ class _Gate:
             self._report(node, 'edge-syntax', EDGE_SYNTAX, (f'The `{symbol}` operator',),
                          'write it with Pine operators only')
 
+    def _check_string(self, node: ast.AST) -> None:
+        """
+        Report every disallowed escape a string literal is written with, at the
+        escape itself: the parsed value no longer shows how a character was
+        written, so the source text is read.
+        """
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            return
+        for line, start, end, text in _string_escapes(self.source_lines, node,
+                                                      self.string_escapes):
+            label = f'The named Unicode escape `{text}`' if text.startswith('\\N') \
+                else f'The escape `{text}`'
+            self._report(node, 'edge-syntax', EDGE_SYNTAX, (label,),
+                         'write the character itself', at=(line, start, line, end))
+
     def _report(self, node: ast.AST, reason: str, code: Code, args: tuple[str, ...],
-                fix: str) -> None:
+                fix: str, at: tuple[int, int, int, int] | None = None) -> None:
         """
         Record that a node breaks the profile.
 
@@ -727,19 +755,24 @@ class _Gate:
         :param code: The registry code of the rule
         :param args: The code's parameters, as the message shows them
         :param fix: The concrete remedy
+        :param at: The 1-based line and byte column of the finding's start and
+                   end, when it is a part of the node's text rather than all of it
         """
         self._reported.add(id(node))
-        line = getattr(node, 'lineno', 0)
-        col = getattr(node, 'col_offset', 0)
-        # A rejected EXPRESSION covers everything written inside it: the
-        # typed half has nothing to add about its parts
-        spans = isinstance(node, ast.expr)
+        if at is not None:
+            line, col, end_line, end_col = at
+        else:
+            line = getattr(node, 'lineno', 0)
+            col = getattr(node, 'col_offset', 0)
+            # A rejected EXPRESSION covers everything written inside it: the
+            # typed half has nothing to add about its parts
+            spans = isinstance(node, ast.expr)
+            end_line = getattr(node, 'end_lineno', 0) or 0 if spans else 0
+            end_col = getattr(node, 'end_col_offset', 0) or 0 if spans else 0
         self.diags.append(Diag(message=code.render(*args), line=line, col=col,
                                origin=Unknown(reason=reason, line=line, col=col,
                                               detail=type(node).__name__),
-                               fix=fix,
-                               end_line=getattr(node, 'end_lineno', 0) or 0 if spans else 0,
-                               end_col=getattr(node, 'end_col_offset', 0) or 0 if spans else 0,
+                               fix=fix, end_line=end_line, end_col=end_col,
                                code=code.code, args=args))
 
 
@@ -795,6 +828,65 @@ def _binding_points(body: Iterable[ast.stmt]) -> dict[str, tuple[int, int]]:
             pending.append((child, _end(loop.iter) if loop is not None and child is loop.target
                             else at))
     return points
+
+
+def _string_escapes(lines: list[bytes], node: ast.Constant,
+                    letters: frozenset[str]) -> list[tuple[int, int, int, str]]:
+    """
+    The escapes a string constant's source writes with one of ``letters``.
+
+    The source text the node spans is lexed again: one or more literals
+    (implicit concatenation), with whitespace, line continuations and comments
+    between them. A raw literal has no escapes, and an escaped backslash is
+    skipped whole, so ``\\\\N`` is no escape.
+
+    :param lines: The source lines as bytes, split where the parser counts lines
+    :param node: A constant parsed from string literals
+    :param letters: The letters after the backslash to report
+    :return: ``(line, start, end, text)`` per escape: the 1-based line, the
+             UTF-8 byte columns and the escape as written
+    """
+    first = node.lineno - 1
+    last = (node.end_lineno or node.lineno) - 1
+    text = b'\n'.join(lines[first:last + 1])
+    stop = len(text) - len(lines[last]) + (node.end_col_offset or 0) if last < len(lines) \
+        else len(text)
+    wanted = {letter.encode('ascii') for letter in letters}
+    found: list[tuple[int, int, int, str]] = []
+    i = node.col_offset
+    while i < stop:
+        char = text[i:i + 1]
+        if char == b'#':
+            newline = text.find(b'\n', i)
+            i = stop if newline < 0 else newline
+            continue
+        if not char.isalpha() and char not in (b'"', b"'"):
+            # Whitespace, a newline or a line continuation between two literals
+            i += 1
+            continue
+        quote = i
+        while text[quote:quote + 1].isalpha():
+            quote += 1
+        raw = b'r' in text[i:quote].lower()
+        delimiter = text[quote:quote + 1] * (3 if text[quote:quote + 3] in (b'"""', b"'''") else 1)
+        if not delimiter:
+            break
+        i = quote + len(delimiter)
+        while i < stop and not text.startswith(delimiter, i):
+            if text[i:i + 1] != b'\\':
+                i += 1
+                continue
+            letter = text[i + 1:i + 2]
+            if not raw and letter in wanted:
+                end = i + 2
+                if letter == b'N' and text[end:end + 1] == b'{':
+                    end = text.find(b'}', end) + 1 or end
+                line_start = text.rfind(b'\n', 0, i) + 1
+                found.append((node.lineno + text.count(b'\n', 0, i), i - line_start,
+                              end - line_start, text[i:end].decode('utf-8', 'replace')))
+            i += 2
+        i += len(delimiter)
+    return found
 
 
 def _end(node: ast.stmt | ast.expr) -> tuple[int, int]:
