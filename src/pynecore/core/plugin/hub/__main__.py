@@ -20,9 +20,9 @@ from . import HUB_ENV, TOKEN_ENV
 from .server import ProviderHub
 
 
-async def _run(config_dir: Path | None, token: str) -> None:
+async def _run(config_dir: Path | None, token: str, port: int) -> None:
     hub = ProviderHub(token, config_dir=config_dir)
-    port = await hub.start()
+    port = await hub.start(port=port)
     sys.stdout.write(json.dumps({"host": "127.0.0.1", "port": port}) + "\n")
     sys.stdout.flush()
 
@@ -49,6 +49,9 @@ def main() -> int:
                                      description="Serve data providers to other processes.")
     parser.add_argument("--config-dir", type=Path, default=None,
                         help="directory of the plugin configs and the symbol map")
+    parser.add_argument("--port", type=int, default=0,
+                        help="port to listen on (default: a free one); a hub started "
+                             "again on the port of one that ended gets its clients back")
     args = parser.parse_args()
     token = os.environ.get(TOKEN_ENV, "")
     if not token:
@@ -57,7 +60,7 @@ def main() -> int:
     os.environ.pop(HUB_ENV, None)
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
     try:
-        asyncio.run(_run(args.config_dir, token))
+        asyncio.run(_run(args.config_dir, token, args.port))
     except KeyboardInterrupt:
         pass
     return 0

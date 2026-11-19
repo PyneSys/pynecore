@@ -45,6 +45,13 @@ def _token() -> bytes:
     return os.environ.get(TOKEN_ENV, "").encode()
 
 
+def _unreachable(exc: OSError) -> protocol.RemoteNetworkError:
+    """The failure of the connection to the hub itself, as a provider failure that
+    a retry can cure: a front end starts a hub that ended again."""
+    return protocol.RemoteNetworkError(f"the provider hub cannot be reached: {exc}",
+                                       f"builtins.{type(exc).__qualname__}", True)
+
+
 class _Channel:
     """A blocking request connection to the hub. One request at a time."""
 
@@ -52,9 +59,14 @@ class _Channel:
         address = hub_address()
         if address is None:
             raise ConnectionError(f"no provider hub is set ({HUB_ENV})")
-        self._sock = socket.create_connection(address)
-        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self._sock.sendall(protocol.frame(_token()))
+        self.broken = False
+        """The connection failed: nothing more can be asked on it."""
+        try:
+            self._sock = socket.create_connection(address)
+            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self._sock.sendall(protocol.frame(_token()))
+        except OSError as exc:
+            raise _unreachable(exc) from exc
         self._lock = threading.Lock()
 
     def request(self, message: dict[str, Any],
@@ -68,20 +80,28 @@ class _Channel:
         :return: The answer's value.
         :raises BaseException: What the hub answered with, see
             :func:`~pynecore.core.plugin.hub.protocol.decode_error`.
+        :raises RemoteNetworkError: If the connection to the hub failed; the channel
+            is :attr:`broken` then.
         """
         with self._lock:
-            self._sock.sendall(protocol.frame(protocol.dumps(message)))
             failure: BaseException | None = None
-            while True:
-                answer: dict[str, Any] = protocol.loads(protocol.recv_frame(self._sock))
-                if "ev" not in answer:
-                    break
-                if failure is None and on_event is not None:
-                    try:
-                        on_event(answer)
-                    except BaseException as exc:
-                        failure = exc
-                        self._sock.sendall(protocol.frame(protocol.dumps({"op": "cancel"})))
+            try:
+                self._sock.sendall(protocol.frame(protocol.dumps(message)))
+                while True:
+                    answer: dict[str, Any] = protocol.loads(protocol.recv_frame(self._sock))
+                    if "ev" not in answer:
+                        break
+                    if failure is None and on_event is not None:
+                        try:
+                            on_event(answer)
+                        except BaseException as exc:
+                            failure = exc
+                            self._sock.sendall(protocol.frame(protocol.dumps({"op": "cancel"})))
+            except OSError as exc:
+                self.broken = True
+                if failure is not None:
+                    raise failure
+                raise _unreachable(exc) from exc
             if failure is not None:
                 raise failure
             if not answer["ok"]:
@@ -102,15 +122,31 @@ _class_channel_lock = threading.Lock()
 def _class_request(message: dict[str, Any]) -> Any:
     """A request that concerns a plugin class, not an instance: sent on one
     connection the process keeps for them."""
+    channel = _shared_class_channel()
+    try:
+        return _ask_class_channel(channel, message)
+    except OSError:
+        # The hub was started again: asked once more on a new connection, as a class
+        # request changes nothing in the hub
+        if not channel.broken:
+            raise
+    return _ask_class_channel(_shared_class_channel(), message)
+
+
+def _shared_class_channel() -> _Channel:
     global _class_channel
     with _class_channel_lock:
         if _class_channel is None:
             _class_channel = _Channel()
-        channel = _class_channel
+        return _class_channel
+
+
+def _ask_class_channel(channel: _Channel, message: dict[str, Any]) -> Any:
+    global _class_channel
     try:
         return channel.request(message)
     except OSError:
-        # The hub was restarted: the next request connects again
+        # The next request connects again
         with _class_channel_lock:
             if _class_channel is channel:
                 _class_channel = None
@@ -164,23 +200,63 @@ class RemoteProvider(ProviderPlugin[Any]):
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
                  ohlcv_dir: Path | None = None, config: Any = None):
         super().__init__(symbol=symbol, timeframe=timeframe, ohlcv_dir=ohlcv_dir, config=None)
-        self._channel = _Channel()
+        self._open_request = {"op": "open", "plugin": self.hub_plugin, "symbol": symbol,
+                              "timeframe": timeframe, "ohlcv_dir": ohlcv_dir}
+        self._channel: _Channel | None = None
+        self._handle = ""
+        self._open()
+
+    def _open(self) -> _Channel:
+        """Open the instance in the hub, on a call connection of its own.
+
+        Also how the instance comes back after the hub was started again: the new
+        hub knows nothing of the old one's instances.
+
+        :return: The call connection.
+        """
+        previous, self._channel = self._channel, None
+        if previous is not None:
+            previous.close()
+        channel = _Channel()
         try:
-            opened = self._channel.request({
-                "op": "open", "plugin": self.hub_plugin, "symbol": symbol,
-                "timeframe": timeframe, "ohlcv_dir": ohlcv_dir,
-            })
+            opened = channel.request(self._open_request)
         except BaseException:
-            self._channel.close()
+            channel.close()
             raise
-        self._handle: int = opened["handle"]
+        self._channel = channel
+        self._handle = opened["handle"]
         for name, value in opened["attributes"].items():
             setattr(self, name, value)
         self.config = SimpleNamespace(symbol_map=opened["symbol_map"])
+        return channel
+
+    def _request(self, message: dict[str, Any],
+                 on_event: Callable[[dict[str, Any]], None] | None = None, *,
+                 repeatable: bool = True) -> Any:
+        """Ask the hub on the instance's call connection, opening the instance again
+        when that connection is gone.
+
+        :param message: The request.
+        :param on_event: Receives the events sent before the answer.
+        :param repeatable: Whether the request is asked once more when the connection
+            fails under it. Not for a request whose events were already acted on.
+        :return: The answer's value.
+        """
+        channel = self._channel
+        if channel is None or channel.broken:
+            channel = self._open()
+        try:
+            return channel.request(message, on_event)
+        except protocol.RemoteNetworkError:
+            if not (repeatable and channel.broken):
+                raise
+        return self._open().request(message, on_event)
 
     def close(self) -> None:
         """Give the instance up in the hub. Closing the process does the same."""
-        self._channel.close()
+        channel, self._channel = self._channel, None
+        if channel is not None:
+            channel.close()
 
     def __del__(self) -> None:
         channel = getattr(self, "_channel", None)
@@ -188,8 +264,7 @@ class RemoteProvider(ProviderPlugin[Any]):
             channel.close()
 
     def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
-        return self._channel.request({"op": "call", "method": method, "args": args,
-                                      "kwargs": kwargs})
+        return self._request({"op": "call", "method": method, "args": args, "kwargs": kwargs})
 
     @override
     def normalize_symbol(self, symbol: str) -> str:
@@ -197,7 +272,7 @@ class RemoteProvider(ProviderPlugin[Any]):
 
     @override
     def resolve_symbol(self, pine_key: str) -> str:
-        return self._channel.request({
+        return self._request({
             "op": "resolve_symbol", "pine_key": pine_key,
             "global_map": bool(self.global_symbol_map), "provider_name": self.provider_name,
         })
@@ -220,10 +295,11 @@ class RemoteProvider(ProviderPlugin[Any]):
             elif event["ev"] == "progress" and on_progress is not None:
                 on_progress(event["time"])
 
-        self._channel.request({
+        # Not asked twice: the bars of a failed pass are saved already
+        self._request({
             "op": "download", "time_from": time_from, "time_to": time_to, "limit": limit,
             "with_extra": with_extra,
-        }, on_event)
+        }, on_event, repeatable=False)
 
 
 class _Stream:
@@ -331,6 +407,15 @@ class RemoteLiveProvider(RemoteProvider, LiveProviderPlugin[Any]):
     @override
     async def connect(self) -> None:
         await self.disconnect()
+        try:
+            await self._connect_stream()
+        except LookupError:
+            # The hub was started again and holds no instance of the old one
+            await asyncio.to_thread(self._open)
+            self._generation = None
+            await self._connect_stream()
+
+    async def _connect_stream(self) -> None:
         address = hub_address()
         if address is None:
             raise ConnectionError(f"no provider hub is set ({HUB_ENV})")

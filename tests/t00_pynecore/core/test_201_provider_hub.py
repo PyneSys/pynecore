@@ -521,3 +521,85 @@ def __test_hub_shutdown_does_not_wait_for_a_client_that_stops_reading__():
         writer.close()
 
     asyncio.run(run())
+
+
+def __test_clients_come_back_to_a_hub_started_again__(monkeypatch):
+    """After the hub ended and another one took its port, a client's calls and its
+    stream work again: the instance is opened anew, by the client itself"""
+    from pynecore.core.plugin import is_retryable_provider_error, load_plugin
+    from pynecore.core.plugin.hub.protocol import RemoteNetworkError
+    from pynecore.core.plugin.hub.server import ProviderHub
+
+    __test_helper_reset_fake()
+    fake = __test_helper_FakeProvider
+    with __test_helper_hub(monkeypatch, load=__test_helper_fake_load) as (hub, loop):
+        port = hub._server.sockets[0].getsockname()[1]
+        provider = load_plugin("fake")(symbol="AAA", timeframe="1")
+        second = ProviderHub("secret", load=__test_helper_fake_load)
+
+        async def run() -> None:
+            await provider.connect()
+            waiting = asyncio.ensure_future(provider.watch_ohlcv("aaa", "1"))
+            await asyncio.sleep(0.05)
+
+            asyncio.run_coroutine_threadsafe(hub.close(), loop).result(10)
+            with pytest.raises(ConnectionError):
+                await asyncio.wait_for(waiting, 5)
+            # No hub: a failure a retry can cure, for the download and the stream alike
+            with pytest.raises(RemoteNetworkError) as caught:
+                await asyncio.to_thread(provider.update_symbol_info)
+            assert is_retryable_provider_error(caught.value)
+            await provider.disconnect()
+            with pytest.raises(OSError):
+                await provider.connect()
+
+            asyncio.run_coroutine_threadsafe(second.start(port=port), loop).result(10)
+            assert (await asyncio.to_thread(provider.update_symbol_info)).ticker == "AAA"
+            await provider.connect()
+            assert fake.connects == 2
+            bar = OHLCV(60_000, 1.0, 2.0, 0.5, 1.5, 10.0)
+            waiting = asyncio.ensure_future(provider.watch_ohlcv("aaa", "1"))
+            await asyncio.sleep(0.05)
+            __test_helper_feed(loop, bar)
+            assert await asyncio.wait_for(waiting, 5) == bar
+            await provider.disconnect()
+
+        try:
+            asyncio.run(run())
+        finally:
+            provider.close()
+            asyncio.run_coroutine_threadsafe(second.close(), loop).result(10)
+
+
+def __test_a_handle_of_an_ended_hub_names_nothing_in_the_next__(monkeypatch):
+    """A client of a hub that ended never reaches, through the hub started again, the
+    instance another client opened there first: it opens its own"""
+    from pynecore.core.plugin import load_plugin
+    from pynecore.core.plugin.hub.server import ProviderHub
+
+    __test_helper_reset_fake()
+    with __test_helper_hub(monkeypatch, load=__test_helper_fake_load) as (hub, loop):
+        port = hub._server.sockets[0].getsockname()[1]
+        provider = load_plugin("fake")(symbol="AAA", timeframe="1")
+        second = ProviderHub("secret", load=__test_helper_fake_load)
+        other = None
+
+        async def run() -> None:
+            nonlocal other
+            await provider.connect()
+            asyncio.run_coroutine_threadsafe(hub.close(), loop).result(10)
+            await provider.disconnect()
+
+            asyncio.run_coroutine_threadsafe(second.start(port=port), loop).result(10)
+            other = await asyncio.to_thread(load_plugin("fake"), symbol="BBB", timeframe="1")
+            await provider.connect()
+            assert second._handles[provider._handle].key[1] == "AAA"
+            await provider.disconnect()
+
+        try:
+            asyncio.run(run())
+        finally:
+            provider.close()
+            if other is not None:
+                other.close()
+            asyncio.run_coroutine_threadsafe(second.close(), loop).result(10)

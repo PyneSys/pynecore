@@ -151,11 +151,13 @@ class RemoteProviderError(ProviderError):
         return type(self), (self.args[0], self.remote_type, self.retryable)
 
 
-class RemoteNetworkError(RemoteProviderError, OSError):
-    """A provider's failure in the hub with a socket-level fault behind it.
+class RemoteNetworkError(RemoteProviderError, ConnectionError):
+    """A provider's failure in the hub with a socket-level fault behind it, or a
+    failed connection to the hub itself.
 
-    An :class:`OSError`, as the fault in the hub was: the live runner retries a
-    failed first connection on those.
+    An :class:`OSError`, as the fault was: the live runner retries a failed first
+    connection on those. Always worth a retry when it is the hub that could not be
+    reached: a front end restarts a hub that ended.
     """
 
 

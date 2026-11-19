@@ -25,6 +25,7 @@ question must reach the venue again.
 import asyncio
 import hmac
 import logging
+import secrets
 import threading
 from collections.abc import Callable
 from datetime import datetime
@@ -102,7 +103,7 @@ class _Connection:
         self.closed = False
         self.instance: '_Instance | None' = None
         """The instance this connection opened, on a call connection."""
-        self.handle: int | None = None
+        self.handle: str | None = None
         """What a stream connection names that instance by."""
         self.attached: '_Instance | None' = None
         """The instance whose shared connection this one takes part in."""
@@ -216,8 +217,7 @@ class ProviderHub:
         self._load = load
         self._symbol_map = SymbolMap.load(config_dir)
         self._instances: dict[tuple[Any, ...], _Instance] = {}
-        self._handles: dict[int, _Instance] = {}
-        self._next_handle = 1
+        self._handles: dict[str, _Instance] = {}
         self._server: asyncio.Server | None = None
         self._clients: set[asyncio.Task[None]] = set()
         self._connections: set[_Connection] = set()
@@ -379,8 +379,9 @@ class ProviderHub:
             instance = self._instances.setdefault(key, _Instance(key, real))
         instance.openers.add(connection)
         connection.instance = instance
-        handle = self._next_handle
-        self._next_handle += 1
+        # Unique across hubs: a client of a hub that ended must not reach, through a
+        # hub started again, an instance another client opened there
+        handle = secrets.token_hex(16)
         self._handles[handle] = instance
         connection.handle = handle
 
@@ -508,7 +509,8 @@ class ProviderHub:
     def _streamed(self, connection: _Connection, request: dict[str, Any]) -> _Instance:
         instance = self._handles.get(request["handle"])
         if instance is None:
-            raise ConnectionError("the provider was closed in the hub")
+            # Not a connection fault: the client opens the provider again
+            raise LookupError("the hub holds no such provider")
         if not isinstance(instance.real, LiveProviderPlugin):
             raise TypeError(f"plugin {instance.key[0]!r} has no live data")
         return instance
