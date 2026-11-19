@@ -53,7 +53,7 @@ from pynecore.transformers.pine_type_rules import (  # noqa: E402
 
 #: Registry format version. Bump whenever the shape below changes; the
 #: consumers (the inference engine, and the PyneAOT front end) pin it.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 #: The route ``classify_callee`` gives a callee it proves nothing about. The
 #: ``routes`` section leaves such paths out, and the transform reads a path it
@@ -141,6 +141,7 @@ class LibTypeCollector:
         modules = self._import_lib()
         return {'v': SCHEMA_VERSION, 'names': names, 'classes': self._collect_fields(),
                 'scalar_classes': self._collect_scalars(),
+                'bit_sets': self._collect_bit_sets(),
                 'routes': collect_routes(), 'star_exports': collect_star_exports(modules)}
 
     def _import_lib(self) -> list[types.ModuleType]:
@@ -199,14 +200,7 @@ class LibTypeCollector:
 
         :return: Class name -> scalar type character
         """
-        bases: dict[str, list[str]] = {}
-        for file_path in sorted(self.types_path.rglob('*.py')):
-            tree = ast.parse(file_path.read_text(), filename=str(file_path))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ClassDef):
-                    bases.setdefault(node.name, [
-                        base.id if isinstance(base, ast.Name) else base.attr
-                        for base in node.bases if isinstance(base, (ast.Name, ast.Attribute))])
+        bases = self._type_bases()
         scalars: dict[str, str] = {'str': STR, 'StrLiteral': STR, 'int': INT,
                                    'float': FLOAT, 'bool': BOOL}
         settled = False
@@ -220,6 +214,43 @@ class LibTypeCollector:
                     scalars[name] = found
                     settled = False
         return {name: scalar for name, scalar in sorted(scalars.items()) if name in bases}
+
+    def _collect_bit_sets(self) -> list[str]:
+        """
+        The classes of the type package that are a set of flags.
+
+        ``Display`` derives from ``BitSet``, whose ``+`` and ``-`` are the union
+        and the difference of two sets and answer the same class:
+        ``display.all - display.status_line`` is a ``Display``.
+
+        :return: The class names, sorted
+        """
+        bases = self._type_bases()
+        found = {'BitSet'}
+        settled = False
+        while not settled:
+            settled = True
+            for name, parents in bases.items():
+                if name not in found and any(parent in found for parent in parents):
+                    found.add(name)
+                    settled = False
+        return sorted(found - {'BitSet'})
+
+    def _type_bases(self) -> dict[str, list[str]]:
+        """
+        The base classes every class of the type package names.
+
+        :return: Class name -> the names of its bases
+        """
+        bases: dict[str, list[str]] = {}
+        for file_path in sorted(self.types_path.rglob('*.py')):
+            tree = ast.parse(file_path.read_text(), filename=str(file_path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    bases.setdefault(node.name, [
+                        base.id if isinstance(base, ast.Name) else base.attr
+                        for base in node.bases if isinstance(base, (ast.Name, ast.Attribute))])
+        return bases
 
     def _module_prefix(self, file_path: Path) -> str:
         """Dotted lib path of a module, as a script spells it (``''`` for lib itself)."""

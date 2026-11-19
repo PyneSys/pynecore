@@ -845,6 +845,7 @@ pub const LIB_TYPE_OVERRIDES: &[(&str, CallRule)] = &[
     ("ta.median", Is("arg0")),
     ("ta.range", Is("arg0")),
     ("ta.mode", Is("arg0")),
+    ("ta.vwap", Is("vwap")),
     ("int", Is(INT)),
     ("float", Is(FLOAT)),
     ("bool", Is(BOOL)),
@@ -965,6 +966,7 @@ pub const OVERRIDE_PARAM_NAMES: &[(&str, &[&str])] = &[
             "active",
         ],
     ),
+    ("ta.vwap", &["source", "anchor", "stdev_mult"]),
 ];
 
 /// The declared parameter order of an override name (`OVERRIDE_PARAM_NAMES.get(name)`).

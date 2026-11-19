@@ -21,6 +21,7 @@ the script the fast path can see -- and never stop anything. In an
 """
 import ast
 import re
+from collections.abc import Container
 
 from ..errorcodes import (
     TYPE_FUNCTION_VALUE, TYPE_NOT_LIB_NAME, TYPE_NOT_PINE_EXPRESSION, TYPE_UNKNOWN_CALL,
@@ -77,22 +78,27 @@ _FIXES: dict[str, str] = {
 }
 
 
-def unknown_diags(tree: ast.Module, table: PineTypeTable) -> list[Diag]:
+def unknown_diags(tree: ast.Module, table: PineTypeTable,
+                  uninstantiated: Container[int] = frozenset()) -> list[Diag]:
     """
     One diagnostic per root cause of an UNKNOWN value in the module.
 
     :param tree: The analysed, type-stamped module
     :param table: Its type table, for the provenance of the names
+    :param uninstantiated: ``id()`` of the definitions the inference left
+                           untyped because nothing calls them; their bodies
+                           hold no value of the program
     :return: The diagnostics, in source order of the roots
     """
-    return _Report(tree, table).run()
+    return _Report(tree, table, uninstantiated).run()
 
 
 class _Report:
     """One pass over one stamped module."""
 
-    def __init__(self, tree: ast.Module, table: PineTypeTable):
+    def __init__(self, tree: ast.Module, table: PineTypeTable, uninstantiated: Container[int]):
         self.tree = tree
+        self.uninstantiated = uninstantiated
         self.factory = FactoryFields(tree)
         self.table = table
         self.parent_of: dict[int, ast.AST] = {}
@@ -176,8 +182,12 @@ class _Report:
                     scope_of[id(node)] = scope
             if cls in _MARKED:
                 scope = self._mark(node, scope)
-            # Reversed, so the children come off the stack in source order
             depth += 1
+            if id(node) in self.uninstantiated:
+                # Only the defaults are values: they belong to the enclosing scope
+                push((node.args, node, scope, depth))
+                continue
+            # Reversed, so the children come off the stack in source order
             for name in reversed(node._fields):
                 value = getattr(node, name, None)
                 if isinstance(value, ast.AST):

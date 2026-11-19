@@ -10,8 +10,8 @@ use super::facts::{
 use super::{Engine, Frame, R};
 use crate::pine_qualifier::{CONST, SERIES};
 use crate::pine_type_rules::{
-    FLOAT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, UNKNOWN, array_of, bare_wrapper, binop_type,
-    class_of, element_of, elements_of, is_matrix, is_tuple, render_ty, tuple_of,
+    FLOAT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, UNKNOWN, array_of, bare_wrapper, class_of,
+    element_of, elements_of, is_matrix, is_tuple, render_ty, tuple_of,
 };
 use crate::pine_type_table::{Unknown, qualify};
 use crate::steps::security_default::is_requested;
@@ -116,7 +116,7 @@ impl Engine<'_, '_> {
                 let qual = self.target_qual(target).max(self.qual(value));
                 self.store(
                     target,
-                    binop_type(op, &current, &value_ty),
+                    &facts::typed_binop(op, &current, &value_ty),
                     stmt,
                     false,
                     None,

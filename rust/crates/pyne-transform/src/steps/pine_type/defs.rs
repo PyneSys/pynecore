@@ -60,11 +60,30 @@ impl Engine<'_, '_> {
                 }
             }
             let walked = self.nid(node).is_some_and(|nid| self.walked.contains(&nid));
-            if !walked {
+            if walked {
+                continue;
+            }
+            if self.uninstantiated_def(&key, node)? {
+                self.uninstantiated.insert(node);
+            } else {
                 self.declaration_context(&key, node)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether a definition nothing called has no instance to type
+    /// (`_uninstantiated_def`): a plain one nested in a function, with a parameter
+    /// that declares no type.
+    fn uninstantiated_def(&self, key: &str, node: NodeId) -> R<bool> {
+        let scope = self.scope();
+        if scope.is_empty() || !facts::decorators(self.ast, node).is_empty() {
+            return Ok(false);
+        }
+        if key != crate::pine_type_table::qualify(&scope, facts::def_name(self.ast, node)) {
+            return Ok(false);
+        }
+        Ok(self.declared_params(node)?.iter().any(|ty| ty == UNKNOWN))
     }
 
     /// The parameter types a definition states on its own (`_declared_params`).

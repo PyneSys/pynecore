@@ -245,6 +245,9 @@ impl Gen {
         let scalars = self.pairs(object(scalars, "scalar_classes"), "scalar_classes");
         writeln!(out, "pub(super) static SCALAR_CLASSES: &[(u16, u16)] = {scalars};").unwrap();
 
+        let bit_sets = self.list(&strings(section(document, "bit_sets"), "bit_sets"));
+        writeln!(out, "pub(super) static BIT_SETS: (u16, u16) = {bit_sets};").unwrap();
+
         out.push_str("pub(super) static NAMES: &[(u16, LibStatic)] = &[");
         for (name, entry) in object(section(document, "names"), "names") {
             assert!(entry.get("kind").and_then(Value::as_str).is_some(), "names.{name}.kind");

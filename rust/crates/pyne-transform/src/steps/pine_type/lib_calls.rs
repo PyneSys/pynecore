@@ -19,7 +19,7 @@ use crate::pine_type_rules::{
     default_fit, element_of, get_ty, is_array, is_map, is_matrix, is_na_text_param, is_na_widen,
     is_not_pine_string, join, key_of, lib_type_override, matrix_of, object_ty, overload_binding,
     overload_choice, overload_result, override_param_names, pin_chars, pin_for, render_ty,
-    set_na_class, set_pin, set_pins, set_widen, shape_conflict, value_of,
+    set_na_class, set_pin, set_pins, set_widen, shape_conflict, tuple_of, value_of,
 };
 use crate::pine_type_table::{CallSite, Diag, Unknown};
 
@@ -821,6 +821,22 @@ impl Engine<'_, '_> {
             }
             form if form.starts_with("merge_") || form.starts_with("put_") => {
                 self.merge_override(form, args, keywords, names)
+            }
+            "vwap" => {
+                let hidden = args.iter().any(|&arg| facts::is_starred(self.ast, arg))
+                    || keywords
+                        .iter()
+                        .any(|&keyword| facts::keyword_parts(self.ast, keyword).0.is_none());
+                if hidden {
+                    return Ok(Some(UNKNOWN.to_string()));
+                }
+                Ok(Some(match bound_arg(self.ast, args, keywords, 2, names) {
+                    // A `None` passed, spelled out or through a name bound to
+                    // it, is the default: no bands
+                    None => FLOAT.to_string(),
+                    Some(mult) if self.ty_of(mult) == VOID => FLOAT.to_string(),
+                    Some(_) => tuple_of(&[FLOAT, FLOAT, FLOAT]),
+                }))
             }
             "matrix_mult" => {
                 let base = self.arg_ty(args, keywords, 0, names);

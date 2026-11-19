@@ -29,7 +29,7 @@ from ..pine_analysis import analyse_module
 from pynecore.transformers.lib_registry import lib_types
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
-    BOOL, FLOAT, INT, UNKNOWN, builtin_class_id, get_ty, object_ty,
+    BOOL, FLOAT, INT, UNKNOWN, builtin_class_id, get_ty, object_ty, tuple_of,
 )
 
 
@@ -181,6 +181,59 @@ def __test_an_input_with_no_typeable_default_is_unknown__():
 def __test_the_source_type_travels_through__(call: str, expected: str):
     """``ta.change``, ``nz`` and ``fixnan`` carry their source's type"""
     assert _expr_type(call) == expected, call
+
+
+@pytest.mark.parametrize("call,expected", [
+    # Read bare it is the variable form, the call without arguments
+    ('lib.ta.vwap', 'f'),
+    ('lib.ta.vwap()', 'f'),
+    ('lib.ta.vwap(lib.hlc3)', 'f'),
+    ('lib.ta.vwap(lib.high, lib.high > lib.open)', 'f'),
+    ('lib.ta.vwap(source=lib.close, anchor=lib.close > lib.open)', 'f'),
+    # The band multiplier turns the value into the value with its two bands
+    ('lib.ta.vwap(lib.hlc3, lib.close > lib.open, 1)', tuple_of([FLOAT, FLOAT, FLOAT])),
+    ('lib.ta.vwap(lib.hlc3, stdev_mult=2.0)', tuple_of([FLOAT, FLOAT, FLOAT])),
+    # A ``None`` spelled out is the default, no bands
+    ('lib.ta.vwap(stdev_mult=None)', 'f'),
+    ('lib.ta.vwap(lib.hlc3, lib.close > lib.open, None)', 'f'),
+    # An unpacking hides whether the multiplier is passed
+    ('lib.ta.vwap(*unknown_thing)', UNKNOWN),
+])
+def __test_vwap_is_a_value_or_the_value_with_its_bands__(call: str, expected: str):
+    assert _expr_type(call) == expected
+
+
+def __test_a_vwap_multiplier_bound_to_none_is_the_default__():
+    # A name bound to ``None`` passes the default as well as the literal does,
+    # and a na multiplier is still a multiplier
+    assert _expr_type('lib.ta.vwap(stdev_mult=mult)', preamble='mult = None\n') == FLOAT
+    assert _expr_type('lib.ta.vwap(lib.hlc3, lib.close > lib.open, mult)',
+                      preamble='mult = None\n') == FLOAT
+    assert _expr_type('lib.ta.vwap(stdev_mult=mult)', preamble='mult = lib.na\n') \
+        == tuple_of([FLOAT, FLOAT, FLOAT])
+
+
+@pytest.mark.parametrize("expression,expected", [
+    # A set of flags combines with another into one of the same class
+    ('lib.display.all - lib.display.status_line', 'o:lib#Display'),
+    ('lib.display.pane + lib.display.data_window', 'o:lib#Display'),
+    ('lib.text.format_bold + lib.text.format_italic', 'o:lib#FormatEnum'),
+    # ... and with nothing else, nor through any other operator
+    ('lib.display.all - lib.text.format_bold', UNKNOWN),
+    ('lib.display.all - 1', UNKNOWN),
+    ('lib.display.all * lib.display.pane', UNKNOWN),
+    # An object that is no set of flags has no arithmetic
+    ('lib.xloc.bar_index + lib.xloc.bar_time', UNKNOWN),
+])
+def __test_two_flag_sets_combine_into_one_of_their_class__(expression: str, expected: str):
+    assert _expr_type(expression) == expected
+
+
+def __test_a_flag_set_is_updated_in_place__():
+    types = _types('from pynecore import lib\n'
+                   'shown = lib.display.all\n'
+                   'shown -= lib.display.status_line\n')
+    assert types['shown'] == 'o:lib#Display'
 
 
 def __test_an_untypable_source_does_not_become_a_type__():
@@ -586,3 +639,60 @@ def main():
 ''', 'calc')
     assert types['compared'] == FLOAT
     assert types['price'] == FLOAT
+
+
+# --- a function nothing calls ------------------------------------------------
+
+
+NEVER_CALLED = '''
+from pynecore import lib
+
+
+def scale(value):
+    return value * 2.0
+
+
+def main():
+    start = lib.input.int(10)
+{body}
+    return scale(lib.close)
+'''
+
+
+@pytest.mark.parametrize('body', [
+    # Its parameter has no type, and neither has anything built on it
+    '    def mid(length):\n        return (lib.ta.highest(length) + lib.ta.lowest(length)) / 2\n',
+    # A helper it calls is only typed by the calls that are made
+    '    def twice(value):\n        return scale(value)\n',
+    # One it would have called is never called either
+    '    def outer(value):\n        return inner(value)\n\n'
+    '    def inner(value):\n        return value + start\n',
+])
+def __test_a_nested_function_nothing_calls_has_no_instance__(body: str):
+    """Pine types a function per call, so an untyped parameter of one never called is no gap"""
+    table = infer_module(ast.parse(NEVER_CALLED.format(body=body)), 'test')
+
+    assert not table.diags
+    assert table.bindings['scale']['value'].ty == FLOAT
+    assert not any(scope.startswith('main·') for scope in table.bindings)
+
+
+@pytest.mark.parametrize('body, scope', [
+    # Every parameter states its type: the definition describes its one instance
+    ('    def shifted(length: int):\n        return missing(length)\n', 'main·shifted'),
+    # A parameterless one is its own instance too
+    ('    def level():\n        return missing(start)\n', 'main·level'),
+])
+def __test_a_nested_function_that_states_its_types_is_still_typed__(body: str, scope: str):
+    table = infer_module(ast.parse(NEVER_CALLED.format(body=body)), 'test')
+
+    assert scope in table.bindings
+    assert [diag.origin.reason for diag in table.diags if diag.origin] == ['unknown-call']
+
+
+def __test_a_module_level_function_nothing_calls_is_still_typed__():
+    """An importer may call it, so the context its definition describes stands"""
+    table = infer_module(ast.parse(
+        'def spread(high, low):\n    return high - low\n\n\ndef main():\n    return 1\n'), 'test')
+
+    assert {diag.origin.detail for diag in table.diags if diag.origin} == {'high', 'low'}

@@ -13,9 +13,9 @@ use crate::pine_qualifier::{
 };
 use crate::pine_type_rules::{
     BOOL, CallRule, DYN_DEFAULT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, TY_ATTR, TYPELESS,
-    UNKNOWN, VOID, binop_type, builtin_name_type, class_of, compare_type, constant_type,
-    elements_of, is_array, is_map, is_matrix, is_tuple, join, lib_type_override, object_ty,
-    render_ty, tuple_of, unaryop_type,
+    UNKNOWN, VOID, builtin_name_type, class_of, compare_type, constant_type, elements_of, is_array,
+    is_map, is_matrix, is_tuple, join, lib_type_override, object_ty, render_ty, tuple_of,
+    unaryop_type,
 };
 use crate::pine_type_table::ClassSig;
 
@@ -302,6 +302,14 @@ impl Engine<'_, '_> {
             );
         };
         if entry.kind == "value" {
+            if let Some(rule) = lib_type_override(&name)
+                && let Some(resolved) =
+                    self.apply_override(rule, &[], &[], Some(0), None::<&[String]>)?
+            {
+                // A property that is also called: the bare read is the call
+                // without arguments
+                return Ok(resolved);
+            }
             return Ok(entry.ty.clone().unwrap_or_else(|| UNKNOWN.to_string()));
         }
         if name == "na" {
@@ -543,13 +551,13 @@ impl Engine<'_, '_> {
         };
         let left_ty = self.expr(left)?;
         let right_ty = self.expr(right)?;
-        let result = binop_type(op, &left_ty, &right_ty);
+        let result = facts::typed_binop(op, &left_ty, &right_ty);
         for (operand, operand_ty) in [(left, &left_ty), (right, &right_ty)] {
             if operand_ty == TYPELESS {
-                self.record_widen(operand, facts::na_widen(result))?;
+                self.record_widen(operand, facts::na_widen(&result))?;
             }
         }
-        Ok(result.to_string())
+        Ok(result)
     }
 
     fn e_ifexp(&mut self, node: NodeId) -> R<String> {

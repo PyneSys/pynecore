@@ -7,16 +7,16 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use pyne_ast::walk::{children, walk};
-use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Unsupported};
+use pyne_ast::{Ast, Constant, ExprContext, Kind, NodeId, Operator, Unsupported};
 
 use crate::data;
 use crate::node_ids::node_id;
 use crate::pine_type_rules::{
     BOOL, FLOAT, INT, NUMERIC, OBJECT, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA,
     WIDEN_BOOL_NA, WIDEN_FLOAT, WIDEN_ITEMS, WIDEN_MAP_NA, WIDEN_MATRIX, WIDEN_MATRIX_NA,
-    WIDEN_NUMBER_NA, WIDEN_STRING_NA, builtin_class_id, class_of, dotted, element_of, elements_of,
-    forward_reference, get_pins, get_widen_site, get_widens, is_array, is_map, is_matrix, join,
-    object_ty, shape_conflict,
+    WIDEN_NUMBER_NA, WIDEN_STRING_NA, binop_type, builtin_class_id, class_of, dotted, element_of,
+    elements_of, forward_reference, get_pins, get_widen_site, get_widens, is_array, is_map,
+    is_matrix, join, object_ty, shape_conflict,
 };
 
 /// Values no fit check has a say about (`_UNCHECKED`).
@@ -566,6 +566,19 @@ pub fn widen_for(kind: &str, element: &str, other: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Type of a binary arithmetic expression over two typed operands (`_binop_type`).
+pub fn typed_binop(op: Operator, left: &str, right: &str) -> String {
+    use std::sync::OnceLock;
+    static BIT_SETS: OnceLock<HashSet<String>> = OnceLock::new();
+    let bit_sets = BIT_SETS.get_or_init(|| {
+        data::bit_sets().iter().map(|name| object_ty(&builtin_class_id(name))).collect()
+    });
+    if matches!(op, Operator::Add | Operator::Sub) && left == right && bit_sets.contains(left) {
+        return left.to_string();
+    }
+    binop_type(op, left, right).to_string()
 }
 
 /// The lib classes that are a scalar, by object type (`lib_scalar_classes`).

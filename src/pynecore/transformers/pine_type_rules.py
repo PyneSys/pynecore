@@ -2060,6 +2060,8 @@ def is_na_literal(node: ast.AST) -> bool:
 #: ``'array_of_join_args'``    an array over the join of every argument
 #: ``'matrix_mult'``     ``matrix.mult``, whose result follows its SECOND
 #:                       operand: a matrix by an array yields an array
+#: ``'vwap'``            ``ta.vwap``, a float, or a tuple of three once its
+#:                       band multiplier is passed
 #:
 #: Every form from ``'same_arrayN'`` down DECLINES -- answers nothing at all --
 #: where the shape it reads is not known, so the call falls through to the
@@ -2135,6 +2137,10 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'ta.median': 'arg0',
     'ta.range': 'arg0',
     'ta.mode': 'arg0',
+    # ``ta.vwap`` is one value, and the value with its upper and lower band once a
+    # band multiplier is passed. Read bare (``ta.vwap``) it is the call without
+    # arguments
+    'ta.vwap': 'vwap',
     # The casts are the only place the TYPE and the VALUE move together
     'int': INT,
     'float': FLOAT,
@@ -2254,8 +2260,9 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'map.copy': 'same_map0',
 }
 
-#: Declared parameter order of the lib names whose module lives outside
-#: ``pynecore/lib`` and therefore has no registry entry to read it from. A
+#: Declared parameter order of the lib names the registry holds no parameters
+#: for: those whose module lives outside ``pynecore/lib``, and a property that
+#: is also called, which the registry records as a value. A
 #: type-preserving override names the parameter it copies from, and a keyword
 #: spelling (``input(title='WMA Length', defval=10)``) only binds back to that
 #: position with the order in hand.
@@ -2265,4 +2272,6 @@ OVERRIDE_PARAM_NAMES: Final[dict[str, list[str]]] = {
     # ``core/script.py::_Input.enum``
     'input.enum': ['defval', 'title', 'options', 'tooltip', 'inline', 'group', 'confirm',
                    'display', 'active'],
+    # ``lib/ta.py::vwap``
+    'ta.vwap': ['source', 'anchor', 'stdev_mult'],
 }

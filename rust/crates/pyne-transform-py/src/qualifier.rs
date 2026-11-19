@@ -159,6 +159,9 @@ pub fn registry<'py>(py: Python<'py>, section: &str) -> PyResult<Bound<'py, PyAn
                 dict.set_item(name, scalar)?;
             }
         }
+        "bit_sets" => {
+            dict.set_item("bit_sets", data::bit_sets().to_vec())?;
+        }
         "star_exports" => {
             for (module, names) in data::star_exports() {
                 dict.set_item(module, names.clone())?;

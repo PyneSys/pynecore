@@ -164,6 +164,12 @@ pub fn scalar_classes() -> &'static HashMap<String, String> {
     SCALARS.get_or_init(|| pairs(tables::SCALAR_CLASSES))
 }
 
+/// `lib_types.json`'s `bit_sets`: the lib classes that are a set of flags.
+pub fn bit_sets() -> &'static [String] {
+    static BIT_SETS: OnceLock<Vec<String>> = OnceLock::new();
+    BIT_SETS.get_or_init(|| list(tables::BIT_SETS))
+}
+
 /// An entry of `lib_types.json`'s `names` (`lib_registry.lib_types()[name]`): the
 /// fields a native step reads so far.
 #[derive(Clone, Debug, PartialEq, Eq)]

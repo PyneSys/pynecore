@@ -178,6 +178,15 @@ impl<'e> Report<'e, '_, '_> {
             }
             scope = self.mark(node, scope);
             depth += 1;
+            if self.engine.uninstantiated.contains(&node) {
+                // Only the defaults are values: they belong to the enclosing scope
+                if let Kind::FunctionDef { args, .. } | Kind::AsyncFunctionDef { args, .. } =
+                    ast.kind(node)
+                {
+                    stack.push((*args, Some(node), scope, depth));
+                }
+                continue;
+            }
             for child in children(ast, node).into_iter().rev() {
                 stack.push((child, Some(node), scope.clone(), depth));
             }

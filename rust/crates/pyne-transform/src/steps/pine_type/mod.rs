@@ -142,6 +142,8 @@ struct Engine<'a, 'h> {
     defs: IndexMap<String, Vec<NodeId>>,
     rebound: HashMap<String, HashSet<String>>,
     walked: HashSet<i64>,
+    /// The definitions no walk ever enters (`_uninstantiated_def`).
+    uninstantiated: HashSet<NodeId>,
     context_stack: Vec<i64>,
     next_context: i64,
     in_progress: HashSet<(String, Vec<String>, Option<i64>)>,
@@ -236,6 +238,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             defs: IndexMap::new(),
             rebound: HashMap::new(),
             walked: HashSet::new(),
+            uninstantiated: HashSet::new(),
             context_stack: vec![0],
             next_context: 1,
             in_progress: HashSet::new(),

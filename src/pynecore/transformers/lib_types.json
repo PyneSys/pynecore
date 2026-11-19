@@ -1,4 +1,8 @@
 {
+ "bit_sets": [
+  "Display",
+  "FormatEnum"
+ ],
  "classes": {
   "AskOHLC": {
    "close": "f",
@@ -9960,5 +9964,5 @@
    "period"
   ]
  },
- "v": 9
+ "v": 10
 }

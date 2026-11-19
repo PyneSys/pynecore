@@ -209,6 +209,7 @@ def _walker_rule(rule: Callable[[Any], str]) -> Callable[..., str]:
 
 _LIB_CLASSES: dict[str, 'ClassSig'] = {}
 _LIB_SCALARS: dict[str, str] = {}
+_LIB_BIT_SETS: set[str] = set()
 _LIB_NAMESPACES: set[str] = set()
 
 
@@ -247,6 +248,36 @@ def lib_scalar_classes() -> dict[str, str]:
         _LIB_SCALARS.update({object_ty(builtin_class_id(name)): scalar
                              for name, scalar in published.items()})
     return _LIB_SCALARS
+
+
+def lib_bit_sets() -> set[str]:
+    """
+    The lib classes that are a set of flags, loaded once.
+
+    ``display.all - display.status_line`` and ``text.format_bold +
+    text.format_italic`` combine two sets into one of the same class: that is
+    the only arithmetic Pine has over such a value.
+
+    :return: The object type of every such class
+    """
+    if not _LIB_BIT_SETS:
+        _LIB_BIT_SETS.update(object_ty(builtin_class_id(name))
+                             for name in lib_registry().get('bit_sets') or ())
+    return _LIB_BIT_SETS
+
+
+def _binop_type(op: ast.operator, left: str, right: str) -> str:
+    """
+    Type of a binary arithmetic expression over two typed operands.
+
+    :param op: The operator node
+    :param left: Type of the left operand
+    :param right: Type of the right operand
+    :return: Type of the result
+    """
+    if isinstance(op, (ast.Add, ast.Sub)) and left == right and left in lib_bit_sets():
+        return left
+    return binop_type(op, left, right)
 
 
 def lib_namespaces() -> set[str]:
@@ -450,6 +481,8 @@ class _Inference:
         self._rebound: dict[str, set[str]] = {}
         #: Def node ids that already have at least one context
         self._walked: set[int] = set()
+        #: ``id()`` of the definitions no walk ever enters, see ``_uninstantiated_def``
+        self._uninstantiated: set[int] = set()
         #: Context ids, innermost last; 0 is the module body itself
         self._contexts: list[int] = [0]
         self._next_context = 1
@@ -1012,7 +1045,7 @@ class _Inference:
         self._report_unhandled_widens()
         # Where the types ran out, once per cause: the coverage meter of a
         # hand-written script, the first error of an edge module
-        self.table.diags.extend(unknown_diags(tree, self.table))
+        self.table.diags.extend(unknown_diags(tree, self.table, self._uninstantiated))
         # The implementations are only final once every body has been walked:
         # an unannotated return only gets its type from the walk. Published
         # here so a consumer -- the module interface, and through it another
@@ -1519,7 +1552,7 @@ class _Inference:
             case ast.AugAssign():
                 value_ty = self._expr(stmt.value)
                 current = self._target_type(stmt.target)
-                self._store(stmt.target, binop_type(stmt.op, current, value_ty), stmt,
+                self._store(stmt.target, _binop_type(stmt.op, current, value_ty), stmt,
                             qual=max(self._target_qual(stmt.target), self._qual(stmt.value)))
             case ast.Return():
                 qual = CONST
@@ -1704,6 +1737,9 @@ class _Inference:
         goes last if anything still waiting calls it -- callers first, and by
         the time a called helper comes up it already has its contexts and is
         skipped. A cycle has no such order and takes the first one left.
+
+        A definition that has no instance at all is not walked: see
+        ``_uninstantiated_def``.
         """
         remaining = [(key, node, self._called_names(node)) for key, node in self._pending[-1]]
         self._pending[-1].clear()
@@ -1721,7 +1757,36 @@ class _Inference:
                     callers[index] -= 1
             nid = node_id(node)
             if nid is None or nid not in self._walked:
-                self._declaration_context(key, node)
+                if self._uninstantiated_def(key, node):
+                    self._uninstantiated.add(id(node))
+                else:
+                    self._declaration_context(key, node)
+
+    def _uninstantiated_def(self, key: str,
+                            node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        """
+        Whether a definition nothing called has no instance to type.
+
+        Pine instantiates a function per call, so one that is never called is
+        never typed and its body cannot be wrong about a type. A parameter
+        without a declared type has none there: walking the body would report
+        every read of it, and would join UNKNOWN into each helper the body
+        calls. Such a definition is left untyped, and the report passes it by.
+
+        Only a plain definition nested in a function qualifies. A module-level
+        one may be imported and a decorated one (``@export``, ``@method``) is
+        published, so both keep the context their own definition describes;
+        so does a method, which is reached through its class.
+
+        :param key: Scope-qualified id of the definition
+        :param node: The definition, which no call site typed
+        :return: True when its body is not to be walked
+        """
+        if self._scope == '' or node.decorator_list:
+            return False
+        if key != self._qualify(self._scope, node.name):
+            return False
+        return UNKNOWN in self._declared_params(node)
 
     def _declared_params(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, ...]:
         """
@@ -2660,6 +2725,12 @@ class _Inference:
             # passes the module object itself
             return OBJECT if name in lib_namespaces() else UNKNOWN
         if entry['kind'] == 'value':
+            if override is not None:
+                # A property that is also called: the bare read is the call
+                # without arguments
+                resolved = self._apply_override(override, (), (), 0)
+                if resolved is not None:
+                    return resolved
             return entry['ty']
         if name == 'na':
             # In value position ``na`` is Pine's typeless absence marker, not
@@ -2920,7 +2991,7 @@ class _Inference:
     def _e_binop(self, node: ast.BinOp) -> str:
         left = self._expr(node.left)
         right = self._expr(node.right)
-        result = binop_type(node.op, left, right)
+        result = _binop_type(node.op, left, right)
         # A typeless na operand takes the other operand's type (``binop_type``), so it
         # is the na of that type: ``na * x`` of a float is the float na, not the
         # typeless one the na object's own arithmetic would hand on
@@ -3768,6 +3839,18 @@ class _Inference:
             return array_of(result) if result != UNKNOWN else None
         if override.startswith('merge_') or override.startswith('put_'):
             return self._merge_override(override, args, keywords, param_names)
+        if override == 'vwap':
+            # The band multiplier is what turns the value into the value with
+            # its two bands, however the call spells it
+            if any(isinstance(arg, ast.Starred) for arg in args) \
+                    or any(keyword.arg is None for keyword in keywords):
+                return UNKNOWN
+            mult = _bound_arg(args, keywords, 2, param_names)
+            if mult is None or self._ty_of(mult) == VOID:
+                # A ``None`` passed, spelled out or through a name bound to it,
+                # is the default: no bands
+                return FLOAT
+            return tuple_of([FLOAT, FLOAT, FLOAT])
         if override == 'matrix_mult':
             # ``matrix.mult`` follows its SECOND operand: a matrix by a matrix
             # or a scalar is a matrix, a matrix by an array is an array. Which
