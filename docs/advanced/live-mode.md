@@ -81,7 +81,10 @@ script sees for the first time.
 The data iterator marks the end of the history with the `LIVE_TRANSITION` sentinel, and the
 ScriptRunner switches to the live phase when it reads it.  At this point:
 
-- `barstate.islastconfirmedhistory` becomes `True` on the final historical bar
+- `barstate.islast` is `True` on the final historical bar: it is the dataset's last bar until
+  the first live update arrives, so `if barstate.islast` blocks (tables, last-bar labels) show
+  at once, even on a closed market
+- `barstate.islastconfirmedhistory` becomes `True` on the final confirmed historical bar
 - Output writers flush to disk (plot CSV, trade CSV)
 - Strategy suppression is lifted — orders are now active
 

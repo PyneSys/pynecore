@@ -137,8 +137,9 @@ if barstate.isrealtime:
 - `barstate.islastconfirmedhistory` is `false` on every bar, including the dataset's last bar.
 
 **Live mode** (`pyne run --live`, or `pyne run --broker`): the historical phase behaves like a
-backtest, except that `barstate.islast` is `false` on the historical bars and
-`barstate.islastconfirmedhistory` is `true` on the final historical bar. On the streamed bars
+backtest, except that `barstate.islast` is `true` only on the final historical bar (the dataset's
+last bar until the first live update arrives) and `barstate.islastconfirmedhistory` is `true` on
+the final confirmed historical bar. On the streamed bars
 `barstate.ishistory` is `false`, `barstate.isrealtime` and `barstate.islast` are `true`,
 `barstate.isconfirmed` is `true` only on the bar-closing update, and `barstate.isnew` marks the
 first execution of a new bar. See [Live Mode](../../advanced/live-mode.md#barstate-values) for the

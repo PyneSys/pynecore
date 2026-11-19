@@ -3926,7 +3926,11 @@ class ScriptRunner:
 
                 # Last bar detection
                 if is_live:
-                    barstate.islast = False
+                    # The history's last bar is the dataset's last bar until the
+                    # first live update arrives, which can be a whole bar away (or
+                    # a weekend, on a closed market): ``if barstate.islast`` blocks
+                    # (tables, labels on the last bar) run on it at once.
+                    barstate.islast = (next_item is LIVE_TRANSITION)
                     # The last CONFIRMED history bar: the one before a forming tail
                     barstate.islastconfirmedhistory = (
                         next_is_forming_tail

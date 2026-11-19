@@ -8,6 +8,7 @@ from pynecore.lib import barstate, plot, script
 def main():
     plot(1 if barstate.islastconfirmedhistory else 0, "lch")
     plot(1 if barstate.isconfirmed else 0, "confirmed")
+    plot(1 if barstate.islast else 0, "last")
 
 
 __test_helper_MINUTE = 60_000
@@ -22,7 +23,7 @@ def __test_helper_bar(i, is_closed=True):
 
 
 def __test_helper_history_flags(script_path, module_key, syminfo, catch_up, history_as_of):
-    """``(islastconfirmedhistory, isconfirmed)`` of every history bar of a live run.
+    """``(bar, islastconfirmedhistory, isconfirmed, islast)`` of every history bar of a live run.
 
     :param catch_up: Bars the catch-up drain delivers before the live transition.
     :param history_as_of: The download instant of the history.
@@ -39,7 +40,7 @@ def __test_helper_history_flags(script_path, module_key, syminfo, catch_up, hist
     runner = ScriptRunner(script_path, iter(feed), syminfo, live=True,
                           last_bar_index=last, last_bar_time=last * __test_helper_MINUTE,
                           history_as_of=history_as_of)
-    rows = [(c.timestamp // __test_helper_MINUTE, pv["lch"], pv["confirmed"])
+    rows = [(c.timestamp // __test_helper_MINUTE, pv["lch"], pv["confirmed"], pv["last"])
             for c, pv in runner.run_iter()]
     n_hist = __test_helper_N_HIST + len(catch_up) - sum(
         1 for b in catch_up if b.timestamp == last * __test_helper_MINUTE)
@@ -52,10 +53,12 @@ def __test_forming_tail_moves_last_confirmed_history_back__(script_path, module_
     rows = __test_helper_history_flags(
         script_path, module_key, syminfo, [],
         history_as_of=last * __test_helper_MINUTE + __test_helper_MINUTE // 2)
-    flagged = [i for i, lch, _ in rows if lch == 1]
+    flagged = [i for i, lch, *_ in rows if lch == 1]
     assert flagged == [last - 1], rows
     assert rows[-1][2] == 0, "the forming tail runs unconfirmed"
-    assert all(confirmed == 1 for _, _, confirmed in rows[:-1])
+    assert all(confirmed == 1 for _, _, confirmed, _ in rows[:-1])
+    assert [i for i, *_, is_last in rows if is_last == 1] == [last], \
+        "the forming tail is the dataset's last bar until the first live update"
 
 
 def __test_closed_tail_is_the_last_confirmed_history_bar__(script_path, module_key, syminfo):
@@ -64,9 +67,11 @@ def __test_closed_tail_is_the_last_confirmed_history_bar__(script_path, module_k
     rows = __test_helper_history_flags(
         script_path, module_key, syminfo, [],
         history_as_of=(last + 1) * __test_helper_MINUTE)
-    flagged = [i for i, lch, _ in rows if lch == 1]
+    flagged = [i for i, lch, *_ in rows if lch == 1]
     assert flagged == [last], rows
-    assert all(confirmed == 1 for _, _, confirmed in rows)
+    assert all(confirmed == 1 for _, _, confirmed, _ in rows)
+    assert [i for i, *_, is_last in rows if is_last == 1] == [last], \
+        "the closed tail is the dataset's last bar until the first live update"
 
 
 def __test_helper_monthly_flags(script_path, module_key, syminfo, months, history_as_of):
@@ -118,6 +123,6 @@ def __test_caught_up_tail_is_the_last_confirmed_history_bar__(script_path, modul
     rows = __test_helper_history_flags(
         script_path, module_key, syminfo, [__test_helper_bar(last)],
         history_as_of=last * __test_helper_MINUTE + __test_helper_MINUTE // 2)
-    flagged = [i for i, lch, _ in rows if lch == 1]
+    flagged = [i for i, lch, *_ in rows if lch == 1]
     assert flagged == [last], rows
-    assert all(confirmed == 1 for _, _, confirmed in rows)
+    assert all(confirmed == 1 for _, _, confirmed, _ in rows)
