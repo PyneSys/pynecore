@@ -1,10 +1,13 @@
 from typing import Any, Callable, TYPE_CHECKING
 from dataclasses import dataclass
+import json
 import re
+import threading
 from time import sleep
 from datetime import datetime, UTC, timedelta, time
 from pathlib import Path
 import tomllib
+from weakref import WeakValueDictionary
 
 from pynecore.core.plugin import override, ProviderError, Broker
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
@@ -75,6 +78,131 @@ def add_space_before_uppercase(s):
 
 
 @dataclass
+class _SharedClient:
+    """The CCXT client of one exchange and config, shared in a process.
+
+    A client holds the exchange's whole market list, by far the largest thing a
+    provider keeps. Every provider instance of the same exchange and config uses
+    one client, so a process that serves several symbols holds the list once.
+    The stream of each instance stays its own (its CCXT Pro client only borrows
+    the loaded markets).
+
+    The instances may run on different threads: every request made through the
+    client holds :attr:`lock`.
+
+    :ivar client: The CCXT client.
+    :ivar lock: Held around every request of the client.
+    :ivar full_fetch_markets: The exchange's own ``fetchMarkets`` option while the
+        option chains are left out of the market list, ``None`` when the list is
+        complete.
+    """
+
+    __slots__ = ('client', 'lock', 'full_fetch_markets', '__weakref__')
+
+    def __init__(self, client: "ccxt.Exchange"):
+        self.client = client
+        self.lock = threading.RLock()
+        self.full_fetch_markets: dict[str, Any] | None = None
+
+    @staticmethod
+    def set_fetch_markets(client: "ccxt.Exchange", fetch_markets: dict[str, Any]) -> None:
+        """Set a client's ``fetchMarkets`` option: the kinds of markets it loads."""
+        client.options = {**(client.options or {}), 'fetchMarkets': fetch_markets}
+
+    def skip_option_markets(self, user_options: Any) -> None:
+        """Leave the option chains out of the market list.
+
+        Where an exchange lists options they are most of its markets (Bybit:
+        2282 of 3757), and every loaded market stays in memory for the life of
+        the client. A provider of one symbol needs its own market and the spot
+        and swap markets :meth:`CCXTProvider.resolve_symbol` looks up, so the
+        chains are loaded only when a symbol turns out to be an option or the
+        whole symbol list is asked for (:meth:`load_option_markets`). A
+        ``fetchMarkets`` option the user configured is left as it is.
+
+        :param user_options: The ``options`` of the exchange's config, if any.
+        """
+        if isinstance(user_options, dict) and 'fetchMarkets' in user_options:
+            return
+        fetch_markets = (self.client.options or {}).get('fetchMarkets')
+        if not isinstance(fetch_markets, dict):
+            return
+        types = fetch_markets.get('types')
+        if not isinstance(types, list) or 'option' not in types:
+            return
+        self.full_fetch_markets = fetch_markets
+        self.set_fetch_markets(self.client, {
+            **fetch_markets, 'types': [t for t in types if t != 'option'],
+        })
+
+    def load_markets(self) -> None:
+        """Load the market list unless it is loaded."""
+        with self.lock:
+            self.client.load_markets()
+
+    def load_option_markets(self) -> None:
+        """Bring the option chains back into the market list.
+
+        Markets already loaded are loaded again, as CCXT replaces the whole
+        list. Does nothing when the list is complete. When the reload fails the list
+        stays narrowed, and the next call tries again.
+        """
+        with self.lock:
+            if self.full_fetch_markets is None:
+                return
+            self.set_fetch_markets(self.client, self.full_fetch_markets)
+            if self.client.markets:
+                self.client.load_markets(True)
+            self.full_fetch_markets = None
+
+
+# Freed with the last provider instance that uses it
+_shared_clients: 'WeakValueDictionary[str, _SharedClient]' = WeakValueDictionary()
+_shared_clients_lock = threading.Lock()
+
+
+def _shared_client(exchange_name: str, exchange_config: dict[str, Any], *, sandbox: bool,
+                   skip_options: bool) -> _SharedClient:
+    """The process's client of an exchange and config, created at its first use.
+
+    :param exchange_name: The CCXT exchange id.
+    :param exchange_config: The CCXT constructor arguments of the config.
+    :param sandbox: Whether the client runs on the exchange's testnet.
+    :param skip_options: Whether a client created now leaves the option chains out of
+        its market list. A client that exists keeps the list it has.
+    :return: The shared client.
+    :raises CCXTError: If CCXT has no such exchange.
+    """
+    import ccxt
+
+    key = json.dumps([exchange_name, sandbox, exchange_config], sort_keys=True, default=repr)
+    with _shared_clients_lock:
+        shared = _shared_clients.get(key)
+        if shared is not None:
+            return shared
+        try:
+            client: ccxt.Exchange = getattr(ccxt, exchange_name)({
+                'enableRateLimit': True,
+                'adjustForTimeDifference': True,
+                **exchange_config
+            })
+        except AttributeError:
+            raise CCXTError(
+                f"Unknown exchange: {exchange_name!r}. Run "
+                f"`pyne data download ccxt --list-brokers` to see available exchanges."
+            ) from None
+        if sandbox:
+            try:
+                client.set_sandbox_mode(True)
+            except ccxt.NotSupported:
+                pass
+        shared = _SharedClient(client)
+        if skip_options:
+            shared.skip_option_markets(exchange_config.get('options'))
+        _shared_clients[key] = shared
+        return shared
+
+
 class CCXTConfig(LiveProviderConfig):
     """CCXT provider configuration.
 
@@ -293,24 +421,23 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         self._last_bar_ohlcv: OHLCV | None = None
         self._exchange_config: dict[str, Any] = dict(exchange_config)
 
-        # Create the CCXT client
-        try:
-            self._client: ccxt.Exchange = getattr(ccxt, exchange_name)({
-                'enableRateLimit': True,
-                'adjustForTimeDifference': True,
-                **exchange_config
-            })
-        except AttributeError:
-            raise CCXTError(
-                f"Unknown exchange: {exchange_name!r}. Run "
-                f"`pyne data download ccxt --list-brokers` to see available exchanges."
-            ) from None
+        # A provider without a symbol is asked for the exchange's symbol list:
+        # only one of a symbol can do without the option chains
+        self._shared = _shared_client(
+            exchange_name, self._exchange_config,
+            sandbox=bool(self.config and getattr(self.config, 'sandbox', False)),
+            skip_options=symbol is not None)
         self.history_has_idle_bars = self._client.id not in _NO_IDLE_BAR_EXCHANGES
-        if self.config and getattr(self.config, 'sandbox', False):
-            try:
-                self._client.set_sandbox_mode(True)
-            except ccxt.NotSupported:
-                pass
+
+    @property
+    def _client(self) -> "ccxt.Exchange":
+        """The CCXT client of the instance's exchange, shared with the other
+        instances of it. A client set here is this instance's alone."""
+        return self._shared.client
+
+    @_client.setter
+    def _client(self, client: "ccxt.Exchange") -> None:
+        self._shared = _SharedClient(client)
 
     @override
     def normalize_symbol(self, symbol: str) -> str:
@@ -345,7 +472,7 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
             market_id = market_id[:-2]
             market_type = 'swap'
         try:
-            self._client.load_markets()
+            self._shared.load_markets()
         except ccxt.BaseError:
             return pine_key
         for market in self._client.markets_by_id.get(market_id) or ():
@@ -358,7 +485,8 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         """Get list of symbols."""
         import ccxt
         try:
-            self._client.load_markets()
+            self._shared.load_option_markets()
+            self._shared.load_markets()
         except ccxt.BaseError as exc:
             raise CCXTError(f"{self._client.id}: {exc}") from exc
         return self._client.symbols or []
@@ -476,7 +604,10 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
         """Update symbol info from the exchange."""
         import ccxt
         try:
-            self._client.load_markets()
+            self._shared.load_markets()
+            if self.symbol not in (self._client.markets or {}):
+                # The one kind of market left out: the symbol may be an option
+                self._shared.load_option_markets()
         except ccxt.BaseError as exc:
             raise CCXTError(f"{self._client.id}: {exc}") from exc
         assert self._client.markets
@@ -559,12 +690,13 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 attempt = 1
                 while True:
                     try:
-                        res: list = self._client.fetch_ohlcv(
-                            symbol=self.symbol,
-                            limit=limit,
-                            timeframe=self.xchg_timeframe,
-                            since=since
-                        )
+                        with self._shared.lock:
+                            res: list = self._client.fetch_ohlcv(
+                                symbol=self.symbol,
+                                limit=limit,
+                                timeframe=self.xchg_timeframe,
+                                since=since
+                            )
                         break
                     except ccxt.BaseError as exc:
                         # Only network-level faults and the bare ``ExchangeError``
@@ -668,6 +800,15 @@ class CCXTProvider(LiveProviderPlugin[CCXTConfig]):
                 **getattr(client, 'options', {}),
                 'defaultType': self.config.default_type,
             }
+
+        # The history download loaded the markets already: the stream's client
+        # uses the same objects instead of downloading and holding a second
+        # copy. A CCXT without the call loads its own, of the same kinds.
+        share_markets = getattr(client, 'set_markets_from_exchange', None)
+        if self._client.markets and share_markets is not None:
+            share_markets(self._client)
+        elif self._shared.full_fetch_markets is not None:
+            self._shared.set_fetch_markets(client, (self._client.options or {})['fetchMarkets'])
 
     @override
     async def disconnect(self) -> None:

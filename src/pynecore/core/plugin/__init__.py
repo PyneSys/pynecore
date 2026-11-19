@@ -29,6 +29,7 @@ Discovery::
 """
 
 import inspect
+import os
 import re
 import sys
 from collections.abc import Iterable
@@ -36,6 +37,8 @@ from typing import TypeVar, Generic, Any
 
 # noinspection PyProtectedMember
 from importlib.metadata import entry_points, EntryPoint
+
+from .hub import HUB_ENV
 
 if sys.version_info >= (3, 12):
     # noinspection PyUnusedImports
@@ -197,6 +200,33 @@ def discover_plugins() -> dict[str, EntryPoint]:
 def load_plugin(name: str) -> type:
     """
     Load and return a plugin class by name.
+
+    In a process that uses a provider hub (see :mod:`~pynecore.core.plugin.hub`) a
+    data provider's class is the one that forwards to the hub.
+
+    :param name: Plugin name as declared in the entry point.
+    :return: The plugin class.
+    :raises PluginNotFoundError: If no plugin with the given name is installed.
+    :raises PluginNameConflictError: If several installed packages declare the
+        same plugin name — loading either one would be a guess.
+    """
+    if os.environ.get(HUB_ENV):
+        # A process of a provider hub's front end: a data provider is served by the
+        # hub, and its plugin is not imported here. Imported late: the remote
+        # classes build on this package.
+        from .hub.remote import remote_plugin
+        remote = remote_plugin(name)
+        if remote is not None:
+            return remote
+    return load_installed_plugin(name)
+
+
+def load_installed_plugin(name: str) -> type:
+    """
+    Load and return the plugin class installed in this environment.
+
+    Unlike :func:`load_plugin`, never the remote class of a provider hub: this is the
+    plugin itself, with its SDK.
 
     :param name: Plugin name as declared in the entry point.
     :return: The plugin class.

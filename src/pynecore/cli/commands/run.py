@@ -47,6 +47,7 @@ from pynecore.core.provider_download import (
     open_live_stream, parse_time_value, require_live_provider,
 )
 from pynecore.core.plugin import ProviderError
+from pynecore.core.plugin.hub import HUB_ENV, TOKEN_ENV
 from ...cli.utils.api_error_handler import APIErrorHandler
 from ...cli.utils.profile_report import print_profile_report
 
@@ -1172,6 +1173,12 @@ def run(
     if option_error is not None:
         secho(f"Error: {option_error.report()}", err=True, fg=colors.RED)
         raise Exit(1)
+
+    if broker:
+        # A provider hub serves market data only: a broker run holds its plugin itself,
+        # and so do the security contexts it starts
+        os.environ.pop(HUB_ENV, None)
+        os.environ.pop(TOKEN_ENV, None)
 
     data_path, syminfo, provider_data = resolve_data(
         data, time_from, retry_transient=(live or broker),
