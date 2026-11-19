@@ -1880,6 +1880,10 @@ class OrderSyncEngine:
         # venue already netted while its fills are still streaming in is the
         # bot's own trade, not a reduction to confirm.
         self._shrink_reported = False
+        # Whether a live order of ours may hold the observed shrink as a fill
+        # the venue has not reported yet (:meth:`_shrink_may_be_own_fill`),
+        # read once per sighting; ``None`` until read.
+        self._shrink_own_fill_possible: bool | None = None
         # The reduction :meth:`_adopt_external_shrink` booked without a fill
         # that a late fill may still explain: its unexplained quantity, the
         # side that reduces the book, and the venue ids of the orders that
@@ -6865,8 +6869,10 @@ class OrderSyncEngine:
             observed = (venue_abs, now)
             self._shrink_observed = observed
             self._shrink_reported = False
+            self._shrink_own_fill_possible = None
         in_flight = self._position_work_in_flight()
-        if not in_flight and not self._shrink_reported:
+        if not in_flight and not self._shrink_reported and (
+                now - observed[1] >= grace or not self._shrink_may_be_own_fill()):
             self._shrink_reported = True
             _blog_warning(
                 "exchange holds %s but the book %s — confirming the external "
@@ -6954,6 +6960,49 @@ class OrderSyncEngine:
                  'venue_signed': venue_abs if side == 'sell' else -venue_abs},
             )
 
+    def _shrink_may_be_own_fill(self) -> bool:
+        """Whether a live order of ours may be the observed shrink, its fill not reported yet.
+
+        A protective leg the venue fires on its own (a resting stop, a
+        position-attached bracket) reduces the position the moment it fills,
+        and the venue's position view can show that before the fill event
+        arrives (capitalcom cycle 442, a pyramid leg's stop). Such a shrink is
+        no news for the operator within the fill-report grace: every live
+        order of the bot not proven resting with no unreported fill
+        (:meth:`_orders_proven_resting_unfilled`) may hold it. A
+        position-attached leg never rests as an order, so it always may; an
+        unreadable open-orders view proves nothing. Only an order on the side
+        that reduces the book counts: a filled entry still mapped holds no
+        reduction. Read once per sighting: fills only accumulate, so an order
+        not proven now cannot become so.
+        """
+        if self._shrink_own_fill_possible is None:
+            ids = self._reducing_bot_order_ids()
+            proven = self._orders_proven_resting_unfilled(ids) if ids else frozenset()
+            self._shrink_own_fill_possible = proven is None or bool(ids - proven)
+        return self._shrink_own_fill_possible
+
+    def _reducing_bot_order_ids(self) -> frozenset[str]:
+        """Venue ids of the bot's live orders on the side that reduces the book.
+
+        Those of :meth:`_live_bot_order_ids` that are not an entry adding to
+        the book: an exit or a close always reduces, an entry only on the
+        reducing side (a reversal), a journal row when it sells a long book
+        or buys a short one. A mapped id whose intent is gone counts, its
+        side unknown.
+        """
+        reduce_side = 'sell' if self._position.size > 0.0 else 'buy'
+        ids: set[str] = set()
+        for key, oids in self._order_mapping.items():
+            intent = self._active_intents.get(key)
+            if not isinstance(intent, EntryIntent) or intent.side == reduce_side:
+                ids.update(oids)
+        if self._store_ctx is not None:
+            for row in self._store_ctx.iter_live_orders():
+                if row.exchange_order_id and row.side == reduce_side:
+                    ids.add(row.exchange_order_id)
+        return frozenset(ids)
+
     def _live_bot_order_ids(self) -> frozenset[str]:
         """Venue ids of the bot's orders that may still be working.
 
@@ -6985,8 +7034,9 @@ class OrderSyncEngine:
         except (ExchangeConnectionError, ExchangeRateLimitError,
                 OrderDispositionUnknownError) as e:
             _blog_warning(
-                "adopted reduction: open-orders read failed (%s) — a late fill of any "
-                "live order of ours is held until the venue position settles it", e,
+                "venue reduction: open-orders read failed (%s) — any live order of "
+                "ours may hold an unreported fill of it until the venue position "
+                "settles it", e,
             )
             return None
         known: dict[str, float] = {}
@@ -20449,7 +20499,8 @@ class OrderSyncEngine:
                         # replicated onto every position-side leg (persist-first
                         # ownership index), not sent as a single whole-row order.
                         bracket = self._run_async_write(
-                            self._one_way_emulator.run_exit_bracket(envelope, port),
+                            self._one_way_emulator.run_exit_bracket(
+                                envelope, port, now=time.monotonic()),
                         )
                         if bracket.skipped:
                             # Flat position (a close raced the exit) or an
@@ -24029,7 +24080,8 @@ class OrderSyncEngine:
                     # key, so no stale rows accrete and the amend overwrites the
                     # old protection wholesale.
                     bracket = self._run_async_write(
-                        self._one_way_emulator.run_exit_bracket(new_env, port),
+                        self._one_way_emulator.run_exit_bracket(
+                            new_env, port, now=time.monotonic()),
                     )
                     if bracket.skipped:
                         raise OrderSkippedByPlugin(

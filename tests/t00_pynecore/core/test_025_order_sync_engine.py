@@ -8218,6 +8218,42 @@ def __test_a_dispatched_trigger_close_ahead_of_its_fill_is_no_external_reduction
     assert notices() == 1
 
 
+def __test_a_shrink_our_unlisted_protective_leg_may_hold_waits_for_the_grace__(caplog):
+    """A venue-fired leg of ours may be the shrink until its fill report is overdue.
+
+    Live (capitalcom cycle 442, 2026-11-19, twice): a pyramid leg's
+    position-attached stop and take-profit fired, the position view showed
+    the reduction first, and the reconcile announced "confirming the external
+    reduction" right before the fill event arrived. A leg the open orders do
+    not show resting (a position-attached bracket never does) may hold such
+    an unreported fill, so the notice waits for the fill-report grace.
+    """
+    from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long_with_bracket(b, engine, pos)
+    b.open_orders = []
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.6, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cross",
+    )
+
+    def notices() -> int:
+        return len([r for r in caplog.records
+                    if r.levelno == logging.WARNING
+                    and "confirming the external reduction" in r.getMessage()])
+
+    with caplog.at_level(logging.WARNING):
+        engine.reconcile()
+        engine.reconcile()
+        assert notices() == 0 and pos.size == 1.0
+        # Its fill report is overdue: the shrink is now news.
+        _age_shrink_observation(engine, EXTERNAL_FLATTEN_CONFIRM_GRACE_S + 1.0)
+        engine.reconcile()
+    assert notices() == 1
+
+
 def __test_a_shrink_left_after_our_close_settles_is_reported_once__(caplog):
     """The shrink notice waits for our own work, then appears once, before the adoption."""
     from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S

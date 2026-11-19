@@ -94,11 +94,13 @@ from pynecore.core.broker.store_helpers import (
     update_close_leg_state,
 )
 
-#: Incomplete-book deferrals of one exit on one pending entry that count as
-#: the routine wait for the entry's fill to drain (live: a pyramid entry's
-#: fill lands within the next one or two syncs). Past it the deferral is a
-#: stall: the newest leg stays unprotected, so the caller warns.
-BOOK_INCOMPLETE_GRACE_DEFERRALS = 3
+#: Seconds an exit's incomplete-book deferral on one pending entry counts as
+#: the routine wait for the entry's fill to drain. Past it the deferral is a
+#: stall: the newest leg stays unprotected, so the caller warns. Measured in
+#: time, not in syncs: the sync cadence is the engine's, not the venue's fill
+#: latency (live: ctrader drained a pyramid fill in one or two syncs, bybit
+#: cycle 438 took four syncs within the same second).
+BOOK_INCOMPLETE_GRACE_S = 30.0
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -225,8 +227,8 @@ class BracketFanResult:
     :ivar skip_reason: Human-readable cause for an incomplete-book skip, for
         the caller's skip message; ``None`` for the flat / flipped-side skips.
     :ivar stalled: ``True`` on the one incomplete-book skip where the wait for
-        the pending entry's fill outgrew :data:`BOOK_INCOMPLETE_GRACE_DEFERRALS`
-        — the deferral is no longer routine and the caller warns.
+        the pending entry's fill outgrew :data:`BOOK_INCOMPLETE_GRACE_S` — the
+        deferral is no longer routine and the caller warns.
     """
     legs: tuple[str, ...]
     skipped: bool
@@ -278,9 +280,10 @@ class OneWayEmulator:
         #: is a property of the exit, not of a dispatch: a trailing exit is
         #: re-dispatched on every bar it changes, so it is reported once.
         self._trail_activation_reported: set[tuple[str, str, str | None]] = set()
-        #: Consecutive incomplete-book deferrals per (exit intent key, pending
-        #: entry coid); dropped once the exit's fan passes the gate.
-        self._book_incomplete_deferrals: dict[tuple[object, str], int] = {}
+        #: Incomplete-book deferrals per (exit intent key, pending entry coid):
+        #: the caller's ``now`` of the first one, and whether the stall was
+        #: flagged; dropped once the exit's fan passes the gate.
+        self._book_incomplete_deferrals: dict[tuple[object, str], tuple[float, bool]] = {}
 
     def take_replay_refusals(self) -> list[BracketReplayRefusal]:
         """Hand over (and forget) the brackets the restart replay could not re-assert."""
@@ -616,7 +619,7 @@ class OneWayEmulator:
     # === Exit-bracket replication =========================================
 
     async def run_exit_bracket(
-            self, envelope: 'DispatchEnvelope', port: 'PositionPort',
+            self, envelope: 'DispatchEnvelope', port: 'PositionPort', now: float = 0.0,
     ) -> BracketFanResult:
         """Replicate a Pine exit's bracket onto the net-survivor position legs.
 
@@ -647,7 +650,14 @@ class OneWayEmulator:
         The fan is also deferred (``skipped=True`` with a ``skip_reason``)
         while any protected-side position entry's fill is still pending in the
         journal — see :meth:`_pending_position_entry` — so it always runs over
-        a complete book and covers a same-sync pyramid entry's own leg.
+        a complete book and covers a same-sync pyramid entry's own leg. The
+        wait is a stall once it outlasts :data:`BOOK_INCOMPLETE_GRACE_S`.
+
+        :param envelope: The exit's dispatch envelope.
+        :param port: The venue's position port.
+        :param now: The caller's monotonic seconds, timing an incomplete-book
+            deferral (the engine itself keeps no clock).
+        :return: The legs the bracket went onto, or the skip.
         """
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
@@ -700,15 +710,15 @@ class OneWayEmulator:
             pending_coid = self._pending_position_entry(protected_side)
             if pending_coid is not None:
                 deferral_key = (intent.intent_key, pending_coid)
-                deferrals = self._book_incomplete_deferrals.get(deferral_key, 0) + 1
-                self._book_incomplete_deferrals[deferral_key] = deferrals
-                stalled = deferrals == BOOK_INCOMPLETE_GRACE_DEFERRALS + 1
+                since, flagged = self._book_incomplete_deferrals.get(deferral_key, (now, False))
+                stalled = not flagged and now - since >= BOOK_INCOMPLETE_GRACE_S
+                self._book_incomplete_deferrals[deferral_key] = (since, flagged or stalled)
                 return BracketFanResult(
                     legs=(), skipped=True,
                     skip_reason=(
                         f"position book incomplete — entry dispatch "
                         f"{pending_coid!r} has not journaled its fill "
-                        + (f"after {deferrals} syncs; its leg stays unprotected "
+                        + (f"after {now - since:.0f}s; its leg stays unprotected "
                            f"until it does" if stalled else "yet")
                     ),
                     stalled=stalled,

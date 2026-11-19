@@ -33,7 +33,7 @@ from pynecore.core.broker.models import (
     PositionLeg,
 )
 from pynecore.core.broker.one_way_emulator import (
-    BOOK_INCOMPLETE_GRACE_DEFERRALS,
+    BOOK_INCOMPLETE_GRACE_S,
     BracketFanResult,
     ClearFanResult,
     CloseFanResult,
@@ -689,9 +689,11 @@ def __test_run_exit_bracket_incomplete_book_stalls_after_the_grace__(tmp_path):
 
     Measured live (ctrader cycle 360, pyramid): every pyramid round deferred its
     new leg's exit for the one or two syncs its fill took to drain, each logged
-    as a WARNING. A wait past :data:`BOOK_INCOMPLETE_GRACE_DEFERRALS` leaves the
-    leg unprotected for real, so exactly that skip is ``stalled``; the counter
-    restarts once the fan passes the gate.
+    as a WARNING. Bybit cycle 438 took four syncs within the same second, and a
+    sync count flagged that routine wait as a stall. A wait past
+    :data:`BOOK_INCOMPLETE_GRACE_S` leaves the leg unprotected for real, so
+    exactly that skip is ``stalled``, however many syncs came before it; the
+    wait restarts once the fan passes the gate.
     """
     store, ctx = _make_store(tmp_path)
     _entry_row(ctx, "e-l1", side="buy", qty=1.0, pine_id="L1", leg_id="10", filled=1.0)
@@ -700,12 +702,12 @@ def __test_run_exit_bracket_incomplete_book_stalls_after_the_grace__(tmp_path):
     eng = OneWayEmulator(store_ctx=ctx)
     env = _exit_env("L2-X", "L2", qty=1.0, tp=1.20, sl=1.00)
 
-    results = [_run(eng.run_exit_bracket(env, port))
-               for _ in range(BOOK_INCOMPLETE_GRACE_DEFERRALS + 2)]
+    # Many syncs within the grace, then one past it, then another.
+    times = [0.1 * i for i in range(10)] + [BOOK_INCOMPLETE_GRACE_S, BOOK_INCOMPLETE_GRACE_S + 1.0]
+    results = [_run(eng.run_exit_bracket(env, port, now=t)) for t in times]
     assert all(r.skipped for r in results)
-    assert [r.stalled for r in results] == (
-        [False] * BOOK_INCOMPLETE_GRACE_DEFERRALS + [True, False])
-    assert "unprotected" in (results[BOOK_INCOMPLETE_GRACE_DEFERRALS].skip_reason or "")
+    assert [r.stalled for r in results] == [False] * 10 + [True, False]
+    assert "unprotected" in (results[10].skip_reason or "")
 
     ctx.upsert_order("e-l2", state=STATE_CONFIRMED, exchange_order_id="11", filled_qty=1.0)
     port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
@@ -713,9 +715,9 @@ def __test_run_exit_bracket_incomplete_book_stalls_after_the_grace__(tmp_path):
     assert _run(eng.run_exit_bracket(env, port)).skipped is False
     assert not eng._book_incomplete_deferrals  # noqa: SLF001
     _entry_row(ctx, "e-l3", side="buy", qty=1.0, pine_id="L3")  # next round
-    again = [_run(eng.run_exit_bracket(env, port))
-             for _ in range(BOOK_INCOMPLETE_GRACE_DEFERRALS)]
-    assert [r.stalled for r in again] == [False] * BOOK_INCOMPLETE_GRACE_DEFERRALS
+    later = BOOK_INCOMPLETE_GRACE_S + 100.0
+    again = [_run(eng.run_exit_bracket(env, port, now=later + t)) for t in (0.0, 1.0, 2.0)]
+    assert [r.stalled for r in again] == [False] * 3
     store.close()
 
 
