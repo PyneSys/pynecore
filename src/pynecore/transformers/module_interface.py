@@ -396,7 +396,8 @@ def interface_digest(interface: ModuleInterface) -> str:
                            'methods': {method: _unlined(_export_json(published))
                                        for method, published in sig.methods.items()},
                            'members': {member: _unlined(_export_json(published))
-                                       for member, published in sig.members.items()}}
+                                       for member, published in sig.members.items()},
+                           'enum': sig.enum}
                     for name, sig in interface.classes.items()},
         # An extension is keyed by the FOREIGN class id, whose module half is
         # another module's path -- that is the identity, and a dependent
@@ -1475,6 +1476,7 @@ def _class_json(sig: ClassSig) -> dict:
         'required': sig.required,
         'methods': {name: _export_json(method) for name, method in sig.methods.items()},
         'members': {name: _export_json(member) for name, member in sig.members.items()},
+        'enum': sig.enum,
     }
 
 
@@ -1496,4 +1498,5 @@ def _class_from_json(name: str, data: dict) -> ClassSig:
         methods={method: _export_from_json(method, sig)
                  for method, sig in (data.get('methods') or {}).items()},
         members={member: _export_from_json(member, sig)
-                 for member, sig in (data.get('members') or {}).items()})
+                 for member, sig in (data.get('members') or {}).items()},
+        enum=bool(data.get('enum', False)))

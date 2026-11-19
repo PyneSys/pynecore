@@ -42,7 +42,7 @@ from typing import Any
 
 #: Format version of the JSON. Bump whenever the shape below changes; the
 #: consumer (``transformers/pine_edge_gate.py``) pins it.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: What PyneCore allows on top of the IDE's profile, in the spec's own shapes.
 EXTRAS: dict[str, Any] = {
@@ -99,6 +99,7 @@ def collect(spec: Any) -> dict[str, Any]:
                          for module, names in sorted(spec.ALLOWED_FROM_MODULES.items())},
         'func_decorators': sorted(list(pair) for pair in spec.ALLOWED_FUNC_DECORATORS),
         'class_decorators': sorted(list(pair) for pair in spec.ALLOWED_CLASS_DECORATORS),
+        'enum_bases': sorted(list(pair) for pair in spec.ENUM_BASES),
         'builtin_calls': sorted(spec.ALLOWED_BUILTIN_CALLS),
         'lib_builtin_names': dict(sorted(spec.LIB_BUILTIN_NAMES.items())),
         'extras': EXTRAS,

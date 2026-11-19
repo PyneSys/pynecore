@@ -399,3 +399,45 @@ def __test_the_payload_round_trips_the_classes__(tmp_path):
     assert list(restored.classes) == ['Settings']
     assert restored.classes['Settings'] == interface.classes['Settings']
     assert restored.digest == interface.digest
+
+
+# --- a library export's signature shim is no class --------------------------
+
+
+SHIMS = '''from typing import Any, Protocol
+
+from pynecore.core.pine_export import Exported
+
+
+class Pivot:
+    price: float = 0.0
+
+
+class _ProtocolDraw(Protocol):
+    def __call__(self, this: Pivot) -> Any: ...
+
+
+class _ProtocolDraw2(Protocol):
+    def __call__(self, this: Pivot, width: int) -> Any: ...
+
+
+draw: _ProtocolDraw = Exported()
+draw: _ProtocolDraw2 = Exported()
+'''
+
+
+def __test_an_export_shim_is_not_a_class__():
+    """``class _ProtocolDraw(Protocol)`` is typing scaffolding: no value is an object of it"""
+    table = infer_module(ast.parse(SHIMS), 'test')
+
+    assert list(table.classes) == ['Pivot']
+    assert list(table.class_sigs) == [class_id('test', 'Pivot')]
+
+
+def __test_an_overloaded_export_declares_its_proxy_without_a_conflict__():
+    """One ``Exported()`` proxy per signature, all under the export's name"""
+    table = infer_module(ast.parse(SHIMS), 'test')
+
+    binding = table.binding('', 'draw')
+    assert binding is not None and binding.ty == OBJECT
+    assert not table.diags

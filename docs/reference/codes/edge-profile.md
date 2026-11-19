@@ -145,12 +145,16 @@ Pine needs.
 Message:
 
 ```text
-{detail} A class in the Pyne Edge profile is a plain `@udt` or `@dataclass` field list with methods.
+{detail} A class in the Pyne Edge profile is a `@udt` or `@dataclass` field list with methods, or an enum.
 ```
 
 A class has exactly one `@udt` or `@dataclass` decorator, no base classes or
 keywords, and a body of annotated fields and undecorated methods that take
 their receiver first.
+
+An enum is the other class form: its single base is `StrEnum` imported from
+`enum`, it takes no decorator, and its body holds `member = 'title'`
+assignments only.
 
 <a id="E0009"></a>
 

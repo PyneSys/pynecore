@@ -1,5 +1,7 @@
 //! Expressions and their qualifiers.
 
+use std::rc::Rc;
+
 use pyne_ast::walk::children;
 use pyne_ast::{Constant, Int, Kind, NodeId, Value};
 
@@ -12,9 +14,10 @@ use crate::pine_qualifier::{
 use crate::pine_type_rules::{
     BOOL, CallRule, DYN_DEFAULT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, TY_ATTR, TYPELESS,
     UNKNOWN, VOID, binop_type, builtin_name_type, class_of, compare_type, constant_type,
-    elements_of, is_array, is_map, is_matrix, is_tuple, join, lib_type_override, render_ty,
-    tuple_of, unaryop_type,
+    elements_of, is_array, is_map, is_matrix, is_tuple, join, lib_type_override, object_ty,
+    render_ty, tuple_of, unaryop_type,
 };
+use crate::pine_type_table::ClassSig;
 
 impl Engine<'_, '_> {
     /// Type one expression, stamping it and everything under it (`_expr`).
@@ -172,7 +175,8 @@ impl Engine<'_, '_> {
     /// The qualifier of an attribute read (`_attribute_qual`).
     fn attribute_qual(&mut self, node: NodeId) -> R<u8> {
         let Some(name) = self.lib_name(node) else {
-            return Ok(if self.names_class(node)?.is_some() { CONST } else { SERIES });
+            let constant = self.names_class(node)?.is_some() || self.enum_of(node)?.is_some();
+            return Ok(if constant { CONST } else { SERIES });
         };
         Ok(match data::lib_entries().get(&name) {
             Some(entry) if entry.kind == "value" => {
@@ -278,6 +282,10 @@ impl Engine<'_, '_> {
             if self.names_class(node)?.is_some() {
                 return Ok(OBJECT.to_string());
             }
+            if let Some(sig) = self.enum_of(node)? {
+                // Before the constructor case: an enum has no `new`
+                return Ok(self.enum_member(&sig, node));
+            }
             if attr == "new" && self.names_class(value)?.is_some() {
                 return Ok(OBJECT.to_string());
             }
@@ -300,6 +308,35 @@ impl Engine<'_, '_> {
             return Ok(TYPELESS.to_string());
         }
         Ok(OBJECT.to_string())
+    }
+
+    /// The enum an attribute is read on, when its base names one (`_enum_of`).
+    fn enum_of(&mut self, node: NodeId) -> R<Option<Rc<ClassSig>>> {
+        let Kind::Attribute { value, .. } = self.kind(node).clone() else { return Ok(None) };
+        let Some(spelled) = self.dotted(value) else { return Ok(None) };
+        let parts: Vec<String> = spelled.split('.').map(str::to_string).collect();
+        let Some(cid) = self.class_named(&parts, value)? else { return Ok(None) };
+        Ok(self.class_sig(&cid, node)?.filter(|sig| sig.is_enum))
+    }
+
+    /// Type a member read of an enum: a value of the enum itself (`_enum_member`).
+    fn enum_member(&mut self, sig: &ClassSig, node: NodeId) -> String {
+        let Kind::Attribute { attr, .. } = self.kind(node).clone() else {
+            return UNKNOWN.to_string();
+        };
+        if sig.fields.contains_key(&attr) {
+            return object_ty(&sig.id);
+        }
+        let name = sig.name.clone();
+        self.node_diag(
+            &pynecore_codes::TYPE_NO_FIELD,
+            &[&name, &attr],
+            node,
+            "unknown-field",
+            &format!("{name}.{attr}"),
+            &format!("read a member '{name}' declares"),
+        );
+        UNKNOWN.to_string()
     }
 
     /// Type a `obj.field` read from the receiver's class (`_field_read`).
@@ -536,6 +573,9 @@ impl Engine<'_, '_> {
             return Ok(UNKNOWN.to_string());
         };
         let base = self.expr(value)?;
+        if let Some(prefix) = self.tuple_prefix(&base, slice)? {
+            return Ok(prefix);
+        }
         self.expr(slice)?;
         if is_tuple(&base) {
             let elements = elements_of(&base);
@@ -572,6 +612,28 @@ impl Engine<'_, '_> {
             return Ok(UNKNOWN.to_string());
         }
         Ok(base)
+    }
+
+    /// Type the leading elements of a tuple, `f(...)[:2]` (`_tuple_prefix`).
+    fn tuple_prefix(&mut self, base: &str, index: NodeId) -> R<Option<String>> {
+        if !is_tuple(base) {
+            return Ok(None);
+        }
+        let Kind::Slice { lower: None, upper: Some(upper), step: None } = *self.kind(index) else {
+            return Ok(None);
+        };
+        let Kind::Constant { value: Constant::Int(Int::Small(bound)), .. } = *self.kind(upper)
+        else {
+            return Ok(None);
+        };
+        let elements = elements_of(base);
+        let Some(count) = usize::try_from(bound).ok().filter(|&count| count <= elements.len())
+        else {
+            return Ok(None);
+        };
+        self.expr(upper)?;
+        self.stamp(index, OBJECT);
+        Ok(Some(tuple_of(&elements[..count])))
     }
 
     /// Whether an expression reads a series (`_is_series`).

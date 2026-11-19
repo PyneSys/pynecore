@@ -48,6 +48,12 @@
   "disallowed_string_escapes": [
     "N"
   ],
+  "enum_bases": [
+    [
+      "enum",
+      "StrEnum"
+    ]
+  ],
   "extras": {
     "dunder_names": [
       "__all__",
@@ -78,6 +84,9 @@
     "dataclasses": [
       "dataclass",
       "field"
+    ],
+    "enum": [
+      "StrEnum"
     ],
     "typing": [
       "Any",
@@ -136,11 +145,11 @@
     "arg",
     "keyword"
   ],
-  "rules_version": "2026.11.2",
+  "rules_version": "2026.11.3",
   "unary_ops": [
     "Not",
     "UAdd",
     "USub"
   ],
-  "v": 3
+  "v": 4
 }

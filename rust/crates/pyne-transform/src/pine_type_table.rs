@@ -238,6 +238,10 @@ pub struct ClassSig {
     /// Method name -> its signature, for the methods declared in the class body,
     /// receiver first
     pub members: IndexMap<String, ExportSig>,
+    /// Whether the class is a Pine `enum` (`enum`): its fields are then its
+    /// members, each typed as an object of the class itself and read through
+    /// the class
+    pub is_enum: bool,
 }
 
 /// Everything the inference learned about one module.
@@ -395,6 +399,7 @@ impl ClassSig {
             required: json_int(value, "required")?,
             methods,
             members,
+            is_enum: value.get("enum").and_then(serde_json::Value::as_bool).unwrap_or(false),
         })
     }
 }

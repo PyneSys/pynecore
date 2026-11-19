@@ -226,6 +226,7 @@ impl<'py> Classes<'py> {
             required: int(&get("required")?)?,
             methods: dict(&get("methods")?, string, |item| self.export_sig_from(item))?,
             members: dict(&get("members")?, string, |item| self.export_sig_from(item))?,
+            is_enum: boolean(&get("enum")?)?,
         })
     }
 
@@ -439,6 +440,7 @@ impl<'py> Classes<'py> {
         kwargs.set_item("required", sig.required)?;
         kwargs.set_item("methods", self.export_sigs_to(&sig.methods)?)?;
         kwargs.set_item("members", self.export_sigs_to(&sig.members)?)?;
+        kwargs.set_item("enum", sig.is_enum)?;
         self.class_sig.call((), Some(&kwargs))
     }
 }

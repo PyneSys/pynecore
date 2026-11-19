@@ -14,8 +14,8 @@ extracts it into ``edge_rules.json`` next to this file, versioned by the
 spec's own ``EDGE_RULES_VERSION``. This module pins that version: a spec
 revision that is not re-extracted fails at import rather than gating against
 stale rules. What the data cannot express -- the structural rules: what a
-class may contain, which callee a bare name may be, where a ``lambda`` may
-stand, where a builtin-named lib read resolves, how a string literal's escapes
+class or an enum may contain, which callee a bare name may be, where a ``lambda`` may
+stand, which slice is a prefix unpack, where a builtin-named lib read resolves, how a string literal's escapes
 are read from the source text -- is code here, and mirrors the IDE's checker
 rule for rule.
 
@@ -48,7 +48,7 @@ __all__ = ['EDGE_RULES_VERSION', 'STRICT_ENV', 'DIAG_ENV', 'edge_rules', 'strict
 
 #: The profile revision this gate was written against. ``edge_rules.json``
 #: must carry the same one.
-EDGE_RULES_VERSION: Final = '2026.11.2'
+EDGE_RULES_VERSION: Final = '2026.11.3'
 
 #: ``1`` makes an edge module's first diagnostic an error, ``0`` never
 #: does; unset is ``0`` until the corpus is clean enough to flip the default.
@@ -203,6 +203,8 @@ class _Gate:
                       for module, name in rules['extras'].get('func_decorators', ()))
         self.class_decorators: frozenset[tuple[str, str]] = frozenset(
             (module, name) for module, name in rules['class_decorators'])
+        self.enum_bases: frozenset[tuple[str, str]] = frozenset(
+            (module, name) for module, name in rules['enum_bases'])
         self.builtin_calls: frozenset[str] = frozenset(rules['builtin_calls'])
         self.string_escapes: frozenset[str] = frozenset(rules['disallowed_string_escapes'])
         #: The source lines as bytes, split where the parser counts lines: the
@@ -235,6 +237,7 @@ class _Gate:
         self.module_bound_from: dict[str, tuple[int, int]] = {}
         self.allowed_lambdas: set[int] = set()
         self.allowed_lists: set[int] = set()
+        self.allowed_slices: set[int] = set()
         #: For each enclosing function, innermost last: the function, name ->
         #: index of the body statement that first binds it (-1 for a
         #: parameter), and the index of the body statement being visited. The
@@ -334,6 +337,13 @@ class _Gate:
                     and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
                             for e in stmt.value.elts):
                 self.allowed_lists.add(id(stmt.value))
+        # ``a, b = f(...)[:2]`` is the one legitimate slice: the prefix unpack
+        # of a call's tuple, which the compiler emits
+        for node in ast_walk.walk_statements(self.tree):
+            if isinstance(node, ast.Assign):
+                prefix = _prefix_unpack_slice(node)
+                if prefix is not None:
+                    self.allowed_slices.add(id(prefix))
 
     # --- the walk --------------------------------------------------------
 
@@ -345,6 +355,9 @@ class _Gate:
             # Its elements are string constants: only their escapes are left
             for element in node.elts:
                 self._check_string(element)
+            return
+        if isinstance(node, ast.Slice) and id(node) in self.allowed_slices:
+            # Its one child is the integer bound
             return
         if kind not in self.nodes and hasattr(node, 'lineno'):
             label = _NODE_LABELS.get(kind, f'`{kind}`')
@@ -391,7 +404,10 @@ class _Gate:
                         if stmt.returns is not None:
                             self._visit(stmt.returns)
                 return
-            self._check_class(node)
+            if self._is_enum(node):
+                self._check_enum(node)
+            else:
+                self._check_class(node)
             self._visit_scope(node, node.body)
             return
         elif isinstance(node, ast.Call):
@@ -534,6 +550,37 @@ class _Gate:
             self._report(node, 'edge-class', EDGE_CLASS,
                          ('A method takes its receiver as its first parameter.',),
                          'take the receiver as the first parameter')
+
+    def _is_enum(self, node: ast.ClassDef) -> bool:
+        """
+        A Pine ``enum``: a class whose single base is a string enum base of the
+        profile, under whatever name it was imported.
+        """
+        base = node.bases[0] if len(node.bases) == 1 else None
+        return isinstance(base, ast.Name) and self.from_imports.get(base.id) in self.enum_bases
+
+    def _check_enum(self, node: ast.ClassDef) -> None:
+        """
+        An enum declares its members and nothing else: each one is its title,
+        a string literal assigned to the member's name.
+        """
+        if node.keywords or node.decorator_list:
+            self._report(node, 'edge-class', EDGE_CLASS,
+                         ('An enum takes no decorator and no class keywords.',),
+                         'remove the decorator and the keywords')
+        body = node.body
+        if body and _is_docstring(body[0]):
+            body = body[1:]
+        for stmt in body:
+            if isinstance(stmt, ast.Pass):
+                continue
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)):
+                self._report(stmt, 'edge-class', EDGE_CLASS,
+                             ("An enum body can hold only `member = 'title'` assignments.",),
+                             'declare the members only')
 
     def _is_protocol_shim(self, node: ast.ClassDef) -> bool:
         """
@@ -915,6 +962,33 @@ def _scope_bound(node: ast.FunctionDef) -> dict[str, int]:
 
 def _has_special_parameters(args: ast.arguments) -> bool:
     return bool(args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg)
+
+
+def _prefix_unpack_slice(stmt: ast.Assign) -> ast.Slice | None:
+    """
+    The slice of a prefix unpack ``a, b = f(...)[:2]``, None for any other statement.
+
+    The value is a call sliced by a constant, non-negative upper bound with no
+    lower bound and no step, and the single tuple target has exactly as many
+    elements as that bound, none of them starred.
+
+    :param stmt: The assignment
+    :return: Its slice when the assignment is a prefix unpack
+    """
+    if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Tuple):
+        return None
+    targets, value = stmt.targets[0].elts, stmt.value
+    if not (isinstance(value, ast.Subscript) and isinstance(value.value, ast.Call)
+            and isinstance(value.slice, ast.Slice)):
+        return None
+    bounds = value.slice
+    upper = bounds.upper
+    if bounds.lower is not None or bounds.step is not None \
+            or not isinstance(upper, ast.Constant) or type(upper.value) is not int \
+            or upper.value != len(targets) \
+            or any(isinstance(target, ast.Starred) for target in targets):
+        return None
+    return bounds
 
 
 def _is_docstring(stmt: ast.stmt) -> bool:

@@ -4,7 +4,9 @@ use indexmap::IndexMap;
 use pyne_ast::walk::children;
 use pyne_ast::{Kind, NodeId};
 
-use super::facts::{self, enumerated, spells_persistent, spells_series, unchecked};
+use super::facts::{
+    self, enumerated, is_export_proxy, spells_persistent, spells_series, unchecked,
+};
 use super::{Engine, Frame, R};
 use crate::pine_qualifier::{CONST, SERIES};
 use crate::pine_type_rules::{
@@ -73,7 +75,7 @@ impl Engine<'_, '_> {
                     value_ty = Some(self.declared_constructor(declared, value, ty)?);
                 }
                 let mut unknown: Option<Unknown> = None;
-                if bare_wrapper(self.ast, annotation) {
+                if bare_wrapper(self.ast, annotation) || is_export_proxy(self.ast, value) {
                     declared = value_ty.clone();
                 } else if let (Some(was), Some(ty)) = (&declared, &value_ty)
                     && was != UNKNOWN

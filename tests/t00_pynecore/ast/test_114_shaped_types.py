@@ -53,6 +53,7 @@ from pynecore.transformers.pine_type_rules import (
     get_pin, get_ty, head, is_int_typed, is_shaped, join, key_of, map_of, matrix_of,
     object_ty, pin_for, render_ty, shape_mismatch, tuple_of, value_of,
 )
+from pynecore.transformers.pine_type_report import unknown_diags
 from pynecore.transformers.pine_type_table import PineTypeTable
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
@@ -2959,3 +2960,33 @@ def main():
              if isinstance(node, ast.Call) and ast.unparse(node.func) == 'init'}
     assert get_pin(calls['init(Tm(), h=1, m=2)']) is None
     assert table.diags == []
+
+
+# --- the leading elements of a tuple ---------------------------------------
+
+
+PREFIX = '''def three() -> tuple[bool, float, int]:
+    return (True, 1.5, 2)
+'''
+
+
+def __test_a_prefix_unpack_types_each_name_by_its_position__():
+    """``a, b = f()[:2]`` is Pine's ``[a, b] = f()`` over a longer tuple"""
+    types = _types(PREFIX + 'def main():\n    a, b = three()[:2]\n    return a\n', 'main')
+
+    assert types['a'] == BOOL and types['b'] == FLOAT
+
+
+def __test_a_tuple_prefix_is_a_tuple_and_reports_nothing__():
+    tree, table = _infer(PREFIX + 'def main():\n    t = three()[:2]\n    return t\n')
+
+    binding = table.binding('main', 't')
+    assert binding is not None and binding.ty == tuple_of([BOOL, FLOAT])
+    assert not unknown_diags(tree, table)
+
+
+@pytest.mark.parametrize('index', ['1:', ':4', ':-1', '::2', ':n'])
+def __test_any_other_slice_of_a_tuple_is_unknown__(index: str):
+    types = _types(PREFIX + f'def main(n: int):\n    t = three()[{index}]\n    return t\n', 'main')
+
+    assert types['t'] == UNKNOWN

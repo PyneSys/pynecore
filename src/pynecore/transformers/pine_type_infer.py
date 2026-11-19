@@ -1219,17 +1219,24 @@ class _Inference:
         :param names: Class name -> class id, for this module's own classes
         """
         methods = self._declared_methods(tree)
+        enum_bases = _imported_as(tree, 'enum', 'StrEnum')
         for name, node in own.items():
             cid = names[name]
             fields: dict[str, str] = {}
             required = 0
+            enum = len(node.bases) == 1 and isinstance(node.bases[0], ast.Name) \
+                and node.bases[0].id in enum_bases
             for stmt in node.body:
                 if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
                     fields[stmt.target.id] = annotation_type(stmt.annotation, self._classes)
                     if stmt.value is None:
                         required += 1
+                elif enum and isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+                        and isinstance(stmt.targets[0], ast.Name):
+                    # ``fast = 'Fast'``: a member, which is a value of the enum
+                    fields[stmt.targets[0].id] = object_ty(cid)
             self.table.class_sigs[cid] = ClassSig(
-                name=name, id=cid, fields=fields, required=required, methods={})
+                name=name, id=cid, fields=fields, required=required, methods={}, enum=enum)
         self._class_methods = methods
         self._class_sigs.update(self.table.class_sigs)
 
@@ -1278,12 +1285,22 @@ class _Inference:
         statement is itself a module-scope binding, so nothing else would tell
         the two apart.
 
+        A library export's signature shim (``class _ProtocolDraw(Protocol)``)
+        is not one either. It is typing scaffolding around the module-level
+        ``draw: _ProtocolDraw = Exported()`` proxy, erased at run time, and no
+        value is ever an object of it: read as a class it typed the proxy as
+        one, and an overloaded export, which is declared once per signature,
+        as several different ones.
+
         :param tree: The module being walked
         :return: Class name -> its declaration, the LAST one under that name
         """
+        protocols = _imported_as(tree, 'typing', 'Protocol')
         declared: dict[str, list[ast.ClassDef]] = {}
         for node in ast_walk.walk_statements(tree):
-            if isinstance(node, ast.ClassDef):
+            if isinstance(node, ast.ClassDef) \
+                    and not any(isinstance(base, ast.Name) and base.id in protocols
+                                for base in node.bases):
                 declared.setdefault(node.name, []).append(node)
         out: dict[str, ast.ClassDef] = {}
         for name, nodes in declared.items():
@@ -1466,11 +1483,14 @@ class _Inference:
                 if declared is not None and value_ty is not None and stmt.value is not None:
                     value_ty = self._declared_constructor(declared, stmt.value, value_ty)
                 unknown = None
-                if bare_wrapper(stmt.annotation):
+                if bare_wrapper(stmt.annotation) or _is_export_proxy(stmt.value):
                     # ``x: Series = expr`` and ``var x = expr``: the wrapper says
                     # how the variable lives, the VALUE says what it holds. A
                     # bare declaration without a value binds nothing yet -- the
-                    # assignment that follows is what gives the name its type
+                    # assignment that follows is what gives the name its type.
+                    # ``draw: _ProtocolDraw = Exported()`` is the proxy of a
+                    # library export: its annotation is a signature shim, which
+                    # is no type, and an overloaded export has one per signature
                     declared = value_ty
                 elif declared != UNKNOWN and value_ty is not None \
                         and value_ty not in _UNCHECKED and not _fits(declared, value_ty):
@@ -2495,8 +2515,9 @@ class _Inference:
         name = self._lib_name(node)
         if name is None:
             # A field of an object changes with the object; a class named through
-            # its module is a constant
-            return CONST if self._names_class(node) is not None else SERIES
+            # its module is a constant, and so is a member of an enum
+            return CONST if self._names_class(node) is not None \
+                or self._enum_of(node) is not None else SERIES
         entry = lib_types().get(name)
         if entry is not None and entry['kind'] == 'value':
             return lib_value_qualifier(name, entry['ty'])
@@ -2620,6 +2641,11 @@ class _Inference:
                 # A class named through its module, ``zigzag.Pivot`` in a
                 # ``na(zigzag.Pivot)``: the class object, as a bare class name
                 return OBJECT
+            enum = self._enum_of(node)
+            if enum is not None:
+                # Before the constructor case: an enum has no ``new``, so
+                # ``chrono.Zone.new`` is a member read, declared or not
+                return self._enum_member(enum, node)
             if node.attr == 'new' and self._names_class(node.value) is not None:
                 # ``zigzag.Settings.new``: the constructor Pine spells on a
                 # type, a callable reference; what it builds is the call's
@@ -2643,6 +2669,45 @@ class _Inference:
             return TYPELESS
         # A bare reference to a lib function is the function itself
         return OBJECT
+
+    def _enum_of(self, node: ast.Attribute) -> ClassSig | None:
+        """
+        The enum an attribute is read on, when its base NAMES one.
+
+        ``Speed.fast`` and ``chart.Speed.fast`` read a member through the class,
+        own or imported; a value of the enum is an object like any other and is
+        not this case.
+
+        :param node: The attribute node
+        :return: The enum's signature, or None when the base names no enum
+        """
+        spelled = dotted_name(node.value)
+        if spelled is None:
+            return None
+        cid = self._class_named(tuple(spelled.split('.')), node.value)
+        if cid is None:
+            return None
+        sig = self._class_sig(cid, node)
+        return sig if sig is not None and sig.enum else None
+
+    def _enum_member(self, sig: ClassSig, node: ast.Attribute) -> str:
+        """
+        Type a member read of an enum: a value of the enum itself.
+
+        Pine's enum is a type of its own, so a member is an object of the
+        enum's class and nothing a string operation takes.
+
+        :param sig: The enum's signature
+        :param node: The attribute node
+        :return: The enum's object type, or UNKNOWN for a member it does not declare
+        """
+        if node.attr in sig.fields:
+            return object_ty(sig.id)
+        self._node_diag(
+            TYPE_NO_FIELD, (sig.name, node.attr), node,
+            'unknown-field', f'{sig.name}.{node.attr}',
+            fix=f"read a member '{sig.name}' declares")
+        return UNKNOWN
 
     def _field_read(self, base: str, node: ast.Attribute) -> str:
         """
@@ -2900,6 +2965,9 @@ class _Inference:
 
     def _e_subscript(self, node: ast.Subscript) -> str:
         base = self._expr(node.value)
+        prefix = self._tuple_prefix(base, node.slice)
+        if prefix is not None:
+            return prefix
         self._expr(node.slice)
         if is_tuple(base):
             # A tuple has no history: the index picks a POSITION, and only a
@@ -2931,6 +2999,34 @@ class _Inference:
         # MEASURED: ``d[1]`` on an int-typed ``d`` is int -- the history index
         # is type-preserving, it reads the same series one bar back
         return base
+
+    def _tuple_prefix(self, base: str, index: ast.expr) -> str | None:
+        """
+        Type the leading elements of a tuple, ``f(...)[:2]``.
+
+        It is what Pine's ``[a, b] = f()`` compiles to where ``f`` returns more
+        values than the names it is unpacked into: the tuple of the first ``n``
+        positions, each with its own type. Only a constant bound within the
+        tuple is known before the program runs.
+
+        :param base: The type of the subscripted value
+        :param index: The subscript's index expression
+        :return: The prefix tuple's type, or None when the read is not one
+        """
+        if not is_tuple(base) or not isinstance(index, ast.Slice) \
+                or index.lower is not None or index.step is not None:
+            return None
+        upper = index.upper
+        if not isinstance(upper, ast.Constant) or type(upper.value) is not int:
+            return None
+        elements = elements_of(base)
+        if not 0 <= upper.value <= len(elements):
+            return None
+        self._expr(upper)
+        # The slice itself is no value: it is known for what it is, like a
+        # tuple target, whatever an earlier walk without the callee's type left
+        self._stamp(index, OBJECT)
+        return tuple_of(elements[:upper.value])
 
     def _is_series(self, node: ast.expr) -> bool:
         """
@@ -6602,6 +6698,25 @@ def _is_overload(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return False
 
 
+def _imported_as(tree: ast.Module, module: str, name: str) -> set[str]:
+    """
+    The names a module's statements bind to one name of a module outside PyneCore.
+
+    A class statement spells its base by the name the import binds: PyneComp
+    writes a Pine enum's as ``from enum import StrEnum as Enum``, an export
+    shim's as ``from typing import Protocol``.
+
+    :param tree: The module being walked
+    :param module: The module imported from
+    :param name: The name imported from it
+    :return: Every name bound to it
+    """
+    return {alias.asname or alias.name
+            for node in ast_walk.walk_statements(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == module and not node.level
+            for alias in node.names if alias.name == name}
+
+
 def _is_method(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """
     Whether a definition is a Pine method.
@@ -6708,6 +6823,12 @@ def _spells_persistent(annotation: ast.expr | None) -> bool:
     return any((isinstance(sub, ast.Name) and sub.id in _PERSISTENT_HEADS)
                or (isinstance(sub, ast.Attribute) and sub.attr in _PERSISTENT_HEADS)
                for sub in ast_walk.walk(annotation))
+
+
+def _is_export_proxy(value: ast.expr | None) -> bool:
+    """Whether a value is ``Exported()``, the module-level proxy of a library export."""
+    return isinstance(value, ast.Call) and not value.args and not value.keywords \
+        and dotted_name(value.func) == 'Exported'
 
 
 def _spells_series(annotation: ast.expr | None) -> bool:

@@ -369,6 +369,17 @@ pub fn spells_persistent(ast: &Ast, annotation: Option<NodeId>) -> bool {
     spells(ast, annotation, PERSISTENT_HEADS)
 }
 
+/// Whether a value is `Exported()`, the module-level proxy of a library export
+/// (`_is_export_proxy`).
+pub fn is_export_proxy(ast: &Ast, value: Option<NodeId>) -> bool {
+    let Some((func, args, keywords)) = value.and_then(|value| call_parts(ast, value)) else {
+        return false;
+    };
+    args.is_empty()
+        && keywords.is_empty()
+        && crate::pine_type_rules::dotted(ast, func).as_deref() == Some("Exported")
+}
+
 /// Whether an annotation wraps its type in a series head (`_spells_series`).
 pub fn spells_series(ast: &Ast, annotation: Option<NodeId>) -> bool {
     spells(ast, annotation, SERIES_HEADS)

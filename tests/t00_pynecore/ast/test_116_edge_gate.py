@@ -251,6 +251,69 @@ def __test_a_class_is_a_field_list__():
     assert diags[0].code == 'E0008' and 'annotated fields and methods' in diags[0].message
 
 
+@pytest.mark.parametrize('snippet', [
+    'def f():\n    return (1, 2, 3)\na, b = f()[:2]\n',
+    'def f(x):\n    return (x, x, x)\ndef main():\n    a, b = f(1)[:2]\n    return a + b\n',
+])
+def __test_a_prefix_unpack_is_the_one_slice__(snippet: str):
+    """``a, b = f(...)[:2]``: Pine's ``[a, b] = f()`` over a longer tuple"""
+    assert not _gate(HEAD + snippet)
+
+
+@pytest.mark.parametrize('snippet', [
+    # The bound is the number of targets, a constant, with nothing before it
+    'def f():\n    return (1, 2, 3)\na, b = f()[:3]\n',
+    'def f():\n    return (1, 2, 3)\na, b = f()[1:3]\n',
+    'def f():\n    return (1, 2, 3)\na, b = f()[:2:1]\n',
+    'def f():\n    return (1, 2, 3)\nn = 2\na, b = f()[:n]\n',
+    # The value is a call, and the targets are plain
+    't = (1, 2, 3)\na, b = t[:2]\n',
+    'def f():\n    return (1, 2, 3)\nt = f()[:2]\n',
+])
+def __test_any_other_slice_is_reported__(snippet: str):
+    diags = _gate(HEAD + snippet)
+    assert [diag.code for diag in diags] == ['E0001'], [diag.message for diag in diags]
+    assert diags[0].message == 'A slice is not allowed in the Pyne Edge profile.'
+
+
+ENUM_HEAD = HEAD + 'from enum import StrEnum as Enum\n'
+
+
+@pytest.mark.parametrize('snippet', [
+    "class Speed(Enum):\n    fast = 'Fast'\n    slow = 'Slow'\n",
+    'class Speed(Enum):\n    """How fast"""\n    fast = \'Fast\'\n',
+    'class Speed(Enum):\n    pass\n',
+    "class Speed(Enum):\n    fast = 'Fast'\nx = Speed.fast\ny = x == Speed.fast\n",
+])
+def __test_a_pine_enum_is_let_through__(snippet: str):
+    """Pine's ``enum``: a string enum base over ``member = 'title'`` assignments"""
+    assert not _gate(ENUM_HEAD + snippet)
+    assert not _gate(HEAD + 'from enum import StrEnum\n' + snippet.replace('(Enum)', '(StrEnum)'))
+
+
+@pytest.mark.parametrize('snippet, fragment', [
+    ('class Speed(Enum):\n    fast = 1\n', 'An enum body'),
+    ("class Speed(Enum):\n    fast: str = 'Fast'\n", 'An enum body'),
+    ("class Speed(Enum):\n    fast = slow = 'Fast'\n", 'An enum body'),
+    ('class Speed(Enum):\n    def m(self):\n        return 1\n', 'An enum body'),
+    ("@udt\nclass Speed(Enum):\n    fast = 'Fast'\n", 'An enum takes no decorator'),
+    ("class Speed(Enum, metaclass=type):\n    fast = 'Fast'\n", 'An enum takes no decorator'),
+])
+def __test_an_enum_declares_its_members_only__(snippet: str, fragment: str):
+    diags = _gate(ENUM_HEAD + snippet)
+    assert [diag.code for diag in diags] == ['E0008'], [diag.message for diag in diags]
+    assert fragment in diags[0].message
+
+
+def __test_only_the_string_enum_is_an_enum_base__():
+    """Another ``enum`` base is neither importable nor an enum: the class is judged as a class"""
+    diags = _gate(HEAD + 'from enum import IntEnum\nclass Speed(IntEnum):\n    fast = 1\n')
+    assert diags[0].code == 'E0006' and '`enum.IntEnum`' in diags[0].message
+    assert any(diag.code == 'E0008' and 'base classes' in diag.message for diag in diags)
+    diags = _gate(ENUM_HEAD + "class Speed(Enum, object):\n    fast = 'Fast'\n")
+    assert any(diag.code == 'E0008' and 'base classes' in diag.message for diag in diags)
+
+
 def __test_a_class_body_declares_plain_methods__():
     """
     A method in the class body is Pine's ``method m(Type this)``: undecorated,

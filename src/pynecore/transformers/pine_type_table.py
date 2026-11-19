@@ -289,6 +289,10 @@ class ClassSig:
     #: before any search for an exported method of that name; the receiver
     #: is the first parameter, like a Pine method's
     members: dict[str, ExportSig] = field(default_factory=dict)
+    #: Whether the class is a Pine ``enum``. Its ``fields`` are then its
+    #: members, each typed as an object of the class itself and read through
+    #: the class (``Speed.fast``), never through a value of it
+    enum: bool = False
 
 
 @dataclass(slots=True, frozen=True)

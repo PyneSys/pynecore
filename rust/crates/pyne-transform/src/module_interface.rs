@@ -391,6 +391,7 @@ pub fn interface_digest(interface: &Interface) -> String {
                     "required": sig.required,
                     "methods": exports_of(&sig.methods),
                     "members": exports_of(&sig.members),
+                    "enum": sig.is_enum,
                 }),
             )
         })

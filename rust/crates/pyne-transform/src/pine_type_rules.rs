@@ -863,7 +863,8 @@ pub const LIB_TYPE_OVERRIDES: &[(&str, CallRule)] = &[
     ("input.source", Is(FLOAT)),
     ("input.price", Is(FLOAT)),
     ("input.time", Is(INT)),
-    ("input.enum", Is(OBJECT)),
+    // An enum input holds a member of its default's enum
+    ("input.enum", Is("arg0")),
     // --- the containers
     ("array.get", Is("elem0")),
     ("array.first", Is("elem0")),
@@ -955,8 +956,16 @@ pub fn builtin_name_type(name: &str) -> Option<&'static str> {
 }
 
 /// Declared parameter order of the lib names whose module has no registry entry.
-pub const OVERRIDE_PARAM_NAMES: &[(&str, &[&str])] =
-    &[("input", &["defval", "title", "tooltip", "inline", "group", "display", "active"])];
+pub const OVERRIDE_PARAM_NAMES: &[(&str, &[&str])] = &[
+    ("input", &["defval", "title", "tooltip", "inline", "group", "display", "active"]),
+    (
+        "input.enum",
+        &[
+            "defval", "title", "options", "tooltip", "inline", "group", "confirm", "display",
+            "active",
+        ],
+    ),
+];
 
 /// The declared parameter order of an override name (`OVERRIDE_PARAM_NAMES.get(name)`).
 pub fn override_param_names(name: &str) -> Option<&'static [&'static str]> {

@@ -75,7 +75,7 @@ pub static EDGE_CLASS: super::Code = super::Code {
     code: "E0008",
     severity: super::Severity::Error,
     title: "Class outside the Edge profile",
-    message: "{detail} A class in the Pyne Edge profile is a plain `@udt` or `@dataclass` field list with methods.",
+    message: "{detail} A class in the Pyne Edge profile is a `@udt` or `@dataclass` field list with methods, or an enum.",
     params: &["detail"],
     fix: None,
 };

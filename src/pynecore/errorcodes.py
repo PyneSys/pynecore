@@ -70,8 +70,8 @@ EDGE_CLASS = Code(
     'E0008',
     'error',
     'Class outside the Edge profile',
-    '{detail} A class in the Pyne Edge profile is a plain `@udt` or `@dataclass` field list with '
-    'methods.',
+    '{detail} A class in the Pyne Edge profile is a `@udt` or `@dataclass` field list with '
+    'methods, or an enum.',
     ('detail',),
 )
 EDGE_CALL = Code(

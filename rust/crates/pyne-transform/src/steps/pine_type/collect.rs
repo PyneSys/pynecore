@@ -2,7 +2,7 @@
 //! module's imports and classes, every definition with its annotated signature,
 //! and, once every body is walked, the methods the classes publish.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -14,7 +14,7 @@ use super::facts::{self, arg_parts, args_of, every_param, is_method, is_overload
 use super::{Engine, Import, R, Shadowed};
 use crate::data;
 use crate::pine_type_rules::{
-    UNKNOWN, builtin_class_id, class_id, class_of, impl_sig, overload_result,
+    UNKNOWN, builtin_class_id, class_id, class_of, impl_sig, object_ty, overload_result,
 };
 use crate::pine_type_table::{ClassSig, ExportSig, FuncSig, qualify};
 
@@ -36,6 +36,7 @@ pub(super) fn lib_classes() -> &'static IndexMap<String, ClassSig> {
                     required: 0,
                     methods: IndexMap::new(),
                     members: IndexMap::new(),
+                    is_enum: false,
                 };
                 (cid, sig)
             })
@@ -209,10 +210,17 @@ impl Engine<'_, '_> {
         names: &IndexMap<String, String>,
     ) -> R<()> {
         let methods = self.declared_methods(tree)?;
+        let enum_bases = self.imported_as(tree, "enum", "StrEnum");
         for (name, &node) in own {
             let cid = names[name].clone();
             let mut fields: IndexMap<String, String> = IndexMap::new();
             let mut required = 0;
+            let is_enum = match self.kind(node) {
+                Kind::ClassDef { bases, .. } if bases.len() == 1 => {
+                    matches!(self.kind(bases[0]), Kind::Name { id, .. } if enum_bases.contains(id))
+                }
+                _ => false,
+            };
             for &stmt in facts::def_body(self.ast, node) {
                 if let Kind::AnnAssign { target, annotation, value, .. } = self.kind(stmt)
                     && let Kind::Name { id, .. } = self.kind(*target)
@@ -222,6 +230,13 @@ impl Engine<'_, '_> {
                     if value.is_none() {
                         required += 1;
                     }
+                } else if is_enum
+                    && let Kind::Assign { targets, .. } = self.kind(stmt)
+                    && targets.len() == 1
+                    && let Kind::Name { id, .. } = self.kind(targets[0])
+                {
+                    // `fast = 'Fast'`: a member, which is a value of the enum
+                    fields.insert(id.clone(), object_ty(&cid));
                 }
             }
             let sig = ClassSig {
@@ -231,6 +246,7 @@ impl Engine<'_, '_> {
                 required,
                 methods: IndexMap::new(),
                 members: IndexMap::new(),
+                is_enum,
             };
             self.class_sigs_table.insert(cid, sig);
         }
@@ -239,6 +255,29 @@ impl Engine<'_, '_> {
             self.class_sigs.insert(cid.clone(), Rc::new(sig.clone()));
         }
         Ok(())
+    }
+
+    /// The names a module's statements bind to one name of a module outside
+    /// PyneCore (`_imported_as`).
+    fn imported_as(&self, tree: NodeId, wanted_module: &str, wanted: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for node in walk_statements(self.ast, tree) {
+            let Kind::ImportFrom { module: Some(module), names, level, .. } = self.kind(node)
+            else {
+                continue;
+            };
+            if module != wanted_module || level.unwrap_or(0) != 0 {
+                continue;
+            }
+            for &alias in names {
+                if let Kind::Alias { name, asname } = self.kind(alias)
+                    && name == wanted
+                {
+                    out.insert(asname.clone().unwrap_or_else(|| name.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// The Pine methods this module declares, by the class they attach to
@@ -263,9 +302,15 @@ impl Engine<'_, '_> {
 
     /// The classes this module declares and still holds, by name (`_own_class_nodes`).
     fn own_class_nodes(&self, tree: NodeId) -> IndexMap<String, NodeId> {
+        // A library export's signature shim is typing scaffolding, no class
+        let protocols = self.imported_as(tree, "typing", "Protocol");
         let mut declared: IndexMap<String, Vec<NodeId>> = IndexMap::new();
         for node in walk_statements(self.ast, tree) {
-            if let Kind::ClassDef { name, .. } = self.kind(node) {
+            if let Kind::ClassDef { name, bases, .. } = self.kind(node)
+                && !bases.iter().any(
+                    |&base| matches!(self.kind(base), Kind::Name { id, .. } if protocols.contains(id)),
+                )
+            {
                 declared.entry(name.clone()).or_default().push(node);
             }
         }

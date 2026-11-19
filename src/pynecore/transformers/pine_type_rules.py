@@ -2158,7 +2158,8 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'input.source': FLOAT,
     'input.price': FLOAT,
     'input.time': INT,
-    'input.enum': OBJECT,
+    # An enum input holds a member of its default's enum
+    'input.enum': 'arg0',
 
     # --- the containers ---------------------------------------------------
     # MEASURED (FX:EURUSD@60, probes ``shape_probe1``/``3``/``4``/``5``, an
@@ -2261,4 +2262,7 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
 OVERRIDE_PARAM_NAMES: Final[dict[str, list[str]]] = {
     # ``core/script.py::_Input.__call__``
     'input': ['defval', 'title', 'tooltip', 'inline', 'group', 'display', 'active'],
+    # ``core/script.py::_Input.enum``
+    'input.enum': ['defval', 'title', 'options', 'tooltip', 'inline', 'group', 'confirm',
+                   'display', 'active'],
 }
