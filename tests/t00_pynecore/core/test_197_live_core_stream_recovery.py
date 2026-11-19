@@ -937,3 +937,65 @@ def __test_a_history_bar_asked_before_the_publish_lag_is_asked_again__():
     finally:
         revise.cancel()
         consumer.close()
+
+
+def __test_a_bar_revised_after_it_was_handed_on_is_reported__(caplog, monkeypatch):
+    """On a venue that revises a fresh bar, a change after the publish lag is reported
+
+    The bar asked once the lag is over goes to the script. The history is asked for
+    it one more time later: the venue changed the bar in between, so the log names
+    the bar and the changed values, and the stream does not hand the bar on again.
+    """
+    lag = 0.4
+    monkeypatch.setattr(live_runner, "_REVISION_CHECK_S", 1.4)
+    last = _now_ms() - 2 * _TF_MS + 300
+    s1 = last + _TF_MS
+    venue = _Venue([[_bar(last)]], publish_lag=lag, revises=True)
+    venue.set_history([_bar(s1, 155.0, volume=12.0)])
+    reported = threading.Event()
+
+    class _Reported(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "revised by the venue" in record.getMessage():
+                reported.set()
+
+    watcher = _Reported()
+    core_logger = logging.getLogger("pyne_core_logger")
+    core_logger.addHandler(watcher)
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        consumer = _Consumer(venue)
+        try:
+            assert consumer.wait_for(lambda: len(consumer.closed) >= 2, timeout=10.0)
+            assert consumer.closed[1].close == 155.0
+            venue.set_history([_bar(s1, 157.0, volume=12.0)])
+            assert venue.wait_for(
+                lambda: any(asked >= (s1 + _TF_MS) / 1000.0 + 1.35
+                            for asked, _ in venue.history_calls), timeout=10.0)
+            assert reported.wait(5.0), "the revision was not reported"
+            assert consumer.stamps() == [last, s1]
+        finally:
+            consumer.close()
+            core_logger.removeHandler(watcher)
+    assert f"bar ts={s1} revised by the venue after the script processed it" in caplog.text
+    assert "close 155.0 -> 157.0" in caplog.text
+    assert "volume" not in caplog.text.split("revised by the venue")[1].split("\n")[0]
+
+
+def __test_a_bar_the_venue_left_unchanged_is_not_reported__(caplog, monkeypatch):
+    """The later look at a bar says nothing when the venue's bar is still the one handed on"""
+    lag = 0.4
+    monkeypatch.setattr(live_runner, "_REVISION_CHECK_S", 1.4)
+    last = _now_ms() - 2 * _TF_MS + 300
+    s1 = last + _TF_MS
+    venue = _Venue([[_bar(last)]], publish_lag=lag, revises=True)
+    venue.set_history([_bar(s1, 155.0, volume=12.0)])
+    with caplog.at_level(logging.INFO, logger="pyne_core_logger"):
+        consumer = _Consumer(venue)
+        try:
+            assert consumer.wait_for(lambda: len(consumer.closed) >= 2, timeout=10.0)
+            assert venue.wait_for(
+                lambda: any(asked >= (s1 + _TF_MS) / 1000.0 + 1.35
+                            for asked, _ in venue.history_calls), timeout=10.0)
+        finally:
+            consumer.close()
+    assert "revised by the venue" not in caplog.text

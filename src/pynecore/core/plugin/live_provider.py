@@ -201,7 +201,10 @@ class LiveProviderPlugin(ProviderPlugin[LiveProviderConfigT], metaclass=ABCMeta)
     ``True`` for a venue whose history answers with a slot right at its close and
     revises the bar's values afterwards, within :attr:`history_publish_lag`. The
     framework then takes no bar from an answer asked earlier than the lag past the
-    bar's close: it asks again once the lag is over. ``False`` (the default): a bar
+    bar's close: it asks again once the lag is over. A bar taken this way is asked
+    for one more time, 30 seconds after its close (twice the lag when that is
+    longer), and a bar the venue changed after the script processed it is reported
+    in the log; the script's values are not recomputed. ``False`` (the default): a bar
     the history returns is final whenever it is asked, so a later slot's bar can also
     prove an earlier one empty before the lag ends.
     """

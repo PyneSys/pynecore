@@ -620,6 +620,12 @@ _MISSED_CLOSE_PROBES = 3
 # dead and is reconnected.
 _STALE_HISTORY_CLOSES = 2
 
+# Seconds after a bar's close at which a bar taken from a revising history
+# (:attr:`LiveProviderPlugin.history_revises_before_lag`) is asked for once more,
+# to report a revision that came after the script processed the bar. At least
+# twice the provider's publish lag.
+_REVISION_CHECK_S = 30.0
+
 
 def _backoff_delay(provider: LiveProviderPlugin, attempt: int) -> float:
     """The provider's reconnect backoff before retry ``attempt``.
@@ -1128,6 +1134,7 @@ def live_ohlcv_generator(
     publish_lag_ms = float(getattr(provider, "history_publish_lag", 10.0)) * 1000.0
     stream_closes_final = bool(getattr(provider, "stream_closes_match_history", True))
     history_revises = bool(getattr(provider, "history_revises_before_lag", False))
+    revision_check_ms = max(_REVISION_CHECK_S * 1000.0, 2.0 * publish_lag_ms)
 
     # Feed-liveness watchdog threshold: how long ``watch_ohlcv`` may stay
     # silent during an open session before the feed is declared dead and a
@@ -1358,6 +1365,8 @@ def live_ohlcv_generator(
         # then never be spliced in. Replayed in order once the slot is settled.
         # Closed bars are all kept, a forming slot only by its newest update.
         held_updates: list[OHLCV] = []
+        # Pending late-revision checks of bars taken from a revising history
+        revision_checks: set[asyncio.Task] = set()
 
         async def _stop_within(seconds: float) -> bool:
             """Wait up to ``seconds`` for a shutdown request.
@@ -1570,6 +1579,52 @@ def live_ohlcv_generator(
 
             history_query = getattr(provider, "backfill_closed_bars", None)
 
+            async def _report_late_revision(
+                    emitted: OHLCV,
+                    query: Callable[[str, str, int], Coroutine[Any, Any, list[OHLCV]]],
+            ) -> None:
+                """Ask the history for ``emitted`` once more and report a changed bar.
+
+                Runs beside the stream: the script has processed ``emitted`` and
+                nothing is corrected, the line only tells the operator that the
+                venue's final bar is not the one the script computed with. A
+                failed query or a bar the answer lacks is not reported.
+
+                :param emitted: The closed bar handed on from the history.
+                :param query: The provider's history query.
+                """
+                due_ms = _slot_close(emitted.timestamp) + revision_check_ms
+                if await _stop_within(max(0.0, due_ms / 1000.0 - time.time())):
+                    return
+                try:
+                    answer = await query(
+                        watch_symbol, timeframe,
+                        previous_open_ms(emitted.timestamp, timeframe))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("late-revision check of ts=%d failed: %s",
+                                 emitted.timestamp, exc)
+                    return
+                final = next((history_bar for history_bar in answer
+                              if history_bar.is_closed
+                              and history_bar.timestamp == emitted.timestamp), None)
+                if final is None:
+                    return
+                changed = [
+                    f"{name} {was} -> {now}" for name, was, now in (
+                        ("open", emitted.open, final.open),
+                        ("high", emitted.high, final.high),
+                        ("low", emitted.low, final.low),
+                        ("close", emitted.close, final.close),
+                        ("volume", emitted.volume, final.volume),
+                    ) if was != now]
+                if changed:
+                    # broker_info: an operator must see every bar the script
+                    # computed with that is not the venue's final one
+                    broker_info(
+                        "bar ts=%d revised by the venue after the script processed "
+                        "it: %s — the script's values stay as computed",
+                        emitted.timestamp, ", ".join(changed))
+
             def _splice_closed(bars: list[OHLCV], since_ms: int,
                                asked_ms: float) -> list[OHLCV]:
                 """Hand on the closed history bars the stream has not, in order.
@@ -1617,6 +1672,14 @@ def live_ohlcv_generator(
                         last_forming_bar = None
                     bar_queue.put(history_bar)
                     accepted.append(history_bar)
+                    # A bar old enough is final: only a fresh one is checked again
+                    if (history_revises and history_query is not None
+                            and _slot_close(history_bar.timestamp) + revision_check_ms
+                            > asked_ms):
+                        check = asyncio.ensure_future(
+                            _report_late_revision(history_bar, history_query))
+                        revision_checks.add(check)
+                        check.add_done_callback(revision_checks.discard)
                 return accepted
 
             def _history_floor(since_ms: int | None) -> int | None:
@@ -2667,6 +2730,16 @@ def live_ohlcv_generator(
         finally:
             if backfill is not None:
                 backfill.detach()
+            pending_checks = list(revision_checks)
+            for pending_check in pending_checks:
+                pending_check.cancel()
+            if pending_checks:
+                # Bounded: a history query that swallows its cancellation must
+                # not hold the teardown
+                _, unfinished = await asyncio.wait(
+                    pending_checks, timeout=_HOOK_CANCEL_GRACE_S)
+                for pending_check in unfinished:
+                    pending_check.add_done_callback(_discard_task_outcome)
             if engine_task is not None and not engine_task.done():
                 engine_task.cancel()
                 try:
