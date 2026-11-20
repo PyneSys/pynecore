@@ -7565,6 +7565,11 @@ class OrderSyncEngine:
         anyway, with an ERROR and a :class:`ProtectionRearmedUnverifiedEvent`:
         a position left without its stop is the larger risk.
 
+        An exit whose parent has an exit-leg fill still queued is not judged
+        on that pass (:meth:`_exits_with_queued_fills`): the stop or its
+        sibling filled after the drain, so the leg is gone from the venue
+        while the book still holds the parent it is closing.
+
         Position-attached brackets (NATIVE ``tp_sl_bracket``) never show up
         in ``get_open_orders``, so the pass is inert there. The same holds
         per exit for a bracket attached as a position attribute through the
@@ -7773,6 +7778,10 @@ class OrderSyncEngine:
                     and not any(leg.stop_price is not None
                                 for leg in legs_by_exit.get(key, []))):
                 unprotected.append((key, intent))
+        if unprotected:
+            settling_exits = self._exits_with_queued_fills(unprotected)
+            unprotected = [(key, intent) for key, intent in unprotected
+                           if key not in settling_exits]
         if held_abs <= 0.0 or not unprotected:
             self._stop_fate_pending_since.clear()
             return
@@ -7916,6 +7925,30 @@ class OrderSyncEngine:
                 continue
             pending.setdefault(key, []).append(row.client_order_id)
         return pending
+
+    def _exits_with_queued_fills(self, exits: list[tuple[str, ExitIntent]]) -> set[str]:
+        """Return the exits whose parent has an exit-leg fill queued but not booked.
+
+        :meth:`reconcile` drains the event queue before it reads the venue, so
+        a leg that fills while those reads run is already gone from the open
+        orders while its fill still waits in the queue, unbooked, and the
+        book holds the parent as before. The plugin may have closed the leg's
+        journal row on that fill too, so the absence looks explained.
+        Measured live (bybit-inverse cycle 398): the position read still
+        showed the parent, the SL filled, the open-orders read no longer
+        listed it, and the exit was reported without a stop while its stop
+        was closing the parent. A fill of the exit's own legs, or of any
+        exit leg of the same parent, settles the absence once it is booked,
+        so the next pass judges the booked state.
+        """
+        with self._event_queue.mutex:
+            queued: list[OrderEvent | _NativeCancelAllExpected] = list(self._event_queue.queue)
+        parents: set[str] = set()
+        for event in queued:
+            if (isinstance(event, OrderEvent) and (event.fill_qty or 0.0) > 0.0
+                    and event.from_entry is not None):
+                parents.add(event.from_entry)
+        return {key for key, intent in exits if intent.from_entry in parents}
 
     def _cancel_owned_venue_order(
             self, order: ExchangeOrder, coid: str | None, event_kind: str,

@@ -7975,6 +7975,120 @@ def __test_stop_rearm_after_a_delayed_cancel_mints_fresh_ids__(tmp_path):
         assert len(engine.order_mapping[l3_key]) == 2
 
 
+def __test_a_stop_filling_during_the_reconcile_reads_is_not_a_missing_stop__(tmp_path, caplog):
+    """An SL fill that lands after the drain does not read as a missing stop.
+
+    Measured live (bybit-inverse cycle 398, L-X): ``reconcile`` drained the
+    queue, the position read still showed the parent, then the SL filled
+    and the venue cancelled its TP sibling (reduce-only). The open-orders
+    read listed neither leg, the plugin had closed the SL's journal row on
+    the fill, and the fill waited unbooked in the queue — so the stop pass
+    reported the closing parent as unprotected. The next pass books the
+    fill and finds nothing to judge. Here the stop of the oldest parent
+    fills, the trade the FIFO booking closes.
+    """
+    store, ctx = _stop_coverage_store(tmp_path)
+    with store:
+        b = MockBroker(two_leg_exits=True)
+        engine, pos = _spot_like_pyramid(b, store_ctx=ctx)
+        template = b._mk_order(b.exit_calls[0], 't')
+        l2_key, l3_key = f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3"
+        l2_tp, l2_sl = engine.order_mapping[l2_key]
+        l3_tp, l3_sl = engine.order_mapping[l3_key]
+        l3_legs = [
+            _resting_leg(replace(template, id=l3_tp, side="sell"), qty=0.009995, price=2492.0),
+            _resting_leg(replace(template, id=l3_sl, side="sell"), qty=0.009995, stop=2488.5),
+        ]
+        b.position = ExchangePosition(
+            symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+            unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cash",
+        )
+        sl_fill = replace(
+            _fill_event('sell', 0.009995, 2488.5, pine_id="L2-X", leg=LegType.STOP_LOSS,
+                        xchg_id=l2_sl, fill_id="sl-l2-fill"),
+            from_entry="L2",
+        )
+        tp_cancel = replace(
+            _fill_event('sell', 0.009995, 2492.0, pine_id="L2-X", leg=LegType.TAKE_PROFIT,
+                        xchg_id=l2_tp, event_type='cancelled', filled_qty=0.0),
+            from_entry="L2", fill_qty=None, fill_price=None,
+            cancel_reason='venue_reduce_only',
+        )
+        ctx.upsert_order(
+            "sl-L2", symbol=SYMBOL, side="sell", qty=0.009995, state="confirmed",
+            intent_key=l2_key, exchange_order_id=l2_sl, from_entry="L2",
+            pine_entry_id="L2-X", extras={},
+        )
+
+        async def _sl_fills_between_the_reads(symbol=None):
+            # The venue fills the SL after the position read: the plugin closes
+            # the leg's journal row on the fill, the push lands in the queue,
+            # and the open orders no longer list L2's legs.
+            ctx.close_order("sl-L2")
+            engine.on_order_event(tp_cancel)
+            engine.on_order_event(sl_fill)
+            return list(l3_legs)
+
+        b.get_open_orders = _sl_fills_between_the_reads  # type: ignore[method-assign]
+        n_cancels = len(b.cancel_calls)
+        with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+            engine.reconcile()
+        assert not [r for r in caplog.records if "stop-coverage" in r.getMessage()]
+        assert len(b.cancel_calls) == n_cancels
+
+        async def _settled_orders(symbol=None):
+            return list(l3_legs)
+
+        b.get_open_orders = _settled_orders  # type: ignore[method-assign]
+        b.position = replace(b.position, size=0.009995)
+        with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+            engine.reconcile()
+            engine.reconcile()
+        assert pos.size == pytest.approx(0.009995)
+        assert l2_key not in engine.active_intents
+        assert l3_key in engine.active_intents
+        assert not [r for r in caplog.records if "stop-coverage" in r.getMessage()]
+
+
+def __test_a_queued_cancel_of_the_stop_does_not_hide_its_absence__(caplog):
+    """Only a queued fill settles a missing stop; a queued cancel push does not.
+
+    The stop vanished and its cancel push landed after the drain: nothing
+    of the parent filled, so the parent is still open without its stop and
+    the pass reports it as usual.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, _pos = _spot_like_pyramid(b)
+    template = b._mk_order(b.exit_calls[0], 't')
+    l2_key, l3_key = f"L2-X{chr(0)}L2", f"L3-X{chr(0)}L3"
+    l2_tp, l2_sl = engine.order_mapping[l2_key]
+    l3_tp, l3_sl = engine.order_mapping[l3_key]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=0.01999, entry_price=2489.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="cash",
+    )
+    sl_cancel = replace(
+        _fill_event('sell', 0.009995, 2488.5, pine_id="L2-X", leg=LegType.STOP_LOSS,
+                    xchg_id=l2_sl, event_type='cancelled', filled_qty=0.0),
+        from_entry="L2", fill_qty=None, fill_price=None,
+    )
+
+    async def _stop_cancelled_between_the_reads(symbol=None):
+        engine.on_order_event(sl_cancel)
+        return [
+            _resting_leg(replace(template, id=l2_tp, side="sell"), qty=0.009995, price=2492.0),
+            _resting_leg(replace(template, id=l3_tp, side="sell"), qty=0.009995, price=2492.0),
+            _resting_leg(replace(template, id=l3_sl, side="sell"), qty=0.009995, stop=2488.5),
+        ]
+
+    b.get_open_orders = _stop_cancelled_between_the_reads  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
+        engine.reconcile()
+    reports = [r.getMessage() for r in caplog.records if "stop-coverage" in r.getMessage()]
+    assert len(reports) == 1 and "re-arming on the next pass" in reports[0]
+    assert "L2-X|L2" in reports[0] and "L3-X" not in reports[0]
+
+
 def _list_resting_stops(b, engine, pos) -> None:
     """Make the mock venue list one resting stop leg per active exit (sized to its parent)."""
     template = b._mk_order(b.exit_calls[0], 't')
