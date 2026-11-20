@@ -81,7 +81,7 @@
   },
   "PineType": {
     "module": "pine_type_transformer",
-    "digest": "0f86108b1fa2d9ab4c13f5449c2b435af42a3f38fb4b65c965cb7041e0e346ab"
+    "digest": "0b48b2c56d6e4860a165b6f5394a9e40629e42759d438825a5e32e75172f2a33"
   },
   "ImplicitConversion": {
     "module": "implicit_conversion",

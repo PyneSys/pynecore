@@ -64,7 +64,7 @@ use facts::{BranchIndex, BranchPath, Pos, ScopeFacts, nid, unchecked};
 const MAX_LOOP_PASSES: usize = 5;
 
 /// Ceiling on how many per-call-site contexts one module may produce (`_MAX_CONTEXTS`).
-const MAX_CONTEXTS: usize = 500;
+const MAX_CONTEXTS: usize = 5000;
 
 type R<T> = Result<T, Unsupported>;
 

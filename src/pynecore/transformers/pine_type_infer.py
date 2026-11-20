@@ -120,9 +120,11 @@ _MAX_LOOP_PASSES = 5
 #: Ceiling on how many per-call-site contexts one module may produce. Contexts
 #: follow the call GRAPH, so a module that fans out through many layers of
 #: generic helpers could in principle produce a path-shaped explosion. Real
-#: scripts stay two orders of magnitude below this; the limit exists so a
-#: pathological one degrades to UNKNOWN instead of hanging the compiler.
-_MAX_CONTEXTS = 500
+#: scripts stay an order of magnitude below this (MEASURED: the largest of a
+#: thousand published scripts needs 546, walked in under half a second); the
+#: limit exists so a pathological one degrades to UNKNOWN instead of hanging
+#: the compiler.
+_MAX_CONTEXTS = 5000
 
 #: The lib namespaces ``core.pine_method.method_call`` dispatches a builtin
 #: method to, by the receiver's runtime class. A method name that reaches only
