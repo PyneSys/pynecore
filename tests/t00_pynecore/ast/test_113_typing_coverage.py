@@ -29,7 +29,7 @@ from ..pine_analysis import analyse_module
 from pynecore.transformers.lib_registry import lib_types
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
-    BOOL, FLOAT, INT, UNKNOWN, builtin_class_id, get_ty, object_ty, tuple_of,
+    BOOL, FLOAT, INT, STR, UNKNOWN, builtin_class_id, get_ty, object_ty, tuple_of,
 )
 
 
@@ -234,6 +234,32 @@ def __test_a_flag_set_is_updated_in_place__():
                    'shown = lib.display.all\n'
                    'shown -= lib.display.status_line\n')
     assert types['shown'] == 'o:lib#Display'
+
+
+@pytest.mark.parametrize("expression,expected", [
+    # A lib constant Pine spells as a string is one type with a string
+    ("lib.format.volume if lib.close > 0 else '#.##'", STR),
+    ("'#.##' if lib.close > 0 else lib.format.volume", STR),
+    # ... and with the constant of another such class
+    ('lib.extend.none if lib.close > 0 else lib.line.style_solid', STR),
+    # Two of one class keep it
+    ('lib.size.small if lib.close > 0 else lib.size.large', 'o:lib#Size'),
+    # A set of flags is a type of its own, and so is an object
+    ('lib.display.all if lib.close > 0 else 1', UNKNOWN),
+    ("lib.format.volume if lib.close > 0 else lib.line.new(0, 0, 1, 1)", UNKNOWN),
+])
+def __test_a_string_constant_of_the_lib_joins_with_a_string__(expression: str, expected: str):
+    assert _expr_type(expression) == expected
+
+
+def __test_a_string_parameter_takes_a_lib_constant_as_its_default__():
+    table = infer_module(ast.parse(
+        'from pynecore import lib\n\n\n'
+        'def cell(alignment: str = lib.text.align_right):\n    return alignment\n\n\n'
+        'def main():\n    return cell()\n'), 'test')
+
+    assert not table.diags
+    assert table.bindings['cell']['alignment'].ty == STR
 
 
 def __test_an_untypable_source_does_not_become_a_type__():

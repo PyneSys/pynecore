@@ -181,8 +181,9 @@ impl Engine<'_, '_> {
             });
             return Ok(UNKNOWN.to_string());
         }
-        let is_group = entry.is_some_and(|entry| entry.kind == "overloads");
-        let pin = self.pin(node, is_group)?;
+        // Only a group that dispatches has implementations to select among: the
+        // others spell the types of one function, which every context runs
+        let pin = self.pin(node, data::dispatchers().contains(callee))?;
         let (_, args, keywords) = facts::call_parts(self.ast, node).expect("a call");
         let (args, keywords) = (args.to_vec(), keywords.to_vec());
         let ty = self.lib_call_type(callee, &args, &keywords, argc, pin.as_deref())?;

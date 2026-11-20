@@ -185,6 +185,15 @@
    "width": "f"
   }
  },
+ "dispatchers": [
+  "ta.highest",
+  "ta.highestbars",
+  "ta.lowest",
+  "ta.lowestbars",
+  "ta.pivothigh",
+  "ta.pivotlow",
+  "timestamp"
+ ],
  "names": {
   "adjustment.dividends": {
    "kind": "value",
@@ -7159,7 +7168,7 @@
    ],
    "params": [
     "?",
-    "?"
+    "s"
    ],
    "ret": "s"
   },
@@ -9964,5 +9973,5 @@
    "period"
   ]
  },
- "v": 10
+ "v": 11
 }

@@ -170,6 +170,13 @@ pub fn bit_sets() -> &'static [String] {
     BIT_SETS.get_or_init(|| list(tables::BIT_SETS))
 }
 
+/// `lib_types.json`'s `dispatchers`: the lib overload groups that select an
+/// implementation at run time (`lib_registry.lib_dispatchers()`).
+pub fn dispatchers() -> &'static HashSet<String> {
+    static DISPATCHERS: OnceLock<HashSet<String>> = OnceLock::new();
+    DISPATCHERS.get_or_init(|| list(tables::DISPATCHERS).into_iter().collect())
+}
+
 /// An entry of `lib_types.json`'s `names` (`lib_registry.lib_types()[name]`): the
 /// fields a native step reads so far.
 #[derive(Clone, Debug, PartialEq, Eq)]

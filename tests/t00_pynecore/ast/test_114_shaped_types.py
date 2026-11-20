@@ -877,27 +877,27 @@ def __test_an_element_read_pins_the_call_it_feeds__(tmp_path, monkeypatch):
     """
     The pipeline's own answer: ``array.get`` on an ``array<int>`` is int.
 
-    ``math.max(array.get(a, 0), 1)`` is two int-typed arguments, so the site
-    pins ``'ii'`` -- which it could not do while the element type was lost at
-    the ``get``.
+    ``ta.highest(close, array.get(a, 0))`` is a float and an int-typed
+    argument, so the site pins ``'fi'`` -- which it could not do while the
+    element type was lost at the ``get``.
     """
     monkeypatch.syspath_prepend(tmp_path)
     path = _write(tmp_path, 'shp_pin_mod', '''"""
 @pyne
 """
-from pynecore.lib import array, math
+from pynecore.lib import array, close, ta
 
 
 def main(n: int):
     a = array.new_int(1, n)
-    return math.max(array.get(a, 0), 1)
+    return ta.highest(close, array.get(a, 0))
 ''')
     tree, _ = _analysed(path)
     call = [node for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.math.max'][-1]
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.ta.highest'][-1]
 
-    assert [get_ty(arg) for arg in call.args] == [INT, INT]
-    assert get_pin(call) == 'ii'
+    assert [get_ty(arg) for arg in call.args] == [FLOAT, INT]
+    assert get_pin(call) == 'fi'
 
 
 #: An int-TYPED element with a fractional VALUE: the one case where the static
@@ -1120,13 +1120,13 @@ def __test_two_libraries_same_named_classes_stay_apart__(tmp_path, monkeypatch):
 """
 import shp_coll_one
 import shp_coll_two
-from pynecore.lib import math
+from pynecore.lib import ta
 
 
 def take(a: shp_coll_one.Settings, b: shp_coll_two.Settings):
     first = a.value
     second = b.value
-    return math.max(a.value, 1), math.max(b.value, 1)
+    return ta.highest(a.value, 5), ta.highest(b.value, 5)
 ''')
 
     tree, table = _analysed(app)
@@ -1145,7 +1145,7 @@ def take(a: shp_coll_one.Settings, b: shp_coll_two.Settings):
 
     # ... and the pin follows: two int-typed arguments pin as ints
     pins = [get_pin(node) for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.math.max']
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.ta.highest']
     assert pins == ['ii', 'fi']
 
 

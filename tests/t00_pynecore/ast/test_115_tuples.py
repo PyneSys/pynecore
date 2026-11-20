@@ -428,11 +428,11 @@ def pair(x: int):
 
 t = pair(2)
 a, b = pair(2)
-whole = math.max(t, 1)
-half = math.max(a, 1)
+whole = ta.highest(t, 1)
+half = ta.highest(a, 1)
 ''')
     pins = [get_pin(node) for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.math.max']
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.ta.highest']
     # The tuple says nothing about which implementation to take, so its
     # position is left out of the selection instead of blocking the int one
     # next to it (the runtime checks it against the chosen implementation
@@ -465,10 +465,10 @@ def __test_a_lib_tuple_half_pins_what_it_feeds__():
     """An unpacked half reaches an overload site with its own type"""
     tree, _ = _infer(SETUP + '''
 trend, direction = ta.supertrend(3.0, 10)
-picked = math.max(direction, 1)
+picked = ta.highest(direction, 1)
 ''')
     pins = [get_pin(node) for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.math.max']
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.ta.highest']
     assert pins == ['fi']
 
 
@@ -832,11 +832,11 @@ def __test_a_spoiled_container_takes_every_pin_with_it__():
     tree, table = _infer(SETUP + '''
 def main(x: int):
     ai = array.new_int(1, x)
-    fine = math.max(x, 1)
+    fine = ta.highest(x, 1)
     alias = ai
     array.concat(alias, ("x",))
     bad = array.last(ai)
-    picked = math.max(bad, 1)
+    picked = ta.highest(bad, 1)
     return picked
 ''')
     types = {name: binding.ty for name, binding in table.bindings['main'].items()}
@@ -851,11 +851,11 @@ def main(x: int):
     assert table.pins_suppressed.origin is not None \
         and table.pins_suppressed.origin.reason == 'shape-mismatch'
 
-    # The same script without the spoiled merge pins ``math.max(x, 1)`` as usual
+    # The same script without the spoiled merge pins ``ta.highest(x, 1)`` as usual
     tree, table = _infer(SETUP + '''
 def main(x: int):
     ai = array.new_int(1, x)
-    fine = math.max(x, 1)
+    fine = ta.highest(x, 1)
     return fine
 ''')
     assert table.pins_suppressed is None

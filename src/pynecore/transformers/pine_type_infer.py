@@ -69,7 +69,9 @@ from ..errorcodes import (
 from . import ast_walk
 from . import module_interface
 from .factory_fields import FactoryFields, dotted_name
-from .lib_registry import lib_registry, lib_routes, lib_star_exports, lib_types
+from .lib_registry import (
+    lib_dispatchers, lib_registry, lib_routes, lib_star_exports, lib_types,
+)
 from .module_paths import module_spec_origin, package_member
 from .node_ids import ID_ATTR, assign_node_ids, node_id
 from .pine_type_report import unknown_diags
@@ -3216,7 +3218,9 @@ class _Inference:
             self.table.calls.append(CallSite(
                 callee=callee, line=_line(node), col=_col(node), argc=argc, ty=UNKNOWN, pin=None))
             return UNKNOWN
-        pin = self._pin(node, isinstance(entry, dict) and entry.get('kind') == 'overloads')
+        # Only a group that dispatches has implementations to select among: the
+        # others spell the types of one function, which every context runs
+        pin = self._pin(node, callee in lib_dispatchers())
         ty = self._lib_call_type(callee, node.args, node.keywords, argc, pin)
         self.table.calls.append(CallSite(
             callee=callee, line=_line(node), col=_col(node), argc=argc, ty=ty, pin=pin))

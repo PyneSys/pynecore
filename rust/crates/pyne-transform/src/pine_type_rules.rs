@@ -519,6 +519,24 @@ pub fn value_of(ty: &str) -> &str {
     if ty.starts_with(MAP) { skip_chars(ty, MAP.len() + 2) } else { UNKNOWN }
 }
 
+/// The scalar a type is where it meets another type (`constant_scalar`): the scalar
+/// of a lib constant class that is no set of flags, any other type unchanged.
+pub fn constant_scalar(ty: &str) -> &str {
+    static SCALARS: OnceLock<HashMap<String, String>> = OnceLock::new();
+    if !ty.starts_with("o:") {
+        return ty;
+    }
+    let scalars = SCALARS.get_or_init(|| {
+        let flags = crate::data::bit_sets();
+        crate::data::scalar_classes()
+            .iter()
+            .filter(|(name, _)| !flags.contains(name))
+            .map(|(name, scalar)| (object_ty(&builtin_class_id(name)), scalar.clone()))
+            .collect()
+    });
+    scalars.get(ty).map_or(ty, String::as_str)
+}
+
 /// Whether two types cannot both be right where one value goes.
 pub fn shape_mismatch(left: &str, right: &str) -> bool {
     if left == right || left == UNKNOWN || left == TYPELESS || right == UNKNOWN || right == TYPELESS
@@ -528,7 +546,11 @@ pub fn shape_mismatch(left: &str, right: &str) -> bool {
     if is_tuple(left) || is_tuple(right) {
         return true;
     }
-    head(left) == OBJECT && head(right) == OBJECT
+    if head(left) != OBJECT || head(right) != OBJECT {
+        return false;
+    }
+    // Two lib constants are scalars to each other, see `constant_scalar`
+    constant_scalar(left) == left || constant_scalar(right) == right
 }
 
 /// The pair of types that keeps two types from being joined, if any.
@@ -668,6 +690,11 @@ pub fn join(left: &str, right: &str) -> String {
     }
     if is_numeric(left) && is_numeric(right) {
         return FLOAT.to_string();
+    }
+    let (scalar, other) = (constant_scalar(left), constant_scalar(right));
+    if scalar != left || other != right {
+        // A lib constant meeting a scalar, or a constant of another class
+        return join(scalar, other);
     }
     UNKNOWN.to_string()
 }

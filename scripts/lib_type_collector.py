@@ -53,7 +53,7 @@ from pynecore.transformers.pine_type_rules import (  # noqa: E402
 
 #: Registry format version. Bump whenever the shape below changes; the
 #: consumers (the inference engine, and the PyneAOT front end) pin it.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 #: The route ``classify_callee`` gives a callee it proves nothing about. The
 #: ``routes`` section leaves such paths out, and the transform reads a path it
@@ -142,6 +142,7 @@ class LibTypeCollector:
         return {'v': SCHEMA_VERSION, 'names': names, 'classes': self._collect_fields(),
                 'scalar_classes': self._collect_scalars(),
                 'bit_sets': self._collect_bit_sets(),
+                'dispatchers': collect_dispatchers(names),
                 'routes': collect_routes(), 'star_exports': collect_star_exports(modules)}
 
     def _import_lib(self) -> list[types.ModuleType]:
@@ -301,6 +302,36 @@ def collect_routes() -> dict[str, str]:
     routes: dict[str, str] = {}
     _record_routes('lib', pynecore.lib, routes)
     return dict(sorted(routes.items()))
+
+
+def collect_dispatchers(names: dict[str, dict[str, Any]]) -> list[str]:
+    """
+    The overload groups of the lib that select an implementation at run time.
+
+    A group declared with ``pynecore.core.overload`` is a dispatcher: its
+    implementations are separate functions, and the argument types of a call
+    decide which one runs (``ta.highest``). One declared with ``typing.overload``
+    only spells the types of a single function (``math.max``, ``line.new``): every
+    call runs the same body, so a call site has nothing to select.
+
+    Every lib module must be imported first (``LibTypeCollector._import_lib``).
+
+    :param names: The registry's ``names`` section
+    :return: The registry keys of the dispatching groups, sorted
+    """
+    found: list[str] = []
+    for key, entry in names.items():
+        if entry['kind'] != 'overloads':
+            continue
+        value: object = pynecore.lib
+        for part in key.split('.'):
+            value = getattr(value, part)
+        if isinstance(value, types.ModuleType):
+            # ``lib/plot.py::plot`` is spelled ``plot``
+            value = getattr(value, key.rpartition('.')[2])
+        if getattr(value, '__pyne_bind__', None) is not None:
+            found.append(key)
+    return sorted(found)
 
 
 def _record_routes(path: str, owner: object, routes: dict[str, str]) -> None:

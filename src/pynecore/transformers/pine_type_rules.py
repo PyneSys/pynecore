@@ -21,6 +21,7 @@ from typing import Final, NamedTuple, TypeVar
 
 from . import ast_walk
 from .factory_fields import dotted_name
+from .lib_registry import lib_registry
 
 #: Any expression node -- ``stamp_lowering`` hands back exactly what it got.
 _E = TypeVar('_E', bound=ast.expr)
@@ -753,6 +754,35 @@ def value_of(ty: str) -> str:
     return ty[len(_MAP) + 2:] if ty.startswith(_MAP) else UNKNOWN
 
 
+#: Lib class type -> the scalar its constants are, filled on first use
+_CONSTANT_SCALARS: Final[dict[str, str]] = {}
+
+
+def constant_scalar(ty: str) -> str:
+    """
+    The scalar a type is where it meets another type.
+
+    ``format.volume`` is a ``Format`` and ``text.align_right`` an ``AlignEnum``
+    so that the parameter taking one can say which constants it means, but Pine
+    spells every such constant as a ``const string`` (or a ``const int``): it
+    is one type with ``'#.##'``, and with a constant of another such class. A
+    set of flags (``display.all``) is the exception, a type of its own.
+
+    :param ty: Any type
+    :return: The scalar of a lib constant class, any other type unchanged
+    """
+    if not ty.startswith(_OBJ):
+        return ty
+    if not _CONSTANT_SCALARS:
+        registry = lib_registry()
+        flags = set(registry.get('bit_sets') or ())
+        _CONSTANT_SCALARS.update(
+            {object_ty(builtin_class_id(name)): scalar
+             for name, scalar in (registry.get('scalar_classes') or {}).items()
+             if name not in flags})
+    return _CONSTANT_SCALARS.get(ty, ty)
+
+
 def shape_mismatch(left: str, right: str) -> bool:
     """
     Whether two types are objects of DIFFERENT shape.
@@ -775,7 +805,10 @@ def shape_mismatch(left: str, right: str) -> bool:
         return False
     if is_tuple(left) or is_tuple(right):
         return True
-    return head(left) == OBJECT and head(right) == OBJECT
+    if head(left) != OBJECT or head(right) != OBJECT:
+        return False
+    # Two lib constants are scalars to each other, see ``constant_scalar``
+    return constant_scalar(left) == left or constant_scalar(right) == right
 
 
 def shape_conflict(left: str, right: str) -> tuple[str, str] | None:
@@ -918,6 +951,10 @@ def join(left: str, right: str) -> str:
         return tuple_of([join(item, other) for item, other in zip(items, others)])
     if left in NUMERIC and right in NUMERIC:
         return FLOAT
+    scalar, other = constant_scalar(left), constant_scalar(right)
+    if scalar != left or other != right:
+        # A lib constant meeting a scalar, or a constant of another class
+        return join(scalar, other)
     return UNKNOWN
 
 

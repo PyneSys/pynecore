@@ -307,6 +307,59 @@ b = wrapper(2.0)
     assert 'context-dependent-pin' in reasons
 
 
+@pytest.mark.parametrize('call, of_int, of_float', [
+    ('lib.math.max(v, 0)', 'i', 'f'),
+    ('lib.math.min(v, 0)', 'i', 'f'),
+    ('lib.math.round(v / 7, 1)', 'f', 'f'),
+    ('lib.math.round(v)', 'i', 'i'),
+])
+def __test_one_function_behind_its_overloads_has_nothing_to_pin__(call: str, of_int: str,
+                                                                 of_float: str):
+    """
+    ``math.max`` spells its types as overloads of a single function.
+
+    An int and a float context run the same body, so the site carries no pin,
+    and the contexts have nothing to disagree about. Each still types the call
+    by its own arguments.
+    """
+    source = f'''
+from pynecore import lib
+
+def wrapper(v):
+    return {call}
+
+a = wrapper(1)
+b = wrapper(2.0)
+'''
+    _, calls = _calls(source, call.partition('(')[0])
+    assert len(calls) == 1
+    assert get_pin(calls[0]) is None
+    assert get_pins(calls[0]) is None
+
+    table = infer_module(ast.parse(source), 'test')
+    assert not table.diags
+    types = {name: binding.ty for name, binding in table.bindings[''].items()}
+    assert (types['a'], types['b']) == (of_int, of_float)
+
+
+def __test_a_dispatching_lib_group_keeps_its_pin_per_context__():
+    """``ta.highest`` selects an implementation, so its contexts are told apart"""
+    source = '''
+from pynecore import lib
+
+def wrapper(v):
+    return lib.ta.highest(v, 5)
+
+a = wrapper(1)
+b = wrapper(2.0)
+'''
+    _, calls = _calls(source, 'lib.ta.highest')
+    assert get_pin(calls[0]) is None
+    pins = get_pins(calls[0])
+    assert pins is not None
+    assert sorted(pins.values()) == ['fi', 'ii']
+
+
 def _run(source: str, mod_name: str):
     """Run the slot mini pipeline WITH the type pass and exec the result.
 

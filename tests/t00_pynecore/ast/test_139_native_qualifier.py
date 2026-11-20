@@ -124,6 +124,7 @@ def __test_native_registries_match__():
     for section in ('routes', 'scalar_classes', 'star_exports'):
         assert __test_helper_data(section) == registry[section], section
     assert __test_helper_data('bit_sets') == {'bit_sets': registry['bit_sets']}
+    assert __test_helper_data('dispatchers') == {'dispatchers': registry['dispatchers']}
     assert __test_helper_data('module_properties') == {
         module: {member: entry['type'] for member, entry in members.items()}
         for module, members in module_properties().items()}

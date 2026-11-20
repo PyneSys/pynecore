@@ -16,10 +16,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-__all__ = ['lib_registry', 'lib_types', 'lib_routes', 'lib_star_exports']
+__all__ = ['lib_registry', 'lib_types', 'lib_routes', 'lib_star_exports', 'lib_dispatchers']
 
 _LIB_TYPES_PATH = Path(__file__).parent / 'lib_types.json'
 _LIB_REGISTRY: dict[str, Any] = {}
+_LIB_DISPATCHERS: set[str] = set()
 
 
 def lib_registry() -> dict[str, Any]:
@@ -67,3 +68,17 @@ def lib_star_exports() -> dict[str, list[str]]:
     :return: Module name (``pynecore.lib.ta``) -> its ``__all__``, sorted
     """
     return lib_registry()['star_exports']
+
+
+def lib_dispatchers() -> set[str]:
+    """
+    The overload groups of the lib that select an implementation at run time.
+
+    Every other group spells the types of one function (``typing.overload``), so
+    a call to it has nothing to select and takes no overload pin.
+
+    :return: The registry keys of the dispatching groups (``ta.highest``)
+    """
+    if not _LIB_DISPATCHERS:
+        _LIB_DISPATCHERS.update(lib_registry().get('dispatchers') or ())
+    return _LIB_DISPATCHERS
