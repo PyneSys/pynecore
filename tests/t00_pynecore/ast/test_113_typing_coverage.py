@@ -205,6 +205,15 @@ def __test_vwap_is_a_value_or_the_value_with_its_bands__(call: str, expected: st
     assert _expr_type(call) == expected
 
 
+@pytest.mark.parametrize("call,expected", [
+    ("lib.request.seed('repo', 'SYMBOL', lib.close)", FLOAT),
+    ("lib.request.seed('repo', 'SYMBOL', lib.bar_index)", INT),
+    ("lib.request.seed('repo', 'SYMBOL', expression=lib.close > lib.open)", BOOL),
+])
+def __test_a_seed_request_is_of_its_expression_s_type__(call: str, expected: str):
+    assert _expr_type(call) == expected
+
+
 def __test_a_vwap_multiplier_bound_to_none_is_the_default__():
     # A name bound to ``None`` passes the default as well as the literal does,
     # and a na multiplier is still a multiplier

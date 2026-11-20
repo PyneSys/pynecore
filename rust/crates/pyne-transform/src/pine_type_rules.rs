@@ -872,6 +872,7 @@ pub const LIB_TYPE_OVERRIDES: &[(&str, CallRule)] = &[
     ("ta.median", Is("arg0")),
     ("ta.range", Is("arg0")),
     ("ta.mode", Is("arg0")),
+    ("request.seed", Is("arg2")),
     ("ta.vwap", Is("vwap")),
     ("int", Is(INT)),
     ("float", Is(FLOAT)),

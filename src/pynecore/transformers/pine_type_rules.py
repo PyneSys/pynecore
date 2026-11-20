@@ -2177,6 +2177,9 @@ LIB_TYPE_OVERRIDES: Final[dict[str, object]] = {
     'ta.median': 'arg0',
     'ta.range': 'arg0',
     'ta.mode': 'arg0',
+    # ``request.seed`` evaluates its expression in the seed's context, like
+    # ``request.security``, and yields a value of the expression's own type
+    'request.seed': 'arg2',
     # ``ta.vwap`` is one value, and the value with its upper and lower band once a
     # band multiplier is passed. Read bare (``ta.vwap``) it is the call without
     # arguments
