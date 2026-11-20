@@ -197,15 +197,15 @@
  "names": {
   "adjustment.dividends": {
    "kind": "value",
-   "ty": "i"
+   "ty": "s"
   },
   "adjustment.none": {
    "kind": "value",
-   "ty": "i"
+   "ty": "s"
   },
   "adjustment.splits": {
    "kind": "value",
-   "ty": "i"
+   "ty": "s"
   },
   "alert": {
    "default_ty": [

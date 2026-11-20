@@ -408,6 +408,34 @@ fn decorated(ast: &Ast, node: NodeId, name: &str) -> bool {
     })
 }
 
+/// Whether a definition is a library export (`_is_exported`).
+pub fn is_exported(ast: &Ast, node: NodeId) -> bool {
+    decorated(ast, node, "export")
+}
+
+/// The names a module's own statements bind an `Exported()` proxy to, with how
+/// many times each (`_export_proxies`).
+pub fn export_proxies(ast: &Ast, body: &[NodeId]) -> HashMap<String, usize> {
+    let mut stores: HashMap<String, usize> = HashMap::new();
+    for &stmt in body {
+        let targets: Vec<NodeId> = match ast.kind(stmt) {
+            Kind::Assign { targets, value, .. } if is_export_proxy(ast, Some(*value)) => {
+                targets.clone()
+            }
+            Kind::AnnAssign { target, value, .. } if is_export_proxy(ast, *value) => {
+                vec![*target]
+            }
+            _ => continue,
+        };
+        for target in targets {
+            if let Kind::Name { id, .. } = ast.kind(target) {
+                *stores.entry(id.clone()).or_default() += 1;
+            }
+        }
+    }
+    stores
+}
+
 /// Whether a definition is one implementation of an `@overload` group (`_is_overload`).
 pub fn is_overload(ast: &Ast, node: NodeId) -> bool {
     decorated(ast, node, "overload")

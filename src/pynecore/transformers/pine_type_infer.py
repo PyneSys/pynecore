@@ -574,6 +574,9 @@ class _Inference:
         #: Module-scope name -> the position of every ``def`` that binds it, the
         #: stores ``_module_rebinds`` leaves out
         self._module_def_positions: dict[str, list[tuple[int, int]]] = {}
+        #: The module-scope names every store of which is an ``Exported()`` proxy,
+        #: see ``_own_export``
+        self._own_proxies: frozenset[str] = frozenset()
         #: The branch path of every module statement, for the same question
         self._branches = _BranchIndex(())
         #: The loop statements the walk is inside, outermost first. A loop
@@ -1137,6 +1140,10 @@ class _Inference:
             name: [position for position, _ in defs]
             for name, defs in _module_defs(tree.body).items()}
         self._rebound[''] = set(self._module_rebinds)
+        self._own_proxies = frozenset(
+            name for name, stores in _export_proxies(tree.body).items()
+            if len(self._module_rebinds.get(name, ())) == stores
+            and name not in self._module_def_positions)
         annotations, self._sec_writes = _scan_tree(tree)
         self._requested = requested_functions(tree)
         self._collect_imports(tree)
@@ -2515,9 +2522,14 @@ class _Inference:
         MEASURED: TradingView does NOT truncate a Pine ``for``. With
         ``R = input.int(14)``, ``for i = R / 8 to R / 4`` iterates i = 1.75 and
         2.75, so the counter is an int-TYPED variable carrying a fractional
-        value -- exactly the law this whole pass exists for. The type is
-        therefore the join of the bounds, and a native ``range`` over int
-        arguments yields an int.
+        value -- exactly the law this whole pass exists for.
+
+        MEASURED (v5 and v6): the counter has the type of the ``from``
+        expression alone. ``for i = 1 to x`` over a float ``x`` leaves ``i``
+        an int (``array.get(a, i)`` compiles), ``for i = 0.5 to x`` makes it a
+        float (the same read is rejected), and a float step beside an int
+        ``from`` does not compile at all. A native ``range`` of one argument
+        starts at 0, an int.
 
         Iterating a CONTAINER is the other half: ``for x in arr`` gives ``x``
         the array's element type, which is the shape's whole point. A matrix
@@ -2529,7 +2541,7 @@ class _Inference:
             if callee in ('range', 'pine_range', 'lib.pine_range'):
                 bounds = [self._ty_of(a) for a in iter_node.args]
                 if bounds and all(b in NUMERIC for b in bounds):
-                    return INT if all(b == INT for b in bounds) else FLOAT
+                    return INT if len(bounds) == 1 or bounds[0] == INT else FLOAT
                 return UNKNOWN
         if is_matrix(iter_ty):
             return array_of(element_of(iter_ty))
@@ -4946,10 +4958,70 @@ class _Inference:
             home = self._interface_at(source, source, node)
             if home is None:
                 return None
+        elif not builtin:
+            own = self._own_export(name, node)
+            if own is not None:
+                return self._own_export_result(own[0], own[1], name, node, args)
         published = self._library_method(name, node, home)
         if published is None:
             return None
         return self._published_result(published, name, node, args)
+
+    def _own_export(self, name: str, node: ast.Call) -> tuple[str, int] | None:
+        """
+        The definition this module's own ``Exported`` proxy of a name holds.
+
+        A library calling one of its own exported methods by name on an object
+        of its own class: the module that declares the class is the first one
+        the runtime asks, and what it holds under the name is the proxy, bound
+        to the ``@export`` definition of that name. The answer is claimed only
+        where nothing but a proxy is stored under the name at module scope (an
+        overloaded export has one per signature) and the name resolves, from
+        the call, to definitions that are all exported.
+
+        :param name: The method name
+        :param node: The ``method_call`` node
+        :return: (scope-qualified id of the definition, its declaring frame
+                 index), or None
+        """
+        if name not in self._own_proxies:
+            return None
+        resolved = self._resolve_func(name, node)
+        if resolved is None:
+            return None
+        key, frame, shadowed = resolved
+        definitions = self._defs.get(key)
+        if shadowed or not frame or not definitions \
+                or not all(_is_exported(definition) for definition in definitions):
+            return None
+        return key, frame
+
+    def _own_export_result(self, key: str, frame: int, name: str, node: ast.Call,
+                           args: Sequence[ast.expr]) -> str:
+        """
+        Type a call by name to an export of this module.
+
+        A method spelled by name is never pinned (the runtime selects from the
+        values), so a group answers the way a published one does: only where
+        the implementations the receiver can reach agree on the return. A
+        single definition is typed in the context the call describes, outside
+        the per-instance channel, which a call by name hands nothing through.
+
+        :param key: Scope-qualified id of the definition
+        :param frame: Index of the frame whose scope declares it
+        :param name: The method name
+        :param node: The call node, for its keywords and position
+        :param args: The receiver followed by the arguments after it
+        :return: The type the call evaluates to
+        """
+        if key in self._overload_groups:
+            self._ensure_group(key, frame)
+            if not self._group_call_fits(key, name, node, args):
+                return UNKNOWN
+            receiver = self._ty_of(args[0]) if args else UNKNOWN
+            return overload_result([impl.ret for impl in self._impl_sigs(key)
+                                    if _takes_receiver(impl, receiver)])
+        return self._call_context(key, node, frame, args, record=False)
 
     def _member_result(self, cid: str, name: str, node: ast.Call,
                        args: Sequence[ast.expr]) -> str | None:
@@ -7267,6 +7339,45 @@ def _is_method(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
         if isinstance(target, ast.Name) and target.id == 'method':
             return True
     return False
+
+
+def _is_exported(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """
+    Whether a definition is a library export.
+
+    The decorator is matched by its bare name, like a method's.
+
+    :param node: The definition to inspect
+    :return: True when it carries ``@export``
+    """
+    for decorator in node.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Attribute) and target.attr == 'export':
+            return True
+        if isinstance(target, ast.Name) and target.id == 'export':
+            return True
+    return False
+
+
+def _export_proxies(body: Sequence[ast.stmt]) -> dict[str, int]:
+    """
+    The names a module's own statements bind an ``Exported()`` proxy to.
+
+    :param body: The module body
+    :return: Every module-level name assigned one -> how many times
+    """
+    stores: dict[str, int] = {}
+    for stmt in body:
+        if isinstance(stmt, ast.Assign) and _is_export_proxy(stmt.value):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign) and _is_export_proxy(stmt.value):
+            targets = [stmt.target]
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                stores[target.id] = stores.get(target.id, 0) + 1
+    return stores
 
 
 def _publishes_nothing(module: str) -> bool:

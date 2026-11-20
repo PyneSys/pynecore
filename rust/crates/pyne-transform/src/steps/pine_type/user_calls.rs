@@ -634,9 +634,58 @@ impl Engine<'_, '_> {
             if home.is_none() {
                 return Ok(None);
             }
+        } else if !builtin && let Some((key, frame)) = self.own_export(name, node) {
+            return self.own_export_result(&key, frame, name, node, args).map(Some);
         }
         let Some(published) = self.library_method(name, node, home)? else { return Ok(None) };
         self.published_result(&published, name, node, args).map(Some)
+    }
+
+    /// The definition this module's own `Exported` proxy of a name holds
+    /// (`_own_export`): a library calling one of its own exported methods by name
+    /// on an object of its own class reaches the proxy first.
+    fn own_export(&self, name: &str, node: NodeId) -> Option<(String, usize)> {
+        if !self.own_proxies.contains(name) {
+            return None;
+        }
+        let (key, frame, shadowed) = self.resolve_func(name, node)?;
+        let definitions = self.defs.get(&key)?;
+        if shadowed
+            || frame == 0
+            || definitions.is_empty()
+            || !definitions.iter().all(|&definition| facts::is_exported(self.ast, definition))
+        {
+            return None;
+        }
+        Some((key, frame))
+    }
+
+    /// Type a call by name to an export of this module (`_own_export_result`): a
+    /// group answers where the implementations the receiver reaches agree, a
+    /// single definition in the context the call describes.
+    fn own_export_result(
+        &mut self,
+        key: &str,
+        frame: usize,
+        name: &str,
+        node: NodeId,
+        args: &[NodeId],
+    ) -> R<String> {
+        if self.overload_groups.contains(key) {
+            self.ensure_group(key, frame)?;
+            if !self.group_call_fits(key, name, node, Some(args))? {
+                return Ok(UNKNOWN.to_string());
+            }
+            let receiver = args.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
+            let impls = self.impl_sigs(key)?;
+            let returns: Vec<&str> = impls
+                .iter()
+                .filter(|imp| takes_receiver(imp, &receiver))
+                .map(|imp| imp.ret.as_str())
+                .collect();
+            return Ok(overload_result(&returns).to_string());
+        }
+        self.call_context(key, node, frame, Some(args), false)
     }
 
     /// Type a call to a method its class declares in its own body (`_member_result`):

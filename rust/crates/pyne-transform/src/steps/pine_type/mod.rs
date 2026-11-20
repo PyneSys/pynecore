@@ -179,6 +179,9 @@ struct Engine<'a, 'h> {
     callee_key: HashMap<i64, String>,
     module_rebinds: IndexMap<String, Vec<(Pos, BranchPath)>>,
     module_def_positions: HashMap<String, Vec<Pos>>,
+    /// The module-scope names every store of which is an `Exported()` proxy
+    /// (`_own_export`).
+    own_proxies: HashSet<String>,
     branches: BranchIndex,
     loop_stack: Vec<NodeId>,
     classes: IndexMap<String, String>,
@@ -277,6 +280,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             callee_key: HashMap::new(),
             module_rebinds: IndexMap::new(),
             module_def_positions: HashMap::new(),
+            own_proxies: HashSet::new(),
             branches: BranchIndex::default(),
             loop_stack: Vec::new(),
             classes: IndexMap::new(),
@@ -809,6 +813,14 @@ impl<'a, 'h> Engine<'a, 'h> {
             .map(|(name, defs)| (name, defs.into_iter().map(|(at, _)| at).collect()))
             .collect();
         self.rebound.insert(String::new(), self.module_rebinds.keys().cloned().collect());
+        self.own_proxies = facts::export_proxies(self.ast, &body)
+            .into_iter()
+            .filter(|(name, stores)| {
+                self.module_rebinds.get(name).map_or(0, Vec::len) == *stores
+                    && !self.module_def_positions.contains_key(name)
+            })
+            .map(|(name, _)| name)
+            .collect();
         let scan = facts::scan_tree(self.ast, tree)?;
         self.sec_writes = scan.writes;
         self.requested = requested_functions(self.ast, tree);

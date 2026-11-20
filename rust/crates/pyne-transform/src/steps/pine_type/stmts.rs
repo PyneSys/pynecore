@@ -496,8 +496,9 @@ impl Engine<'_, '_> {
                 if !bounds.is_empty()
                     && bounds.iter().all(|bound| NUMERIC.contains(&bound.as_str()))
                 {
-                    let all_int = bounds.iter().all(|bound| bound == INT);
-                    return if all_int { INT } else { FLOAT }.to_string();
+                    // MEASURED: the counter has the type of `from` alone
+                    let from_int = bounds.len() == 1 || bounds[0] == INT;
+                    return if from_int { INT } else { FLOAT }.to_string();
                 }
                 return UNKNOWN.to_string();
             }

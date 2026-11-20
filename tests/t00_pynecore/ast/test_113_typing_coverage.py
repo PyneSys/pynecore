@@ -426,10 +426,10 @@ def __test_an_in_module_class_is_constructed_to_an_object__():
 
 def __test_pine_range_is_an_object_and_its_counter_keeps_the_bounds__():
     """
-    MEASURED: a Pine ``for`` does not truncate, so the counter joins the bounds.
+    MEASURED: a Pine ``for`` does not truncate, and the counter has the type of ``from``.
 
     The ITERABLE is an ordinary known non-scalar; only the counter carries the
-    algebra.
+    algebra. A float ``to`` leaves an int ``from``'s counter an int.
     """
     types = _types(
         'from pynecore import lib, pine_range\n'
@@ -439,10 +439,13 @@ def __test_pine_range_is_an_object_and_its_counter_keeps_the_bounds__():
         '    counter = i\n'
         'for j in pine_range(0.0, R, 1):\n'
         '    widened = j\n'
+        'for k in pine_range(1, lib.input.float(3.5)):\n'
+        '    kept = k\n'
     )
     assert types['span'] == 'o'
     assert types['counter'] == 'i'
     assert types['widened'] == 'f'
+    assert types['kept'] == 'i'
 
 
 # --- 8. method_call ---------------------------------------------------------
@@ -915,3 +918,62 @@ def __test_a_loop_over_a_map_types_the_key_and_the_value__(tmp_path: Path):
         'for key, value in m.items():\n    w = key + "x"\n    lib.math.abs(value)')
     assert not codes
     assert (types['key'], types['value']) == (STR, FLOAT)
+
+
+OWN_EXPORT_BY_NAME = '''"""
+@pyne edge
+"""
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_method import method, method_call
+from pynecore.core.pine_udt import udt
+from pynecore.lib import script
+from typing import Protocol, Any
+
+
+__all__ = ['Tile', 'area', 'double']
+
+
+@udt
+class Tile:
+    side: float = 1.0
+
+
+class _ProtocolArea(Protocol):
+    def __call__(self, this: Tile) -> Any: ...
+
+
+class _ProtocolDouble(Protocol):
+    def __call__(self, tile: Tile) -> Any: ...
+
+
+area: _ProtocolArea = Exported()
+double: _ProtocolDouble = Exported()
+
+
+@script.library('probe')
+def main():
+    @export
+    @method
+    def area(this: Tile):
+        return this.side * this.side
+DECORATOR
+    def double(tile: Tile):
+        return method_call('area', tile) * 2.0
+'''
+
+
+def __test_a_library_reaches_its_own_export_by_name__():
+    """The module declaring the receiver's class is asked first, and holds the proxy"""
+    table = infer_module(
+        ast.parse(OWN_EXPORT_BY_NAME.replace('DECORATOR', '\n    @export')), 'test')
+    assert not [diag.code for diag in table.diags]
+    assert table.funcs['main·double'].ret == FLOAT
+
+
+def __test_a_method_no_proxy_holds_is_not_reached_by_name__():
+    """Only an ``Exported`` proxy answers a name"""
+    source = OWN_EXPORT_BY_NAME.replace('DECORATOR', '\n    @export') \
+        .replace('area: _ProtocolArea = Exported()\n', '') \
+        .replace("    @export\n    @method\n", "    @method\n")
+    table = infer_module(ast.parse(source), 'test')
+    assert [diag.code for diag in table.diags][:1] == ['E0054']

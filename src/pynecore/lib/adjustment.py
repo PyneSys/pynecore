@@ -1,6 +1,6 @@
 #
 # Constants
 #
-none = 0
-dividends = 1
-splits = 2
+none = "none"
+dividends = "dividends"
+splits = "splits"
