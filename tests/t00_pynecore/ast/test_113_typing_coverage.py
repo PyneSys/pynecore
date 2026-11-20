@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from ..pine_analysis import analyse_module
+from pynecore.errorcodes import CALL_ARGUMENT_TWICE
 from pynecore.transformers.lib_registry import lib_types
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
@@ -722,3 +723,38 @@ def __test_a_module_level_function_nothing_calls_is_still_typed__():
         'def spread(high, low):\n    return high - low\n\n\ndef main():\n    return 1\n'), 'test')
 
     assert {diag.origin.detail for diag in table.diags if diag.origin} == {'high', 'low'}
+
+
+# --- a lib parameter filled twice --------------------------------------------
+
+
+def _codes(statement: str) -> list[str]:
+    """The diagnostic codes one statement over the lib reports."""
+    table = infer_module(ast.parse(f'from pynecore import lib\n{statement}\n'), 'test')
+    return [diag.code for diag in table.diags]
+
+
+@pytest.mark.parametrize('statement', [
+    # A function
+    'x = lib.ta.sma(lib.close, source=lib.close)',
+    'x = lib.ta.ema(lib.close, source=lib.close)',
+    # A group, each of whose implementations starts with the same parameter
+    'x = lib.ta.highest(lib.close, 5, source=lib.high)',
+    'x = lib.math.round(1.5, number=2.5)',
+])
+def __test_a_keyword_naming_a_filled_lib_parameter_is_reported__(statement: str):
+    """Python raises on a parameter given a positional and a keyword argument"""
+    assert _codes(statement) == [CALL_ARGUMENT_TWICE.code]
+
+
+@pytest.mark.parametrize('statement', [
+    'x = lib.ta.sma(lib.close, length=5)',
+    'x = lib.ta.sma(source=lib.close, length=5)',
+    'x = lib.math.round(1.5, precision=2)',
+    # The one-argument implementation names ``length`` first; the two-argument
+    # one takes ``close`` for its source and the keyword for its length
+    'x = lib.ta.highest(lib.close, length=5)',
+])
+def __test_a_keyword_naming_a_free_lib_parameter_is_taken__(statement: str):
+    """A group is called wrongly only where no implementation binds the call"""
+    assert not _codes(statement)

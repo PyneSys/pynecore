@@ -3403,6 +3403,16 @@ class _Inference:
             if not any(keyword.arg in impl['names'] or impl.get('kwarg') for impl in impls):
                 self._bad_call(node, callee, CALL_UNKNOWN_PARAMETER, (callee, keyword.arg))
                 return False
+        if not any(isinstance(arg, ast.Starred) for arg in positional_args):
+            # A keyword may not name a parameter a positional argument fills
+            # already. A group is wrong only where every implementation the
+            # call could reach binds one twice
+            filled = len(positional_args)
+            twice = [_bound_twice(impl, filled, node.keywords) for impl in impls
+                     if _arity_fits(impl, argc) and _takes_keywords(impl, node.keywords)]
+            if twice and all(name is not None for name in twice):
+                self._bad_call(node, callee, CALL_ARGUMENT_TWICE, (twice[0], callee))
+                return False
         if kind != 'function':
             return True
         params, names = entry['params'], entry['names']
@@ -7101,6 +7111,31 @@ def _arity_fits(impl: dict[str, Any], argc: int) -> bool:
     if impl.get('kwarg'):
         return len(params) - impl['defaults'] <= argc
     return len(params) - impl['defaults'] <= argc <= len(params)
+
+
+def _takes_keywords(impl: dict[str, Any], keywords: Sequence[ast.keyword]) -> bool:
+    """Whether a lib implementation has a parameter for every keyword of a call."""
+    if impl.get('kwarg'):
+        return True
+    names = impl['names']
+    return all(keyword.arg is None or keyword.arg in names for keyword in keywords)
+
+
+def _bound_twice(impl: dict[str, Any], filled: int,
+                 keywords: Sequence[ast.keyword]) -> str | None:
+    """
+    The parameter of a lib implementation a call fills both ways.
+
+    :param impl: The registry entry of the implementation
+    :param filled: How many positional arguments the call passes
+    :param keywords: The call's keyword arguments
+    :return: The first keyword naming a parameter a positional argument fills, or None
+    """
+    taken = impl['names'][:filled]
+    for keyword in keywords:
+        if keyword.arg in taken:
+            return keyword.arg
+    return None
 
 
 def _own_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:

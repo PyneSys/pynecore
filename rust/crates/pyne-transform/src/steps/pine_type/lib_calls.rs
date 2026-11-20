@@ -101,6 +101,27 @@ pub(super) fn arity_fits(entry: &LibEntry, argc: i64) -> bool {
     required <= argc && argc <= params
 }
 
+/// Whether a lib implementation has a parameter for every keyword of a call
+/// (`_takes_keywords`).
+fn takes_keywords(entry: &LibEntry, keywords: &[Option<&str>]) -> bool {
+    if entry.kwarg {
+        return true;
+    }
+    let names = entry.names.as_deref().unwrap_or(&[]);
+    keywords.iter().all(|keyword| keyword.is_none_or(|name| names.iter().any(|n| n == name)))
+}
+
+/// The parameter of a lib implementation a call fills both ways (`_bound_twice`).
+fn bound_twice<'a>(
+    entry: &LibEntry,
+    filled: usize,
+    keywords: &[Option<&'a str>],
+) -> Option<&'a str> {
+    let names = entry.names.as_deref().unwrap_or(&[]);
+    let taken = &names[..filled.min(names.len())];
+    keywords.iter().flatten().copied().find(|name| taken.iter().any(|n| n == name))
+}
+
 /// Whether a lib parameter may take an argument (`_lib_param_takes`).
 fn lib_param_takes(declared: &str, passed: &str) -> bool {
     if unchecked(passed) {
@@ -430,6 +451,32 @@ impl Engine<'_, '_> {
                     callee,
                     &pynecore_codes::CALL_UNKNOWN_PARAMETER,
                     &[callee, &spelled],
+                );
+                return Ok(false);
+            }
+        }
+        let starred =
+            positional_args.iter().any(|&arg| matches!(self.ast.kind(arg), Kind::Starred { .. }));
+        if !starred {
+            // A keyword may not name a parameter a positional argument fills
+            // already. A group is wrong only where every implementation the
+            // call could reach binds one twice
+            let spelled: Vec<Option<&str>> =
+                keywords.iter().map(|&keyword| keyword_parts(self.ast, keyword).0).collect();
+            let twice: Vec<Option<&str>> = impls
+                .iter()
+                .filter(|imp| arity_fits(imp, argc) && takes_keywords(imp, &spelled))
+                .map(|imp| bound_twice(imp, positional_args.len(), &spelled))
+                .collect();
+            if let Some(Some(name)) = twice.first()
+                && twice.iter().all(Option::is_some)
+            {
+                let name = name.to_string();
+                self.bad_call(
+                    node,
+                    callee,
+                    &pynecore_codes::CALL_ARGUMENT_TWICE,
+                    &[&name, callee],
                 );
                 return Ok(false);
             }
