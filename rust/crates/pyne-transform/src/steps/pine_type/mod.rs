@@ -176,7 +176,15 @@ struct Engine<'a, 'h> {
     pin_sink: Vec<Option<usize>>,
     pending: Vec<Vec<(String, NodeId)>>,
     signed: HashSet<String>,
-    pin_diags: HashSet<i64>,
+    /// Overload call node id -> the node, for the sites whose disagreeing contexts are
+    /// reported (`_pin_reports`)
+    pin_reports: IndexMap<i64, NodeId>,
+    /// Overload call node id -> context id -> whether that context's value dispatch
+    /// runs the implementation its pin selects (`_pin_settled`)
+    pin_settled: HashMap<i64, HashMap<i64, bool>>,
+    /// Node ids of the varying sites whose every instance is handed its vector entry
+    /// (`_delivered`)
+    delivered: HashSet<i64>,
     unvectored: HashSet<i64>,
     call_ctx: HashMap<i64, IndexMap<i64, i64>>,
     callee_key: HashMap<i64, String>,
@@ -278,7 +286,9 @@ impl<'a, 'h> Engine<'a, 'h> {
             pin_sink: vec![None],
             pending: vec![Vec::new()],
             signed: HashSet::new(),
-            pin_diags: HashSet::new(),
+            pin_reports: IndexMap::new(),
+            pin_settled: HashMap::new(),
+            delivered: HashSet::new(),
             unvectored: HashSet::new(),
             call_ctx: HashMap::new(),
             callee_key: HashMap::new(),
@@ -837,6 +847,7 @@ impl<'a, 'h> Engine<'a, 'h> {
         self.stamp_widen_sites();
         self.stamp_instance_vectors(tree);
         self.suppress_pins(tree);
+        self.report_context_pins();
         self.report_unhandled_widens()?;
         self.sync_module_bindings();
         let reported = report::unknown_diags(self, tree)?;

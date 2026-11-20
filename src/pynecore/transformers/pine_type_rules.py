@@ -49,8 +49,8 @@ __all__ = [
     'NA_TEXT_PARAMS', 'NOT_PINE_STRINGS', 'get_widen',
     'set_widen', 'WIDEN_SITE_ATTR', 'WIDENS_ATTR', 'get_widen_site', 'set_widen_site',
     'get_widens', 'set_widens',
-    'pin_chars', 'pin_for', 'overload_result', 'ImplSig', 'overload_pick', 'overload_bind',
-    'overload_choice', 'overload_binding',
+    'pin_chars', 'pin_for', 'value_chars', 'overload_result', 'ImplSig', 'overload_pick',
+    'overload_bind', 'overload_choice', 'overload_candidates', 'overload_binding',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
     'default_fit', 'annotation_takes_none', 'impl_sig', 'param_fit', 'default_ty',
 ]
@@ -1550,6 +1550,25 @@ def pin_chars(arg_types: Sequence[str]) -> str:
                    for t in arg_types)
 
 
+def value_chars(arg_types: Sequence[str]) -> str:
+    """
+    A call site's argument types as the selector reads the VALUES of an unpinned call.
+
+    An unpinned call dispatches on what its arguments hold at run time. A
+    float-typed value may be a Python int there (``float x = 1``), which the
+    exact pass takes for an int, and an array or a matrix of a scalar is matched
+    by its head element, which an empty one does not have: each of those
+    positions reads as ``PIN_ANY``, and the selection reads it from the
+    argument's static type instead (``_takes_position``). An int, a bool and a
+    string keep their characters.
+
+    :param arg_types: Type of each positional argument, in order
+    :return: One character per argument
+    """
+    return ''.join(PIN_ANY if char == FLOAT or char in _PIN_CONTAINER_CHARS else char
+                   for char in pin_chars(arg_types))
+
+
 def overload_result(returns: list[str]) -> str:
     """
     Type of a call to an overload group, from its implementations' returns.
@@ -1744,14 +1763,9 @@ def overload_choice(impls: list[ImplSig], pin: str,
     than overruling the runtime's own choice.
 
     A position the pin carries no witness for (``PIN_ANY``) is read from the
-    argument's static type where that is an object of a known class: the
-    selector checks an object against the parameter's class
-    (``_check_type``), so only an implementation declaring that class, or none,
-    can take it. Any other such position -- a container, a bare object, a type
-    not known here -- may be taken by anything, which leaves the site
-    unanswerable unless an earlier implementation rules it out. A typeless
-    ``na`` at such a position is taken for whatever the implementation
-    declares there, the way the selector takes it.
+    argument's static type, the way ``_takes_position`` reads it: by the kind of
+    value it is, and by its whole declared type where every value of that type
+    passes the selector's check of it.
 
     :param impls: Every implementation of the group, in declaration order
     :param pin: The call site's pin, one character per positional argument
@@ -1767,6 +1781,117 @@ def overload_choice(impls: list[ImplSig], pin: str,
                 continue
             return impl if verdict == _YES else None
     return None
+
+
+def overload_candidates(impls: list[ImplSig], pin: str,
+                        shapes: Sequence[str] = ()) -> list[int] | None:
+    """
+    The implementations the runtime selector can run for a call site, by index.
+
+    The walk is ``overload_choice``'s -- the exact pass, positional half first,
+    the implementations in declaration order -- but an implementation that MAY
+    take the call joins the set instead of ending the walk, and the first one
+    that surely takes it closes the set: the exact pass selects the first
+    implementation that takes the call, so it runs one of those collected up
+    to there.
+
+    Where no implementation surely takes the call, the exact pass may take
+    none, and the selector's widening pass (``core/overload._select``) then
+    runs the first implementation that takes the arguments with an int where a
+    float is wanted, or a float where an int is. The set still holds every
+    implementation that can run only where each one left out is out of reach
+    of that pass too (``_out_of_reach``); otherwise the answer is None.
+
+    :param impls: Every implementation of the group, in declaration order
+    :param pin: One character per positional argument: the call site's pin, or
+                its arguments read as values (``value_chars``)
+    :param shapes: The static type of each positional argument, where the caller
+                   has them; empty when it does not
+    :return: The indices of the implementations that can run, in the order the
+             walk met them, or None where the runtime may run another one
+    """
+    wanted = tuple(pin)
+    found: list[int] = []
+    for exact_arity in (True, False):
+        for index, impl in enumerate(impls):
+            verdict = _takes(impl, wanted, exact_arity, shapes)
+            if verdict == _NO:
+                continue
+            if index not in found:
+                found.append(index)
+            if verdict == _YES:
+                return found
+    if not found or not all(index in found or _out_of_reach(impl, wanted, shapes)
+                            for index, impl in enumerate(impls)):
+        return None
+    return found
+
+
+def _out_of_reach(impl: ImplSig, wanted: tuple[str, ...], shapes: Sequence[str]) -> bool:
+    """
+    Whether the selector's widening pass rejects an implementation for every value.
+
+    The widening pass binds the arguments the way the exact pass does, so an
+    implementation the call's arity rules out stays out. A parameter it fills
+    stays out when the argument's kind of value cannot meet it in that pass
+    either (``_widening_rejects``). A default the exact pass rejects is no
+    proof: the widening pass may take an int default for a float parameter.
+
+    :param impl: The implementation's shape
+    :param wanted: The call's characters, one per positional argument
+    :param shapes: The static type of each positional argument, or nothing
+    :return: True when the widening pass never runs the implementation
+    """
+    if impl.open_ended:
+        return False
+    argc = len(wanted)
+    if not impl.required <= argc <= len(impl.params) and argc != len(impl.fits):
+        return True
+    return any(_widening_rejects(declared, _given_at(want, shapes, index))
+               for index, (declared, want) in enumerate(zip(impl.params, wanted)))
+
+
+def _given_at(want: str, shapes: Sequence[str], index: int) -> str:
+    """
+    The static type of one argument: its shape where the caller has it, else
+    the type its character stands for.
+
+    :param want: The argument's character
+    :param shapes: The static type of each positional argument, or nothing
+    :param index: The argument's position
+    :return: The type, UNKNOWN where neither says one
+    """
+    given = shapes[index] if index < len(shapes) else UNKNOWN
+    if given != UNKNOWN:
+        return given
+    if want in PINNABLE:
+        return want
+    return _PIN_CONTAINER_TYPES.get(want, UNKNOWN)
+
+
+def _widening_rejects(declared: str, given: str) -> bool:
+    """
+    Whether the widening pass rejects every value of a type for a parameter.
+
+    Values of different kinds (``_kind``) never meet, with one exception: an
+    ``NA`` object -- the na of a class, of a container, and the bool na of a
+    script that keeps a third bool state -- passes for an ``int``, ``float``,
+    ``str`` or ``bool`` parameter in that pass (``core/overload._check_type``
+    answers ``not strict`` for it). A number's na is a NaN and a string's is
+    ``''``, plain values of their own kind. A color may be the typeless na,
+    which no pass rejects. A same-kind mismatch never qualifies: an int meets a
+    float parameter there, and a container's sampled element is checked the
+    same way.
+
+    :param declared: The parameter's type
+    :param given: The argument's static type
+    :return: True when no value of ``given`` passes
+    """
+    kind = _kind(given)
+    declared_kind = _kind(declared)
+    if kind is None or declared_kind is None or kind == declared_kind or given == COLOR:
+        return False
+    return not (declared in (INT, FLOAT, BOOL, STR) and given not in (INT, FLOAT, STR))
 
 
 def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool,
@@ -1811,6 +1936,29 @@ def _takes_position(declared: str, want: str, given: str) -> int:
     """
     How one parameter answers one argument of the exact pass.
 
+    A position without a witness (``PIN_ANY``) is read from the argument's
+    static type, for every value that type admits at run time: a value of the
+    type, or the na the conversion pass builds for it (``implicit_conversion``)
+    -- a ``NaN`` for a number, ``''`` for a string, ``NA(<class>)`` for an
+    object, ``NA(list)`` / ``NA(dict)`` / ``NA(Matrix)`` for a container. The
+    selector checks such a value against the parameter's type
+    (``core/overload._check_type``), and the answer follows from what it checks:
+
+    * A typeless ``na`` is taken for whatever the position declares.
+    * An object of a known class is taken by a parameter of its class alone.
+    * A container is checked by what it is -- a ``list``, a ``dict``, a
+      ``Matrix`` -- so a parameter of another kind (``_kind``) never takes it,
+      and one of the same kind only for some values: it is then matched by a
+      SAMPLED element, which an empty one does not have (it passes for the
+      first ``list[...]`` parameter whatever its element). Where every element
+      type it spells passes its own check -- an object, a string, a bool, a
+      color, not a number (``_strictly_held``) -- the declared type itself is
+      taken for sure.
+    * A color is taken by a color parameter. Anything else may take it too:
+      the compiler leaves a color ``na`` as the typeless ``na``
+      (``pine_type_infer._na_widen`` converts none for a color), which the
+      exact pass takes for every parameter.
+
     :param declared: The parameter's type
     :param want: The argument's pin character
     :param given: The argument's static type, for a position without a witness
@@ -1826,7 +1974,14 @@ def _takes_position(declared: str, want: str, given: str) -> int:
         # alone, anything else by whatever declares the position
         if class_of(given) is not None and declared not in (UNKNOWN, OBJECT):
             return _YES if declared == given else _NO
-        return _MAYBE
+        if given == COLOR:
+            return _YES if declared == COLOR else _MAYBE
+        declared_kind = _kind(declared)
+        if not (is_array(given) or is_matrix(given) or is_map(given)) or declared_kind is None:
+            return _MAYBE
+        if _kind(given) != declared_kind:
+            return _NO
+        return _YES if declared == given and _strictly_held(given) else _MAYBE
     shaped = _PIN_CONTAINER_TYPES.get(want)
     if shaped is not None:
         # The witness is a one-element container, which the selector takes
@@ -1844,6 +1999,58 @@ def _takes_position(declared: str, want: str, given: str) -> int:
     if declared == UNKNOWN:
         return _MAYBE
     return _YES if declared == want else _NO
+
+
+def _kind(ty: str) -> str | None:
+    """
+    The kind of value the selector checks a value of a type as.
+
+    The selector's check of a value starts with its Python type: a number is an
+    ``int`` or a ``float`` (either one for either Pine type), a container a
+    ``list``, a ``dict`` or a ``Matrix``, an object its class. Two types of
+    different kinds have no value in common. A lib constant class is no kind
+    here: its constants are strings or ints themselves, which a ``str`` or an
+    ``int`` parameter takes.
+
+    :param ty: Any type
+    :return: The kind, or None where the type does not say one
+    """
+    if ty in NUMERIC:
+        return FLOAT
+    if ty in (BOOL, STR, COLOR):
+        return ty
+    if is_array(ty):
+        return _ARRAY
+    if is_matrix(ty):
+        return _MATRIX
+    if is_map(ty):
+        return _MAP
+    if class_of(ty) is not None and constant_scalar(ty) == ty:
+        return ty
+    return None
+
+
+def _strictly_held(ty: str) -> bool:
+    """
+    Whether every value of a type passes the exact pass's check against the type itself.
+
+    A number does not: an int-typed value may be a Python float, a float-typed
+    one a Python int. An object, a string, a bool and a color do, their na
+    included (a color na is the typeless na, which passes everything). A
+    container does where every element type it spells does, since the selector
+    checks a sampled element against the declared one.
+
+    :param ty: Any type
+    :return: True when the declared type takes every value of itself
+    """
+    if ty in (BOOL, STR, COLOR):
+        return True
+    if is_array(ty) or is_matrix(ty):
+        return _strictly_held(element_of(ty))
+    if is_map(ty):
+        return len(ty) > len(_MAP) and _strictly_held(key_of(ty)) \
+            and _strictly_held(value_of(ty))
+    return class_of(ty) is not None and constant_scalar(ty) == ty
 
 
 def overload_bind(impls: list[ImplSig], chars: str, shapes: Sequence[str],

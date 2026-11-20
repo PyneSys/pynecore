@@ -559,6 +559,44 @@ def __test_native_stamp_lowering_matches__():
             __test_helper_compare_lowering(root, rng.choice(__test_helper_PARAM_TYPES))
 
 
+#: The parameter types the candidate walk is checked over: the selection's, and the
+#: containers, colors and lib constant classes its wildcard reading tells apart
+__test_helper_CANDIDATE_TYPES = __test_helper_PARAM_TYPES + [
+    'a:o:x#A', 'a:o:x#B', 'm:o:x#A', 'a:c', 'm:c', 'M:s:o:x#A', 'M:s:s', 'M:i:f', 'M:s:c',
+    'M:', 'M:sx', 'a:a:s', 'o:lib#Size', 'a:o:lib#Size', 'v', 'T:1:s']
+
+
+def __test_native_overload_candidates_match__():
+    """The candidate walk and the value reading of a call site over random groups."""
+    __test_helper_require_native()
+    rng = random.Random(149)
+    types = __test_helper_CANDIDATE_TYPES
+    for args in itertools.product(types + ['', 'é'], repeat=2):
+        assert __test_helper_native('value_chars', list(args)) == rules.value_chars(list(args))
+    chars = __test_helper_PIN_CHARS + '**'
+    answered = several = 0
+    for _ in range(40_000):
+        impls = []
+        for _ in range(rng.randint(1, 4)):
+            count = rng.randint(0, 3)
+            params = tuple(rng.choice(types) for _ in range(count))
+            fits = ''.join(rng.choice('yyn?') for _ in range(count + rng.choice((0, 0, 0, 1))))
+            impls.append(rules.ImplSig(params=params, required=rng.randint(0, count),
+                                       open_ended=rng.random() < 0.05, ret=rng.choice(types),
+                                       fits=fits, names=('x', 'y', 'z')[:count]))
+        width = rng.randint(0, 3)
+        shapes = [rng.choice(types) for _ in range(rng.randint(0, width))]
+        pin = rules.value_chars(shapes + ['?'] * (width - len(shapes))) if rng.random() < 0.5 \
+            else ''.join(rng.choice(chars) for _ in range(width))
+        found = rules.overload_candidates(impls, pin, shapes)
+        assert (__test_helper_native('overload_candidates', __test_helper_impl_tuples(impls), pin,
+                                     shapes)
+                == found), (impls, pin, shapes)
+        answered += found is not None
+        several += found is not None and len(found) > 1
+    assert answered > 1_000 and several > 100, (answered, several)
+
+
 #: The functions of two or more strings the pipeline's calls are recorded for
 __test_helper_RECORDED = (
     'join', 'binop_type', 'unaryop_type', 'compare_type', 'head', 'array_of', 'matrix_of',
@@ -566,7 +604,7 @@ __test_helper_RECORDED = (
     'shape_mismatch', 'shape_conflict', 'render_ty', 'namespace_of', 'object_ty', 'class_id',
     'builtin_class_id', 'is_tuple', 'is_array', 'is_matrix', 'is_map', 'is_shaped', 'arity',
     'is_na_widen', 'pin_for', 'pin_chars', 'overload_result', 'default_fit', 'is_int_typed',
-    'constant_type', 'overload_choice', 'overload_binding',
+    'constant_type', 'overload_choice', 'overload_binding', 'overload_candidates', 'value_chars',
 )
 
 #: The functions over a tree the pipeline's calls are compared at the call
@@ -672,14 +710,16 @@ def __test_helper_replay(state):
     for name, calls in state.calls.items():
         original = state.originals[name]
         for args in calls:
-            if name in ('overload_choice', 'overload_binding'):
+            if name in ('overload_choice', 'overload_binding', 'overload_candidates'):
                 impls = [rules.ImplSig(*impl) for impl in args[0]]
                 rest = [dict(arg[1]) if isinstance(arg, tuple) and arg[:1] == ('dict',)
                         else arg for arg in args[1:]]
                 choice = original(impls, *rest)
                 native_rest = [list(arg) if isinstance(arg, tuple) else arg for arg in rest]
                 got = __test_helper_native(name, [tuple(impl) for impl in impls], *native_rest)
-                assert got == __test_helper_index(impls, choice), (name, args)
+                expected = choice if name == 'overload_candidates' \
+                    else __test_helper_index(impls, choice)
+                assert got == expected, (name, args)
             elif name in ('binop_type', 'unaryop_type'):
                 op = getattr(ast, args[0])()
                 assert __test_helper_native(name, *args) == original(op, *args[1:]), args

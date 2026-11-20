@@ -169,19 +169,12 @@ impl Engine<'_, '_> {
             });
             return Ok(UNKNOWN.to_string());
         }
-        let pin = self.pin(node, is_group)?;
+        let pin = self.pin(node, is_group, is_group.then_some(sig.impls.as_slice()))?;
         let ty = if is_group {
             let (_, args, keywords) = facts::call_parts(self.ast, node).expect("a call");
             let (args, keywords) = (args.to_vec(), keywords.to_vec());
-            let shapes = self.shapes(&args);
-            let kw_shapes = self.keyword_shapes(&keywords);
-            match self.choice(&sig.impls, pin.as_deref(), shapes.as_deref(), kw_shapes.as_ref()) {
-                None => sig.ret.clone(),
-                Some(choice) => {
-                    self.widen_group_nas(&choice, &args, &keywords)?;
-                    choice.ret
-                }
-            }
+            self.group_result(&sig.impls, pin.as_deref(), &args, &keywords)?
+                .unwrap_or_else(|| sig.ret.clone())
         } else if sig.annotated {
             sig.ret.clone()
         } else {

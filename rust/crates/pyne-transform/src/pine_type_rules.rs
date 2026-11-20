@@ -1444,6 +1444,23 @@ pub fn pin_chars<S: AsRef<str>>(arg_types: &[S]) -> String {
         .collect()
 }
 
+/// A call site's argument types as the selector reads the values of an unpinned call
+/// (`value_chars`): a float and a scalar container read as `PIN_ANY`, an int, a bool and
+/// a string keep their characters.
+pub fn value_chars<S: AsRef<str>>(arg_types: &[S]) -> String {
+    pin_chars(arg_types)
+        .chars()
+        .map(|char| {
+            let text = char.to_string();
+            if text == FLOAT || PIN_CONTAINERS.iter().any(|&(_, pin)| pin == char) {
+                PIN_ANY
+            } else {
+                char
+            }
+        })
+        .collect()
+}
+
 /// Type of a call to an overload group: the implementations' agreed return type.
 pub fn overload_result<S: AsRef<str>>(returns: &[S]) -> &str {
     let Some(first) = returns.first() else {
@@ -1539,6 +1556,124 @@ pub fn overload_choice<S: AsRef<str>>(impls: &[ImplSig], pin: &str, shapes: &[S]
     None
 }
 
+/// The implementations the runtime selector can run for a call site, by index
+/// (`overload_candidates`): the exact pass walked like `overload_choice`, each
+/// implementation that may take the call collected, the first that surely takes it
+/// closing the set; `None` where the widening pass may run one left out.
+pub fn overload_candidates<S: AsRef<str>>(
+    impls: &[ImplSig],
+    pin: &str,
+    shapes: &[S],
+) -> Option<Vec<usize>> {
+    let wanted = pin_items(pin);
+    let mut found: Vec<usize> = Vec::new();
+    for exact_arity in [true, false] {
+        for (index, imp) in impls.iter().enumerate() {
+            let verdict = takes(imp, &wanted, exact_arity, shapes);
+            if verdict == Verdict::No {
+                continue;
+            }
+            if !found.contains(&index) {
+                found.push(index);
+            }
+            if verdict == Verdict::Yes {
+                return Some(found);
+            }
+        }
+    }
+    let settled = impls
+        .iter()
+        .enumerate()
+        .all(|(index, imp)| found.contains(&index) || out_of_reach(imp, &wanted, shapes));
+    if found.is_empty() || !settled { None } else { Some(found) }
+}
+
+/// Whether the selector's widening pass rejects an implementation for every value
+/// (`_out_of_reach`): the call's arity rules it out, or a parameter it fills takes no
+/// value of the argument's type in that pass either.
+fn out_of_reach<S: AsRef<str>>(imp: &ImplSig, wanted: &[&str], shapes: &[S]) -> bool {
+    if imp.open_ended {
+        return false;
+    }
+    let argc = wanted.len();
+    if !(imp.required <= argc && argc <= imp.params.len()) && argc != imp.fits.chars().count() {
+        return true;
+    }
+    imp.params
+        .iter()
+        .zip(wanted)
+        .enumerate()
+        .any(|(index, (declared, want))| widening_rejects(declared, given_at(want, shapes, index)))
+}
+
+/// The static type of one argument: its shape where the caller has it, else the type
+/// its character stands for (`_given_at`).
+fn given_at<'a, S: AsRef<str>>(want: &'a str, shapes: &'a [S], index: usize) -> &'a str {
+    let given = shape_at(shapes, index);
+    if given != UNKNOWN {
+        return given;
+    }
+    if PINNABLE.contains(&want) {
+        return want;
+    }
+    pin_container_type(want).unwrap_or(UNKNOWN)
+}
+
+/// Whether the widening pass rejects every value of a type for a parameter
+/// (`_widening_rejects`): values of different kinds never meet there, but an `NA`
+/// object passes for an int, float, string or bool parameter, and a color may be the
+/// typeless na.
+fn widening_rejects(declared: &str, given: &str) -> bool {
+    let (Some(kind), Some(declared_kind)) = (kind_of(given), kind_of(declared)) else {
+        return false;
+    };
+    if kind == declared_kind || given == COLOR {
+        return false;
+    }
+    !([INT, FLOAT, BOOL, STR].contains(&declared) && ![INT, FLOAT, STR].contains(&given))
+}
+
+/// The kind of value the selector checks a value of a type as (`_kind`); `None` where
+/// the type does not say one.
+fn kind_of(ty: &str) -> Option<&str> {
+    if NUMERIC.contains(&ty) {
+        return Some(FLOAT);
+    }
+    if [BOOL, STR, COLOR].contains(&ty) {
+        return Some(ty);
+    }
+    if is_array(ty) {
+        return Some(ARRAY);
+    }
+    if is_matrix(ty) {
+        return Some(MATRIX);
+    }
+    if is_map(ty) {
+        return Some(MAP);
+    }
+    if class_of(ty).is_some() && constant_scalar(ty) == ty {
+        return Some(ty);
+    }
+    None
+}
+
+/// Whether every value of a type passes the exact pass's check against the type itself
+/// (`_strictly_held`).
+fn strictly_held(ty: &str) -> bool {
+    if [BOOL, STR, COLOR].contains(&ty) {
+        return true;
+    }
+    if is_array(ty) || is_matrix(ty) {
+        return strictly_held(element_of(ty));
+    }
+    if is_map(ty) {
+        return ty.chars().count() > MAP.len()
+            && strictly_held(key_of(ty))
+            && strictly_held(value_of(ty));
+    }
+    class_of(ty).is_some() && constant_scalar(ty) == ty
+}
+
 fn shape_at<S: AsRef<str>>(shapes: &[S], index: usize) -> &str {
     shapes.get(index).map_or(UNKNOWN, AsRef::as_ref)
 }
@@ -1595,7 +1730,22 @@ fn takes_position(declared: &str, want: &str, given: &str) -> Verdict {
         if class_of(given).is_some() && declared != UNKNOWN && declared != OBJECT {
             return if declared == given { Verdict::Yes } else { Verdict::No };
         }
-        return Verdict::Maybe;
+        if given == COLOR {
+            return if declared == COLOR { Verdict::Yes } else { Verdict::Maybe };
+        }
+        // A container is checked by what it is, then by a sampled element
+        let declared_kind = kind_of(declared);
+        if !(is_array(given) || is_matrix(given) || is_map(given)) || declared_kind.is_none() {
+            return Verdict::Maybe;
+        }
+        if kind_of(given) != declared_kind {
+            return Verdict::No;
+        }
+        return if declared == given && strictly_held(given) {
+            Verdict::Yes
+        } else {
+            Verdict::Maybe
+        };
     }
     if let Some(shaped) = pin_container_type(want) {
         if declared == shaped {

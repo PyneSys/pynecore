@@ -11,14 +11,14 @@ use super::facts::{
     self, arg_parts, arity, call_arity, every_param, fits, keyword_parts, reaches_library_methods,
     unchecked,
 };
-use super::{Engine, R};
+use super::{Engine, R, lib_calls};
 use crate::data;
 use crate::pine_qualifier::SERIES;
 use crate::pine_type_rules::ImplSig;
 use crate::pine_type_rules::{
     NUMERIC, OBJECT, PINE_LOOP, TYPELESS, UNKNOWN, array_of, builtin_call_type, class_of,
-    elements_of, impl_sig, is_map, join, namespace_of, object_ty, overload_result, param_defaults,
-    pin_for, render_ty, tuple_of,
+    elements_of, impl_sig, is_map, join, namespace_of, object_ty, overload_candidates,
+    overload_result, param_defaults, pin_for, render_ty, tuple_of, value_chars,
 };
 use crate::pine_type_table::{CallSite, ClassSig, ExportSig};
 
@@ -141,7 +141,8 @@ impl Engine<'_, '_> {
             });
             return Ok(UNKNOWN.to_string());
         }
-        let pin = self.pin(node, is_group)?;
+        let impls = if is_group { Some(self.impl_sigs(&key)?) } else { None };
+        let pin = self.pin(node, is_group, impls.as_deref())?;
         let ty = if is_group {
             self.group_type(&key, pin.as_deref(), &args, &keywords)?
         } else {
@@ -453,7 +454,7 @@ impl Engine<'_, '_> {
             if !self.ensure_group(&key, frame, &spelled, node, Some(&args), false)?
                 || !self.group_call_fits(&key, &name, node, Some(&args))?
             {
-                self.record_pin(node, None, true)?;
+                self.record_pin(node, None, true, true)?;
                 return Ok(Some(UNKNOWN.to_string()));
             }
             let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
@@ -463,7 +464,10 @@ impl Engine<'_, '_> {
                 Some(shapes) if keywords.is_empty() => pin_for(shapes),
                 _ => None,
             };
-            self.record_pin(node, pin.clone(), true)?;
+            let impls = self.impl_sigs(&key)?;
+            let settled =
+                lib_calls::settled(Some(&impls), pin.as_deref(), shapes.as_deref().unwrap_or(&[]));
+            self.record_pin(node, pin.clone(), true, settled)?;
             return self.group_type(&key, pin.as_deref(), &args, &keywords).map(Some);
         }
         self.call_context(&key, node, frame, Some(&args), true).map(Some)
@@ -698,8 +702,13 @@ impl Engine<'_, '_> {
             if !self.group_call_fits(key, name, node, Some(args))? {
                 return Ok(UNKNOWN.to_string());
             }
-            let receiver = args.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
             let impls = self.impl_sigs(key)?;
+            let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
+            let keywords = keywords.to_vec();
+            if let Some(settled) = self.group_result(&impls, None, args, &keywords)? {
+                return Ok(settled);
+            }
+            let receiver = args.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
             let returns: Vec<&str> = impls
                 .iter()
                 .filter(|imp| takes_receiver(imp, &receiver))
@@ -752,6 +761,11 @@ impl Engine<'_, '_> {
             return Ok(UNKNOWN.to_string());
         }
         if sig.kind == "group" {
+            let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
+            let keywords = keywords.to_vec();
+            if let Some(settled) = self.group_result(&sig.impls, None, args, &keywords)? {
+                return Ok(settled);
+            }
             let receiver = args.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
             let returns: Vec<&str> = sig
                 .impls
@@ -867,25 +881,22 @@ impl Engine<'_, '_> {
         let positional: Vec<NodeId> = args.unwrap_or(own_args).to_vec();
         let keywords = keywords.to_vec();
         let (defs, sigs): (Vec<NodeId>, Vec<ImplSig>) = self.group_impls(key)?.into_iter().unzip();
+        let found = self.reached(&sigs, &positional, &keywords, by_name);
         let mut reached = pending.clone();
         let mut unsure = true;
-        if by_name {
-            let receiver = positional.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
-            reached.retain(|imp| match defs.iter().position(|known| known == imp) {
-                None => true,
-                Some(at) => takes_receiver(&sigs[at], &receiver),
-            });
-        } else {
-            let shapes = self.shapes(&positional);
-            let pin = match &shapes {
-                Some(shapes) if keywords.is_empty() => pin_for(shapes),
-                _ => None,
-            };
-            let kw_shapes = self.keyword_shapes(&keywords);
-            if let Some(at) =
-                self.choice_at(&sigs, pin.as_deref(), shapes.as_deref(), kw_shapes.as_ref())
-            {
-                let chosen = defs[at];
+        match found {
+            None => {
+                if by_name {
+                    let receiver =
+                        positional.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
+                    reached.retain(|imp| match defs.iter().position(|known| known == imp) {
+                        None => true,
+                        Some(at) => takes_receiver(&sigs[at], &receiver),
+                    });
+                }
+            }
+            Some(found) if found.len() == 1 && !by_name => {
+                let chosen = defs[found[0]];
                 if !pending.contains(&chosen) {
                     return Ok(true);
                 }
@@ -900,6 +911,9 @@ impl Engine<'_, '_> {
                 }
                 reached = vec![chosen];
                 unsure = false;
+            }
+            Some(found) => {
+                reached.retain(|imp| found.iter().any(|&index| defs[index] == *imp));
             }
         }
         if unsure {
@@ -918,7 +932,8 @@ impl Engine<'_, '_> {
         walked.map(|()| true)
     }
 
-    /// Type of a call to a user overload group (`_group_type`).
+    /// Type of a call to a user overload group (`_group_type`): what the
+    /// implementations it can run agree on, else the group's own type.
     fn group_type(
         &mut self,
         key: &str,
@@ -927,13 +942,63 @@ impl Engine<'_, '_> {
         keywords: &[NodeId],
     ) -> R<String> {
         let impls = self.impl_sigs(key)?;
+        match self.group_result(&impls, pin, args, keywords)? {
+            Some(settled) => Ok(settled),
+            None => Ok(self.funcs[key].ret.clone()),
+        }
+    }
+
+    /// Type of a call to an overload group, from the implementations it can run
+    /// (`_group_result`): the one the exact pass settles (`choice`) or the one
+    /// `overload_candidates` leaves, with its typeless `na` arguments converted, or what
+    /// several candidates agree on.
+    pub(super) fn group_result(
+        &mut self,
+        impls: &[ImplSig],
+        pin: Option<&str>,
+        args: &[NodeId],
+        keywords: &[NodeId],
+    ) -> R<Option<String>> {
         let shapes = self.shapes(args);
         let kw_shapes = self.keyword_shapes(keywords);
-        let Some(choice) = self.choice(&impls, pin, shapes.as_deref(), kw_shapes.as_ref()) else {
-            return Ok(self.funcs[key].ret.clone());
+        let (Some(shapes), Some(kw_shapes)) = (shapes, kw_shapes) else { return Ok(None) };
+        if let Some(choice) = self.choice(impls, pin, Some(&shapes), Some(&kw_shapes)) {
+            self.widen_group_nas(&choice, args, keywords)?;
+            return Ok(Some(choice.ret));
+        }
+        if !kw_shapes.is_empty() {
+            return Ok(None);
+        }
+        let chars = match pin {
+            Some(pin) => pin.to_string(),
+            None => value_chars(&shapes),
         };
-        self.widen_group_nas(&choice, args, keywords)?;
-        Ok(choice.ret)
+        let Some(found) = overload_candidates(impls, &chars, &shapes) else { return Ok(None) };
+        if let [only] = found[..] {
+            self.widen_group_nas(&impls[only], args, keywords)?;
+            return Ok(Some(impls[only].ret.clone()));
+        }
+        let first = &impls[found[0]].ret;
+        Ok(found.iter().all(|&index| impls[index].ret == *first).then(|| first.clone()))
+    }
+
+    /// The implementations of a group a call can run, by index, as `group_result`
+    /// reads them (`_reached`); `None` where the selection leaves the call open.
+    fn reached(
+        &self,
+        sigs: &[ImplSig],
+        args: &[NodeId],
+        keywords: &[NodeId],
+        by_name: bool,
+    ) -> Option<Vec<usize>> {
+        let shapes = self.shapes(args)?;
+        let kw_shapes = self.keyword_shapes(keywords)?;
+        if !kw_shapes.is_empty() {
+            return self.choice_at(sigs, None, Some(&shapes), Some(&kw_shapes)).map(|at| vec![at]);
+        }
+        let pin = if by_name { None } else { pin_for(&shapes) };
+        let chars = pin.unwrap_or_else(|| value_chars(&shapes));
+        overload_candidates(sigs, &chars, &shapes)
     }
 
     /// Convert the typeless `na` arguments of a call the exact pass settled

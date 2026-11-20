@@ -408,6 +408,94 @@ b = wrapper(2.0)
     assert 'context-dependent-pin' in reasons
 
 
+def __test_helper_context_pin_reported(source: str) -> bool:
+    table = infer_module(ast.parse(source), 'test')
+    return any(diag.origin is not None and diag.origin.reason == 'context-dependent-pin'
+               for diag in table.diags)
+
+
+def __test_a_delivered_per_context_pin_is_not_reported__():
+    """
+    The same disagreeing site, its instances created inside ``main``: each call
+    site hands its instance the vector entry that holds its own pin, so the int
+    instance runs the int implementation and nothing needs annotating
+    """
+    source = GROUP + '''
+def wrapper(v):
+    return g(v)
+
+def main():
+    a = wrapper(1)
+    b = wrapper(2.0)
+'''
+    _, calls = _calls(source, 'g')
+    assert sorted(get_pins(calls[0]).values(), key=str) == [None, 'i']
+    assert not __test_helper_context_pin_reported(source)
+
+
+def __test_an_undelivered_pin_is_reported_through_the_callers__():
+    """
+    An instance is handed its vector only where its caller is handed its own:
+    ``holder`` is created by raw calls of the module body, so the ``wrapper``
+    instances it creates get nothing, and ``g(v)`` dispatches on its values;
+    created from ``main`` instead, every instance down the chain gets its pin
+    """
+    body = '''
+def wrapper(v):
+    return g(v)
+
+def holder(v):
+    return wrapper(v)
+'''
+    assert __test_helper_context_pin_reported(GROUP + body + '''
+a = holder(1)
+b = holder(2.0)
+''')
+    assert not __test_helper_context_pin_reported(GROUP + body + '''
+def main():
+    a = holder(1)
+    b = holder(2.0)
+''')
+
+
+def __test_an_undelivered_pin_the_values_settle_is_not_reported__():
+    """
+    A site no instance is handed its pin at, where the values settle every
+    context on the implementation its pin does: the object argument rules the
+    other implementation out in both passes of the selector, so the int-typed
+    argument decides nothing
+    """
+    source = '''
+from pynecore.core.overload import overload
+from pynecore.core.pine_udt import udt
+
+@udt
+class A:
+    v: int = 0
+
+@udt
+class B:
+    v: int = 0
+
+@overload
+def g(x: int, c: A) -> str:
+    return 'a'
+
+@overload
+def g(x: float, c: B) -> str:
+    return 'b'
+
+def wrapper(v, c):
+    return g(v, c)
+
+a = wrapper(1, A())
+b = wrapper(2.0, B())
+'''
+    _, calls = _calls(source, 'g')
+    assert sorted(get_pins(calls[0]).values(), key=str) == [None, 'i*']
+    assert not __test_helper_context_pin_reported(source)
+
+
 @pytest.mark.parametrize('call, of_int, of_float', [
     ('lib.math.max(v, 0)', 'i', 'f'),
     ('lib.math.min(v, 0)', 'i', 'f'),

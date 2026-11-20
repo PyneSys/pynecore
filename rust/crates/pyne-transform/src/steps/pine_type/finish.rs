@@ -396,6 +396,9 @@ impl Engine<'_, '_> {
         }
         let any_varying = vectors.varying.values().any(|sites| !sites.is_empty());
         let mut vector_stamps: Vec<(NodeId, Value)> = Vec::new();
+        // The call sites that hand the instance they create a constant vector; the
+        // module body's own sites are raw calls, which hand nothing
+        let mut handing: HashSet<i64> = HashSet::new();
         if any_varying {
             let per_instance: HashSet<NodeId> =
                 vectors.varying.values().flatten().copied().collect();
@@ -428,6 +431,9 @@ impl Engine<'_, '_> {
                 if seen.len() != 1 {
                     continue;
                 }
+                if owner.contains_key(&nid) || impl_owner.contains_key(&nid) {
+                    handing.insert(nid);
+                }
                 let vector = seen.pop().expect("one vector");
                 let all_none = Entry::Vector(Rc::new(vec![Entry::None; width]));
                 if vector != Entry::None && vector != all_none {
@@ -435,12 +441,80 @@ impl Engine<'_, '_> {
                 }
             }
         }
+        let delivered = if any_varying {
+            self.delivered_sites(&vectors.varying, &cids, &handing)
+        } else {
+            HashSet::new()
+        };
+        self.delivered = delivered;
         for (node, sites) in stamps {
             set_varying(self.ast, node, sites.as_deref());
         }
         for (node, vector) in vector_stamps {
             set_vector(self.ast, node, Some(vector));
         }
+    }
+}
+
+impl Engine<'_, '_> {
+    /// The varying call sites whose every instance is handed its own vector entry
+    /// (`_delivered_sites`): an instance is handed its vector by a site with a constant
+    /// one, or by a varying site of a caller that is handed its own.
+    fn delivered_sites(
+        &self,
+        varying: &IndexMap<String, Vec<NodeId>>,
+        cids: &HashMap<String, Vec<i64>>,
+        handing: &HashSet<i64>,
+    ) -> HashSet<i64> {
+        let ast: &pyne_ast::Ast = self.ast;
+        let is_call = |site: NodeId| matches!(ast.kind(site), Kind::Call { .. });
+        let varying_nids: HashSet<i64> = varying
+            .values()
+            .flatten()
+            .filter(|&&site| is_call(site))
+            .filter_map(|&site| facts::nid(ast, site))
+            .collect();
+        let mut created: HashSet<i64> = HashSet::new();
+        let mut undelivered: HashSet<i64> = self.unvectored.clone();
+        for (site_nid, per_caller) in &self.call_ctx {
+            created.extend(per_caller.values().copied());
+            let callee_varies = self
+                .callee_key
+                .get(site_nid)
+                .and_then(|callee| varying.get(callee))
+                .is_some_and(|sites| !sites.is_empty());
+            if !varying_nids.contains(site_nid) && !handing.contains(site_nid) && callee_varies {
+                undelivered.extend(per_caller.values().copied());
+            }
+        }
+        for (key, sites) in varying {
+            if !sites.is_empty() {
+                let key_cids = cids.get(key).map(Vec::as_slice).unwrap_or(&[]);
+                undelivered.extend(key_cids.iter().copied().filter(|cid| !created.contains(cid)));
+            }
+        }
+        let mut frontier: Vec<i64> = undelivered.iter().copied().collect();
+        while let Some(caller) = frontier.pop() {
+            for site_nid in &varying_nids {
+                let callee = self.call_ctx.get(site_nid).and_then(|seen| seen.get(&caller));
+                if let Some(&callee) = callee
+                    && undelivered.insert(callee)
+                {
+                    frontier.push(callee);
+                }
+            }
+        }
+        varying
+            .iter()
+            .filter(|(key, _)| {
+                !cids
+                    .get(*key)
+                    .is_some_and(|key_cids| key_cids.iter().any(|cid| undelivered.contains(cid)))
+            })
+            .flat_map(|(_, sites)| sites.iter().copied())
+            .filter(|&site| is_call(site))
+            .filter_map(|site| facts::nid(ast, site))
+            .collect()
     }
 }
 

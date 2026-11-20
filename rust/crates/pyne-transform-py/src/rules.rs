@@ -377,6 +377,7 @@ pub fn call<'py>(
         "is_na_widen" => rules::is_na_widen(a.opt_str(0)?.as_deref()).into_bound_py_any(py),
         "pin_for" => rules::pin_for(&a.strs(0)?).into_bound_py_any(py),
         "pin_chars" => rules::pin_chars(&a.strs(0)?).into_bound_py_any(py),
+        "value_chars" => rules::value_chars(&a.strs(0)?).into_bound_py_any(py),
         "overload_result" => rules::overload_result(&a.strs(0)?).into_bound_py_any(py),
         "default_fit" => {
             let fit = rules::default_fit(&a.str(0)?, a.opt_str(1)?.as_deref(), a.flag(2)?);
@@ -384,6 +385,9 @@ pub fn call<'py>(
         }
         "overload_choice" => {
             rules::overload_choice(&a.impls(0)?, &a.str(1)?, &a.strs(2)?).into_bound_py_any(py)
+        }
+        "overload_candidates" => {
+            rules::overload_candidates(&a.impls(0)?, &a.str(1)?, &a.strs(2)?).into_bound_py_any(py)
         }
         "overload_pick" => {
             let impls = a.impls(0)?;

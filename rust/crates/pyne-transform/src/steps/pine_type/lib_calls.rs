@@ -18,8 +18,9 @@ use crate::pine_type_rules::{
     WIDEN_FLOAT, WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA, array_of, class_of,
     default_fit, element_of, get_ty, is_array, is_map, is_matrix, is_na_text_param, is_na_widen,
     is_not_pine_string, join, key_of, lib_type_override, matrix_of, object_ty, overload_binding,
-    overload_choice, overload_result, override_param_names, pin_chars, pin_for, render_ty,
-    set_na_class, set_pin, set_pins, set_widen, shape_conflict, tuple_of, value_of,
+    overload_candidates, overload_choice, overload_result, override_param_names, pin_for,
+    render_ty, set_na_class, set_pin, set_pins, set_widen, shape_conflict, tuple_of, value_chars,
+    value_of,
 };
 use crate::pine_type_table::{CallSite, Diag, Unknown};
 
@@ -161,6 +162,17 @@ pub(super) fn lib_impl_sig(entry: &LibEntry) -> ImplSig {
     }
 }
 
+/// Whether a call site's value dispatch runs the implementation its pin selects
+/// (`_settled`): both readings leave one and the same candidate, an int-typed value
+/// read as one that may hold a float.
+pub(super) fn settled(impls: Option<&[ImplSig]>, pin: Option<&str>, shapes: &[String]) -> bool {
+    let Some(pin) = pin else { return true };
+    let Some(impls) = impls else { return false };
+    let Some(pinned) = overload_candidates(impls, pin, shapes) else { return false };
+    let values = value_chars(shapes).replace(INT, &PIN_ANY.to_string());
+    pinned.len() == 1 && overload_candidates(impls, &values, shapes) == Some(pinned)
+}
+
 impl Engine<'_, '_> {
     /// Type a call to a lib name and record its call site (`_lib_call`).
     pub(super) fn lib_call(&mut self, node: NodeId, callee: &str) -> R<String> {
@@ -204,7 +216,11 @@ impl Engine<'_, '_> {
         }
         // Only a group that dispatches has implementations to select among: the
         // others spell the types of one function, which every context runs
-        let pin = self.pin(node, data::dispatchers().contains(callee))?;
+        let dispatches = data::dispatchers().contains(callee);
+        let impls: Option<Vec<ImplSig>> = entry
+            .filter(|entry| dispatches && entry.kind == "overloads")
+            .map(|entry| entry.impls.iter().map(lib_impl_sig).collect());
+        let pin = self.pin(node, dispatches, impls.as_deref())?;
         let (_, args, keywords) = facts::call_parts(self.ast, node).expect("a call");
         let (args, keywords) = (args.to_vec(), keywords.to_vec());
         let ty = self.lib_call_type(callee, &args, &keywords, argc, pin.as_deref())?;
@@ -524,18 +540,26 @@ impl Engine<'_, '_> {
         Ok(true)
     }
 
-    /// The overload pin this call site justifies in the running context (`_pin`).
-    pub(super) fn pin(&mut self, node: NodeId, is_group: bool) -> R<Option<String>> {
+    /// The overload pin this call site justifies in the running context (`_pin`);
+    /// `impls` are the group's implementations, where the static selection reads them.
+    pub(super) fn pin(
+        &mut self,
+        node: NodeId,
+        is_group: bool,
+        impls: Option<&[ImplSig]>,
+    ) -> R<Option<String>> {
         let mut pin = None;
+        let mut shapes: Vec<String> = Vec::new();
         if let Some((_, args, keywords)) = facts::call_parts(self.ast, node)
             && is_group
             && keywords.is_empty()
             && !args.iter().any(|&arg| facts::is_starred(self.ast, arg))
         {
-            let types: Vec<String> = args.iter().map(|&arg| self.ty_of(arg)).collect();
-            pin = pin_for(&types);
+            shapes = args.iter().map(|&arg| self.ty_of(arg)).collect();
+            pin = pin_for(&shapes);
         }
-        self.record_pin(node, pin, true)
+        let settled = settled(impls, pin.as_deref(), &shapes);
+        self.record_pin(node, pin, true, settled)
     }
 
     /// The pin of an `inline_series` call site in the running context
@@ -547,16 +571,18 @@ impl Engine<'_, '_> {
             _ => UNKNOWN.to_string(),
         };
         let collection = is_array(&ty) || is_matrix(&ty) || is_map(&ty);
-        self.record_pin(node, collection.then(|| COLLECTION_HISTORY.to_string()), false)
+        self.record_pin(node, collection.then(|| COLLECTION_HISTORY.to_string()), false, false)
     }
 
     /// Merge this context's verdict into the node's pin and stamp both forms
-    /// (`_record_pin`); `diagnose` reports contexts that disagree.
+    /// (`_record_pin`); `diagnose` keeps the site for `report_context_pins`, with
+    /// `settled` (`_settled`) for this context.
     pub(super) fn record_pin(
         &mut self,
         node: NodeId,
         pin: Option<String>,
         diagnose: bool,
+        settled: bool,
     ) -> R<Option<String>> {
         let Some(nid) = self.nid(node) else {
             set_pin(self.ast, node, pin.as_deref());
@@ -578,7 +604,28 @@ impl Engine<'_, '_> {
         let pairs: Vec<(i64, Option<String>)> =
             seen.iter().map(|(&cid, pin)| (cid, pin.clone())).collect();
         set_pins(self.ast, node, if agreed { None } else { Some(&pairs) });
-        if diagnose && !agreed && self.pin_diags.insert(nid) {
+        if diagnose {
+            self.pin_reports.insert(nid, node);
+            self.pin_settled.entry(nid).or_default().insert(context, settled);
+        }
+        Ok(pin)
+    }
+
+    /// Report the overload sites whose contexts disagree where it changes what runs
+    /// (`_report_context_pins`): a site not every instance of which is handed its own
+    /// pin, where some context's values may run another implementation than its pin.
+    pub(super) fn report_context_pins(&mut self) {
+        let suppressed = self.pins_suppressed.is_some();
+        for (nid, node) in self.pin_reports.clone() {
+            let Some(seen) = self.pins.get(&nid) else { continue };
+            let distinct: HashSet<&Option<String>> = seen.values().collect();
+            let settled = self.pin_settled.get(&nid);
+            let all_settled = seen
+                .keys()
+                .all(|cid| settled.and_then(|settled| settled.get(cid)).copied().unwrap_or(false));
+            if distinct.len() < 2 || (!suppressed && self.delivered.contains(&nid)) || all_settled {
+                continue;
+            }
             let mut values: Vec<&Option<String>> = distinct.into_iter().collect();
             values.sort_by_key(|value| match value {
                 None => "None".to_string(),
@@ -599,7 +646,6 @@ impl Engine<'_, '_> {
                 "annotate the parameters so every call site agrees",
             );
         }
-        Ok(pin)
     }
 
     /// Merge this context's conversion verdict for a value into its stamp
@@ -1176,7 +1222,6 @@ impl Engine<'_, '_> {
         kw_shapes: Option<&IndexMap<String, String>>,
     ) -> Option<usize> {
         let (shapes, kw_shapes) = (shapes?, kw_shapes?);
-        let any = |chars: String| chars.replace(FLOAT, &PIN_ANY.to_string());
         if !kw_shapes.is_empty() {
             let declares =
                 |known: &str| impls.iter().any(|imp| imp.names.iter().any(|named| named == known));
@@ -1184,10 +1229,10 @@ impl Engine<'_, '_> {
                 .iter()
                 .map(|(name, ty)| (facts::runtime_keyword(name, declares), ty.clone()))
                 .collect();
-            let chars = any(pin_chars(shapes));
+            let chars = value_chars(shapes);
             let kw_chars: Vec<(String, String)> = kw_shapes
                 .iter()
-                .map(|(name, ty)| (name.clone(), any(pin_chars(std::slice::from_ref(ty)))))
+                .map(|(name, ty)| (name.clone(), value_chars(std::slice::from_ref(ty))))
                 .collect();
             let kw_types: Vec<(String, String)> =
                 kw_shapes.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect();
@@ -1195,7 +1240,7 @@ impl Engine<'_, '_> {
         }
         let chars = match pin {
             Some(pin) => pin.to_string(),
-            None => any(pin_chars(shapes)),
+            None => value_chars(shapes),
         };
         overload_choice(impls, &chars, shapes)
     }

@@ -18,7 +18,7 @@ import ast
 import pytest
 
 from pynecore.core.instance_state import _make_state
-from pynecore.core.overload import Implementation, _anchored  # noqa: internal API
+from pynecore.core.overload import Implementation, _anchored, _select  # noqa: internal API
 from pynecore.errorcodes import WrongOperandTypeError
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
@@ -28,11 +28,15 @@ from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
     FIT_OMISSIBLE, FIT_REQUIRED, INT, ImplSig, NONE_DEFAULT, OBJECT, TYPELESS,
     annotation_takes_none, class_id, default_fit, get_pin, get_ty, object_ty, overload_bind,
-    overload_binding, overload_choice, overload_pick,
+    overload_binding, overload_candidates, overload_choice, overload_pick,
 )
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
 from pynecore.transformers.slot_layout import ModuleLayout
+from pynecore.types.box import Box
+from pynecore.types.color import Color
+from pynecore.types.line import Line
+from pynecore.types.na import NA
 
 # The reverse-engineering probe (``ovl2.pine``, FX:EURUSD@60) AS COMPILED: this
 # is PyneComp's output verbatim, with only the measured argument substituted.
@@ -815,3 +819,149 @@ def __test_a_call_with_keywords_is_bound_by_name__(impls: list[ImplSig], chars: 
     assert overload_bind(impls, chars, shapes, kw_chars, kw_shapes) == expected
     choice = overload_binding(impls, chars, shapes, kw_chars, kw_shapes)
     assert choice is (None if expected is None else next(i for i in impls if i.ret == expected))
+
+
+LINES_TY = 'a:' + PIVOT_TY
+BOXES_TY = 'a:' + HOLDER_TY
+PIVOT_MAP_TY = 'M:s:' + PIVOT_TY
+
+
+@pytest.mark.parametrize("impls,pin,shapes,expected", [
+    # A container of a known element: the declared type itself takes it for
+    # sure, a container of another kind never does
+    ([ImplSig((PIVOT_MAP_TY,), 1, False, 'M', 'n'), ImplSig((LINES_TY,), 1, False, 'A', 'n')],
+     '*', [LINES_TY], [1]),
+    ([ImplSig((LINES_TY,), 1, False, 'A', 'n'), ImplSig((BOXES_TY,), 1, False, 'B', 'n')],
+     '*', [LINES_TY], [0]),
+    # ... while one of the same kind with another element may take it: an empty
+    # one passes for the first ``list[...]`` parameter
+    ([ImplSig((BOXES_TY,), 1, False, 'B', 'n'), ImplSig((LINES_TY,), 1, False, 'A', 'n')],
+     '*', [LINES_TY], [0, 1]),
+    # A scalar or a class parameter never takes a container
+    ([ImplSig(('f',), 1, False, 'F', 'n'), ImplSig((PIVOT_TY,), 1, False, 'P', 'n'),
+      ImplSig((LINES_TY,), 1, False, 'A', 'n')], '*', [LINES_TY], [2]),
+    # A container of numbers is matched by a sampled element that may not be of
+    # its declared type, so not even the declared type is sure to take it
+    ([ImplSig(('M:s:f',), 1, False, 'F', 'n'), ImplSig(('M:s:i',), 1, False, 'I', 'n')],
+     '*', ['M:s:f'], [0, 1]),
+    # A color: a color parameter takes it, any other parameter may take the
+    # typeless na a color na is
+    ([ImplSig(('c',), 1, False, 'C', 'n'), ImplSig(('s',), 1, False, 'S', 'n')],
+     '*', ['c'], [0]),
+    ([ImplSig(('s',), 1, False, 'S', 'n'), ImplSig(('c',), 1, False, 'C', 'n')],
+     '*', ['c'], [0, 1]),
+    # No implementation is sure to take the call: the one left is what runs where
+    # every other one is out of the widening pass's reach too -- a class mismatch is
+    ([ImplSig((PIVOT_TY, 'f'), 2, False, 'P', 'nn'), ImplSig((HOLDER_TY, 'f'), 2, False, 'H', 'nn')],
+     '**', [HOLDER_TY, 'f'], [1]),
+    # ... an int argument for a float parameter is not, the widening pass takes it
+    ([ImplSig(('f', 's'), 2, False, 'F', 'nn'), ImplSig(('i', '?'), 2, False, 'I', 'nn')],
+     'is', [], None),
+    # ... a bool for an int parameter is
+    ([ImplSig(('b', 's'), 2, False, 'B', 'nn'), ImplSig(('i', '?'), 2, False, 'I', 'nn')],
+     'is', [], [1]),
+    # ... nor is the na of a class for a float parameter, which that pass takes
+    ([ImplSig(('f', 'f'), 2, False, 'F', 'nn'), ImplSig((PIVOT_TY, '?'), 2, False, 'P', 'nn')],
+     '*f', [PIVOT_TY, 'f'], None),
+    # ... nor a default the exact pass rejects, which that pass may take
+    ([ImplSig(('i', 'f'), 1, False, 'X', 'nn'), ImplSig(('?',), 1, False, 'U', 'n')],
+     'i', [], None),
+    # ... while an arity the call does not meet is
+    ([ImplSig(('i', 'f'), 2, False, 'X', 'nn'), ImplSig(('?',), 1, False, 'U', 'n')],
+     'i', [], [1]),
+])
+def __test_the_candidates_are_what_the_selector_can_run__(impls: list[ImplSig], pin: str,
+                                                          shapes: list[str],
+                                                          expected: list[int] | None):
+    """The candidate walk collects what may run, and answers only where nothing else can"""
+    assert overload_candidates(impls, pin, shapes) == expected
+
+
+def __test_the_candidate_readings_hold_at_run_time__():
+    """
+    The values behind the container, color and widening readings, through the
+    runtime selector itself: an empty list passes for the first ``list[...]``
+    implementation whatever its element, a list of objects for the one of its
+    class, a color na (the typeless na) for a string parameter, the na of a class
+    for a float parameter in the widening pass
+    """
+    def boxes(x: list[Box]) -> str:
+        return 'boxes'
+
+    def lines(x: list[Line]) -> str:
+        return 'lines'
+
+    def mapped(x: dict[str, Line]) -> str:
+        return 'map'
+
+    group = [Implementation(boxes), Implementation(lines)]
+    assert _select(group, ([],), {}).func is boxes
+    assert _select(group, ([NA(Line)],), {}).func is lines
+    assert _select([Implementation(mapped), Implementation(lines)], ([],), {}).func is lines
+    assert _select([Implementation(mapped), Implementation(lines)], (NA(list),), {}).func is lines
+
+    def text(x: str) -> str:
+        return 'str'
+
+    def color(x: Color) -> str:
+        return 'color'
+
+    assert _select([Implementation(text), Implementation(color)], (NA(None),), {}).func is text
+    assert _select([Implementation(text), Implementation(color)], (NA(Color),), {}).func is color
+
+    def number(x: float) -> str:
+        return 'float'
+
+    assert _select([Implementation(number)], (NA(Line),), {}).func is number
+
+
+CANDIDATE_GROUPS = '''
+from pynecore.core.overload import overload
+from pynecore.lib import array, na
+from pynecore.types import Box, Label, Line
+
+@overload
+def count(x: list[Line]) -> int:
+    return array.size(x)
+
+@overload
+def count(x: list[Box]) -> int:
+    return array.size(x) + 1
+
+@overload
+def first(x: list[Box]) -> Box:
+    return array.get(x, 0)
+
+@overload
+def first(x: list[Line]) -> Line:
+    return array.get(x, 0)
+
+@overload
+def tag(x: dict[str, Label], y: str) -> str:
+    return y
+
+@overload
+def tag(x: list[Line], y: str) -> int:
+    return 1
+'''
+
+
+def __test_a_call_the_candidates_agree_on_is_typed__():
+    """
+    ``count(lines)`` can run either implementation (an empty array of lines
+    passes for the ``list[Box]`` one, declared first), and both return an int;
+    ``first(lines)`` can too, and they disagree, so it has no type; ``tag``
+    takes an array by its kind, so a map runs the map implementation
+    """
+    table = infer_module(ast.parse(CANDIDATE_GROUPS + '''
+def main():
+    lines: list[Line] = array.new_line(0)
+    labels: dict[str, Label] = {}
+    n = count(lines)
+    f = first(lines)
+    t = tag(labels, 'x')
+    u = tag(lines, 'x')
+    return n
+'''), 'test')
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert (types['n'], types['f'], types['t'], types['u']) == ('i', '?', 's', 'i')

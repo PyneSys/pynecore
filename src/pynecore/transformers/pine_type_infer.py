@@ -80,14 +80,15 @@ from .pine_type_rules import (
     join, binop_type, unaryop_type, compare_type, annotation_type, bare_wrapper,
     LIB_TYPE_OVERRIDES, OVERRIDE_PARAM_NAMES, BUILTIN_CALL_TYPES, BUILTIN_NAME_TYPES,
     TY_ATTR, get_ty, set_ty, inherit_ty,
-    constant_type, PIN_ANY, pin_chars, pin_for, get_pins, set_pin, set_pins, set_vector,
+    constant_type, PIN_ANY, pin_for, get_pins, set_pin, set_pins, set_vector,
     get_varying, set_varying,
     WIDEN_FLOAT, WIDEN_BOOL, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA,
     WIDEN_BOOL_NA, WIDEN_NA_TEXT, WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
     NA_TEXT_PARAMS,
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
-    overload_result, ImplSig, overload_choice, overload_binding, default_fit, FIT_REQUIRED,
+    overload_result, ImplSig, overload_choice, overload_binding, overload_candidates,
+    value_chars, default_fit, FIT_REQUIRED,
     impl_sig, _param_defaults, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, is_array,
@@ -555,8 +556,15 @@ class _Inference:
         self._pending: list[list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]] = [[]]
         #: Function ids whose signature already absorbed one context
         self._signed: set[str] = set()
-        #: Call node ids already reported as pin-disagreeing
-        self._pin_diags: set[int] = set()
+        #: Overload call node id -> the node, for the sites whose disagreeing
+        #: contexts are reported (``_report_context_pins``)
+        self._pin_reports: dict[int, ast.Call] = {}
+        #: Overload call node id -> context id -> whether the value dispatch of
+        #: that context runs the implementation its pin selects
+        self._pin_settled: dict[int, dict[int, bool]] = {}
+        #: Node ids of the varying sites whose every instance is handed its
+        #: vector entry (``_stamp_instance_vectors``)
+        self._delivered: set[int] = set()
         #: Contexts an instance is created in with no instance vector: reached
         #: through a call site the per-instance channel does not record (a
         #: method call, a call this analysis could not bind)
@@ -1159,6 +1167,7 @@ class _Inference:
         self._stamp_widen_sites()
         self._stamp_instance_vectors(tree)
         self._suppress_pins(tree)
+        self._report_context_pins()
         self._report_unhandled_widens()
         # Where the types ran out, once per cause: the coverage meter of a
         # hand-written script, the first error of an edge module
@@ -3391,7 +3400,10 @@ class _Inference:
             return UNKNOWN
         # Only a group that dispatches has implementations to select among: the
         # others spell the types of one function, which every context runs
-        pin = self._pin(node, callee in lib_dispatchers())
+        dispatches = callee in lib_dispatchers()
+        impls = [_lib_impl_sig(impl) for impl in entry['impls']] \
+            if dispatches and isinstance(entry, dict) and entry['kind'] == 'overloads' else None
+        pin = self._pin(node, dispatches, impls)
         ty = self._lib_call_type(callee, node.args, node.keywords, argc, pin)
         self.table.calls.append(CallSite(
             callee=callee, line=_line(node), col=_col(node), argc=argc, ty=ty, pin=pin))
@@ -3617,7 +3629,8 @@ class _Inference:
             return False
         return True
 
-    def _pin(self, node: ast.Call, is_group: bool) -> str | None:
+    def _pin(self, node: ast.Call, is_group: bool,
+             impls: Sequence[ImplSig] | None = None) -> str | None:
         """
         The overload pin this call site justifies in the running context.
 
@@ -3628,13 +3641,46 @@ class _Inference:
 
         :param node: The call node
         :param is_group: Whether the callee is a proven overload group
+        :param impls: The group's implementations, where the static selection
+                      can read them (``_settled``)
         :return: The pin this context justifies, or None
         """
         pin = None
+        shapes: list[str] = []
         if is_group and not node.keywords and not any(
                 isinstance(a, ast.Starred) for a in node.args):
-            pin = pin_for([self._ty_of(a) for a in node.args])
-        return self._record_pin(node, pin)
+            shapes = [self._ty_of(a) for a in node.args]
+            pin = pin_for(shapes)
+        return self._record_pin(node, pin, settled=self._settled(impls, pin, shapes))
+
+    @staticmethod
+    def _settled(impls: Sequence[ImplSig] | None, pin: str | None,
+                 shapes: Sequence[str]) -> bool:
+        """
+        Whether a call site's value dispatch runs the implementation its pin selects.
+
+        An instance that is not handed its pin dispatches on its values, which
+        changes nothing where the values settle on the implementation the pin
+        does, for every value the argument types admit: both readings leave one
+        and the same candidate (``overload_candidates``). The values are read
+        as ``value_chars`` reads them, an int-typed one included: it may hold a
+        Python float (``14 / 8``, and the numeric na, a NaN), which is what the
+        pin is there to overrule. A site without a pin dispatches on its values
+        either way.
+
+        :param impls: The group's implementations, or None where they are not read
+        :param pin: The pin the running context justified
+        :param shapes: The static type of each positional argument
+        :return: True when the pin makes no difference at run time
+        """
+        if pin is None:
+            return True
+        if impls is None:
+            return False
+        pinned = overload_candidates(list(impls), pin, shapes)
+        return pinned is not None and len(pinned) == 1 \
+            and overload_candidates(list(impls), value_chars(shapes).replace(INT, PIN_ANY),
+                                    shapes) == pinned
 
     def _history_pin(self, node: ast.Call) -> str | None:
         """
@@ -3655,7 +3701,8 @@ class _Inference:
         return self._record_pin(node, _COLLECTION_HISTORY if collection else None,
                                 diagnose=False)
 
-    def _record_pin(self, node: ast.Call, pin: str | None, diagnose: bool = True) -> str | None:
+    def _record_pin(self, node: ast.Call, pin: str | None, diagnose: bool = True,
+                    settled: bool = False) -> str | None:
         """
         Merge this context's verdict into the node's pin and stamp both forms.
 
@@ -3674,12 +3721,17 @@ class _Inference:
           character to each instance.
 
         Both are the same rule: the node carries what holds for every context,
-        and nothing else.
+        and nothing else. Whether contexts that disagree are a problem is only
+        known once the per-instance vectors are worked out
+        (``_report_context_pins``).
 
         :param node: The call node
         :param pin: What the running context justified
-        :param diagnose: Whether contexts that disagree are reported; a site whose
-            instances resolve their own pin needs no annotation
+        :param diagnose: Whether contexts that disagree are reported where some
+            instance is not handed its own pin; a site whose instances resolve
+            their own pin needs no annotation
+        :param settled: Whether this context's value dispatch runs the
+            implementation its pin selects (``_settled``)
         :return: ``pin``
         """
         nid = node_id(node)
@@ -3696,14 +3748,36 @@ class _Inference:
         agreed = len(set(seen.values())) == 1
         set_pin(node, pin if agreed else None)
         set_pins(node, None if agreed else dict(seen))
-        if diagnose and not agreed and nid not in self._pin_diags:
-            self._pin_diags.add(nid)
+        if diagnose:
+            self._pin_reports[nid] = node
+            self._pin_settled.setdefault(nid, {})[self._context] = settled
+        return pin
+
+    def _report_context_pins(self) -> None:
+        """
+        Report the overload sites whose contexts disagree where it changes what runs.
+
+        A site whose contexts justify different pins is handed each instance's
+        own pin through the instance vector where every instance of its
+        definition is created by a call site that hands one
+        (``_stamp_instance_vectors``). Elsewhere an instance dispatches on its
+        values: a site inside an overload implementation, one reached from the
+        module body, through a method found by name or through a call this
+        analysis could not bind, and every site of a module whose pins were
+        taken away. Such a site is reported only where some context's values
+        may run another implementation than its pin selects (``_settled``).
+        """
+        delivered = set() if self._pins_suppressed is not None else self._delivered
+        for nid, node in self._pin_reports.items():
+            seen = self._pins.get(nid, {})
+            if len(set(seen.values())) < 2 or nid in delivered \
+                    or all(self._pin_settled.get(nid, {}).get(cid, False) for cid in seen):
+                continue
             pins = ', '.join(f'`{each}`' for each in sorted(set(seen.values()), key=str))
             self._diag(
                 TYPE_PIN_PER_CONTEXT, (pins,), node,
                 self._unknown('context-dependent-pin', node, dotted_name(node.func) or ''),
                 fix='annotate the parameters so every call site agrees')
-        return pin
 
     def _record_widen(self, node: ast.expr, kind: str | None) -> None:
         """
@@ -4373,7 +4447,7 @@ class _Inference:
                     callee=name, line=_line(node), col=_col(node),
                     argc=_call_arity(node), ty=UNKNOWN, pin=None))
                 return UNKNOWN
-        pin = self._pin(node, is_group)
+        pin = self._pin(node, is_group, self._impl_sigs(key) if is_group else None)
         if is_group:
             ty = self._group_type(key, pin, node.args, node.keywords)
         else:
@@ -4774,11 +4848,12 @@ class _Inference:
             # implementation for an int-typed fractional argument
             if not self._ensure_group(key, frame, spelled, node, args) \
                     or not self._group_call_fits(key, name, node, args):
-                self._record_pin(node, None)
+                self._record_pin(node, None, settled=True)
                 return UNKNOWN
             shapes = self._shapes(args)
             pin = None if shapes is None or node.keywords else pin_for(shapes)
-            self._record_pin(node, pin)
+            self._record_pin(node, pin,
+                             settled=self._settled(self._impl_sigs(key), pin, shapes or ()))
             return self._group_type(key, pin, args, node.keywords)
         # The method handed over as a function is the one the call site's dispatch
         # entry binds, so the instance vector stamped here configures it
@@ -5043,10 +5118,12 @@ class _Inference:
         Type a call by name to an export of this module.
 
         A method spelled by name is never pinned (the runtime selects from the
-        values), so a group answers the way a published one does: only where
-        the implementations the receiver can reach agree on the return. A
-        single definition is typed in the context the call describes, outside
-        the per-instance channel, which a call by name hands nothing through.
+        values), so a group answers the way a published one does: from the
+        implementations its arguments, read as values, can run
+        (``_group_result``), and otherwise only where the implementations the
+        receiver can reach agree on the return. A single definition is typed in
+        the context the call describes, outside the per-instance channel, which
+        a call by name hands nothing through.
 
         :param key: Scope-qualified id of the definition
         :param frame: Index of the frame whose scope declares it
@@ -5059,8 +5136,12 @@ class _Inference:
             self._ensure_group(key, frame, name, node, args, by_name=True)
             if not self._group_call_fits(key, name, node, args):
                 return UNKNOWN
+            impls = self._impl_sigs(key)
+            settled = self._group_result(impls, None, args, node.keywords)
+            if settled is not None:
+                return settled
             receiver = self._ty_of(args[0]) if args else UNKNOWN
-            return overload_result([impl.ret for impl in self._impl_sigs(key)
+            return overload_result([impl.ret for impl in impls
                                     if _takes_receiver(impl, receiver)])
         return self._call_context(key, node, frame, args, record=False)
 
@@ -5109,11 +5190,13 @@ class _Inference:
         signature, and the call is held to that signature the way any call
         into another module is; the declared return is the answer only
         where the parameters are annotated. A method spelled by name is never
-        pinned (the runtime selects from the values), so a group answers only
-        where its implementations agree on the return -- the implementations
-        the receiver can reach, that is: the selector checks an object against
-        the class its parameter declares, so a receiver of a known class is
-        taken only by the implementations declaring that class, or none.
+        pinned (the runtime selects from the values), so a group answers from
+        the implementations its arguments, read as values, can run
+        (``_group_result``), and otherwise only where the implementations the
+        receiver can reach agree on the return: the selector checks an object
+        against the class its parameter declares, so a receiver of a known
+        class is taken only by the implementations declaring that class, or
+        none.
 
         :param sig: The published signature
         :param name: The method name
@@ -5126,6 +5209,9 @@ class _Inference:
         if not self._export_call_fits(node, name, sig, args, by_name):
             return UNKNOWN
         if sig.kind == 'group':
+            settled = self._group_result(sig.impls, None, args, node.keywords)
+            if settled is not None:
+                return settled
             receiver = self._ty_of(args[0]) if args else UNKNOWN
             return overload_result([impl.ret for impl in sig.impls
                                     if _takes_receiver(impl, receiver)])
@@ -5320,25 +5406,26 @@ class _Inference:
         omits (``impl_sig``), and the walk that types them where the definition
         stands has not reached it.
 
-        Only the implementations the call can run are walked. Where the static
-        selection settles one for the call (``_choice``, under the pin the site
-        justifies), that one alone is; a call by name, which the runtime selects
-        from the values, reaches every implementation that can take its
-        receiver (``_takes_receiver``); and a call the selection leaves open
-        reaches them all. An implementation the call cannot run has nothing to
-        tell it, and walking it from here puts the group in a cycle the script
-        does not have: a body of it that calls back into the implementation
-        being walked would read that one's return before it is known, and the
-        UNKNOWN would stay in what the body is typed with.
+        Only the implementations the call can run are walked: the ones the
+        static selection leaves for it (``_group_result`` reads the same ones),
+        under the pin the site justifies, or with its arguments read as values
+        for a call by name, which the runtime selects from the values. Where the
+        selection leaves the call open, a call by name reaches every
+        implementation that can take its receiver (``_takes_receiver``), and
+        any other call reaches them all. An implementation the call cannot run
+        has nothing to tell it, and walking it from here puts the group in a
+        cycle the script does not have: a body of it that calls back into the
+        implementation being walked would read that one's return before it is
+        known, and the UNKNOWN would stay in what the body is typed with.
 
-        An implementation the selection settles on that is being walked already
-        is the one the call is made from, directly or through the functions it
-        calls: a recursion, which is reported the way ``_call_context`` reports
-        one. That holds only where every walk in progress is one the script
-        makes: under a walk of an implementation the call that started it may
-        not reach (the last two cases above), the cycle may run through a call
-        that never selects it, and the call is left to read the return as it
-        stands.
+        The one implementation the selection leaves for a call that is not by
+        name, where it is being walked already, is the one the call is made
+        from, directly or through the functions it calls: a recursion, which is
+        reported the way ``_call_context`` reports one. That holds only where
+        every walk in progress is one the script makes: under a walk of
+        implementations the call that started it may not run (several of them,
+        or an open selection), the cycle may run through a call that never
+        selects it, and the call is left to read the return as it stands.
 
         :param key: Scope-qualified id of the group
         :param frame: Index of the frame whose scope declares the group
@@ -5359,30 +5446,29 @@ class _Inference:
             self._type_defaults(impl, parents)
         positional = node.args if args is None else args
         group = self._group_impls(key)
+        found = self._reached(group, positional, node.keywords, by_name)
         reached = pending
         unsure = True
-        if by_name:
-            receiver = self._ty_of(positional[0]) if positional else UNKNOWN
-            sigs = {id(impl): sig for impl, sig in group}
-            reached = [impl for impl in pending
-                       if id(impl) not in sigs or _takes_receiver(sigs[id(impl)], receiver)]
-        else:
-            shapes = self._shapes(positional)
-            pin = None if shapes is None or node.keywords else pin_for(shapes)
-            choice = self._choice([sig for _, sig in group], pin, shapes,
-                                  self._keyword_shapes(node.keywords))
-            chosen = next((impl for impl, sig in group if sig is choice), None)
-            if chosen is not None:
-                if not any(impl is chosen for impl in pending):
+        if found is None:
+            if by_name:
+                receiver = self._ty_of(positional[0]) if positional else UNKNOWN
+                reached = [impl for impl in pending
+                           if all(impl is not known or _takes_receiver(sig, receiver)
+                                  for known, sig in group)]
+        elif len(found) == 1 and not by_name:
+            chosen = group[found[0]][0]
+            if not any(impl is chosen for impl in pending):
+                return True
+            if (key, self._declared_params(chosen), node_id(chosen)) in self._in_progress:
+                if self._unsure_walks:
                     return True
-                if (key, self._declared_params(chosen), node_id(chosen)) in self._in_progress:
-                    if self._unsure_walks:
-                        return True
-                    self._diag(TYPE_RECURSION, (name,), node,
-                               self._unknown('recursion', node, key))
-                    return False
-                reached = [chosen]
-                unsure = False
+                self._diag(TYPE_RECURSION, (name,), node,
+                           self._unknown('recursion', node, key))
+                return False
+            reached = [chosen]
+            unsure = False
+        else:
+            reached = [impl for impl in pending if any(impl is group[index][0] for index in found)]
         if unsure:
             self._unsure_walks += 1
         try:
@@ -5393,18 +5479,40 @@ class _Inference:
                 self._unsure_walks -= 1
         return True
 
+    def _reached(self, group: Sequence[tuple[ast.AST, ImplSig]], args: Sequence[ast.expr],
+                 keywords: Sequence[ast.keyword], by_name: bool) -> list[int] | None:
+        """
+        The implementations of a group a call can run, by index, as ``_group_result`` reads them.
+
+        :param group: (definition, shape) per implementation, in declaration order
+        :param args: The positional arguments, typed already
+        :param keywords: The keyword arguments, typed already
+        :param by_name: Whether the call found the group by its name, which is never pinned
+        :return: The indices, or None where the selection leaves the call open
+        """
+        shapes = self._shapes(args)
+        kw_shapes = self._keyword_shapes(keywords)
+        if shapes is None or kw_shapes is None:
+            return None
+        sigs = [sig for _, sig in group]
+        if kw_shapes:
+            choice = self._choice(sigs, None, shapes, kw_shapes)
+            return None if choice is None \
+                else [index for index, sig in enumerate(sigs) if sig is choice]
+        pin = None if by_name else pin_for(shapes)
+        return overload_candidates(sigs, pin if pin is not None else value_chars(shapes), shapes)
+
     def _group_type(self, key: str, pin: str | None, args: Sequence[ast.expr],
                     keywords: Sequence[ast.keyword]) -> str:
         """
         Type of a call to a user overload group.
 
         The group's own type is what its implementations AGREE on, which is
-        nothing where they return different types -- but a positional call site
-        whose argument types settle which implementation runs (the selector's
-        exact pass, read statically) has that one's return as the call's type.
-        Without this a composed group (``g(h(1))``) loses the pin the inner
-        call earned: the outer site would read UNKNOWN and dispatch on the
-        value ``h`` happens to produce.
+        nothing where they return different types -- but a call site whose
+        argument types narrow down which implementations can run has what
+        those agree on (``_group_result``). Without this a composed group
+        (``g(h(1))``) loses the pin the inner call earned: the outer site would
+        read UNKNOWN and dispatch on the value ``h`` happens to produce.
 
         :param key: Scope-qualified id of the group
         :param pin: The pin this call site justified, when it has one
@@ -5412,12 +5520,51 @@ class _Inference:
         :param keywords: The keyword arguments, typed already
         :return: The type the call evaluates to
         """
-        choice = self._choice(self._impl_sigs(key), pin, self._shapes(args),
-                              self._keyword_shapes(keywords))
-        if choice is None:
-            return self.table.funcs[key].ret
-        self._widen_group_nas(choice, args, keywords)
-        return choice.ret
+        settled = self._group_result(self._impl_sigs(key), pin, args, keywords)
+        return self.table.funcs[key].ret if settled is None else settled
+
+    def _group_result(self, impls: Sequence[ImplSig], pin: str | None,
+                      args: Sequence[ast.expr], keywords: Sequence[ast.keyword]) -> str | None:
+        """
+        Type of a call to an overload group, from the implementations it can run.
+
+        Where the selector's exact pass settles one implementation (``_choice``)
+        that one runs, and its typeless ``na`` arguments are converted to what it
+        declares (``_widen_group_nas``); a call with keyword arguments is only
+        answered that way. Otherwise a positional call can run the
+        implementations ``overload_candidates`` leaves, under the pin the site
+        justified, or with its arguments read as values where it has none -- a
+        call by name never has one. A single one of them is the implementation
+        that runs, the same way. Several of them type the call where they all
+        return the same type; which one runs is then left to the runtime, and so
+        are the typeless ``na`` arguments.
+
+        :param impls: The group's implementations, in declaration order
+        :param pin: The pin the site justified, when it has one
+        :param args: The positional arguments, typed already
+        :param keywords: The keyword arguments, typed already
+        :return: The type, or None where the implementations that can run are
+                 not known or disagree
+        """
+        shapes = self._shapes(args)
+        kw_shapes = self._keyword_shapes(keywords)
+        if shapes is None or kw_shapes is None:
+            return None
+        choice = self._choice(impls, pin, shapes, kw_shapes)
+        if choice is not None:
+            self._widen_group_nas(choice, args, keywords)
+            return choice.ret
+        if kw_shapes:
+            return None
+        found = overload_candidates(list(impls), pin if pin is not None else value_chars(shapes),
+                                    shapes)
+        if found is None:
+            return None
+        if len(found) == 1:
+            self._widen_group_nas(impls[found[0]], args, keywords)
+            return impls[found[0]].ret
+        returns = {impls[index].ret for index in found}
+        return returns.pop() if len(returns) == 1 else None
 
     def _widen_group_nas(self, impl: ImplSig, args: Sequence[ast.expr],
                          keywords: Sequence[ast.keyword]) -> None:
@@ -5479,13 +5626,11 @@ class _Inference:
 
         The pin is read where the site has one: the runtime selects by the pin's
         witnesses, so what the pin says runs. An unpinned site (nothing in it
-        worth a pin, or a keyword argument) dispatches on its values, and the
-        characters are read off the argument types only where a value is what
-        its type says: a string, a bool, an object of a known class. A
-        float-typed value may be a Python int at run time (``float x = 1``),
-        which the exact pass takes for an int, so a float position of an
-        unpinned site says nothing; an int position never reaches here unpinned.
-        A call with keyword arguments is bound to each implementation's
+        worth a pin, or a keyword argument) dispatches on its values, which are
+        read as such (``value_chars``): a string and a bool are what their type
+        says, a number or a container of numbers is read from its static type
+        as the selector checks a value of it. A call with keyword arguments is
+        bound to each implementation's
         parameters by name (``overload_binding``), under the name the
         dispatcher hands each keyword to (``_runtime_keyword``).
 
@@ -5502,11 +5647,10 @@ class _Inference:
         if kw_shapes:
             declared = {pname for impl in impls for pname in impl.names}
             kw_shapes = {_runtime_keyword(pname, declared): ty for pname, ty in kw_shapes.items()}
-            chars = pin_chars(shapes).replace(FLOAT, PIN_ANY)
-            kw_chars = {name: pin_chars([ty]).replace(FLOAT, PIN_ANY)
-                        for name, ty in kw_shapes.items()}
-            return overload_binding(list(impls), chars, shapes, kw_chars, kw_shapes)
-        chars = pin if pin is not None else pin_chars(shapes).replace(FLOAT, PIN_ANY)
+            kw_chars = {name: value_chars([ty]) for name, ty in kw_shapes.items()}
+            return overload_binding(list(impls), value_chars(shapes), shapes, kw_chars,
+                                    kw_shapes)
+        chars = pin if pin is not None else value_chars(shapes)
         return overload_choice(list(impls), chars, shapes)
 
     def _impl_sigs(self, key: str) -> list[ImplSig]:
@@ -5872,15 +6016,10 @@ class _Inference:
                 callee=name, line=_line(node), col=_col(node),
                 argc=_call_arity(node), ty=UNKNOWN, pin=None))
             return UNKNOWN
-        pin = self._pin(node, is_group)
+        pin = self._pin(node, is_group, sig.impls if is_group else None)
         if is_group:
-            choice = self._choice(sig.impls, pin, self._shapes(node.args),
-                                  self._keyword_shapes(node.keywords))
-            if choice is None:
-                ty = sig.ret
-            else:
-                self._widen_group_nas(choice, node.args, node.keywords)
-                ty = choice.ret
+            settled = self._group_result(sig.impls, pin, node.args, node.keywords)
+            ty = sig.ret if settled is None else settled
         elif sig.annotated:
             ty = sig.ret
         else:
@@ -6326,6 +6465,11 @@ class _Inference:
             # No callee has a vector to be handed, so no call site gets one
             return
         per_instance = {id(call) for key_sites in varying.values() for call in key_sites}
+        # The call sites that hand the instance they create its vector: a
+        # constant one, the same for every context of the caller. The module
+        # body's own sites are left as raw calls by the isolation pass, which
+        # hands nothing there
+        handing: set[int] = set()
         for node in ast_walk.walk(tree):
             if not isinstance(node, ast.Call) or id(node) in per_instance:
                 continue
@@ -6343,9 +6487,56 @@ class _Inference:
             seen = {entry_of(node, cid, frozenset()) for cid in callers}
             if len(seen) != 1:
                 continue
+            if key is not None or nid in impl_owner:
+                handing.add(nid)
             vector = seen.pop()
             if vector is not None and vector != (None,) * len(varying[callee]):
                 set_vector(node, vector)
+        self._delivered = self._delivered_sites(varying, cids, handing)
+
+    def _delivered_sites(self, varying: Mapping[str, Sequence[ast.AST]],
+                         cids: Mapping[str, Sequence[int]], handing: set[int]) -> set[int]:
+        """
+        The varying call sites whose every instance is handed its own vector entry.
+
+        An instance of a definition is handed its vector by the call site that
+        creates it: a site with a constant vector (``handing``), or a varying
+        site of the caller, which hands what the caller's own vector holds for
+        it -- and so only where the caller is handed its own. An instance is
+        handed nothing where it is created by any other site (one of the module
+        body, one whose callers disagree on the vector), by a site the channel
+        does not record (``_unvectored``), or by no site of this module at all.
+
+        :param varying: Definition id -> its varying sites, in source order
+        :param cids: Definition id -> the contexts it was instantiated in
+        :param handing: Node ids of the non-varying sites that hand a constant vector
+        :return: Node ids of the varying call sites every instance is handed
+        """
+        varying_nids = {nid for sites in varying.values() for site in sites
+                        if isinstance(site, ast.Call) for nid in (node_id(site),)
+                        if nid is not None}
+        created: set[int] = set()
+        undelivered = set(self._unvectored)
+        for site_nid, per_caller in self._call_ctx.items():
+            created.update(per_caller.values())
+            if site_nid not in varying_nids and site_nid not in handing \
+                    and varying.get(self._callee_key.get(site_nid, '')):
+                undelivered.update(per_caller.values())
+        for key, sites in varying.items():
+            if sites:
+                undelivered.update(cid for cid in cids.get(key, ()) if cid not in created)
+        frontier = list(undelivered)
+        while frontier:
+            caller = frontier.pop()
+            for site_nid in varying_nids:
+                callee = self._call_ctx.get(site_nid, {}).get(caller)
+                if callee is not None and callee not in undelivered:
+                    undelivered.add(callee)
+                    frontier.append(callee)
+        return {nid for key, sites in varying.items()
+                if not any(cid in undelivered for cid in cids.get(key, ()))
+                for site in sites if isinstance(site, ast.Call)
+                for nid in (node_id(site),) if nid is not None}
 
     def _lib_name(self, node: ast.expr) -> str | None:
         """
