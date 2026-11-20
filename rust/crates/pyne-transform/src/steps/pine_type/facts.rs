@@ -260,6 +260,14 @@ pub fn every_param(ast: &Ast, node: NodeId) -> Vec<NodeId> {
     args.posonlyargs.iter().chain(args.args).chain(args.kwonlyargs).copied().collect()
 }
 
+/// The parameter a keyword argument binds where the runtime adapts its spelling
+/// (`_runtime_keyword`): a keyword no parameter takes as written binds its
+/// `__ren__` image, where the callee declares one.
+pub fn runtime_keyword(name: &str, declares: impl Fn(&str) -> bool) -> String {
+    let renamed = format!("{name}__ren__");
+    if declares(name) || !declares(&renamed) { name.to_string() } else { renamed }
+}
+
 /// The body of a definition.
 pub fn def_body(ast: &Ast, node: NodeId) -> &[NodeId] {
     match ast.kind(node) {

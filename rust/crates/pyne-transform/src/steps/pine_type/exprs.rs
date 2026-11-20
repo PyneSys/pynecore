@@ -177,7 +177,11 @@ impl Engine<'_, '_> {
 
     /// The qualifier of an attribute read (`_attribute_qual`).
     fn attribute_qual(&mut self, node: NodeId) -> R<u8> {
-        let Some(name) = self.lib_name(node) else {
+        let name = match self.lib_name(node) {
+            Some(name) => Some(name),
+            None => self.shadowed_member(node)?,
+        };
+        let Some(name) = name else {
             let constant = self.names_class(node)?.is_some() || self.enum_of(node)?.is_some();
             return Ok(if constant { CONST } else { SERIES });
         };
@@ -281,7 +285,11 @@ impl Engine<'_, '_> {
         if attr == "__class__" {
             return Ok(OBJECT.to_string());
         }
-        let Some(name) = self.lib_name(node) else {
+        let name = match self.lib_name(node) {
+            Some(name) => Some(name),
+            None => self.shadowed_member(node)?,
+        };
+        let Some(name) = name else {
             if self.names_class(node)?.is_some() {
                 return Ok(OBJECT.to_string());
             }
@@ -552,6 +560,7 @@ impl Engine<'_, '_> {
         let Kind::Name { id, .. } = self.kind(node) else { return false };
         self.imports.contains_key(id)
             || self.shadowed.contains_key(id)
+            || (self.own_proxies.contains(id) && self.scope().is_empty())
             || self.lookup(&self.key(node)).is_none()
     }
 
@@ -575,8 +584,15 @@ impl Engine<'_, '_> {
             return Ok(UNKNOWN.to_string());
         };
         self.expr(test)?;
-        let body_ty = self.expr(body)?;
-        let orelse_ty = self.expr(orelse)?;
+        let mut body_ty = self.expr(body)?;
+        let mut orelse_ty = self.expr(orelse)?;
+        // The map one arm holds is the template an argument-less `map.new()`
+        // in the other was written with (see `declared_constructor`)
+        if is_map(&body_ty) && orelse_ty == OBJECT {
+            orelse_ty = self.declared_constructor(&body_ty, orelse, &orelse_ty)?;
+        } else if is_map(&orelse_ty) && body_ty == OBJECT {
+            body_ty = self.declared_constructor(&orelse_ty, body, &body_ty)?;
+        }
         let joined = self.joined(&body_ty, &orelse_ty, node, "the ternary")?;
         for (arm, arm_ty) in [(body, &body_ty), (orelse, &orelse_ty)] {
             if arm_ty == TYPELESS {

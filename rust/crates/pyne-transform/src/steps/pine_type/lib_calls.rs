@@ -691,26 +691,36 @@ impl Engine<'_, '_> {
                 value_ty.to_string()
             });
         }
-        let held = element_of(value_ty);
-        let element = element_of(declared);
-        let convertible = (held == INT && element == FLOAT)
-            || (held == TYPELESS && facts::na_widen(element).is_some());
-        let same_kind = (is_array(declared) && is_array(value_ty))
-            || (is_matrix(declared) && is_matrix(value_ty));
-        let Kind::Call { func, .. } = *self.kind(value) else { return Ok(value_ty.to_string()) };
-        if value_ty == declared || !convertible || !same_kind {
-            return Ok(value_ty.to_string());
-        }
-        let Some(callee) = self.lib_name(func) else { return Ok(value_ty.to_string()) };
-        let Some(positions) = constructor_elements(&callee) else {
+        let Some((func, args, keywords)) = facts::call_parts(self.ast, value) else {
             return Ok(value_ty.to_string());
         };
-        for arg in self.element_args(&callee, value, positions) {
-            let arg_ty = self.ty_of(arg);
-            if arg_ty == INT {
-                self.record_widen(arg, Some(WIDEN_FLOAT.to_string()))?;
-            } else if arg_ty == TYPELESS {
-                self.record_widen(arg, facts::na_widen(element_of(declared)))?;
+        // `map.new<K, V>()` with its template dropped builds a bare object
+        let bare_map = value_ty == OBJECT
+            && is_map(declared)
+            && args.is_empty()
+            && keywords.is_empty()
+            && self.lib_name(func).as_deref() == Some("map.new");
+        if !bare_map {
+            let held = element_of(value_ty);
+            let element = element_of(declared);
+            let convertible = (held == INT && element == FLOAT)
+                || (held == TYPELESS && facts::na_widen(element).is_some());
+            let same_kind = (is_array(declared) && is_array(value_ty))
+                || (is_matrix(declared) && is_matrix(value_ty));
+            if value_ty == declared || !convertible || !same_kind {
+                return Ok(value_ty.to_string());
+            }
+            let Some(callee) = self.lib_name(func) else { return Ok(value_ty.to_string()) };
+            let Some(positions) = constructor_elements(&callee) else {
+                return Ok(value_ty.to_string());
+            };
+            for arg in self.element_args(&callee, value, positions) {
+                let arg_ty = self.ty_of(arg);
+                if arg_ty == INT {
+                    self.record_widen(arg, Some(WIDEN_FLOAT.to_string()))?;
+                } else if arg_ty == TYPELESS {
+                    self.record_widen(arg, facts::na_widen(element_of(declared)))?;
+                }
             }
         }
         if let Some(nid) = self.nid(value) {
@@ -1145,7 +1155,8 @@ impl Engine<'_, '_> {
         Some(out)
     }
 
-    /// The implementation the selector's exact pass settles on (`_choice`).
+    /// The implementation the selector's exact pass settles on (`_choice`); a
+    /// keyword binds the parameter the dispatcher hands it to (`runtime_keyword`).
     pub(super) fn choice(
         &self,
         impls: &[ImplSig],
@@ -1156,6 +1167,12 @@ impl Engine<'_, '_> {
         let (shapes, kw_shapes) = (shapes?, kw_shapes?);
         let any = |chars: String| chars.replace(FLOAT, &PIN_ANY.to_string());
         if !kw_shapes.is_empty() {
+            let declares =
+                |known: &str| impls.iter().any(|imp| imp.names.iter().any(|named| named == known));
+            let kw_shapes: IndexMap<String, String> = kw_shapes
+                .iter()
+                .map(|(name, ty)| (facts::runtime_keyword(name, declares), ty.clone()))
+                .collect();
             let chars = any(pin_chars(shapes));
             let kw_chars: Vec<(String, String)> = kw_shapes
                 .iter()

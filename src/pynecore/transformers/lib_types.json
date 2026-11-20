@@ -1188,9 +1188,9 @@
     "id"
    ],
    "params": [
-    "?"
+    "o:lib#Box"
    ],
-   "ret": "?"
+   "ret": "o:lib#Box"
   },
   "box.delete": {
    "defaults": 0,
@@ -2570,9 +2570,9 @@
     "id"
    ],
    "params": [
-    "?"
+    "o:lib#Label"
    ],
-   "ret": "?"
+   "ret": "o:lib#Label"
   },
   "label.delete": {
    "defaults": 0,
@@ -3024,9 +3024,9 @@
     "id"
    ],
    "params": [
-    "?"
+    "o:lib#Line"
    ],
-   "ret": "?"
+   "ret": "o:lib#Line"
   },
   "line.delete": {
    "defaults": 0,

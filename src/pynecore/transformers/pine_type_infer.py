@@ -2734,6 +2734,8 @@ class _Inference:
         """The qualifier of an attribute read: a lib value, or a field of an object."""
         name = self._lib_name(node)
         if name is None:
+            name = self._shadowed_member(node)
+        if name is None:
             # A field of an object changes with the object; a class named through
             # its module is a constant, and so is a member of an enum
             return CONST if self._names_class(node) is not None \
@@ -2856,6 +2858,8 @@ class _Inference:
             # of a bound temporary; a class object is not a Pine value
             return OBJECT
         name = self._lib_name(node)
+        if name is None:
+            name = self._shadowed_member(node)
         if name is None:
             if self._names_class(node) is not None:
                 # A class named through its module, ``zigzag.Pivot`` in a
@@ -3115,7 +3119,9 @@ class _Inference:
         the walk can see is bound somewhere, or is not a bare name at all. An
         IMPORTED name is the other case -- a Pine library and a namespace
         merged over a builtin one (``shadowed_namespace``) both bind a name
-        whose members are functions, not fields.
+        whose members are functions, not fields. So is the module's own
+        ``Exported()`` proxy read at module scope (``disp.new = disp__ren__``):
+        it stands for an export, and is no Pine object.
 
         :param node: The attribute's base expression
         :return: True when the base names a module or a namespace
@@ -3123,6 +3129,7 @@ class _Inference:
         if not isinstance(node, ast.Name):
             return False
         return node.id in self._imports or node.id in self._shadowed \
+            or (node.id in self._own_proxies and self._scope == '') \
             or self._lookup(self._key(node)) is None
 
     def _node_diag(self, code: Code, args: tuple[str, ...], node: ast.AST, reason: str,
@@ -3177,6 +3184,12 @@ class _Inference:
         # the arms join, they do not widen unconditionally
         body = self._expr(node.body)
         orelse = self._expr(node.orelse)
+        # The map one arm holds is the template an argument-less ``map.new()``
+        # in the other was written with (see ``_declared_constructor``)
+        if is_map(body) and orelse == OBJECT:
+            orelse = self._declared_constructor(body, node.orelse, orelse)
+        elif is_map(orelse) and body == OBJECT:
+            body = self._declared_constructor(orelse, node.body, body)
         joined = self._joined(body, orelse, node, 'the ternary')
         # A typeless na arm next to a string is the string na, next to a number the
         # numeric na
@@ -3831,6 +3844,10 @@ class _Inference:
         the constructor builds the declared type. A typeless ``na`` initial value
         (``matrix.new<float>(2, 2, na)``) is the na of the declared element type.
 
+        ``map.new<K, V>()`` has nothing to read its types off: with its template
+        dropped it builds a bare object, and the declared map is the template
+        it was written with.
+
         A typeless ``na`` assigned to a string is the string na, the empty string;
         assigned to a float or an int, it is the numeric na, NaN.
 
@@ -3844,23 +3861,28 @@ class _Inference:
             kind = _na_widen(declared)
             self._record_widen(value, kind)
             return declared if kind is not None and _holds_na(value) else value_ty
-        held = element_of(value_ty)
-        if value_ty == declared or not isinstance(value, ast.Call) \
-                or not ((held == INT and element_of(declared) == FLOAT)
-                        or (held == TYPELESS and _na_widen(element_of(declared)) is not None)) \
-                or not ((is_array(declared) and is_array(value_ty))
-                        or (is_matrix(declared) and is_matrix(value_ty))):
+        if not isinstance(value, ast.Call):
             return value_ty
-        callee = self._lib_name(value.func)
-        positions = _CONSTRUCTOR_ELEMENTS.get(callee) if callee is not None else None
-        if callee is None or positions is None:
-            return value_ty
-        for arg in _element_args(callee, value, positions):
-            arg_ty = self._ty_of(arg)
-            if arg_ty == INT:
-                self._record_widen(arg, WIDEN_FLOAT)
-            elif arg_ty == TYPELESS:
-                self._record_widen(arg, _na_widen(element_of(declared)))
+        if not (value_ty == OBJECT and is_map(declared) and not value.args
+                and not value.keywords and self._lib_name(value.func) == 'map.new'):
+            held = element_of(value_ty)
+            if value_ty == declared \
+                    or not ((held == INT and element_of(declared) == FLOAT)
+                            or (held == TYPELESS
+                                and _na_widen(element_of(declared)) is not None)) \
+                    or not ((is_array(declared) and is_array(value_ty))
+                            or (is_matrix(declared) and is_matrix(value_ty))):
+                return value_ty
+            callee = self._lib_name(value.func)
+            positions = _CONSTRUCTOR_ELEMENTS.get(callee) if callee is not None else None
+            if callee is None or positions is None:
+                return value_ty
+            for arg in _element_args(callee, value, positions):
+                arg_ty = self._ty_of(arg)
+                if arg_ty == INT:
+                    self._record_widen(arg, WIDEN_FLOAT)
+                elif arg_ty == TYPELESS:
+                    self._record_widen(arg, _na_widen(element_of(declared)))
         nid = node_id(value)
         if nid is not None:
             self._ty[nid] = declared
@@ -4362,10 +4384,11 @@ class _Inference:
         """
         Whether some implementation of a user group takes a call's arguments.
 
-        Each implementation is measured the way a plain definition is; the
-        call is an error only when NONE fits. An open-ended implementation or
-        an unpacked argument is a shape this analysis does not describe, and
-        is let through to the runtime dispatch.
+        Each implementation is measured the way a plain definition is, a
+        keyword bound to the parameter the dispatcher hands it to
+        (``_runtime_keyword``); the call is an error only when NONE fits. An
+        open-ended implementation or an unpacked argument is a shape this
+        analysis does not describe, and is let through to the runtime dispatch.
 
         :param key: Scope-qualified id of the group
         :param name: The callee as written
@@ -4381,10 +4404,14 @@ class _Inference:
         impls = self._defs.get(key, ())
         if not impls:
             return True
+        declared = {param.arg for impl in impls for param in _every_param(impl)}
+        renames = {keyword.arg: _runtime_keyword(keyword.arg, declared)
+                   for keyword in node.keywords if keyword.arg is not None}
         for impl in impls:
             if impl.args.vararg is not None or impl.args.kwarg is not None:
                 return True
-            if self._call_params(impl, node, positional, report=False) is not None:
+            if self._call_params(impl, node, positional, report=False,
+                                 renames=renames) is not None:
                 return True
         self._bad_call(node, name, CALL_NO_OVERLOAD, (name,))
         return False
@@ -4633,12 +4660,19 @@ class _Inference:
             # No other builtin namespace is ever asked for an object of a known
             # class: ``_get_builtin_method`` answers only from the receiver's own
             return self._method_result(cid, name, node, args)
+        if _reaches_library_methods(receiver_ty, name):
+            # The caller's own globals are asked before the libraries it
+            # imports, and what this module stores under the name may be the
+            # proxy of its own export
+            own = self._own_export(name, node)
+            if own is not None:
+                return self._own_export_result(own[0], own[1], name, node, args)
         if self._resolve_func(name, node) is not None:
             return None
         if _reaches_library_methods(receiver_ty, name):
             published = self._library_method(name, node)
             if published is not None:
-                return self._published_result(published, name, node, args)
+                return self._published_result(published, name, node, args, by_name=True)
         returns: list[str] = []
         for candidate in _METHOD_NAMESPACES:
             entry = lib_types().get(f'{candidate}.{name}')
@@ -4965,7 +4999,7 @@ class _Inference:
         published = self._library_method(name, node, home)
         if published is None:
             return None
-        return self._published_result(published, name, node, args)
+        return self._published_result(published, name, node, args, by_name=True)
 
     def _own_export(self, name: str, node: ast.Call) -> tuple[str, int] | None:
         """
@@ -4974,10 +5008,13 @@ class _Inference:
         A library calling one of its own exported methods by name on an object
         of its own class: the module that declares the class is the first one
         the runtime asks, and what it holds under the name is the proxy, bound
-        to the ``@export`` definition of that name. The answer is claimed only
-        where nothing but a proxy is stored under the name at module scope (an
-        overloaded export has one per signature) and the name resolves, from
-        the call, to definitions that are all exported.
+        to the ``@export`` definition of that name. A receiver of no class --
+        an array, a map, a matrix, a scalar -- reaches the same proxy, as the
+        caller's global of the name, before any library the caller imports.
+        The answer is claimed only where nothing but a proxy is stored under
+        the name at module scope (an overloaded export has one per signature)
+        and the name resolves, from the call, to definitions that are all
+        exported.
 
         :param name: The method name
         :param node: The ``method_call`` node
@@ -5060,7 +5097,7 @@ class _Inference:
         return self._published_result(published, name, node, args)
 
     def _published_result(self, sig: ExportSig, name: str, node: ast.Call,
-                          args: Sequence[ast.expr]) -> str:
+                          args: Sequence[ast.expr], by_name: bool = False) -> str:
         """
         Type a call to a method another module publishes.
 
@@ -5078,9 +5115,11 @@ class _Inference:
         :param name: The method name
         :param node: The call node, for its keywords and position
         :param args: The receiver followed by the arguments after it
+        :param by_name: Whether the call found the export by its name, through
+                        its ``Exported`` proxy
         :return: The type the call evaluates to
         """
-        if not self._export_call_fits(node, name, sig, args):
+        if not self._export_call_fits(node, name, sig, args, by_name):
             return UNKNOWN
         if sig.kind == 'group':
             receiver = self._ty_of(args[0]) if args else UNKNOWN
@@ -5328,8 +5367,9 @@ class _Inference:
         bound = [(impl.params[index], arg) for index, arg in enumerate(args)
                  if index < len(impl.params)]
         for keyword in keywords:
-            if keyword.arg in impl.names:
-                bound.append((impl.params[impl.names.index(keyword.arg)], keyword.value))
+            pname = None if keyword.arg is None else _runtime_keyword(keyword.arg, impl.names)
+            if pname in impl.names:
+                bound.append((impl.params[impl.names.index(pname)], keyword.value))
         for declared, value in bound:
             if self._ty_of(value) == TYPELESS and declared not in NUMERIC:
                 self._record_widen(value, _na_widen(declared))
@@ -5374,7 +5414,8 @@ class _Inference:
         which the exact pass takes for an int, so a float position of an
         unpinned site says nothing; an int position never reaches here unpinned.
         A call with keyword arguments is bound to each implementation's
-        parameters by name (``overload_binding``).
+        parameters by name (``overload_binding``), under the name the
+        dispatcher hands each keyword to (``_runtime_keyword``).
 
         :param impls: The group's implementations, in declaration order
         :param pin: The pin the site justified, when it has one
@@ -5387,6 +5428,8 @@ class _Inference:
         if shapes is None or kw_shapes is None:
             return None
         if kw_shapes:
+            declared = {pname for impl in impls for pname in impl.names}
+            kw_shapes = {_runtime_keyword(pname, declared): ty for pname, ty in kw_shapes.items()}
             chars = pin_chars(shapes).replace(FLOAT, PIN_ANY)
             kw_chars = {name: pin_chars([ty]).replace(FLOAT, PIN_ANY)
                         for name, ty in kw_shapes.items()}
@@ -5484,7 +5527,8 @@ class _Inference:
 
     def _call_params(self, target: ast.FunctionDef | ast.AsyncFunctionDef,
                      node: ast.Call, args: Sequence[ast.expr],
-                     report: bool = True) -> tuple[str, ...] | None:
+                     report: bool = True,
+                     renames: Mapping[str, str] | None = None) -> tuple[str, ...] | None:
         """
         The parameter types one call site instantiates the callee with.
 
@@ -5497,6 +5541,9 @@ class _Inference:
         :param target: The callee's definition
         :param node: The call node
         :param args: The positional arguments the call binds, in order
+        :param report: Whether a call that does not fit is reported
+        :param renames: Keyword as the call spells it -> the parameter it binds,
+                        where the runtime moves it (``_runtime_keyword``)
         :return: One type per parameter, or None when the shape is unresolvable
         """
         declared = target.args
@@ -5522,13 +5569,16 @@ class _Inference:
             bound[arg.arg] = value
         declared_names = {a.arg for a in positional + list(declared.kwonlyargs)}
         for keyword in node.keywords:
-            if keyword.arg not in declared_names:
+            pname = keyword.arg
+            if renames is not None and pname is not None:
+                pname = renames.get(pname, pname)
+            if pname not in declared_names:
                 reject(CALL_UNKNOWN_PARAMETER, (name, keyword.arg))
                 return None
-            if keyword.arg in bound:
-                reject(CALL_ARGUMENT_TWICE, (keyword.arg, name))
+            if pname in bound:
+                reject(CALL_ARGUMENT_TWICE, (pname, name))
                 return None
-            bound[keyword.arg] = keyword.value
+            bound[pname] = keyword.value
 
         defaults = _param_defaults(target)
         out: list[str] = []
@@ -5681,6 +5731,37 @@ class _Inference:
         sig = interface.exports.get(member)
         return UNKNOWN if sig is None else self._export_call(node, name, sig, interface)
 
+    def _shadowed_member(self, node: ast.Attribute) -> str | None:
+        """
+        The lib name a read through an alias that merges a library over a builtin
+        namespace reaches, when the builtin half answers it.
+
+        The merge is per MEMBER (see ``_shadowed_call``): a member the library
+        does not publish is the builtin namespace's, and is read as that lib
+        name. A member the library publishes is its export, and an alias some
+        scope or the module itself rebinds holds whatever was stored in it,
+        so neither is a lib name; nor is anything of a library that cannot be
+        resolved at all.
+
+        :param node: The attribute read
+        :return: The registry key it reads, or None when it reads none
+        """
+        head = node.value
+        if not isinstance(head, ast.Name):
+            return None
+        shadow = self._shadowed.get(head.id)
+        if shadow is None or self._nearer_binding(head.id) or head.id in self._multi_imports \
+                or self._import_rebound(head.id):
+            return None
+        interface = self._interface_of(shadow.source.module, shadow.source.attrs, node)
+        if interface is None:
+            return None
+        published = interface.all if interface.all is not None else tuple(interface.exports)
+        if node.attr in published:
+            return None
+        name = f'{shadow.namespace}.{node.attr}'
+        return name if name in lib_types() else None
+
     def _export_call(self, node: ast.Call, name: str, sig: ExportSig,
                      interface: ModuleInterface) -> str:
         """
@@ -5729,19 +5810,25 @@ class _Inference:
         return ty
 
     def _export_call_fits(self, node: ast.Call, name: str, sig: ExportSig,
-                          args: Sequence[ast.expr] | None = None) -> bool:
+                          args: Sequence[ast.expr] | None = None, by_name: bool = False) -> bool:
         """
         Whether a call matches the signature its module publishes.
 
         The interface carries each export's parameter types, names and
         arity -- for a group, one shape per implementation -- which is all a
         call site needs to be held to it, the same way a same-module call is.
+        A keyword binds the parameter the runtime hands it to: a group's
+        dispatcher and a proxy found by name move a keyword the callee declares
+        only under its ``__ren__`` spelling onto that parameter
+        (``_runtime_keyword``); a plain proxy called directly passes it on as
+        written.
 
         :param node: The call node
         :param name: The callee as written
         :param sig: The published signature
         :param args: The positional arguments, when they are not the node's
                      own (a method call binds the receiver first)
+        :param by_name: Whether a ``method_call`` found the export by its name
         :return: True when the call may run
         """
         positional_args = list(node.args if args is None else args)
@@ -5754,8 +5841,12 @@ class _Inference:
                    for shape in shapes):
             self._bad_call(node, name, CALL_ARGUMENT_COUNT, (name, str(argc)))
             return False
-        for keyword in node.keywords:
-            if not any(keyword.arg in shape.names for shape in shapes):
+        known = {pname for shape in shapes for pname in shape.names}
+        adapts = by_name or sig.kind == 'group'
+        keywords = [(keyword, _runtime_keyword(keyword.arg, known) if adapts else keyword.arg)
+                    for keyword in node.keywords if keyword.arg is not None]
+        for keyword, pname in keywords:
+            if not any(pname in shape.names for shape in shapes):
                 self._bad_call(node, name, CALL_UNKNOWN_PARAMETER, (name, keyword.arg))
                 return False
         if sig.kind == 'group':
@@ -5765,13 +5856,12 @@ class _Inference:
             given.append((sig.names[index] if index < len(sig.names) else str(index),
                           sig.params[index], arg))
         positional = set(sig.names[:len(positional_args)])
-        for keyword in node.keywords:
-            if keyword.arg in positional:
-                self._bad_call(node, name, CALL_ARGUMENT_TWICE, (keyword.arg, name))
+        for keyword, pname in keywords:
+            if pname in positional:
+                self._bad_call(node, name, CALL_ARGUMENT_TWICE, (pname, name))
                 return False
-            if keyword.arg in sig.names:
-                given.append((keyword.arg, sig.params[sig.names.index(keyword.arg)],
-                              keyword.value))
+            if pname in sig.names:
+                given.append((pname, sig.params[sig.names.index(pname)], keyword.value))
         for pname, declared, arg in given:
             passed = self._ty_of(arg)
             if declared == UNKNOWN or passed in _UNCHECKED or _fits(declared, passed):
@@ -5962,11 +6052,16 @@ class _Inference:
         """
         Whether a scope between the call and the module binds the imported name.
 
+        A class body written at module level opens a frame of the module's own
+        scope (see ``_class_body``), and the module's names -- the import among
+        them -- are no nearer binding there: whether the module itself rebinds
+        an import is ``_import_rebound``'s question.
+
         :param name: The head of the callee
         :return: True when some enclosing function scope binds it
         """
         return any(name in self._rebound.get(frame.scope, ())
-                   for frame in self._frames[1:])
+                   for frame in self._frames[1:] if frame.scope)
 
     def _import_rebound(self, name: str) -> bool:
         """
@@ -6518,6 +6613,29 @@ def _scan_tree(tree: ast.Module) -> tuple[dict[str, ast.expr], dict[str, list[as
 def _every_param(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
     """Every named parameter of a definition, positional first then kw-only."""
     return list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+
+
+def _runtime_keyword(name: str, declared: Container[str]) -> str:
+    """
+    The parameter a keyword argument binds where the runtime adapts its spelling.
+
+    A compiled library declares a parameter whose Pine name cannot live
+    verbatim in Python under ``name + '__ren__'``, and a call site that cannot
+    tell it reaches such a library spells the keyword the way Pine does. Every
+    overload dispatcher and a ``method_call`` that finds an ``Exported`` proxy
+    by name bind that keyword to the renamed parameter
+    (``core/overload._canonical_kwarg_renames``,
+    ``core/pine_method._adapt_exported_kwargs``) -- and only where no parameter
+    takes the name as written, so a keyword that binds as written stays.
+
+    :param name: The keyword as the call spells it
+    :param declared: Every parameter name the callee declares; for a group,
+                     those of all its implementations
+    :return: The parameter name the keyword binds
+    """
+    if name in declared or name + '__ren__' not in declared:
+        return name
+    return name + '__ren__'
 
 
 def _bound_positions(body: Sequence[ast.AST]) -> dict[str, list[tuple[int, int]]]:

@@ -1,6 +1,7 @@
 //! Calls to the module's own functions and groups, constructors, methods and the
 //! security plumbing.
 
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use pyne_ast::{Constant, Int, Kind, NodeId, Value};
@@ -170,13 +171,25 @@ impl Engine<'_, '_> {
         if impls.is_empty() {
             return Ok(true);
         }
+        let declared: HashSet<String> = impls
+            .iter()
+            .flat_map(|&imp| every_param(self.ast, imp))
+            .map(|param| facts::arg_name(self.ast, param))
+            .collect();
+        let renames: HashMap<String, String> = keywords
+            .iter()
+            .filter_map(|&keyword| keyword_parts(self.ast, keyword).0)
+            .map(|arg| {
+                (arg.to_string(), facts::runtime_keyword(arg, |known| declared.contains(known)))
+            })
+            .collect();
         for imp in impls {
             let open = facts::args_of(self.ast, imp)
                 .is_some_and(|args| args.vararg.is_some() || args.kwarg.is_some());
             if open {
                 return Ok(true);
             }
-            if self.call_params(imp, node, &positional, false)?.is_some() {
+            if self.call_params(imp, node, &positional, false, Some(&renames))?.is_some() {
                 return Ok(true);
             }
         }
@@ -341,13 +354,20 @@ impl Engine<'_, '_> {
             let cid = cid.to_string();
             return self.method_result(&cid, &name, node, &args);
         }
+        // The caller's own globals are asked before the libraries it imports,
+        // and what this module stores under the name may be its own proxy
+        if reaches_library_methods(&receiver_ty, &name)
+            && let Some((key, frame)) = self.own_export(&name, node)
+        {
+            return self.own_export_result(&key, frame, &name, node, &args).map(Some);
+        }
         if self.resolve_func(&name, node).is_some() {
             return Ok(None);
         }
         if reaches_library_methods(&receiver_ty, &name)
             && let Some(published) = self.library_method(&name, node, None)?
         {
-            return self.published_result(&published, &name, node, &args).map(Some);
+            return self.published_result(&published, &name, node, &args, true).map(Some);
         }
         let mut returns: Vec<String> = Vec::new();
         for candidate in METHOD_NAMESPACES {
@@ -569,7 +589,7 @@ impl Engine<'_, '_> {
             return Ok(None);
         };
         let Some(sig) = interface.exports.get(last).cloned() else { return Ok(None) };
-        self.published_result(&sig, last, node, args).map(Some)
+        self.published_result(&sig, last, node, args, false).map(Some)
     }
 
     /// Type an `obj.method(...)` call on a receiver whose class is known (`_method_of`).
@@ -638,12 +658,13 @@ impl Engine<'_, '_> {
             return self.own_export_result(&key, frame, name, node, args).map(Some);
         }
         let Some(published) = self.library_method(name, node, home)? else { return Ok(None) };
-        self.published_result(&published, name, node, args).map(Some)
+        self.published_result(&published, name, node, args, true).map(Some)
     }
 
     /// The definition this module's own `Exported` proxy of a name holds
     /// (`_own_export`): a library calling one of its own exported methods by name
-    /// on an object of its own class reaches the proxy first.
+    /// on an object of its own class reaches the proxy first, and a receiver of no
+    /// class reaches it as the caller's global, before any imported library.
     fn own_export(&self, name: &str, node: NodeId) -> Option<(String, usize)> {
         if !self.own_proxies.contains(name) {
             return None;
@@ -712,18 +733,21 @@ impl Engine<'_, '_> {
         }
         let Some(sig) = self.class_sig(cid, node)? else { return Ok(None) };
         let Some(published) = sig.members.get(name).cloned() else { return Ok(None) };
-        self.published_result(&published, name, node, args).map(Some)
+        self.published_result(&published, name, node, args, false).map(Some)
     }
 
-    /// Type a call to a method another module publishes (`_published_result`).
+    /// Type a call to a method another module publishes (`_published_result`);
+    /// `by_name` is whether the call found the export by its name, through its
+    /// `Exported` proxy.
     fn published_result(
         &mut self,
         sig: &ExportSig,
         name: &str,
         node: NodeId,
         args: &[NodeId],
+        by_name: bool,
     ) -> R<String> {
-        if !self.export_call_fits(node, name, sig, Some(args))? {
+        if !self.export_call_fits(node, name, sig, Some(args), by_name)? {
             return Ok(UNKNOWN.to_string());
         }
         if sig.kind == "group" {
@@ -858,9 +882,9 @@ impl Engine<'_, '_> {
             .collect();
         for &keyword in keywords {
             let (name, value) = keyword_parts(self.ast, keyword);
-            if let Some(name) = name
-                && let Some(at) = imp.names.iter().position(|known| known == name)
-            {
+            let Some(name) = name else { continue };
+            let pname = facts::runtime_keyword(name, |known| imp.names.iter().any(|n| n == known));
+            if let Some(at) = imp.names.iter().position(|known| *known == pname) {
                 bound.push((imp.params[at].clone(), value));
             }
         }
@@ -920,7 +944,7 @@ impl Engine<'_, '_> {
         let parents: Vec<usize> = self.stack[..=frame].to_vec();
         let (func, own_args, _) = facts::call_parts(self.ast, node).expect("a call");
         let positional: Vec<NodeId> = args.unwrap_or(own_args).to_vec();
-        let params = self.call_params(target, node, &positional, true)?;
+        let params = self.call_params(target, node, &positional, true, None)?;
         let nid = self.nid(node);
         let Some(params) = params else {
             if self.bad_calls.contains(&node) {
@@ -976,13 +1000,16 @@ impl Engine<'_, '_> {
         Ok(ret)
     }
 
-    /// The parameter types one call site instantiates the callee with (`_call_params`).
+    /// The parameter types one call site instantiates the callee with (`_call_params`);
+    /// `renames` maps a keyword as the call spells it to the parameter it binds,
+    /// where the runtime moves it.
     fn call_params(
         &mut self,
         target: NodeId,
         node: NodeId,
         args: &[NodeId],
         report: bool,
+        renames: Option<&HashMap<String, String>>,
     ) -> R<Option<Vec<String>>> {
         let Some(declared) = facts::args_of(self.ast, target) else { return Ok(None) };
         let name = facts::def_name(self.ast, target).to_string();
@@ -1019,7 +1046,9 @@ impl Engine<'_, '_> {
         for &keyword in &keywords {
             let (arg, value) = keyword_parts(self.ast, keyword);
             let arg = arg.unwrap_or("").to_string();
-            if !declared_names.contains(&arg) {
+            let pname =
+                renames.and_then(|renames| renames.get(&arg)).cloned().unwrap_or(arg.clone());
+            if !declared_names.contains(&pname) {
                 if report {
                     self.bad_call(
                         node,
@@ -1030,18 +1059,18 @@ impl Engine<'_, '_> {
                 }
                 return Ok(None);
             }
-            if bound.contains_key(&arg) {
+            if bound.contains_key(&pname) {
                 if report {
                     self.bad_call(
                         node,
                         &name,
                         &pynecore_codes::CALL_ARGUMENT_TWICE,
-                        &[&arg, &name],
+                        &[&pname, &name],
                     );
                 }
                 return Ok(None);
             }
-            bound.insert(arg, value);
+            bound.insert(pname, value);
         }
         let defaults = param_defaults(self.ast, target)?;
         let mut out = Vec::new();

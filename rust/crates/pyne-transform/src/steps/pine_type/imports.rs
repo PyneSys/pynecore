@@ -8,6 +8,7 @@ use pyne_ast::{Kind, NodeId};
 
 use super::facts::{self, Pos, call_arity, fits, keyword_parts, unchecked};
 use super::{Engine, Import, R, Shadowed};
+use crate::data;
 use crate::pine_type_rules::{UNKNOWN, render_ty};
 use crate::pine_type_table::{CallSite, ExportSig, ModuleInterface};
 
@@ -115,6 +116,37 @@ impl Engine<'_, '_> {
         }
     }
 
+    /// The lib name a read through an alias that merges a library over a
+    /// builtin namespace reaches, when the builtin half answers it
+    /// (`_shadowed_member`).
+    pub(super) fn shadowed_member(&mut self, node: NodeId) -> R<Option<String>> {
+        let Kind::Attribute { value, attr, .. } = self.kind(node).clone() else {
+            return Ok(None);
+        };
+        let Kind::Name { id: head, .. } = self.kind(value).clone() else { return Ok(None) };
+        let Some(shadow) = self.shadowed.get(&head).cloned() else { return Ok(None) };
+        if self.nearer_binding(&head)
+            || self.multi_imports.contains(&head)
+            || self.import_rebound(&head)
+        {
+            return Ok(None);
+        }
+        let Some(interface) =
+            self.interface_of(&shadow.source.module, &shadow.source.attrs, node)?
+        else {
+            return Ok(None);
+        };
+        let published = match &interface.all {
+            Some(all) => all.contains(&attr),
+            None => interface.exports.contains_key(&attr),
+        };
+        if published {
+            return Ok(None);
+        }
+        let name = format!("{}.{attr}", shadow.namespace);
+        Ok(data::lib_entries().contains_key(name.as_str()).then_some(name))
+    }
+
     /// Type one call against the signature its module publishes (`_export_call`).
     fn export_call(
         &mut self,
@@ -126,7 +158,7 @@ impl Engine<'_, '_> {
         let is_group = sig.kind == "group";
         let (line, col) = (self.line(node), self.col(node));
         let argc = call_arity(self.ast, node);
-        if !self.export_call_fits(node, name, sig, None)? {
+        if !self.export_call_fits(node, name, sig, None, false)? {
             self.calls.push(CallSite {
                 callee: name.to_string(),
                 line,
@@ -176,12 +208,16 @@ impl Engine<'_, '_> {
     }
 
     /// Whether a call matches the signature its module publishes (`_export_call_fits`).
+    /// A group's dispatcher and a proxy found by name (`by_name`) bind a keyword
+    /// to the parameter `runtime_keyword` names; a plain proxy called directly
+    /// passes it on as written.
     pub(super) fn export_call_fits(
         &mut self,
         node: NodeId,
         name: &str,
         sig: &ExportSig,
         args: Option<&[NodeId]>,
+        by_name: bool,
     ) -> R<bool> {
         let (_, own_args, keywords) = facts::call_parts(self.ast, node).expect("a call");
         let positional_args: Vec<NodeId> = args.unwrap_or(own_args).to_vec();
@@ -215,11 +251,24 @@ impl Engine<'_, '_> {
             );
             return Ok(false);
         }
-        for &keyword in &keywords {
-            let arg = keyword_parts(self.ast, keyword).0.unwrap_or("");
-            if !shapes.iter().any(|(_, _, _, names)| names.iter().any(|known| known == arg)) {
-                let arg = arg.to_string();
-                self.bad_call(node, name, &pynecore_codes::CALL_UNKNOWN_PARAMETER, &[name, &arg]);
+        let adapts = by_name || sig.kind == "group";
+        let declares = |known: &str| {
+            shapes.iter().any(|(_, _, _, names)| names.iter().any(|named| named == known))
+        };
+        // Each keyword with the parameter name it binds
+        let named: Vec<(NodeId, String, String)> = keywords
+            .iter()
+            .filter_map(|&keyword| {
+                let (arg, value) = keyword_parts(self.ast, keyword);
+                let arg = arg?;
+                let pname =
+                    if adapts { facts::runtime_keyword(arg, declares) } else { arg.to_string() };
+                Some((value, arg.to_string(), pname))
+            })
+            .collect();
+        for (_, arg, pname) in &named {
+            if !declares(pname) {
+                self.bad_call(node, name, &pynecore_codes::CALL_UNKNOWN_PARAMETER, &[name, arg]);
                 return Ok(false);
             }
         }
@@ -232,15 +281,13 @@ impl Engine<'_, '_> {
             given.push((pname, sig.params[index].clone(), arg));
         }
         let positional: Vec<&String> = sig.names.iter().take(positional_args.len()).collect();
-        for &keyword in &keywords {
-            let (arg, value) = keyword_parts(self.ast, keyword);
-            let arg = arg.unwrap_or("").to_string();
-            if positional.contains(&&arg) {
-                self.bad_call(node, name, &pynecore_codes::CALL_ARGUMENT_TWICE, &[&arg, name]);
+        for (value, _, pname) in named {
+            if positional.contains(&&pname) {
+                self.bad_call(node, name, &pynecore_codes::CALL_ARGUMENT_TWICE, &[&pname, name]);
                 return Ok(false);
             }
-            if let Some(at) = sig.names.iter().position(|known| *known == arg) {
-                given.push((arg, sig.params[at].clone(), value));
+            if let Some(at) = sig.names.iter().position(|known| *known == pname) {
+                given.push((pname, sig.params[at].clone(), value));
             }
         }
         for (pname, declared, arg) in given {
@@ -418,10 +465,12 @@ impl Engine<'_, '_> {
     }
 
     /// Whether a scope between the call and the module binds the imported name
-    /// (`_nearer_binding`).
+    /// (`_nearer_binding`). A module-level class body's frame has the module's
+    /// own scope, which is no nearer binding.
     pub(super) fn nearer_binding(&self, name: &str) -> bool {
         self.stack[1..].iter().any(|&frame| {
-            self.rebound.get(&self.frames[frame].scope).is_some_and(|names| names.contains(name))
+            let scope = &self.frames[frame].scope;
+            !scope.is_empty() && self.rebound.get(scope).is_some_and(|names| names.contains(name))
         })
     }
 

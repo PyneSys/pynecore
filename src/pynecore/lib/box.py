@@ -178,7 +178,7 @@ def delete(id):
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
-def copy(id):
+def copy(id: Box) -> Box:
     if lib._in_lib_main:
         return NA(Box)
 

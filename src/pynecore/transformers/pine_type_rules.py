@@ -1400,15 +1400,18 @@ def _named_type(name: str, classes: Mapping[str, str] = NO_CLASSES) -> str:
     """Resolve a bare annotation name to a type."""
     if name in ANNOTATION_TYPES:
         return ANNOTATION_TYPES[name]
+    # A class the module declares or imports wins over the builtin of the same
+    # name: a script's own ``Line`` is the class it wrote, not the lib's, and
+    # its own ``Map`` is no container
+    found = classes.get(name)
+    if found is not None and not found.startswith(LIB_MODULE + CLASS_SEP):
+        return object_ty(found)
     # A container spelled without its payload is an object whose element type
     # the annotation does not say -- and it stays that even where the module
     # has the container class itself in scope, which is how the lib spells its
     # own ``Matrix`` and ``SequenceView`` returns
     if name in _CONTAINER_NAMES:
         return OBJECT
-    # A class the module declares or imports wins over the builtin of the same
-    # name: a script's own ``Line`` is the class it wrote, not the lib's
-    found = classes.get(name)
     if found is not None:
         return object_ty(found)
     builtin = BUILTIN_CLASSES.get(name)

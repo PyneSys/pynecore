@@ -26,11 +26,12 @@ from pathlib import Path
 import pytest
 
 from ..pine_analysis import analyse_module
-from pynecore.errorcodes import CALL_ARGUMENT_TWICE
+from pynecore.errorcodes import CALL_ARGUMENT_TWICE, CALL_UNKNOWN_PARAMETER
 from pynecore.transformers.lib_registry import lib_types
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
-    BOOL, FLOAT, INT, STR, UNKNOWN, builtin_class_id, get_ty, object_ty, tuple_of,
+    BOOL, FLOAT, INT, OBJECT, STR, UNKNOWN, annotation_type, builtin_class_id, get_ty, object_ty,
+    tuple_of,
 )
 
 
@@ -977,3 +978,376 @@ def __test_a_method_no_proxy_holds_is_not_reached_by_name__():
         .replace("    @export\n    @method\n", "    @method\n")
     table = infer_module(ast.parse(source), 'test')
     assert [diag.code for diag in table.diags][:1] == ['E0054']
+
+
+# --- names a library module reaches through its imports and its own proxies --
+
+
+def _analysed_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, modules: dict[str, str],
+                    script: str) -> tuple[dict[str, str], list[str]]:
+    """Analyse a script next to the modules it imports: its module bindings and diagnostic codes."""
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name, source in modules.items():
+        (tmp_path / f'{name}.py').write_text(source, encoding='utf-8')
+    path = tmp_path / 'importer.py'
+    path.write_text(script, encoding='utf-8')
+    analysed = analyse_module(str(path))
+    assert analysed is not None, "the analysis did not recognize the script"
+    table = analysed[1]
+    return ({name: binding.ty for name, binding in table.bindings[''].items()},
+            [diag.code for diag in table.diags])
+
+
+CLASS_LIB = '''"""
+@pyne edge
+"""
+from pynecore.core.pine_export import export
+from pynecore.core.pine_udt import udt
+from pynecore.lib import script
+
+
+__all__ = ['Fluent', 'one']
+
+
+@udt
+class Fluent:
+    x: int = 0
+
+
+@script.library('fluent')
+def main():
+    @export
+    def one() -> int:
+        return 1
+'''
+
+
+def __test_an_import_named_in_a_module_level_class_body_is_the_import__(tmp_path, monkeypatch):
+    """The class body stands in the module's own scope, where the import is no rebinding"""
+    _, codes = _analysed_codes(tmp_path, monkeypatch, {'t113_class_body_lib': CLASS_LIB}, '''"""
+@pyne
+"""
+from pynecore.core.pine_udt import udt
+from pynecore.lib import na, script
+import t113_class_body_lib as fl
+
+
+@udt
+class Holder:
+    bar: fl.Fluent = na(fl.Fluent)
+
+
+@script.indicator('holder')
+def main():
+    h: Holder = Holder.new()
+''')
+    assert not codes
+
+
+def __test_an_import_a_function_rebinds_is_not_the_import_in_its_class_body__(
+        tmp_path, monkeypatch):
+    """A parameter of the enclosing function holds whatever was passed, not the module"""
+    _, codes = _analysed_codes(tmp_path, monkeypatch, {'t113_class_rebound_lib': CLASS_LIB}, '''"""
+@pyne
+"""
+from pynecore.core.pine_udt import udt
+from pynecore.lib import na, script
+import t113_class_rebound_lib as fl
+
+
+@script.indicator('holder')
+def main():
+    def build(fl):
+        @udt
+        class Holder:
+            bar: fl.Fluent = na(fl.Fluent)
+        return Holder.new()
+    build(1)
+''')
+    # The int passed for ``fl`` has no field ``Fluent``
+    assert codes == ['E0019']
+
+
+SHADOWING_LIB = '''"""
+@pyne edge
+"""
+from pynecore.core.pine_export import Exported, export
+from pynecore.lib import bar_index, script
+from typing import Protocol, Any
+
+
+__all__ = ['leftBarIndex']
+
+
+class _ProtocolLeftbarindex(Protocol):
+    def __call__(self, ) -> Any: ...
+
+
+leftBarIndex: _ProtocolLeftbarindex = Exported()
+
+
+@script.library('shadowing')
+def main():
+    @export
+    def leftBarIndex() -> int:
+        return bar_index
+'''
+
+SHADOWED_READ = '''"""
+@pyne
+"""
+from pynecore.core.pine_import import shadowed_namespace
+from pynecore.lib import chart, script
+import t113_shadowing_lib as chart__ren____lib
+
+
+chart__ren__ = shadowed_namespace(chart__ren____lib, chart)
+first = chart__ren__.MEMBER
+
+
+@script.indicator('shadowed')
+def main():
+    a: int = chart__ren__.leftBarIndex()
+'''
+
+
+def __test_a_value_the_shadowed_namespace_keeps_is_read_through_the_alias__(
+        tmp_path, monkeypatch):
+    """A member the library does not publish is the builtin namespace's"""
+    types, codes = _analysed_codes(
+        tmp_path, monkeypatch, {'t113_shadowing_lib': SHADOWING_LIB},
+        SHADOWED_READ.replace('MEMBER', 'left_visible_bar_time'))
+    assert not codes
+    assert types['first'] == INT
+
+
+def __test_a_member_neither_half_of_a_shadowed_namespace_has_is_still_reported__(
+        tmp_path, monkeypatch):
+    """The builtin half answers only the names the builtin namespace has"""
+    _, codes = _analysed_codes(
+        tmp_path, monkeypatch, {'t113_shadowing_lib': SHADOWING_LIB},
+        SHADOWED_READ.replace('MEMBER', 'no_such_member'))
+    assert codes == ['E0019']
+
+
+RENAMED_KEYWORD_LIB = '''"""
+@pyne edge
+"""
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_method import method
+from pynecore.lib import script
+from typing import Protocol, Any
+
+
+__all__ = ['shout']
+
+
+class _ProtocolShout(Protocol):
+    def __call__(self, this: str, position__ren__: str = 'top') -> Any: ...
+
+
+shout: _ProtocolShout = Exported()
+
+
+@script.library('renamed')
+def main():
+    @export
+    @method
+    def shout(this: str, position__ren__: str = 'top') -> str:
+        return this + position__ren__
+'''
+
+RENAMED_KEYWORD_CALL = '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method_call
+from pynecore.lib import script
+from t113_renamed_keyword_lib import shout
+
+
+@script.indicator('renamed')
+def main():
+    a = CALL
+'''
+
+
+def __test_a_keyword_reaches_its_renamed_parameter_through_a_call_by_name__(
+        tmp_path, monkeypatch):
+    """``method_call`` hands a keyword no parameter takes to its ``__ren__`` image"""
+    _, codes = _analysed_codes(
+        tmp_path, monkeypatch, {'t113_renamed_keyword_lib': RENAMED_KEYWORD_LIB},
+        RENAMED_KEYWORD_CALL.replace('CALL', "method_call('shout', 'x', position='bottom')"))
+    assert not codes
+
+
+def __test_a_direct_call_does_not_rename_its_keyword__(tmp_path, monkeypatch):
+    """A plain proxy called directly passes the keyword on as written"""
+    _, codes = _analysed_codes(
+        tmp_path, monkeypatch, {'t113_renamed_keyword_lib': RENAMED_KEYWORD_LIB},
+        RENAMED_KEYWORD_CALL.replace('CALL', "shout('x', position='bottom')"))
+    assert codes == [CALL_UNKNOWN_PARAMETER.code]
+
+
+def __test_a_bare_map_constructor_takes_the_other_ternary_arm_s_map__(tmp_path: Path):
+    """``map.new()`` lost its template, which the map in the other arm spells"""
+    types, codes = _main_types(
+        tmp_path,
+        'm: dict[str, int] = lib.map.new()\n'
+        'n = m if lib.bar_index > 0 else lib.map.new()\n'
+        'k = lib.map.new() if lib.bar_index > 0 else m')
+    assert not codes
+    assert types['n'] == types['k'] == types['m']
+
+
+def __test_a_bare_map_constructor_next_to_another_shape_is_still_reported__(tmp_path: Path):
+    """Only a map gives the constructor its template"""
+    _, codes = _main_types(
+        tmp_path, 'n = lib.array.new_int(1, 0) if lib.bar_index > 0 else lib.map.new()')
+    assert codes[:1] == ['E0023']
+
+
+@pytest.mark.parametrize('namespace,cls', [('box', 'Box'), ('line', 'Line'), ('label', 'Label')])
+def __test_a_copied_drawing_is_of_its_class__(tmp_path: Path, namespace: str, cls: str):
+    """``box.copy``, ``line.copy`` and ``label.copy`` return the class they take"""
+    types, codes = _main_types(
+        tmp_path, f'a = lib.{namespace}.new(0, 1.0, 1, 0.0)\nb = lib.{namespace}.copy(a)')
+    assert not codes
+    assert types['b'] == object_ty(builtin_class_id(cls))
+
+
+OWN_CLASS_NAMED_MAP = '''
+from pynecore import lib
+from pynecore.core.pine_udt import udt
+from pynecore.types import Box
+
+
+@udt
+class Map:
+    strong: Box = lib.na(Box)
+
+
+def main():
+    def retire(m: Map):
+        return lib.box.set_bgcolor(m.strong, lib.color.red)
+    retire(Map.new())
+'''
+
+
+def __test_a_module_s_own_class_named_like_a_container_is_that_class__():
+    """A script's own ``Map`` is the class it wrote, not the container"""
+    table = infer_module(ast.parse(OWN_CLASS_NAMED_MAP), 'test')
+    assert not [diag.code for diag in table.diags]
+
+
+@pytest.mark.parametrize('classes', [{}, {'Map': builtin_class_id('Map')}])
+def __test_a_container_name_no_own_class_takes_is_the_container__(classes: dict[str, str]):
+    """The lib's own container classes still spell the container"""
+    assert annotation_type(ast.parse('Map', mode='eval').body, classes) == OBJECT
+
+
+OWN_PROXY_REFERENCE = '''"""
+@pyne edge
+"""
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_udt import udt
+from pynecore.lib import script
+from typing import Protocol, Any
+
+__all__ = ['disp', 'disp__ren__']
+
+
+@udt
+class disp__ren__:
+    hi: float = 0.0
+
+
+class _ProtocolDisp(Protocol):
+    def __call__(self, x: float) -> Any: ...
+
+
+disp: _ProtocolDisp = PROXY
+
+
+disp.new = disp__ren__
+
+
+@script.library('proxy')
+def main():
+    @export
+    def disp(x: float):
+        return x * 2
+'''
+
+
+def __test_a_module_s_own_proxy_is_a_reference__():
+    """``disp.new = disp__ren__`` sets an attribute of the export's proxy, no Pine object"""
+    table = infer_module(ast.parse(OWN_PROXY_REFERENCE.replace('PROXY', 'Exported()')), 'test')
+    assert not [diag.code for diag in table.diags]
+
+
+def __test_an_own_export_read_inside_a_function_is_no_reference__():
+    """Inside the library's body the name is the definition, whose attributes are no fields"""
+    source = OWN_PROXY_REFERENCE.replace('PROXY', 'Exported()') \
+        .replace('\n\ndisp.new = disp__ren__\n', '') \
+        .replace('        return x * 2\n', '        return x * 2\n\n    disp.new = disp__ren__\n')
+    table = infer_module(ast.parse(source), 'test')
+    assert [diag.code for diag in table.diags]
+
+
+OWN_METHOD_ON_AN_ARRAY = '''"""
+@pyne edge
+"""
+from pynecore.core.overload import overload
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_method import method, method_call
+from pynecore import lib
+from pynecore.lib import script
+from typing import Protocol, Any
+
+
+class _ProtocolShiftr(Protocol):
+    def __call__(self, arr: list[int]) -> Any: ...
+
+
+shiftr: _ProtocolShiftr = Exported()
+shiftr: _ProtocolShiftr = Exported()
+
+
+@script.library('own')
+def main():
+DECORATOR
+    @overload
+    @method
+    def shiftr(arr: list[int]):
+        return lib.array.shift(arr)
+
+DECORATOR
+    @overload
+    @method
+    def shiftr(arr: list[float]):
+        return lib.array.shift(arr)
+
+    def trim(arr, n):
+        while method_call('size', arr) > n:
+            method_call('shiftr', arr)
+        return arr
+
+    @export
+    def keep(arr: list[int], n: int):
+        return trim(arr, n)
+'''
+
+
+def __test_a_library_reaches_its_own_export_by_name_on_an_array__():
+    """The caller's own proxy answers before the libraries it imports"""
+    table = infer_module(
+        ast.parse(OWN_METHOD_ON_AN_ARRAY.replace('DECORATOR', '    @export')), 'test')
+    assert not [diag.code for diag in table.diags]
+
+
+def __test_a_method_no_proxy_holds_is_not_reached_by_name_on_an_array__():
+    """Only an ``Exported`` proxy answers a name, whatever the receiver"""
+    source = OWN_METHOD_ON_AN_ARRAY.replace('DECORATOR\n', '') \
+        .replace('shiftr: _ProtocolShiftr = Exported()\n', '')
+    table = infer_module(ast.parse(source), 'test')
+    assert [diag.code for diag in table.diags]

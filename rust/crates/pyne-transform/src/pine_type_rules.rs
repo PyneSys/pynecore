@@ -1286,13 +1286,20 @@ fn named_type(name: &str, classes: &Classes) -> String {
     if let Some(&(_, ty)) = ANNOTATION_TYPES.iter().find(|&&(known, _)| known == name) {
         return ty.to_string();
     }
+    // A class the module declares or imports wins over the builtin of the same
+    // name, and its own `Map` is no container
+    let found = classes.get(name);
+    if let Some(found) = found
+        && !found.starts_with(&format!("{LIB_MODULE}{CLASS_SEP}"))
+    {
+        return object_ty(found);
+    }
     // A container spelled without its payload stays an object of unknown elements,
     // even where the module has the container class itself in scope
     if CONTAINER_NAMES.contains(&name) {
         return OBJECT.to_string();
     }
-    // A class the module declares or imports wins over the builtin of the same name
-    if let Some(found) = classes.get(name) {
+    if let Some(found) = found {
         return object_ty(found);
     }
     builtin_class(name).unwrap_or_else(|| UNKNOWN.to_string())

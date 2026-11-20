@@ -155,7 +155,7 @@ def delete(id):
 
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
-def copy(id):
+def copy(id: Line) -> Line:
     """Copy line object"""
     if lib._in_lib_main:
         return NA(Line)
