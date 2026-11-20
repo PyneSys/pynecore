@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::Host;
 use crate::ast_dump::{dump, has_field};
-use crate::pine_type_rules::{Classes, ImplSig, UNKNOWN, annotation_type, get_ty, impl_sig};
+use crate::pine_type_rules::{Classes, Enums, ImplSig, UNKNOWN, annotation_type, get_ty, impl_sig};
 use crate::pine_type_table::{
     CallInterface, ClassSig, DepRecord, ExportSig, ModuleInterface, PineTypeTable, qualify,
 };
@@ -133,6 +133,7 @@ pub fn build_interface(
     collect_defs(ast, tree, "", &mut definitions);
     let classes: Classes =
         table.classes.iter().map(|(name, id)| (name.clone(), id.clone())).collect();
+    let enums: Enums = table.enums.iter().cloned().collect();
 
     let mut exports: IndexMap<String, ExportSig> = IndexMap::new();
     let mut proxied: IndexMap<String, bool> = IndexMap::new();
@@ -140,7 +141,7 @@ pub fn build_interface(
         let name = def_name(ast, *node);
         if scope.is_empty()
             && table.exportable.contains(name)
-            && let Some(sig) = export_sig(ast, *node, key, table, &classes)?
+            && let Some(sig) = export_sig(ast, *node, key, table, &classes, &enums)?
         {
             exports.insert(name.to_string(), sig);
             proxied.insert(
@@ -155,7 +156,7 @@ pub fn build_interface(
         if !scope.is_empty()
             && proxies.contains(name)
             && has_export_decorator(ast, decorators(ast, *node), &export_decorators)
-            && let Some(sig) = export_sig(ast, *node, key, table, &classes)?
+            && let Some(sig) = export_sig(ast, *node, key, table, &classes, &enums)?
         {
             exports.insert(name.to_string(), sig);
             proxied.insert(name.to_string(), true);
@@ -225,6 +226,7 @@ fn export_sig(
     key: &str,
     table: &PineTypeTable,
     classes: &Classes,
+    enums: &Enums,
 ) -> R<Option<ExportSig>> {
     let Some(func) = table.funcs.get(key) else { return Ok(None) };
     let line = ast[node].loc.lineno.unwrap_or(0);
@@ -246,7 +248,8 @@ fn export_sig(
             names: first.names.clone(),
         }));
     }
-    let sig = impl_sig(ast, node, &func.ret, &|value| get_ty(ast, value).to_string(), classes)?;
+    let sig =
+        impl_sig(ast, node, &func.ret, &|value| get_ty(ast, value).to_string(), classes, enums)?;
     let args = match ast.kind(node) {
         Kind::FunctionDef { args, .. } | Kind::AsyncFunctionDef { args, .. } => *args,
         _ => return Ok(None),
@@ -258,7 +261,7 @@ fn export_sig(
             Kind::Arg { annotation, .. } => *annotation,
             _ => None,
         };
-        if annotation_type(ast, annotation, classes)? == UNKNOWN {
+        if annotation_type(ast, annotation, classes, enums)? == UNKNOWN {
             annotated = false;
             break;
         }

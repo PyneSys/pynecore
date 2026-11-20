@@ -263,6 +263,8 @@ pub struct PineTypeTable {
     pub deps: IndexMap<String, DepRecord>,
     /// Every class name an annotation in this module may name -> its class id
     pub classes: IndexMap<String, String>,
+    /// The class ids among `classes` that are enums, the only classes a map key may be
+    pub enums: BTreeSet<String>,
     /// The classes this module declares, by id
     pub class_sigs: IndexMap<String, ClassSig>,
     /// The methods this module declares on classes it does not declare, by class

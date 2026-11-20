@@ -22,8 +22,8 @@ use pyne_ast::{
 
 use crate::fdlibm;
 use crate::pine_type_rules::{
-    BOOL, CallRule, Classes, FLOAT, INT, STR, UNKNOWN, annotation_type, binop_type, is_numeric,
-    join, lib_type_override, set_ty, unaryop_type,
+    BOOL, CallRule, Classes, Enums, FLOAT, INT, STR, UNKNOWN, annotation_type, binop_type,
+    is_numeric, join, lib_type_override, set_ty, unaryop_type,
 };
 use crate::{Context, Error};
 
@@ -1501,7 +1501,8 @@ impl ConstFold {
                     (Some(folded), Some(name)) => {
                         // An explicit annotation is a declaration, so it outranks what
                         // the folded initializer happens to be
-                        let declared = annotation_type(ast, Some(annotation), &Classes::new())?;
+                        let declared =
+                            annotation_type(ast, Some(annotation), &Classes::new(), &Enums::new())?;
                         let ty = if declared != UNKNOWN {
                             declared
                         } else {

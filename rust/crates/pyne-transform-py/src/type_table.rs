@@ -84,6 +84,7 @@ impl<'py> Classes<'py> {
             })?,
             deps: dict(&get("deps")?, string, |item| self.dep_record_from(item))?,
             classes: dict(&get("classes")?, string, string)?,
+            enums: frozenset(&get("enums")?)?,
             class_sigs: dict(&get("class_sigs")?, string, |item| self.class_sig_from(item))?,
             extensions: dict(&get("extensions")?, string, |methods| {
                 dict(methods, string, |item| self.export_sig_from(item))
@@ -287,6 +288,7 @@ impl<'py> Classes<'py> {
         kwargs.set_item("groups", groups)?;
         kwargs.set_item("deps", deps)?;
         kwargs.set_item("classes", classes)?;
+        kwargs.set_item("enums", PyFrozenSet::new(py, &table.enums)?)?;
         kwargs.set_item("class_sigs", class_sigs)?;
         kwargs.set_item("extensions", extensions)?;
         kwargs.set_item("pins_suppressed", self.opt_diag_to(table.pins_suppressed.as_ref())?)?;

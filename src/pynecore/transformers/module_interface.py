@@ -257,12 +257,12 @@ def _export_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, key: str,
             open_ended=first.open_ended, ret=func.ret,
             annotated=all(UNKNOWN not in impl.params for impl in impls),
             impls=impls, line=getattr(node, 'lineno', 0), names=first.names)
-    sig = impl_sig(node, func.ret, classes=table.classes)
+    sig = impl_sig(node, func.ret, classes=table.classes, enums=table.enums)
     positional = list(node.args.posonlyargs) + list(node.args.args)
     return ExportSig(
         name=node.name, kind='function', params=sig.params, required=sig.required,
         open_ended=sig.open_ended, ret=sig.ret,
-        annotated=all(annotation_type(arg.annotation, table.classes) != UNKNOWN
+        annotated=all(annotation_type(arg.annotation, table.classes, table.enums) != UNKNOWN
                       for arg in positional),
         line=getattr(node, 'lineno', 0), names=sig.names)
 

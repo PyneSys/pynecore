@@ -47,8 +47,8 @@ use pynecore_codes::Code;
 use crate::node_ids::assign_node_ids;
 use crate::pine_qualifier::{CONST, SERIES};
 use crate::pine_type_rules::{
-    Classes, FactoryFields, TY_ATTR, UNKNOWN, elements_of, is_tuple, join, render_ty, set_ty,
-    shape_conflict,
+    Classes, Enums, FactoryFields, TY_ATTR, UNKNOWN, elements_of, is_tuple, join, render_ty,
+    set_ty, shape_conflict,
 };
 use crate::pine_type_table::{
     Binding, CallSite, ClassSig, ContextKey, ContextResult, DepRecord, Diag, ExportSig, FuncSig,
@@ -202,6 +202,8 @@ struct Engine<'a, 'h> {
     loop_stack: Vec<NodeId>,
     classes: IndexMap<String, String>,
     classes_lookup: Classes,
+    /// The class ids among `classes` that are enums (`_enums`)
+    enums: Enums,
     class_spellings: HashMap<String, String>,
     type_imports: HashMap<String, String>,
     class_sigs: HashMap<String, Rc<ClassSig>>,
@@ -306,6 +308,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             loop_stack: Vec::new(),
             classes: IndexMap::new(),
             classes_lookup: Classes::new(),
+            enums: Enums::new(),
             class_spellings: HashMap::new(),
             type_imports: HashMap::new(),
             class_sigs,
@@ -371,7 +374,7 @@ impl<'a, 'h> Engine<'a, 'h> {
     }
 
     fn annotation_type(&self, node: Option<NodeId>) -> R<String> {
-        crate::pine_type_rules::annotation_type(self.ast, node, &self.classes_lookup)
+        crate::pine_type_rules::annotation_type(self.ast, node, &self.classes_lookup, &self.enums)
     }
 
     // --- scope plumbing --------------------------------------------------
@@ -903,6 +906,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             groups,
             deps: self.deps,
             classes: self.classes,
+            enums: self.enums.into_iter().collect(),
             class_sigs: self.class_sigs_table,
             extensions: self.extensions,
             pins_suppressed: self.pins_suppressed,

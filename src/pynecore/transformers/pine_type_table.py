@@ -409,6 +409,9 @@ class PineTypeTable:
     #: bring in. An annotation naming one of these is an object of that class,
     #: not an unknown and not an anonymous object
     classes: dict[str, str] = field(default_factory=dict)
+    #: The class ids among ``classes`` that are enums: the only classes a map
+    #: key may be, so the only ones an annotation reads as a map's key type
+    enums: frozenset[str] = frozenset()
     #: The classes this module DECLARES, by id, with their fields and methods.
     #: An imported one is not here -- it belongs to the module that declares
     #: it, and travels in that module's interface

@@ -191,6 +191,40 @@ def __test_an_accessor_of_the_wrong_shape_says_so__():
     assert class_of(OBJECT) is None
 
 
+def __test_an_enum_map_key_is_an_item_of_its_own__():
+    """
+    A map key is a scalar character or an enum, and nothing else.
+
+    An enum's class id may hold any character -- colons and digits included --
+    so its key carries its own length, and a scalar key is spelled exactly as
+    it always was.
+    """
+    speed = object_ty(class_id('/Ádám/a, b:1:c.py', 'Speed'))
+    enums = frozenset({class_of(speed)})
+    assert map_of(STR, FLOAT) == 'M:s:f'
+    assert map_of(INT, array_of(FLOAT), enums) == 'M:i:a:f'
+    keyed = map_of(speed, map_of(STR, speed, enums), enums)
+    assert keyed == f'M:{len(speed)}:{speed}:M:s:{speed}'
+    assert key_of(keyed) == speed
+    assert value_of(keyed) == map_of(STR, speed)
+    assert key_of(value_of(keyed)) == STR and value_of(value_of(keyed)) == speed
+    assert render_ty(keyed) == 'map<Speed, map<string, Speed>>'
+    nested = map_of(speed, map_of(speed, INT, enums), enums)
+    assert value_of(nested) == map_of(speed, INT, enums) and key_of(value_of(nested)) == speed
+    # A class that is no enum is no map key, and neither is anything unknown
+    assert map_of(speed, FLOAT) == OBJECT
+    assert map_of(PIVOT, FLOAT, enums) == OBJECT
+    assert map_of(object_ty(builtin_class_id('Line')), FLOAT, enums) == OBJECT
+    assert map_of(array_of(INT), FLOAT, enums) == OBJECT
+    assert map_of(speed, UNKNOWN, enums) == OBJECT
+    # The annotation reads an enum key only where the enum is one
+    classes = {'Speed': class_of(speed), 'Pivot': class_id('test', 'Pivot')}
+    spelled = ast.parse('dict[Speed, list[float]]', mode='eval').body
+    assert annotation_type(spelled, classes, enums) == map_of(speed, array_of(FLOAT), enums)
+    assert annotation_type(spelled, classes) == OBJECT
+    assert _annotation('dict[Pivot, float]', classes) == OBJECT
+
+
 def __test_an_unknown_element_collapses_to_a_bare_object__():
     """
     A shape carrying nothing is worse than no shape at all.

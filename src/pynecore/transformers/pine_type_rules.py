@@ -484,13 +484,18 @@ SCALARS: Final = frozenset({INT, FLOAT, BOOL, STR, COLOR})
 # say any of that, so the representation stays a ``str`` and grows a grammar:
 #
 #     ty  := <char> | 'o:' <class-id> | 'a:' <ty> | 'm:' <ty>
-#          | 'M:' <key-char> ':' <ty> | 'T:' <item>+
+#          | 'M:' <key> ':' <ty> | 'T:' <item>+
+#     key := <char> | <item>
 #     item := <decimal length> ':' <ty>
 #
-# array, matrix and map, in that order; a map key is a Pine scalar so one
-# character is enough for it and the TAIL is the value type, which makes the
-# grammar unambiguous read left to right. A bare ``'o'`` stays what it always
-# was -- an object whose class was lost -- and is what the diagnostics point at.
+# array, matrix and map, in that order; the TAIL of a map is its value type,
+# which makes the grammar unambiguous read left to right. A map key is a Pine
+# scalar or a Pine enum: a scalar is one character, and an enum -- an object
+# whose class id may hold any character -- is an item, which carries its own
+# length the way a tuple's elements do. No scalar character is a digit, so the
+# first character of a key tells the two apart. A bare ``'o'`` stays what it
+# always was -- an object whose class was lost -- and is what the diagnostics
+# point at.
 #
 # The tuple is the one form holding SEVERAL types in a row, and none of the
 # others is self-delimiting inside a sequence: a class id ends in a module key
@@ -512,6 +517,9 @@ _ARRAY: Final = 'a:'
 _MATRIX: Final = 'm:'
 _MAP: Final = 'M:'
 _TUPLE: Final = 'T:'
+
+#: The enum set of a caller that has none to offer: every class key is refused.
+NO_ENUMS: Final[frozenset[str]] = frozenset()
 
 
 def class_id(module_key: str, name: str) -> str:
@@ -575,17 +583,27 @@ def matrix_of(element: str) -> str:
     return OBJECT if element in (UNKNOWN, VOID) else _MATRIX + element
 
 
-def map_of(key: str, value: str) -> str:
+def map_of(key: str, value: str, enums: frozenset[str] = NO_ENUMS) -> str:
     """
-    The type of a map from one scalar key type to one value type.
+    The type of a map from one key type to one value type.
 
-    :param key: The key type, which Pine requires to be a scalar
+    Pine takes a scalar or an enum as a map key and nothing else: a map keyed by
+    a UDT or a drawing is no Pine type, and it reads as a bare object, the same
+    as a map whose key is not known.
+
+    :param key: The key type
     :param value: The value type
-    :return: The shaped type, or OBJECT when either half is not known
+    :param enums: The class ids of the enums visible where the type is spelled
+    :return: The shaped type, or OBJECT when either half is not known or the key
+             is neither a scalar nor an object of one of ``enums``
     """
-    if key not in SCALARS or value in (UNKNOWN, VOID):
+    if value in (UNKNOWN, VOID):
         return OBJECT
-    return f'{_MAP}{key}:{value}'
+    if key in SCALARS:
+        return f'{_MAP}{key}:{value}'
+    if class_of(key) in enums:
+        return f'{_MAP}{len(key)}:{key}:{value}'
+    return OBJECT
 
 
 def tuple_of(elements: Sequence[str]) -> str:
@@ -734,14 +752,41 @@ def element_of(ty: str) -> str:
     return UNKNOWN
 
 
+def _item_key(ty: str) -> tuple[str, int] | None:
+    """
+    The enum key of a map type, read the way ``map_of`` writes it.
+
+    An enum key is an item: a decimal length, a colon, exactly that many
+    characters, and the colon the value type follows. A key that does not read
+    back that way is a scalar's single character, or no key this module wrote.
+
+    :param ty: A map type
+    :return: The key and the index its value type starts at, or None when the key
+             is no item
+    """
+    start = len(_MAP)
+    colon = ty.find(':', start)
+    digits = ty[start:colon]
+    if colon < 0 or not digits or any(digit not in '0123456789' for digit in digits):
+        return None
+    end = colon + 1 + int(digits)
+    if ty[end:end + 1] != ':':
+        return None
+    return ty[colon + 1:end], end + 1
+
+
 def key_of(ty: str) -> str:
     """
     The key type of a map.
 
     :param ty: Any type
-    :return: The key character, UNKNOWN when the type is not a map
+    :return: The key type -- a scalar character or an enum's object type --,
+             UNKNOWN when the type is not a map
     """
-    return ty[len(_MAP)] if ty.startswith(_MAP) else UNKNOWN
+    if not ty.startswith(_MAP):
+        return UNKNOWN
+    item = _item_key(ty)
+    return ty[len(_MAP)] if item is None else item[0]
 
 
 def value_of(ty: str) -> str:
@@ -751,7 +796,10 @@ def value_of(ty: str) -> str:
     :param ty: Any type
     :return: The value type, UNKNOWN when the type is not a map
     """
-    return ty[len(_MAP) + 2:] if ty.startswith(_MAP) else UNKNOWN
+    if not ty.startswith(_MAP):
+        return UNKNOWN
+    item = _item_key(ty)
+    return ty[len(_MAP) + 2:] if item is None else ty[item[1]:]
 
 
 #: Lib class type -> the scalar its constants are, filled on first use
@@ -1288,7 +1336,8 @@ def bare_wrapper(node: ast.expr) -> bool:
     return name in _TRANSPARENT_SUBSCRIPTS
 
 
-def annotation_type(node: ast.expr | None, classes: Mapping[str, str] = NO_CLASSES) -> str:
+def annotation_type(node: ast.expr | None, classes: Mapping[str, str] = NO_CLASSES,
+                    enums: frozenset[str] = NO_ENUMS) -> str:
     """
     Map a Python annotation onto a Pine type character.
 
@@ -1310,6 +1359,9 @@ def annotation_type(node: ast.expr | None, classes: Mapping[str, str] = NO_CLASS
     list[float]]`` a ``map<string, array<float>>`` -- the spellings PyneComp
     emits for Pine's ``array<T>``, ``matrix<T>`` and ``map<K, V>``. A
     ``tuple[float, int]`` is Pine's ``[float, int]``, one type per position.
+    A map key is a scalar or an enum (``dict[Speed, float]`` is a
+    ``map<Speed, float>``); a map keyed by any other class is no Pine type and
+    reads as a bare object (``map_of``).
 
     :param node: The annotation expression, or None when there is none
     :param classes: Class SPELLING -> class id, for every class visible where
@@ -1318,6 +1370,8 @@ def annotation_type(node: ast.expr | None, classes: Mapping[str, str] = NO_CLASS
                     (``Settings`` for ``from m import Settings``, ``m.Settings``
                     for a namespace import), because identity is (module, name)
                     and two modules' same-named classes are two types
+    :param enums: The class ids of the enums among ``classes``, the only
+                  classes a map key may be
     :return: The type
     """
     if node is None:
@@ -1329,7 +1383,7 @@ def annotation_type(node: ast.expr | None, classes: Mapping[str, str] = NO_CLASS
         # A stringized forward reference: ``'_ExitOrderKey'``, ``'list[Pivot]'``
         if isinstance(node.value, str):
             try:
-                return annotation_type(ast.parse(node.value, mode='eval').body, classes)
+                return annotation_type(ast.parse(node.value, mode='eval').body, classes, enums)
             except SyntaxError:
                 return UNKNOWN
         return UNKNOWN
@@ -1349,37 +1403,39 @@ def annotation_type(node: ast.expr | None, classes: Mapping[str, str] = NO_CLASS
         return _named_type(node.attr, classes)
 
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        return _union_type(node, classes)
+        return _union_type(node, classes, enums)
 
     if isinstance(node, ast.Subscript):
-        return _subscript_type(node, classes)
+        return _subscript_type(node, classes, enums)
 
     return UNKNOWN
 
 
-def _subscript_type(node: ast.Subscript, classes: Mapping[str, str]) -> str:
+def _subscript_type(node: ast.Subscript, classes: Mapping[str, str],
+                    enums: frozenset[str]) -> str:
     """
     Type of a subscripted annotation.
 
     :param node: The ``X[...]`` annotation node
     :param classes: Class name -> class id, visible where it stands
+    :param enums: The class ids of the enums among them
     :return: The type
     """
     value = node.value
     name = value.id if isinstance(value, ast.Name) else \
         (value.attr if isinstance(value, ast.Attribute) else '')
     if name in _TRANSPARENT_SUBSCRIPTS:
-        return annotation_type(node.slice, classes)
+        return annotation_type(node.slice, classes, enums)
     if name in _ARRAY_SUBSCRIPTS:
-        return array_of(annotation_type(node.slice, classes))
+        return array_of(annotation_type(node.slice, classes, enums))
     if name in _MATRIX_SUBSCRIPTS:
-        return matrix_of(annotation_type(node.slice, classes))
+        return matrix_of(annotation_type(node.slice, classes, enums))
     if name in _MAP_SUBSCRIPTS:
         pair = node.slice.elts if isinstance(node.slice, ast.Tuple) else ()
         if len(pair) != 2:
             return OBJECT
-        return map_of(annotation_type(pair[0], classes),
-                      annotation_type(pair[1], classes))
+        return map_of(annotation_type(pair[0], classes, enums),
+                      annotation_type(pair[1], classes, enums), enums)
     if name in _TUPLE_SUBSCRIPTS:
         # ``tuple[int]`` subscripts with the element itself, ``tuple[int,
         # float]`` with a tuple of them: one element or many, the arity is
@@ -1390,7 +1446,7 @@ def _subscript_type(node: ast.Subscript, classes: Mapping[str, str]) -> str:
             # a Pine tuple at all -- Pine's has a fixed arity, and that arity
             # is what an unpack is checked against
             return OBJECT
-        return tuple_of([annotation_type(item, classes) for item in items])
+        return tuple_of([annotation_type(item, classes, enums) for item in items])
     if name in _OBJECT_SUBSCRIPTS:
         return OBJECT
     return UNKNOWN
@@ -1440,12 +1496,14 @@ def _is_typeless(node: ast.expr) -> bool:
     return False
 
 
-def _union_type(node: ast.BinOp, classes: Mapping[str, str] = NO_CLASSES) -> str:
+def _union_type(node: ast.BinOp, classes: Mapping[str, str] = NO_CLASSES,
+                enums: frozenset[str] = NO_ENUMS) -> str:
     """
     Type of an annotation union, ignoring its absence markers.
 
     :param node: The ``X | Y`` annotation node
     :param classes: Class name -> class id, visible where the annotation stands
+    :param enums: The class ids of the enums among them
     :return: The joined type
     """
     members: list[ast.expr] = []
@@ -1463,9 +1521,9 @@ def _union_type(node: ast.BinOp, classes: Mapping[str, str] = NO_CLASSES) -> str
         # ``NA | None`` and friends: absence only, no type to speak of
         return UNKNOWN
 
-    result = annotation_type(contributing[0], classes)
+    result = annotation_type(contributing[0], classes, enums)
     for member in contributing[1:]:
-        result = join(result, annotation_type(member, classes))
+        result = join(result, annotation_type(member, classes, enums))
     return result
 
 
@@ -2184,7 +2242,8 @@ _DYN_DEFAULT: Final = '__dyn_default__'
 
 def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
              ty_of: Callable[[ast.AST], str] = get_ty,
-             classes: Mapping[str, str] = NO_CLASSES) -> ImplSig:
+             classes: Mapping[str, str] = NO_CLASSES,
+             enums: frozenset[str] = NO_ENUMS) -> ImplSig:
     """
     One definition's shape, as the static overload selection reads it.
 
@@ -2197,16 +2256,17 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
     :param ty_of: Types a default expression; the walk passes its OWN view, a
                   consumer reading a finished tree the node stamps
     :param classes: Class name -> class id, visible in the definition's module
+    :param enums: The class ids of the enums among them
     :return: The implementation's shape
     """
     args = node.args
     positional = list(args.posonlyargs) + list(args.args)
     defaults = _param_defaults(node)
     return ImplSig(
-        params=tuple(annotation_type(a.annotation, classes) for a in positional),
+        params=tuple(annotation_type(a.annotation, classes, enums) for a in positional),
         required=len(positional) - len(args.defaults),
         open_ended=args.vararg is not None, ret=ret,
-        fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes)
+        fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes, enums)
                      for arg in positional + list(args.kwonlyargs)),
         names=tuple(a.arg for a in positional),
         bare=''.join('1' if a.annotation is None else '0' for a in positional))
@@ -2214,7 +2274,8 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
 
 def param_fit(arg: ast.arg, default: ast.expr | None,
               ty_of: Callable[[ast.AST], str] = get_ty,
-              classes: Mapping[str, str] = NO_CLASSES) -> str:
+              classes: Mapping[str, str] = NO_CLASSES,
+              enums: frozenset[str] = NO_ENUMS) -> str:
     """
     What one parameter contributes to a call that omits it.
 
@@ -2227,13 +2288,14 @@ def param_fit(arg: ast.arg, default: ast.expr | None,
     :param default: Its default expression, or None when it has none
     :param ty_of: Types the default expression
     :param classes: Class name -> class id, visible where the annotation stands
+    :param enums: The class ids of the enums among them
     :return: One of the ``FIT_*`` characters
     """
     if default is None:
         return FIT_REQUIRED
     if arg.annotation is None:
         return FIT_OMISSIBLE
-    return default_fit(annotation_type(arg.annotation, classes), default_ty(default, ty_of),
+    return default_fit(annotation_type(arg.annotation, classes, enums), default_ty(default, ty_of),
                        annotation_takes_none(arg.annotation))
 
 

@@ -608,6 +608,9 @@ class _Inference:
         #: id, its own and its imports' alike; filled in before anything reads
         #: an annotation
         self._classes: dict[str, str] = {}
+        #: The class ids among ``_classes`` that are enums, the only classes a
+        #: map key may be; filled in together with ``_classes``
+        self._enums: frozenset[str] = frozenset()
         #: Class id -> how this module spells the class in value position: its
         #: own classes by name, an imported one by the path that reached it
         #: (an annotation's spelling, a constructor's callee). It is what the na
@@ -1248,12 +1251,12 @@ class _Inference:
         func = self.table.funcs.get(key)
         if func is None:
             return None
-        shape = impl_sig(node, func.ret, self._ty_of, self._classes)
+        shape = impl_sig(node, func.ret, self._ty_of, self._classes, self._enums)
         positional = list(node.args.posonlyargs) + list(node.args.args)
         return ExportSig(
             name=name, kind='function', params=shape.params,
             required=shape.required, open_ended=shape.open_ended, ret=shape.ret,
-            annotated=all(annotation_type(arg.annotation, self._classes) != UNKNOWN
+            annotated=all(annotation_type(arg.annotation, self._classes, self._enums) != UNKNOWN
                           for arg in positional),
             line=_line(node), names=shape.names)
 
@@ -1369,6 +1372,11 @@ class _Inference:
                 imported[spelled] = found
         self._classes = {**{name: sig.id for name, sig in imported.items()}, **names}
         self.table.classes = self._classes
+        enum_bases = _imported_as(tree, 'enum', 'StrEnum')
+        self._enums = frozenset(
+            [sig.id for sig in imported.values() if sig.enum]
+            + [names[name] for name, node in own.items() if _is_enum_class(node, enum_bases)])
+        self.table.enums = self._enums
         self._class_spellings = {cid: spelled for spelled, cid in self._classes.items()}
         for sig in imported.values():
             self._class_sigs.setdefault(sig.id, sig)
@@ -1388,16 +1396,15 @@ class _Inference:
         :param names: Class name -> class id, for this module's own classes
         """
         methods = self._declared_methods(tree)
-        enum_bases = _imported_as(tree, 'enum', 'StrEnum')
         for name, node in own.items():
             cid = names[name]
             fields: dict[str, str] = {}
             required = 0
-            enum = len(node.bases) == 1 and isinstance(node.bases[0], ast.Name) \
-                and node.bases[0].id in enum_bases
+            enum = cid in self._enums
             for stmt in node.body:
                 if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-                    fields[stmt.target.id] = annotation_type(stmt.annotation, self._classes)
+                    fields[stmt.target.id] = annotation_type(stmt.annotation, self._classes,
+                                                             self._enums)
                     if stmt.value is None:
                         required += 1
                 elif enum and isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
@@ -1437,7 +1444,7 @@ class _Inference:
             positional = list(node.args.posonlyargs) + list(node.args.args)
             if not positional:
                 continue
-            cid = class_of(annotation_type(positional[0].annotation, self._classes))
+            cid = class_of(annotation_type(positional[0].annotation, self._classes, self._enums))
             if cid is not None:
                 out.setdefault(cid, {})[node.name] = node
         return out
@@ -1559,9 +1566,9 @@ class _Inference:
         :param key: Its scope-qualified id
         """
         self._defs.setdefault(key, []).append(stmt)
-        params = [annotation_type(a.annotation, self._classes)
+        params = [annotation_type(a.annotation, self._classes, self._enums)
                   for a in list(stmt.args.posonlyargs) + list(stmt.args.args)]
-        declared = annotation_type(stmt.returns, self._classes)
+        declared = annotation_type(stmt.returns, self._classes, self._enums)
         annotated = declared != UNKNOWN
         if _is_overload(stmt):
             # One name, several implementations: each contributes its
@@ -1651,7 +1658,7 @@ class _Inference:
                         self._frames[-1].loop_counters[self._key(target)] = \
                             self._loop_bound(stmt.value, what, stmt.value.args, None)
             case ast.AnnAssign():
-                declared: str | None = annotation_type(stmt.annotation, self._classes)
+                declared: str | None = annotation_type(stmt.annotation, self._classes, self._enums)
                 value_ty = self._expr(stmt.value) if stmt.value is not None else None
                 if declared is not None and value_ty is not None and stmt.value is not None:
                     value_ty = self._declared_constructor(declared, stmt.value, value_ty)
@@ -1985,7 +1992,7 @@ class _Inference:
         defaults = _param_defaults(node) if is_script_entry(node) else {}
         out: list[str] = []
         for arg in _every_param(node):
-            ty = annotation_type(arg.annotation, self._classes)
+            ty = annotation_type(arg.annotation, self._classes, self._enums)
             if ty == UNKNOWN:
                 default = defaults.get(arg.arg)
                 ty = UNKNOWN if default is None else self._ty_of(default)
@@ -2112,7 +2119,7 @@ class _Inference:
         try:
             self._bind_params(node, params, quals)
             self._function_body(node.body)
-            declared = annotation_type(node.returns, self._classes)
+            declared = annotation_type(node.returns, self._classes, self._enums)
             if declared != UNKNOWN:
                 # A caller reads the call as the declared type and converts nothing,
                 # so a typeless na returned here goes out as that type's na
@@ -2927,7 +2934,7 @@ class _Inference:
         """
         if isinstance(node, ast.Name) and self._lookup(self._key(node)) is not None:
             return False
-        return annotation_type(node, self._classes) != UNKNOWN
+        return annotation_type(node, self._classes, self._enums) != UNKNOWN
 
     def _e_attribute(self, node: ast.Attribute) -> str:
         base = self._expr(node.value)
@@ -4132,7 +4139,7 @@ class _Inference:
                 return object_ty(built)
             if not self._names_type(argument):
                 return None
-            return annotation_type(argument, self._classes)
+            return annotation_type(argument, self._classes, self._enums)
         if override == 'join_args':
             # Every argument widens the result: MEASURED, ``nz(int, float)`` is
             # a float on TradingView while ``nz(int, int)`` is an int
@@ -5846,7 +5853,7 @@ class _Inference:
                 continue
             slot = self._group_slot.get(node_id(impl) or -1)
             ret = returns[slot] if slot is not None and slot < len(returns) else UNKNOWN
-            out.append((impl, impl_sig(impl, ret, self._ty_of, self._classes)))
+            out.append((impl, impl_sig(impl, ret, self._ty_of, self._classes, self._enums)))
         return out
 
     def _call_context(self, key: str, node: ast.Call, frame: int,
@@ -5982,7 +5989,7 @@ class _Inference:
             if passed is None and default is None:
                 reject(CALL_MISSING_ARGUMENT, (name, arg.arg))
                 return None
-            annotated = annotation_type(arg.annotation, self._classes)
+            annotated = annotation_type(arg.annotation, self._classes, self._enums)
             if annotated != UNKNOWN:
                 given_node = passed if passed is not None else default
                 given = self._ty_of(given_node)
@@ -7883,6 +7890,18 @@ def _imported_as(tree: ast.Module, module: str, name: str) -> set[str]:
             for node in ast_walk.walk_statements(tree)
             if isinstance(node, ast.ImportFrom) and node.module == module and not node.level
             for alias in node.names if alias.name == name}
+
+
+def _is_enum_class(node: ast.ClassDef, enum_bases: set[str]) -> bool:
+    """
+    Whether a class statement declares a Pine enum.
+
+    :param node: The class statement
+    :param enum_bases: The names the module binds to ``enum.StrEnum`` (``_imported_as``)
+    :return: True when its one base is such a name
+    """
+    return len(node.bases) == 1 and isinstance(node.bases[0], ast.Name) \
+        and node.bases[0].id in enum_bases
 
 
 def _is_method(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

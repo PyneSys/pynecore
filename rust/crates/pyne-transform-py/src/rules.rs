@@ -50,6 +50,14 @@ impl<'py> Args<'_, 'py> {
         self.get(index)?.extract()
     }
 
+    /// An iterable of class ids, empty when the call passes none at that position.
+    fn enums(&self, index: usize) -> PyResult<rules::Enums> {
+        if index >= self.items.len() {
+            return Ok(rules::Enums::new());
+        }
+        self.get(index)?.try_iter()?.map(|item| item?.extract()).collect()
+    }
+
     /// A `dict[str, str]` in its iteration order.
     fn pairs(&self, index: usize) -> PyResult<Vec<(String, String)>> {
         let value = self.get(index)?;
@@ -346,7 +354,7 @@ pub fn call<'py>(
         "object_ty" => rules::object_ty(&a.str(0)?).into_bound_py_any(py),
         "array_of" => rules::array_of(&a.str(0)?).into_bound_py_any(py),
         "matrix_of" => rules::matrix_of(&a.str(0)?).into_bound_py_any(py),
-        "map_of" => rules::map_of(&a.str(0)?, &a.str(1)?).into_bound_py_any(py),
+        "map_of" => rules::map_of(&a.str(0)?, &a.str(1)?, &a.enums(2)?).into_bound_py_any(py),
         "tuple_of" => rules::tuple_of(&a.strs(0)?).into_bound_py_any(py),
         "head" => rules::head(&a.str(0)?).into_bound_py_any(py),
         "is_shaped" => rules::is_shaped(&a.str(0)?).into_bound_py_any(py),
@@ -422,7 +430,9 @@ fn tree_call<'py>(py: Python<'py>, name: &str, a: &Args<'_, 'py>) -> PyResult<Bo
         "annotation_type" => {
             let node = a.node(&mut from, 0)?;
             let classes = a.classes(1)?;
-            let ty = rules::annotation_type(&from.ast, node, &classes).map_err(unsupported)?;
+            let enums = a.enums(2)?;
+            let ty =
+                rules::annotation_type(&from.ast, node, &classes, &enums).map_err(unsupported)?;
             ty.into_bound_py_any(py)
         }
         "annotation_takes_none" => {
@@ -443,8 +453,9 @@ fn tree_call<'py>(py: Python<'py>, name: &str, a: &Args<'_, 'py>) -> PyResult<Bo
             let ret = a.str(1)?;
             let callable = Some(a.get(2)?).filter(|value| !value.is_none());
             let classes = a.classes(3)?;
+            let enums = a.enums(4)?;
             let ty_of = TyOf { callable, from: &from, failure: RefCell::new(None) };
-            let sig = rules::impl_sig(&from.ast, func, &ret, &|id| ty_of.ty(id), &classes);
+            let sig = rules::impl_sig(&from.ast, func, &ret, &|id| ty_of.ty(id), &classes, &enums);
             let sig = ty_of.finish(sig)?;
             let params = PyTuple::new(py, sig.params)?;
             let names = PyTuple::new(py, sig.names)?;
@@ -456,8 +467,10 @@ fn tree_call<'py>(py: Python<'py>, name: &str, a: &Args<'_, 'py>) -> PyResult<Bo
             let default = a.node(&mut from, 1)?;
             let callable = Some(a.get(2)?).filter(|value| !value.is_none());
             let classes = a.classes(3)?;
+            let enums = a.enums(4)?;
             let ty_of = TyOf { callable, from: &from, failure: RefCell::new(None) };
-            let fit = rules::param_fit(&from.ast, arg, default, &|id| ty_of.ty(id), &classes);
+            let fit =
+                rules::param_fit(&from.ast, arg, default, &|id| ty_of.ty(id), &classes, &enums);
             ty_of.finish(fit)?.to_string().into_bound_py_any(py)
         }
         "default_ty" => {

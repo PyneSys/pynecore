@@ -14,7 +14,7 @@ use super::facts::{self, arg_parts, args_of, every_param, is_method, is_overload
 use super::{Engine, Import, R, Shadowed};
 use crate::data;
 use crate::pine_type_rules::{
-    UNKNOWN, builtin_class_id, class_id, class_of, impl_sig, object_ty, overload_result,
+    Enums, UNKNOWN, builtin_class_id, class_id, class_of, impl_sig, object_ty, overload_result,
 };
 use crate::pine_type_table::{ClassSig, ExportSig, FuncSig, qualify};
 
@@ -195,6 +195,15 @@ impl Engine<'_, '_> {
             self.class_spellings.insert(cid.clone(), spelled.clone());
         }
         self.classes = classes;
+        let enum_bases = self.imported_as(tree, "enum", "StrEnum");
+        let mut enums: Enums =
+            imported.values().filter(|sig| sig.is_enum).map(|sig| sig.id.clone()).collect();
+        for (name, &node) in &own {
+            if self.is_enum_class(node, &enum_bases) {
+                enums.insert(names[name].clone());
+            }
+        }
+        self.enums = enums;
         for sig in imported.into_values() {
             self.class_sigs.entry(sig.id.clone()).or_insert_with(|| Rc::new(sig));
         }
@@ -210,17 +219,11 @@ impl Engine<'_, '_> {
         names: &IndexMap<String, String>,
     ) -> R<()> {
         let methods = self.declared_methods(tree)?;
-        let enum_bases = self.imported_as(tree, "enum", "StrEnum");
         for (name, &node) in own {
             let cid = names[name].clone();
             let mut fields: IndexMap<String, String> = IndexMap::new();
             let mut required = 0;
-            let is_enum = match self.kind(node) {
-                Kind::ClassDef { bases, .. } if bases.len() == 1 => {
-                    matches!(self.kind(bases[0]), Kind::Name { id, .. } if enum_bases.contains(id))
-                }
-                _ => false,
-            };
+            let is_enum = self.enums.contains(&cid);
             for &stmt in facts::def_body(self.ast, node) {
                 if let Kind::AnnAssign { target, annotation, value, .. } = self.kind(stmt)
                     && let Kind::Name { id, .. } = self.kind(*target)
@@ -259,6 +262,17 @@ impl Engine<'_, '_> {
 
     /// The names a module's statements bind to one name of a module outside
     /// PyneCore (`_imported_as`).
+    /// Whether a class statement declares a Pine enum: its one base is a name the
+    /// module binds to `enum.StrEnum` (`_is_enum_class`).
+    fn is_enum_class(&self, node: NodeId, enum_bases: &BTreeSet<String>) -> bool {
+        match self.kind(node) {
+            Kind::ClassDef { bases, .. } if bases.len() == 1 => {
+                matches!(self.kind(bases[0]), Kind::Name { id, .. } if enum_bases.contains(id))
+            }
+            _ => false,
+        }
+    }
+
     fn imported_as(&self, tree: NodeId, wanted_module: &str, wanted: &str) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for node in walk_statements(self.ast, tree) {
@@ -477,8 +491,14 @@ impl Engine<'_, '_> {
     fn published_method(&self, name: &str, node: NodeId, key: &str) -> R<Option<ExportSig>> {
         let Some(func) = self.funcs.get(key) else { return Ok(None) };
         let ret = func.ret.clone();
-        let shape =
-            impl_sig(self.ast, node, &ret, &|value| self.ty_of(value), &self.classes_lookup)?;
+        let shape = impl_sig(
+            self.ast,
+            node,
+            &ret,
+            &|value| self.ty_of(value),
+            &self.classes_lookup,
+            &self.enums,
+        )?;
         let positional = args_of(self.ast, node).map(|args| args.positional()).unwrap_or_default();
         let mut annotated = true;
         for arg in positional {

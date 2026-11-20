@@ -1180,7 +1180,14 @@ impl Engine<'_, '_> {
             };
             out.push((
                 imp,
-                impl_sig(self.ast, imp, &ret, &|value| self.ty_of(value), &self.classes_lookup)?,
+                impl_sig(
+                    self.ast,
+                    imp,
+                    &ret,
+                    &|value| self.ty_of(value),
+                    &self.classes_lookup,
+                    &self.enums,
+                )?,
             ));
         }
         Ok(out)

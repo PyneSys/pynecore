@@ -20,15 +20,22 @@ from pynecore.transformers.pine_type_table import Binding, FuncSig, PineTypeTabl
 
 from .test_137_native_transform import __test_helper_inputs, __test_helper_require_native
 
-#: A library publishing a class, a method on it and an overload group
+#: A library publishing a class, an enum, a method on the class and an overload group
 __test_helper_SHAPES = '''"""
 @pyne
 """
+from enum import StrEnum as Enum
+
 from pynecore.core.overload import overload
 from pynecore.core.pine_method import method
 from pynecore.core.pine_udt import udt
 
-__all__ = ['Point', 'shift', 'scale', 'pick']
+__all__ = ['Point', 'Side', 'shift', 'scale', 'pick']
+
+
+class Side(Enum):
+    left = 'Left'
+    right = 'Right'
 
 
 @udt
@@ -61,14 +68,14 @@ def pick(x: float) -> float:
 '''
 
 #: A script importing it: dependency records, an imported class, a method on that
-#: class, a call to a method its body declares, and a spoiled container that takes
-#: every pin away
+#: class, a call to a method its body declares, a map keyed by the imported enum, and
+#: a spoiled container that takes every pin away
 __test_helper_APP = '''"""
 @pyne
 """
-from pynecore.lib import array, math
+from pynecore.lib import array, map, math
 from pynecore.core.pine_method import method
-from ttab_shapes import Point, scale, pick
+from ttab_shapes import Point, Side, scale, pick
 
 
 @method
@@ -80,6 +87,8 @@ def main(x: int):
     p = Point(1.0, 2, "a")
     y = grow(p, x)
     z = pick(y) + scale(1.5) + p.moved(0.5)
+    sides: dict[Side, float] = map.new()
+    map.put(sides, Side.left, z)
     ai = array.new_int(1, x)
     alias = ai
     array.concat(alias, ("x",))

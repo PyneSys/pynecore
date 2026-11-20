@@ -16,7 +16,7 @@
 //! (`stamp_lowering`, the annotation readers, `FactoryFields`), so the algebra can
 //! be checked one rule at a time against the Python one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use pyne_ast::walk::{children, walk, walk_statements};
@@ -401,13 +401,20 @@ pub fn matrix_of(element: &str) -> String {
     }
 }
 
-/// The type of a map from a scalar key type; `OBJECT` when either half is not known.
-pub fn map_of(key: &str, value: &str) -> String {
-    if !is_scalar(key) || value == UNKNOWN || value == VOID {
-        OBJECT.to_string()
-    } else {
-        format!("{MAP}{key}:{value}")
+/// The type of a map from one key type to one value type (`map_of`): a scalar key is
+/// one character, an enum key a length-prefixed item; `OBJECT` when either half is not
+/// known or the key is neither a scalar nor an object of one of `enums`.
+pub fn map_of(key: &str, value: &str, enums: &Enums) -> String {
+    if value == UNKNOWN || value == VOID {
+        return OBJECT.to_string();
     }
+    if is_scalar(key) {
+        return format!("{MAP}{key}:{value}");
+    }
+    if class_of(key).is_some_and(|cid| enums.contains(cid)) {
+        return format!("{MAP}{}:{key}:{value}", key.chars().count());
+    }
+    OBJECT.to_string()
 }
 
 /// The type of a Pine tuple over its element types, each one length-prefixed;
@@ -501,11 +508,39 @@ pub fn element_of(ty: &str) -> &str {
     if ty.starts_with(ARRAY) || ty.starts_with(MATRIX) { &ty[2..] } else { UNKNOWN }
 }
 
+/// The enum key of a map type and the byte index its value type starts at
+/// (`_item_key`); `None` when the key is no length-prefixed item. A length is ASCII
+/// digits, the only ones `map_of` writes.
+fn item_key(ty: &str) -> Option<(&str, usize)> {
+    let rest = &ty[MAP.len()..];
+    let colon = rest.find(':')?;
+    let digits = &rest[..colon];
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    // A length beyond `usize` is beyond the string as well
+    let size = digits.parse::<usize>().ok()?;
+    let after = &rest[colon + 1..];
+    let end = if size == 0 {
+        0
+    } else {
+        let (index, last) = after.char_indices().nth(size - 1)?;
+        index + last.len_utf8()
+    };
+    if !after[end..].starts_with(':') {
+        return None;
+    }
+    Some((&after[..end], MAP.len() + colon + 1 + end + 1))
+}
+
 /// The key type of a map, `UNKNOWN` when the type is not a map (or has no key, where
 /// Python raises).
 pub fn key_of(ty: &str) -> &str {
     if !ty.starts_with(MAP) {
         return UNKNOWN;
+    }
+    if let Some((key, _)) = item_key(ty) {
+        return key;
     }
     let rest = &ty[MAP.len()..];
     match rest.chars().next() {
@@ -516,7 +551,13 @@ pub fn key_of(ty: &str) -> &str {
 
 /// The value type of a map, `UNKNOWN` when the type is not a map.
 pub fn value_of(ty: &str) -> &str {
-    if ty.starts_with(MAP) { skip_chars(ty, MAP.len() + 2) } else { UNKNOWN }
+    if !ty.starts_with(MAP) {
+        return UNKNOWN;
+    }
+    match item_key(ty) {
+        Some((_, start)) => &ty[start..],
+        None => skip_chars(ty, MAP.len() + 2),
+    }
 }
 
 /// The scalar a type is where it meets another type (`constant_scalar`): the scalar
@@ -1113,6 +1154,10 @@ const OPTIONAL_SUBSCRIPTS: &[&str] = &["Optional"];
 /// Class spelling -> class id, for every class visible where an annotation stands.
 pub type Classes = HashMap<String, String>;
 
+/// The class ids of the enums among a module's `Classes`, the only classes a map key
+/// may be.
+pub type Enums = HashSet<String>;
+
 /// The leaf name of a `Name` or an `Attribute`, empty for anything else.
 fn leaf_name(ast: &Ast, id: NodeId) -> &str {
     match ast.kind(id) {
@@ -1191,10 +1236,12 @@ pub(crate) fn forward_reference(text: &str) -> Result<Option<(Ast, NodeId)>, Uns
 ///
 /// :param node: The annotation expression, or `None` when there is none
 /// :param classes: Class spelling -> class id, visible where the annotation stands
+/// :param enums: The class ids of the enums among them
 pub fn annotation_type(
     ast: &Ast,
     node: Option<NodeId>,
     classes: &Classes,
+    enums: &Enums,
 ) -> Result<String, Unsupported> {
     let Some(node) = node else {
         return Ok(UNKNOWN.to_string());
@@ -1204,7 +1251,7 @@ pub fn annotation_type(
             Constant::None => Ok(VOID.to_string()),
             // A stringized forward reference: ``'_ExitOrderKey'``, ``'list[Pivot]'``
             Constant::Str(text) => match forward_reference(text)? {
-                Some((parsed, body)) => annotation_type(&parsed, Some(body), classes),
+                Some((parsed, body)) => annotation_type(&parsed, Some(body), classes, enums),
                 None => Ok(UNKNOWN.to_string()),
             },
             _ => Ok(UNKNOWN.to_string()),
@@ -1218,8 +1265,8 @@ pub fn annotation_type(
             }
             Ok(named_type(attr, classes))
         }
-        Kind::BinOp { op: Operator::BitOr, .. } => union_type(ast, node, classes),
-        &Kind::Subscript { value, slice, .. } => subscript_type(ast, value, slice, classes),
+        Kind::BinOp { op: Operator::BitOr, .. } => union_type(ast, node, classes, enums),
+        &Kind::Subscript { value, slice, .. } => subscript_type(ast, value, slice, classes, enums),
         _ => Ok(UNKNOWN.to_string()),
     }
 }
@@ -1238,25 +1285,26 @@ fn subscript_type(
     value: NodeId,
     slice: NodeId,
     classes: &Classes,
+    enums: &Enums,
 ) -> Result<String, Unsupported> {
     let name = leaf_name(ast, value);
     if TRANSPARENT_SUBSCRIPTS.contains(&name) {
-        return annotation_type(ast, Some(slice), classes);
+        return annotation_type(ast, Some(slice), classes, enums);
     }
     if ARRAY_SUBSCRIPTS.contains(&name) {
-        return Ok(array_of(&annotation_type(ast, Some(slice), classes)?));
+        return Ok(array_of(&annotation_type(ast, Some(slice), classes, enums)?));
     }
     if MATRIX_SUBSCRIPTS.contains(&name) {
-        return Ok(matrix_of(&annotation_type(ast, Some(slice), classes)?));
+        return Ok(matrix_of(&annotation_type(ast, Some(slice), classes, enums)?));
     }
     if MAP_SUBSCRIPTS.contains(&name) {
         let pair = tuple_elts(ast, slice).unwrap_or(&[]);
         if pair.len() != 2 {
             return Ok(OBJECT.to_string());
         }
-        let key = annotation_type(ast, Some(pair[0]), classes)?;
-        let value = annotation_type(ast, Some(pair[1]), classes)?;
-        return Ok(map_of(&key, &value));
+        let key = annotation_type(ast, Some(pair[0]), classes, enums)?;
+        let value = annotation_type(ast, Some(pair[1]), classes, enums)?;
+        return Ok(map_of(&key, &value, enums));
     }
     if TUPLE_SUBSCRIPTS.contains(&name) {
         // ``tuple[int]`` subscripts with the element itself, ``tuple[int, float]``
@@ -1272,7 +1320,7 @@ fn subscript_type(
         }
         let types = items
             .iter()
-            .map(|&item| annotation_type(ast, Some(item), classes))
+            .map(|&item| annotation_type(ast, Some(item), classes, enums))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(tuple_of(&types));
     }
@@ -1317,7 +1365,12 @@ fn is_typeless_member(ast: &Ast, node: NodeId) -> bool {
 }
 
 /// Type of an annotation union, ignoring its absence markers (`_union_type`).
-fn union_type(ast: &Ast, node: NodeId, classes: &Classes) -> Result<String, Unsupported> {
+fn union_type(
+    ast: &Ast,
+    node: NodeId,
+    classes: &Classes,
+    enums: &Enums,
+) -> Result<String, Unsupported> {
     fn flatten(ast: &Ast, expr: NodeId, members: &mut Vec<NodeId>) {
         match ast.kind(expr) {
             &Kind::BinOp { left, op: Operator::BitOr, right } => {
@@ -1334,9 +1387,9 @@ fn union_type(ast: &Ast, node: NodeId, classes: &Classes) -> Result<String, Unsu
         // ``NA | None`` and friends: absence only, no type to speak of
         return Ok(UNKNOWN.to_string());
     };
-    let mut result = annotation_type(ast, Some(first), classes)?;
+    let mut result = annotation_type(ast, Some(first), classes, enums)?;
     for member in contributing {
-        result = join(&result, &annotation_type(ast, Some(member), classes)?);
+        result = join(&result, &annotation_type(ast, Some(member), classes, enums)?);
     }
     Ok(result)
 }
@@ -1931,6 +1984,7 @@ pub fn impl_sig(
     ret: &str,
     ty_of: &dyn Fn(NodeId) -> String,
     classes: &Classes,
+    enums: &Enums,
 ) -> Result<ImplSig, Unsupported> {
     let found = params(ast, func)?;
     let defaults = param_defaults(ast, func)?;
@@ -1940,13 +1994,13 @@ pub fn impl_sig(
     let mut bare = String::with_capacity(found.positional.len());
     for &arg in &found.positional {
         let annotation = arg_parts(ast, arg).1;
-        types.push(annotation_type(ast, annotation, classes)?);
+        types.push(annotation_type(ast, annotation, classes, enums)?);
         bare.push(if annotation.is_none() { '1' } else { '0' });
     }
     let mut fits = String::new();
     for &arg in found.positional.iter().chain(found.kwonly) {
         let default = default_of(arg_parts(ast, arg).0);
-        fits.push(param_fit(ast, arg, default, ty_of, classes)?);
+        fits.push(param_fit(ast, arg, default, ty_of, classes, enums)?);
     }
     Ok(ImplSig {
         params: types,
@@ -1966,6 +2020,7 @@ pub fn param_fit(
     default: Option<NodeId>,
     ty_of: &dyn Fn(NodeId) -> String,
     classes: &Classes,
+    enums: &Enums,
 ) -> Result<char, Unsupported> {
     let Some(default) = default else {
         return Ok(FIT_REQUIRED);
@@ -1973,7 +2028,7 @@ pub fn param_fit(
     let Some(annotation) = arg_parts(ast, arg).1 else {
         return Ok(FIT_OMISSIBLE);
     };
-    let declared = annotation_type(ast, Some(annotation), classes)?;
+    let declared = annotation_type(ast, Some(annotation), classes, enums)?;
     let default = default_ty(ast, default, ty_of);
     let takes_none = annotation_takes_none(ast, Some(annotation))?;
     Ok(default_fit(&declared, Some(&default), takes_none))

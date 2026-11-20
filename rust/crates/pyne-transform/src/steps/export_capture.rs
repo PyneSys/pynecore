@@ -22,7 +22,7 @@ use crate::pine_qualifier::{
     CONST, builtin_call_qualifier, lib_call_qualifier, lib_value_qualifier,
 };
 use crate::pine_type_rules::{
-    CallRule, Classes, UNKNOWN, annotation_type, builtin_call_type, is_scalar,
+    CallRule, Classes, Enums, UNKNOWN, annotation_type, builtin_call_type, is_scalar,
 };
 use crate::{Context, Error, Host, Raised, Unsupported};
 
@@ -709,7 +709,12 @@ impl Capture<'_> {
             Kind::AnnAssign { annotation, value: Some(value), .. } => {
                 let (annotation, value) = (*annotation, *value);
                 if allow_series {
-                    let ty = annotation_type(self.ast, Some(annotation), &Classes::new())?;
+                    let ty = annotation_type(
+                        self.ast,
+                        Some(annotation),
+                        &Classes::new(),
+                        &Enums::new(),
+                    )?;
                     if ty != UNKNOWN && !is_scalar(&ty) {
                         return Ok(false);
                     }

@@ -28,11 +28,16 @@ __test_helper_CLASSES = [
     'o:/Users/Ádám/a, b:c#d.py#Pivot', 'o:x', 'o:', 'o:lib#', 'o:lib#Table',
 ]
 
+#: Every one of those classes taken for an enum, so each may key a map
+__test_helper_ENUMS = frozenset(rules.class_of(ty) for ty in __test_helper_CLASSES)
+
 #: Strings the grammar does not produce, read the way the Python module reads them
 __test_helper_MALFORMED = [
     '', 'a:', 'm:', 'T:', 'T:x', 'T:1:', 'T:5:ab', 'T:01:i', 'T:1:i1:f', 'T:1:iX', 'T:0:',
     'T:00:', 'T:0:1:i', 'oo', 'ab', 'é', 'T:99999999999999999999999:i', 'T:1:é', 'T:2:é',
     'M:sx', 'M:é:i', 'M:s:', 'a:é', 'T:-1:i', 'T: 1:i', 'T:1:i:', 'O', 'I', 'F',
+    'M:3:o:x', 'M:3:o:x:', 'M:4:o:x:i', 'M:1:é:i', 'M:2:é:i', 'M:0::i', 'M:01:i:f', 'M:12',
+    'M:1:', 'M:9999999999999999999999:o:x:i', 'M:-1:o:x:i', 'M: 3:o:x:i', 'M:3:o:é:f', 'M:',
 ]
 
 #: Every ``ast.operator`` and ``ast.unaryop`` class name
@@ -57,8 +62,12 @@ def __test_helper_types() -> list[str]:
     base = __test_helper_SCALARS + __test_helper_CLASSES
     shaped = [f'{prefix}{ty}' for prefix in ('a:', 'm:') for ty in base]
     shaped += [f'M:{key}:{value}' for key in __test_helper_SCALARS for value in base]
+    shaped += [rules.map_of(key, value, __test_helper_ENUMS)
+               for key in __test_helper_CLASSES for value in base[::3]]
     nested = [f'{prefix}{ty}' for prefix in ('a:', 'm:') for ty in shaped[:40]]
     nested += [f'M:s:{ty}' for ty in shaped[:40]]
+    nested += [rules.map_of(key, ty, __test_helper_ENUMS)
+               for key in __test_helper_CLASSES[3:7] for ty in shaped[::25]]
     pool = __test_helper_SCALARS + __test_helper_CLASSES[:5] + ['a:i', 'a:f', 'm:i', 'M:s:a:f']
     tuples = [rules.tuple_of(list(items)) for items in itertools.product(pool, repeat=2)]
     tuples += [rules.tuple_of([ty]) for ty in pool]
@@ -163,6 +172,9 @@ def __test_native_lattice_matches__():
     for name in ('join', 'shape_mismatch', 'shape_conflict', 'compare_type', 'map_of',
                  'class_id'):
         __test_helper_check(name, getattr(rules, name), pairs, stats)
+    for enums in (frozenset(), __test_helper_ENUMS, frozenset({'x', '/x/zigzag.py#Pivot'})):
+        __test_helper_check('map_of', rules.map_of,
+                            [(key, value, enums) for key, value in pairs], stats)
     for ty in types:
         assert __test_helper_native('elements_of', rules.tuple_of(rules.elements_of(ty))) \
             == tuple(rules.elements_of(rules.tuple_of(rules.elements_of(ty))))
@@ -221,6 +233,14 @@ __test_helper_CLASS_MAPS = [
      'a.b.c': '/Ádám/a.py#c'},
 ]
 
+#: The enums of each class map: none, and some of the second one's classes, a lib
+#: class id and one no annotation names among them
+__test_helper_ENUM_SETS = [
+    frozenset(),
+    frozenset({'/x/zigzag.py#Pivot', '/Ádám/a.py#c', 'lib#SessionTimeRange', '/mine.py#Line',
+               '/elsewhere.py#Zone'}),
+]
+
 
 def __test_helper_annotations() -> list[str]:
     """Annotation sources: atoms, unions, subscripts of every head, nested shapes."""
@@ -242,23 +262,28 @@ def __test_helper_annotations() -> list[str]:
         'NA[int] | None', 'NA | None', 'None | NA', 'int | float | str | bool | NA',
         'Series[float] | float | NA[float]', 'list[int | float]', 'dict[str | int, float]',
         "'int' | None", "'Any' | int", 'Series', 'Persistent[float | int]',
+        'dict[Pivot, float]', 'dict[a.b.c, list[Pivot]]', 'dict[Pivot, dict[a.b.c, int]]',
+        'dict[Settings, int]', 'dict[Line, str]', 'dict[chr.SessionTimeRange, int]',
+        "dict['Pivot', float]", 'dict[Pivot | NA, float]', 'list[dict[Pivot, int]]',
+        'tuple[dict[Pivot, int], dict[str, Pivot]]', 'Persistent[dict[a.b.c, float]]',
     ]
     return list(dict.fromkeys(out))
 
 
-def __test_helper_compare_annotation(node, classes, stats: Counter, where: str):
+def __test_helper_compare_annotation(node, classes, stats: Counter, where: str,
+                                     enums: frozenset[str] = frozenset()):
     """One annotation: its type under the class map and whether it takes ``None``."""
     unsupported = __test_helper_unsupported()
-    expected = rules.annotation_type(node, classes)
+    expected = rules.annotation_type(node, classes, enums)
     try:
-        got = __test_helper_native('annotation_type', node, dict(classes))
+        got = __test_helper_native('annotation_type', node, dict(classes), enums)
     except unsupported:
         # Only a forward reference outside what the native parser provably agrees on
         assert any(isinstance(sub, ast.Constant) and isinstance(sub.value, str)
                    for sub in ast.walk(node)), (where, ast.dump(node))
         stats['annotation_type unsupported'] += 1
     else:
-        assert got == expected, (where, ast.dump(node), classes)
+        assert got == expected, (where, ast.dump(node), classes, enums)
         stats['annotation_type'] += 1
     expected = rules.annotation_takes_none(node)
     try:
@@ -285,6 +310,8 @@ def __test_native_annotations_match__():
             continue
         for classes in __test_helper_CLASS_MAPS:
             __test_helper_compare_annotation(node, classes, stats, source)
+        __test_helper_compare_annotation(node, __test_helper_CLASS_MAPS[1], stats, source,
+                                         __test_helper_ENUM_SETS[1])
     print(dict(stats))
     assert stats['annotation_type'] > 40_000, stats
     # The forward references the native parser reads are the common ones
@@ -410,6 +437,9 @@ def only(*, a: int = 1, b: bool, c: Series[float] = close): pass
 async def coro(a: int = 0, b: 'list[Pivot]' = None): pass
 def empty(): pass
 def positional_only(a: int, b: float = 1.0, /): pass
+class Speed: pass
+def keyed(a: dict[Speed, float], b: dict[Speed, list[Speed]] = {}, c: dict[str, Speed] = None,
+          d: dict[Speed, int] | None = None, e: 'dict[Speed, bool]' = na): pass
 '''
 
 #: Expressions for the dotted-name helpers and the typeless ``na`` spelling
@@ -479,14 +509,15 @@ def __test_helper_ty_by_shape(node) -> str:
     return ('i', 'f', '?', 'o', 's', 'a:i')[len(ast.dump(node)) % 6]
 
 
-def __test_helper_compare_definition(func, classes, ty_of, stats: Counter, where):
+def __test_helper_compare_definition(func, classes, ty_of, stats: Counter, where,
+                                     enums: frozenset[str] = frozenset()):
     unsupported = __test_helper_unsupported()
     try:
-        native_sig = __test_helper_native('impl_sig', func, 'i', ty_of, dict(classes))
+        native_sig = __test_helper_native('impl_sig', func, 'i', ty_of, dict(classes), enums)
     except unsupported:
         stats['impl_sig unsupported'] += 1
     else:
-        expected = rules.impl_sig(func, 'i', ty_of or rules.get_ty, classes)
+        expected = rules.impl_sig(func, 'i', ty_of or rules.get_ty, classes, enums)
         assert native_sig == tuple(expected), (where, func.name)
         stats['impl_sig'] += 1
     defaults = rules._param_defaults(func)  # noqa: internal API
@@ -497,11 +528,11 @@ def __test_helper_compare_definition(func, classes, ty_of, stats: Counter, where
     for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
         default = defaults.get(arg.arg)
         try:
-            got = __test_helper_native('param_fit', arg, default, ty_of, dict(classes))
+            got = __test_helper_native('param_fit', arg, default, ty_of, dict(classes), enums)
         except unsupported:
             stats['param_fit unsupported'] += 1
             continue
-        assert got == rules.param_fit(arg, default, ty_of or rules.get_ty, classes), \
+        assert got == rules.param_fit(arg, default, ty_of or rules.get_ty, classes, enums), \
             (where, func.name, arg.arg)
         stats['param_fit'] += 1
         if default is not None:
@@ -537,6 +568,9 @@ def __test_native_definitions_match__():
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for class_map, ty_of in ((classes, None), ({}, __test_helper_ty_by_shape)):
                     __test_helper_compare_definition(node, class_map, ty_of, stats, path)
+                # Every class an enum, so each one a map is keyed by keys it
+                __test_helper_compare_definition(node, classes, None, stats, path,
+                                                 frozenset(classes.values()))
             if isinstance(node, ast.expr):
                 assert __test_helper_native('dotted', node) == factory_fields.dotted_name(node)
                 assert __test_helper_native('is_na_literal', node) == rules.is_na_literal(node)
@@ -659,12 +693,14 @@ def __test_helper_freeze(value):
 
 def __test_helper_compare_live(name, original, args, kwargs, state):
     """One call of a tree function, natively, before the Python one runs."""
-    call = dict(zip(('node', 'second', 'third', 'fourth'), args)) | kwargs
+    call = dict(zip(('node', 'second', 'third', 'fourth', 'fifth'), args)) | kwargs
     native = __test_helper_native
     if name == 'annotation_type':
         classes = dict(call.get('second', call.get('classes', {})))
+        enums = call.get('third', call.get('enums', frozenset()))
         node = call['node']
-        assert native(name, node, classes) == original(node, classes), ast.dump(node)
+        assert native(name, node, classes, enums) == original(node, classes, enums), \
+            ast.dump(node)
     elif name in ('annotation_takes_none', 'bare_wrapper', 'is_na_literal'):
         assert native(name, call['node']) == original(call['node'])
     elif name == 'dotted_name':
@@ -677,9 +713,10 @@ def __test_helper_compare_live(name, original, args, kwargs, state):
     elif name in ('impl_sig', 'param_fit'):
         ty_of = call.get('third', call.get('ty_of'))
         classes = dict(call.get('fourth', call.get('classes', {})))
-        expected = original(call['node'], call['second'], ty_of or rules.get_ty, classes)
+        enums = call.get('fifth', call.get('enums', frozenset()))
+        expected = original(call['node'], call['second'], ty_of or rules.get_ty, classes, enums)
         expected = tuple(expected) if name == 'impl_sig' else expected
-        assert native(name, call['node'], call['second'], ty_of, classes) == expected
+        assert native(name, call['node'], call['second'], ty_of, classes, enums) == expected
     elif name == 'default_ty':
         ty_of = call.get('second', call.get('ty_of'))
         assert native(name, call['node'], ty_of) == original(call['node'], ty_of or rules.get_ty)

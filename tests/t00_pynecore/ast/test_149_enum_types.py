@@ -17,14 +17,17 @@ from pathlib import Path
 import pytest
 
 from ..pine_analysis import analyse_module
-from pynecore.errorcodes import TYPE_NO_FIELD
+from pynecore.errorcodes import TYPE_NO_FIELD, TYPE_UNKNOWN_LIB_CALL
 from pynecore.transformers import module_interface
 from pynecore.transformers.module_interface import (
     build_interface, interface_from_payload, interface_payload,
 )
 from pynecore.transformers.pine_qualifier import CONST
 from pynecore.transformers.pine_type_infer import infer_module
-from pynecore.transformers.pine_type_rules import BOOL, UNKNOWN, class_id, get_ty, object_ty
+from pynecore.transformers.pine_type_rules import (
+    BOOL, FLOAT, INT, OBJECT, UNKNOWN, array_of, class_id, get_ty, key_of, map_of, object_ty,
+    render_ty, value_of,
+)
 from pynecore.transformers.pine_type_table import PineTypeTable
 
 
@@ -137,6 +140,92 @@ def __test_a_value_bound_under_the_enums_name_is_no_enum__():
     table = infer_module(tree, 'test')
 
     assert _binding(table, 'main', 'x') == UNKNOWN
+
+
+# --- an enum as a map key --------------------------------------------------
+
+
+#: Every map call over a map keyed by ``Speed``, and a ``for [k, v] in m`` loop
+ENUM_MAP = ENUM + '''
+
+def main():
+    levels: dict[Speed, float] = lib.map.new()
+    put = lib.map.put(levels, Speed.fast, 1.5)
+    got = lib.map.get(levels, Speed.slow)
+    has = lib.map.contains(levels, Speed.fast)
+    gone = lib.map.remove(levels, Speed.fast)
+    keys = lib.map.keys(levels)
+    values = lib.map.values(levels)
+    size = lib.map.size(levels)
+    copied = lib.map.copy(levels)
+    lib.map.put_all(copied, levels)
+    lib.map.clear(levels)
+    for key, value in levels.items():
+        k = key
+        v = value
+    return got
+'''
+
+
+def __test_an_enum_keys_a_map__():
+    """Pine takes an enum as a map key: the map, its keys and its values stay typed"""
+    table = infer_module(ast.parse(ENUM_MAP), 'test')
+
+    levels = map_of(SPEED, FLOAT, frozenset({class_id('test', 'Speed')}))
+    assert key_of(levels) == SPEED and value_of(levels) == FLOAT
+    assert render_ty(levels) == 'map<Speed, float>'
+    expected = {
+        'levels': levels, 'put': FLOAT, 'got': FLOAT, 'has': BOOL, 'gone': FLOAT,
+        'keys': array_of(SPEED), 'values': array_of(FLOAT), 'size': INT, 'copied': levels,
+        'k': SPEED, 'v': FLOAT,
+    }
+    assert {name: _binding(table, 'main', name) for name in expected} == expected
+    assert table.enums == {class_id('test', 'Speed')}
+    assert not table.diags, [diag.message for diag in table.diags]
+
+
+def __test_a_key_of_another_enum_does_not_fit__():
+    """A map keyed by one enum takes no member of another as its key"""
+    source = ENUM + '''
+
+class Side(Enum):
+    left = 'Left'
+
+
+def main():
+    levels: dict[Speed, float] = lib.map.new()
+    lib.map.put(levels, Side.left, 1.5)
+    return levels
+'''
+    table = infer_module(ast.parse(source), 'test')
+
+    assert [diag.origin.reason for diag in table.diags if diag.origin is not None] \
+        == ['shape-mismatch']
+
+
+@pytest.mark.parametrize('key', ['Pivot', 'lib.Line', 'list[Speed]'])
+def __test_a_class_that_is_no_enum_keys_no_map__(key: str):
+    """A UDT, a drawing or a container is no Pine map key: the map is a bare object"""
+    source = ENUM + f'''
+from pynecore.core.pine_udt import udt
+
+
+@udt
+class Pivot:
+    price: float = 0.0
+
+
+def main():
+    levels: dict[{key}, float] = lib.map.new()
+    got = lib.map.get(levels, Speed.fast)
+    return got
+'''
+    table = infer_module(ast.parse(source), 'test')
+
+    assert _binding(table, 'main', 'levels') == OBJECT
+    assert _binding(table, 'main', 'got') == UNKNOWN
+    assert [diag.code for diag in table.diags] == [TYPE_UNKNOWN_LIB_CALL.code]
+    assert table.diags[0].message == TYPE_UNKNOWN_LIB_CALL.render('map.get')
 
 
 # --- the enum a library publishes ------------------------------------------
@@ -278,3 +367,64 @@ def __test_turning_a_class_into_an_enum_moves_the_digest__(tmp_path):
         tree, table = _analysed(path)
         digests.append(build_interface(tree, table, str(path.resolve())).digest)
     assert digests[0] != digests[1]
+
+
+ENUM_MAP_LIB = '''"""
+@pyne
+"""
+from enum import StrEnum as Enum
+
+from pynecore import lib
+from pynecore.core.pine_export import Exported, export
+
+__all__ = ['Zone', 'total']
+total = Exported()
+
+
+class Zone(Enum):
+    exchange = 'Exchange'
+    utc = 'UTC'
+
+
+@export
+def total(levels: dict[Zone, float]) -> float:
+    return lib.map.get(levels, Zone.utc)
+'''
+
+
+@pytest.mark.parametrize('spelling, imported', [
+    ('chrono.Zone', 'import en_mapkey_lib as chrono'),
+    ('Zone', 'from en_mapkey_lib import Zone'),
+])
+def __test_a_library_enum_keys_a_map__(tmp_path, monkeypatch, spelling: str, imported: str):
+    """An imported enum keys a map like an own one, and an export publishes such a map"""
+    monkeypatch.syspath_prepend(tmp_path)
+    lib = _write(tmp_path, 'en_mapkey_lib', ENUM_MAP_LIB)
+    app = _write(tmp_path, 'en_mapkey_app', f'''"""
+@pyne
+"""
+{imported}
+from pynecore import lib
+
+
+def main():
+    levels: dict[{spelling}, float] = lib.map.new()
+    lib.map.put(levels, {spelling}.utc, 1.5)
+    got = lib.map.get(levels, {spelling}.exchange)
+    keys = lib.map.keys(levels)
+    return got
+''')
+
+    _, table = _analysed(app)
+
+    cid = class_id(str(lib.resolve()), 'Zone')
+    levels = map_of(object_ty(cid), FLOAT, frozenset({cid}))
+    assert _binding(table, 'main', 'levels') == levels
+    assert _binding(table, 'main', 'got') == FLOAT
+    assert _binding(table, 'main', 'keys') == array_of(object_ty(cid))
+    assert not table.diags, [diag.message for diag in table.diags]
+
+    tree, lib_table = _analysed(lib)
+    interface = build_interface(tree, lib_table, str(lib.resolve()))
+    assert interface.exports['total'].params == (levels,)
+    assert interface.exports['total'].ret == FLOAT
