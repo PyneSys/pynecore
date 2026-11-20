@@ -491,6 +491,13 @@ class _Inference:
         self._rebound: dict[str, set[str]] = {}
         #: Def node ids that already have at least one context
         self._walked: set[int] = set()
+        #: Def node ids of the generic overload implementations: nested, not
+        #: exported, with a parameter that has no annotation. A call that
+        #: reaches one alone instantiates it, like a plain definition
+        #: (``_generic_call``)
+        self._generic_impls: set[int] = set()
+        #: The generic implementations already walked in their declaration context
+        self._generic_declared: set[int] = set()
         #: ``id()`` of the definitions no walk ever enters, see ``_uninstantiated_def``,
         #: and of the export signature shims, see ``_own_class_nodes``
         self._uninstantiated: set[int] = set()
@@ -1848,6 +1855,14 @@ class _Inference:
 
         if key is None:
             key = self._qualify(self._scope, node.name)
+        nid = node_id(node)
+        if nid is not None and key in self._overload_groups and self._generic_impl(key, node):
+            # An implementation with a parameter that has no annotation is
+            # typed like a plain definition: per call, by the call that reaches
+            # it alone, and in its declaration context only where nothing does
+            self._generic_impls.add(nid)
+            self._pending[-1].append((key, node))
+            return
         if key in self._overload_groups or is_script_entry(node):
             # An implementation of an overload group is already per-signature
             # -- the pin selects among them, so a call site has nothing to
@@ -1856,6 +1871,34 @@ class _Inference:
             self._declaration_context(key, node)
             return
         self._pending[-1].append((key, node))
+
+    def _generic_impl(self, key: str, node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        """
+        Whether an overload implementation is instantiated per call.
+
+        Pine lets the implementations of a group leave parameters without a
+        type where they differ in arity, and such an implementation is typed
+        per call like any function without one. The runtime checks such a
+        parameter against ``Any``, which takes every value, so the arguments
+        that select it are the ones its body runs with.
+
+        Only an implementation nested in a function, under its own name in
+        that scope, qualifies: an exported one publishes the shape its own
+        definition describes, and a module-level one may be imported. One
+        with ``*args`` or ``**kwargs`` binds a call this analysis does not
+        describe.
+
+        :param key: Scope-qualified id of the group
+        :param node: The implementation
+        :return: True when a call that reaches it alone instantiates it
+        """
+        if self._scope == '' or _is_exported(node):
+            return False
+        if key != self._qualify(self._scope, node.name):
+            return False
+        if node.args.vararg is not None or node.args.kwarg is not None:
+            return False
+        return any(arg.annotation is None for arg in _every_param(node))
 
     def _flush_pending(self) -> None:
         """
@@ -1870,7 +1913,10 @@ class _Inference:
         skipped. A cycle has no such order and takes the first one left.
 
         A definition that has no instance at all is not walked: see
-        ``_uninstantiated_def``.
+        ``_uninstantiated_def``. A generic overload implementation no call
+        selected is walked in its declaration context, which types the code it
+        emits the way the definition itself describes it, and the report passes
+        its body by: it has no instance either.
         """
         remaining = [(key, node, self._called_names(node)) for key, node in self._pending[-1]]
         self._pending[-1].clear()
@@ -1888,7 +1934,10 @@ class _Inference:
                     callers[index] -= 1
             nid = node_id(node)
             if nid is None or nid not in self._walked:
-                if self._uninstantiated_def(key, node):
+                if nid is not None and nid in self._generic_impls:
+                    self._uninstantiated.add(id(node))
+                    self._declaration_context(key, node)
+                elif self._uninstantiated_def(key, node):
                     self._uninstantiated.add(id(node))
                 else:
                     self._declaration_context(key, node)
@@ -2081,8 +2130,11 @@ class _Inference:
             self._frames = outer
             self._in_progress.discard(guard)
 
+        instance = site is not None and nid is not None and nid in self._generic_impls
         if nid is not None:
             self._walked.add(nid)
+            if nid in self._generic_impls and not instance:
+                self._generic_declared.add(nid)
         for target in _series_locals(node):
             target_nid = node_id(target)
             if target_nid is not None:
@@ -2090,7 +2142,7 @@ class _Inference:
                 self._local_kinds.setdefault(target_nid, {})[cid] = _history_kind_of(
                     UNKNOWN if binding is None else binding.ty)
         self._merge_bindings(key, bound)
-        self._record_signature(key, node, result)
+        self._record_signature(key, node, result, instance)
         return result
 
     def _function_body(self, body: list[ast.stmt]) -> None:
@@ -2332,8 +2384,18 @@ class _Inference:
                 existing.unknown = binding.unknown
 
     def _record_signature(self, key: str, node: ast.FunctionDef | ast.AsyncFunctionDef,
-                          result: ContextResult) -> None:
-        """Fold a context's parameter and return types into the signature."""
+                          result: ContextResult, instance: bool = False) -> None:
+        """
+        Fold a context's parameter and return types into the signature.
+
+        :param key: Scope-qualified id of the function
+        :param node: Its definition
+        :param result: The context just walked
+        :param instance: Whether the context is one call's instance of a
+                         generic overload implementation. Its return is that
+                         call's alone, so it does not stand for the
+                         implementation in the group's returns.
+        """
         signature = self.table.funcs.get(key)
         if signature is None:
             return
@@ -2349,7 +2411,8 @@ class _Inference:
             # return if it declared none, then re-derive what they agree on
             returns = self._group_returns.get(key, [])
             slot = self._group_slot.get(node_id(node) or -1)
-            if slot is not None and slot < len(returns) and returns[slot] == UNKNOWN:
+            if slot is not None and slot < len(returns) and returns[slot] == UNKNOWN \
+                    and not instance:
                 returns[slot] = result.ret
             signature.ret = overload_result(returns)
         elif self._annotated_returns.get(key):
@@ -4449,7 +4512,9 @@ class _Inference:
                 return UNKNOWN
         pin = self._pin(node, is_group, self._impl_sigs(key) if is_group else None)
         if is_group:
-            ty = self._group_type(key, pin, node.args, node.keywords)
+            ty = self._generic_call(key, frame, node, node.args)
+            if ty is None:
+                ty = self._group_type(key, pin, node.args, node.keywords)
         else:
             ty = self._call_context(key, node, frame)
         self.table.calls.append(CallSite(
@@ -4854,7 +4919,8 @@ class _Inference:
             pin = None if shapes is None or node.keywords else pin_for(shapes)
             self._record_pin(node, pin,
                              settled=self._settled(self._impl_sigs(key), pin, shapes or ()))
-            return self._group_type(key, pin, args, node.keywords)
+            ty = self._generic_call(key, frame, node, args)
+            return self._group_type(key, pin, args, node.keywords) if ty is None else ty
         # The method handed over as a function is the one the call site's dispatch
         # entry binds, so the instance vector stamped here configures it
         # (``core/pine_method``)
@@ -5123,7 +5189,9 @@ class _Inference:
         (``_group_result``), and otherwise only where the implementations the
         receiver can reach agree on the return. A single definition is typed in
         the context the call describes, outside the per-instance channel, which
-        a call by name hands nothing through.
+        a call by name hands nothing through, with each keyword bound to the
+        parameter the proxy hands it to (``_runtime_keyword``,
+        ``core/pine_method._adapt_exported_kwargs``).
 
         :param key: Scope-qualified id of the definition
         :param frame: Index of the frame whose scope declares it
@@ -5143,7 +5211,11 @@ class _Inference:
             receiver = self._ty_of(args[0]) if args else UNKNOWN
             return overload_result([impl.ret for impl in impls
                                     if _takes_receiver(impl, receiver)])
-        return self._call_context(key, node, frame, args, record=False)
+        definitions = self._defs.get(key, ())
+        declared = {param.arg for param in _every_param(definitions[-1])} if definitions else set()
+        renames = {keyword.arg: _runtime_keyword(keyword.arg, declared)
+                   for keyword in node.keywords if keyword.arg is not None}
+        return self._call_context(key, node, frame, args, record=False, renames=renames)
 
     def _member_result(self, cid: str, name: str, node: ast.Call,
                        args: Sequence[ast.expr]) -> str | None:
@@ -5427,6 +5499,11 @@ class _Inference:
         or an open selection), the cycle may run through a call that never
         selects it, and the call is left to read the return as it stands.
 
+        A generic implementation (``_generic_impl``) the call reaches alone is
+        left to the call, which instantiates it (``_generic_call``). One that is
+        reached among others is walked in its declaration context, once, the
+        way it is walked where nothing selects it.
+
         :param key: Scope-qualified id of the group
         :param frame: Index of the frame whose scope declares the group
         :param name: The callee as written, for the report
@@ -5438,8 +5515,7 @@ class _Inference:
         :return: False when the call is a recursion, reported here
         """
         parents = self._frames[:frame + 1]
-        pending = [impl for impl in self._defs.get(key, ())
-                   if node_id(impl) is None or node_id(impl) not in self._walked]
+        pending = [impl for impl in self._defs.get(key, ()) if self._owes_walk(impl)]
         if not pending:
             return True
         for impl in pending:
@@ -5457,6 +5533,9 @@ class _Inference:
                                   for known, sig in group)]
         elif len(found) == 1 and not by_name:
             chosen = group[found[0]][0]
+            if node_id(chosen) in self._generic_impls:
+                # The call instantiates it itself (``_generic_call``)
+                return True
             if not any(impl is chosen for impl in pending):
                 return True
             if (key, self._declared_params(chosen), node_id(chosen)) in self._in_progress:
@@ -5478,6 +5557,86 @@ class _Inference:
             if unsure:
                 self._unsure_walks -= 1
         return True
+
+    def _owes_walk(self, impl: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        """
+        Whether an implementation of a group still waits for its declaration-context walk.
+
+        A generic implementation's instances are the calls' own, so only its
+        declaration context counts; any other implementation is walked once.
+
+        :param impl: The implementation
+        :return: True when no walk has typed it the way its definition describes it
+        """
+        nid = node_id(impl)
+        if nid is None:
+            return True
+        return nid not in (self._generic_declared if nid in self._generic_impls else self._walked)
+
+    def _generic_call(self, key: str, frame: int, node: ast.Call,
+                      args: Sequence[ast.expr]) -> str | None:
+        """
+        Type a call that reaches one generic implementation of a group alone.
+
+        The implementation is instantiated for the call the way a plain
+        definition is (``_call_context``): its parameters take the types and
+        the qualifiers of the arguments bound to them, a keyword bound to the
+        parameter the dispatcher hands it to (``_runtime_keyword``), and the
+        call evaluates to that context's return. The runtime selects that
+        implementation for every value the arguments admit, since a parameter
+        without an annotation takes every value (``ImplSig.bare``).
+
+        No instance vector reaches an implementation: the dispatcher binds it
+        and creates its state itself (``core/overload``), so the context is one
+        the per-instance channel does not record. A call this analysis cannot
+        bind to the parameters gets the context the definition describes.
+
+        :param key: Scope-qualified id of the group
+        :param frame: Index of the frame whose scope declares the group
+        :param node: The call node
+        :param args: The positional arguments, when they are not the node's
+                     own (a method call binds the receiver first)
+        :return: The type the call evaluates to, or None where the call does not
+                 reach one generic implementation alone
+        """
+        if not self._generic_impls:
+            return None
+        group = self._group_impls(key)
+        found = self._reached(group, args, node.keywords, False)
+        if found is None or len(found) != 1:
+            return None
+        target, sig = group[found[0]]
+        if node_id(target) not in self._generic_impls:
+            return None
+        self._widen_group_nas(sig, args, node.keywords)
+        parents = self._frames[:frame + 1]
+        declared = {param.arg for impl in self._defs.get(key, ()) for param in _every_param(impl)}
+        renames = {keyword.arg: _runtime_keyword(keyword.arg, declared)
+                   for keyword in node.keywords if keyword.arg is not None}
+        params = self._call_params(target, node, args, report=False, renames=renames)
+        nid = node_id(node)
+        if params is None:
+            settled = self._analyse(key, target, self._declared_params(target), parents)
+            if settled is None:
+                return UNKNOWN
+            self._unvectored.add(settled.cid)
+            if nid is not None:
+                self._call_q[nid] = settled.ret_qual
+            return settled.ret
+        if (key, params, node_id(target)) in self._in_progress:
+            self._diag(TYPE_RECURSION, (str(dotted_name(node.func)),), node,
+                       self._unknown('recursion', node, key))
+            return UNKNOWN
+        result = self._analyse(key, target, params, parents, node,
+                               self._call_quals(target, node, args, renames))
+        if result is None:
+            self._diag(TYPE_CONTEXT_LIMIT, (str(dotted_name(node.func)),), node,
+                       self._unknown('context-budget', node, key))
+            return UNKNOWN
+        self._unvectored.add(result.cid)
+        if nid is not None:
+            self._call_q[nid] = result.ret_qual
+        return result.ret
 
     def _reached(self, group: Sequence[tuple[ast.AST, ImplSig]], args: Sequence[ast.expr],
                  keywords: Sequence[ast.keyword], by_name: bool) -> list[int] | None:
@@ -5689,7 +5848,8 @@ class _Inference:
         return out
 
     def _call_context(self, key: str, node: ast.Call, frame: int,
-                      args: Sequence[ast.expr] | None = None, record: bool = True) -> str:
+                      args: Sequence[ast.expr] | None = None, record: bool = True,
+                      renames: Mapping[str, str] | None = None) -> str:
         """
         Analyse the callee in the context this call site describes, and type it.
 
@@ -5706,6 +5866,8 @@ class _Inference:
                        receiver's class does not: the dispatch entry hands a
                        vector only to the method passed as a function, so a
                        vector stamped there would configure nobody
+        :param renames: Keyword as the call spells it -> the parameter it binds,
+                        where the runtime moves it (``_runtime_keyword``)
         :return: The type this call evaluates to
         """
         definitions = self._defs.get(key)
@@ -5715,7 +5877,7 @@ class _Inference:
         target = definitions[-1]
         parents = self._frames[:frame + 1]
         positional = node.args if args is None else args
-        params = self._call_params(target, node, positional)
+        params = self._call_params(target, node, positional, renames=renames)
         nid = node_id(node)
         if params is None:
             if id(node) in self._bad_calls:
@@ -5737,7 +5899,7 @@ class _Inference:
                        self._unknown('recursion', node, key))
             return UNKNOWN
         result = self._analyse(key, target, params, parents, node,
-                               self._call_quals(target, node, positional))
+                               self._call_quals(target, node, positional, renames))
         if result is None:
             self._diag(TYPE_CONTEXT_LIMIT, (str(dotted_name(node.func)),), node,
                        self._unknown('context-budget', node, key))
@@ -5844,7 +6006,8 @@ class _Inference:
         return tuple(out)
 
     def _call_quals(self, target: ast.FunctionDef | ast.AsyncFunctionDef, node: ast.Call,
-                    args: Sequence[ast.expr]) -> tuple[int, ...]:
+                    args: Sequence[ast.expr],
+                    renames: Mapping[str, str] | None = None) -> tuple[int, ...]:
         """
         The parameter qualifiers one call site instantiates the callee with.
 
@@ -5855,6 +6018,8 @@ class _Inference:
         :param target: The callee's definition
         :param node: The call node
         :param args: The positional arguments the call binds, in order
+        :param renames: Keyword as the call spells it -> the parameter it binds,
+                        where the runtime moves it (``_runtime_keyword``)
         :return: One qualifier per parameter, positional first then keyword-only
         """
         declared = target.args
@@ -5863,7 +6028,8 @@ class _Inference:
             bound[arg.arg] = value
         for keyword in node.keywords:
             if keyword.arg is not None:
-                bound[keyword.arg] = keyword.value
+                pname = keyword.arg if renames is None else renames.get(keyword.arg, keyword.arg)
+                bound[pname] = keyword.value
         defaults = _param_defaults(target)
         out: list[int] = []
         for arg in _every_param(target):

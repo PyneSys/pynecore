@@ -356,6 +356,11 @@ impl ExportSig {
                     ret: json_str(item, "ret")?,
                     fits: json_str(item, "fits")?,
                     names: json_strs(item, "names")?,
+                    bare: item
+                        .get("bare")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

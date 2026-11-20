@@ -364,6 +364,39 @@ def __test_native_overload_selection_matches__():
     assert answered > 1_000, answered
 
 
+def __test_native_selection_over_unannotated_positions_matches__():
+    """The selection and the candidate walk over random groups with unannotated positions."""
+    __test_helper_require_native()
+    rng = random.Random(151)
+    answered = 0
+    for _ in range(20_000):
+        impls = []
+        for _ in range(rng.randint(1, 4)):
+            impl = __test_helper_impl(rng)
+            # A position shorter or longer than ``params`` stays legal for the reader
+            width = len(impl.params) + rng.choice((0, 0, 0, -1, 1))
+            impls.append(impl._replace(bare=''.join(rng.choice('01') for _ in range(width))))
+        width = rng.randint(0, 4)
+        pin = ''.join(rng.choice(__test_helper_PIN_CHARS) for _ in range(width))
+        shapes = [rng.choice(__test_helper_PARAM_TYPES) for _ in range(rng.randint(0, width))]
+        native_impls = __test_helper_impl_tuples(impls)
+        choice = rules.overload_choice(impls, pin, shapes)
+        assert (__test_helper_native('overload_choice', native_impls, pin, shapes)
+                == __test_helper_index(impls, choice)), (impls, pin, shapes)
+        assert (__test_helper_native('overload_candidates', native_impls, pin, shapes)
+                == rules.overload_candidates(impls, pin, shapes)), (impls, pin, shapes)
+        names = rng.sample(['x', 'y', 'z', 'k'], rng.randint(0, 2))
+        kw_chars = {name: rng.choice(__test_helper_PIN_CHARS) for name in names}
+        kw_shapes = {name: rng.choice(__test_helper_PARAM_TYPES) for name in names
+                     if rng.random() < 0.7}
+        choice = rules.overload_binding(impls, pin, shapes, kw_chars, kw_shapes)
+        assert (__test_helper_native('overload_binding', native_impls, pin, shapes, kw_chars,
+                                     kw_shapes)
+                == __test_helper_index(impls, choice)), (impls, pin, shapes, kw_chars)
+        answered += choice is not None
+    assert answered > 500, answered
+
+
 #: Definitions over every parameter kind, default spelling and annotation family
 __test_helper_DEFINITIONS = '''
 def plain(a, b, c=1, d=2.5): pass

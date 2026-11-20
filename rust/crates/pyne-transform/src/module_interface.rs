@@ -239,7 +239,9 @@ fn export_sig(
             open_ended: first.open_ended,
             ret: func.ret.clone(),
             annotated: impls.iter().all(|imp| !imp.params.iter().any(|param| param == UNKNOWN)),
-            impls: impls.clone(),
+            // Published without the positions that carry no annotation: the payload
+            // does not hold them (`_export_sig`)
+            impls: impls.iter().map(|imp| ImplSig { bare: String::new(), ..imp.clone() }).collect(),
             line,
             names: first.names.clone(),
         }));

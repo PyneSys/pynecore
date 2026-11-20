@@ -1722,6 +1722,22 @@ class ImplSig(NamedTuple):
     fits: str
     #: Name of each positional parameter, so a keyword argument can be matched
     names: tuple[str, ...] = ()
+    #: One character per positional parameter, ``'1'`` where it has no
+    #: annotation: the selector checks such a parameter against ``Any``, which
+    #: takes every value in both of its passes. Empty where the shape does not
+    #: say (a published one), which reads every position by its type.
+    bare: str = ''
+
+
+def _is_bare(impl: ImplSig, index: int) -> bool:
+    """
+    Whether an implementation's positional parameter has no annotation.
+
+    :param impl: The implementation's shape
+    :param index: The parameter's position
+    :return: True when the selector takes every value there
+    """
+    return index < len(impl.bare) and impl.bare[index] == '1'
 
 
 def overload_pick(impls: list[ImplSig], pin: str,
@@ -1758,9 +1774,10 @@ def overload_choice(impls: list[ImplSig], pin: str,
     neither TradingView nor the value-driven dispatch would.
 
     Declaration order decides between implementations that match equally well
-    WITHIN one half, so an earlier one that could take the witnesses too (an
-    unannotated parameter takes anything) makes the site unanswerable rather
-    than overruling the runtime's own choice.
+    WITHIN one half, so an earlier one that could take the witnesses too makes
+    the site unanswerable rather than overruling the runtime's own choice. A
+    parameter without an annotation takes anything (``ImplSig.bare``), so the
+    earlier implementation is then the one that runs.
 
     A position the pin carries no witness for (``PIN_ANY``) is read from the
     argument's static type, the way ``_takes_position`` reads it: by the kind of
@@ -1899,6 +1916,9 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool,
     """
     How one implementation answers a pin in one half of the exact pass.
 
+    A position without an annotation takes every argument (``ImplSig.bare``);
+    every other one answers by its type (``_takes_position``).
+
     :param impl: The implementation's shape
     :param wanted: The pin, one character per positional argument
     :param exact_arity: The positional half, which only reaches an
@@ -1918,6 +1938,8 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool,
         return _NO
     verdict = _YES
     for index, (declared, want) in enumerate(zip(impl.params, wanted)):
+        if _is_bare(impl, index):
+            continue
         taken = _takes_position(declared, want, shapes[index] if index < len(shapes) else UNKNOWN)
         if taken == _NO:
             return _NO
@@ -2104,6 +2126,9 @@ def _binds(impl: ImplSig, chars: str, shapes: Sequence[str],
     """
     How one implementation answers a call with keyword arguments.
 
+    A position without an annotation takes every argument, positional or
+    keyword (``ImplSig.bare``), as in ``_takes``.
+
     :param impl: The implementation's shape
     :param chars: One pin character per positional argument
     :param shapes: The static type of each positional argument
@@ -2118,6 +2143,8 @@ def _binds(impl: ImplSig, chars: str, shapes: Sequence[str],
     verdict = _YES
     bound: set[int] = set(range(len(chars)))
     for index, (declared, want) in enumerate(zip(impl.params, chars)):
+        if _is_bare(impl, index):
+            continue
         taken = _takes_position(declared, want, shapes[index] if index < len(shapes) else UNKNOWN)
         if taken == _NO:
             return _NO
@@ -2131,6 +2158,8 @@ def _binds(impl: ImplSig, chars: str, shapes: Sequence[str],
         if index in bound:
             return _NO
         bound.add(index)
+        if _is_bare(impl, index):
+            continue
         taken = _takes_position(impl.params[index], want, kw_shapes.get(name, UNKNOWN))
         if taken == _NO:
             return _NO
@@ -2179,7 +2208,8 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
         open_ended=args.vararg is not None, ret=ret,
         fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes)
                      for arg in positional + list(args.kwonlyargs)),
-        names=tuple(a.arg for a in positional))
+        names=tuple(a.arg for a in positional),
+        bare=''.join('1' if a.annotation is None else '0' for a in positional))
 
 
 def param_fit(arg: ast.arg, default: ast.expr | None,

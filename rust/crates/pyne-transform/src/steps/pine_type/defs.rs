@@ -26,12 +26,40 @@ impl Engine<'_, '_> {
     /// (a method, keyed under its class).
     pub(super) fn definition_keyed(&mut self, node: NodeId, key: String) -> R<()> {
         self.type_defaults(node, None)?;
+        if let Some(nid) = self.nid(node)
+            && self.overload_groups.contains(&key)
+            && self.generic_impl(&key, node)
+        {
+            // Typed like a plain definition: per call, by the call that reaches it alone
+            self.generic_impls.insert(nid);
+            self.pending.last_mut().expect("a pending list").push((key, node));
+            return Ok(());
+        }
         if self.overload_groups.contains(&key) || is_script_entry(self.ast, node) {
             self.declaration_context(&key, node)?;
             return Ok(());
         }
         self.pending.last_mut().expect("a pending list").push((key, node));
         Ok(())
+    }
+
+    /// Whether an overload implementation is instantiated per call (`_generic_impl`):
+    /// nested under its own name, not exported, without `*args` or `**kwargs`, with
+    /// a parameter that has no annotation.
+    fn generic_impl(&self, key: &str, node: NodeId) -> bool {
+        let scope = self.scope();
+        if scope.is_empty() || facts::is_exported(self.ast, node) {
+            return false;
+        }
+        if key != crate::pine_type_table::qualify(&scope, facts::def_name(self.ast, node)) {
+            return false;
+        }
+        if facts::args_of(self.ast, node)
+            .is_some_and(|args| args.vararg.is_some() || args.kwarg.is_some())
+        {
+            return false;
+        }
+        every_param(self.ast, node).into_iter().any(|arg| arg_parts(self.ast, arg).1.is_none())
     }
 
     /// Walk the definitions of this scope no call site ever typed (`_flush_pending`).
@@ -64,7 +92,12 @@ impl Engine<'_, '_> {
             if walked {
                 continue;
             }
-            if self.uninstantiated_def(&key, node)? {
+            if self.nid(node).is_some_and(|nid| self.generic_impls.contains(&nid)) {
+                // A generic implementation nothing selected: typed the way its
+                // definition describes it, and passed by in the report
+                self.uninstantiated.insert(node);
+                self.declaration_context(&key, node)?;
+            } else if self.uninstantiated_def(&key, node)? {
                 self.uninstantiated.insert(node);
             } else {
                 self.declaration_context(&key, node)?;
@@ -225,8 +258,13 @@ impl Engine<'_, '_> {
         self.stack = outer;
         self.in_progress.remove(&guard);
         walked?;
+        let generic = nid.is_some_and(|nid| self.generic_impls.contains(&nid));
+        let instance = generic && site.is_some();
         if let Some(nid) = nid {
             self.walked.insert(nid);
+            if generic && !instance {
+                self.generic_declared.insert(nid);
+            }
         }
         let bound = std::mem::take(&mut self.frames[own].names);
         for target in super::finish::series_locals(self.ast, node) {
@@ -238,7 +276,7 @@ impl Engine<'_, '_> {
         }
         self.merge_bindings(key, &bound);
         self.frames[own].names = bound;
-        self.record_signature(key, node, index);
+        self.record_signature(key, node, index, instance);
         Ok(Some(index))
     }
 
@@ -500,8 +538,9 @@ impl Engine<'_, '_> {
     }
 
     /// Fold a context's parameter and return types into the signature
-    /// (`_record_signature`).
-    fn record_signature(&mut self, key: &str, node: NodeId, index: usize) {
+    /// (`_record_signature`); the return of one call's `instance` of a generic
+    /// overload implementation does not stand for the implementation.
+    fn record_signature(&mut self, key: &str, node: NodeId, index: usize, instance: bool) {
         if !self.funcs.contains_key(key) {
             return;
         }
@@ -521,6 +560,7 @@ impl Engine<'_, '_> {
             if let Some(slot) = slot
                 && slot < returns.len()
                 && returns[slot] == UNKNOWN
+                && !instance
             {
                 returns[slot] = result_ret.clone();
             }

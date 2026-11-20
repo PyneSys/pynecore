@@ -57,20 +57,21 @@ impl<'py> Args<'_, 'py> {
         dict.iter().map(|(key, item)| Ok((key.extract()?, item.extract()?))).collect()
     }
 
-    /// `ImplSig` tuples: `(params, required, open_ended, ret, fits, names)`.
+    /// `ImplSig` tuples: `(params, required, open_ended, ret, fits, names, bare)`.
     fn impls(&self, index: usize) -> PyResult<Vec<rules::ImplSig>> {
         let mut out = Vec::new();
         for item in self.get(index)?.try_iter()? {
             let item = item?;
-            let (params, required, open_ended, ret, fits, names): (
+            let (params, required, open_ended, ret, fits, names, bare): (
                 Vec<String>,
                 usize,
                 bool,
                 String,
                 String,
                 Vec<String>,
+                String,
             ) = item.extract()?;
-            out.push(rules::ImplSig { params, required, open_ended, ret, fits, names });
+            out.push(rules::ImplSig { params, required, open_ended, ret, fits, names, bare });
         }
         Ok(out)
     }
@@ -447,7 +448,8 @@ fn tree_call<'py>(py: Python<'py>, name: &str, a: &Args<'_, 'py>) -> PyResult<Bo
             let sig = ty_of.finish(sig)?;
             let params = PyTuple::new(py, sig.params)?;
             let names = PyTuple::new(py, sig.names)?;
-            (params, sig.required, sig.open_ended, sig.ret, sig.fits, names).into_bound_py_any(py)
+            (params, sig.required, sig.open_ended, sig.ret, sig.fits, names, sig.bare)
+                .into_bound_py_any(py)
         }
         "param_fit" => {
             let arg = a.node(&mut from, 0)?.ok_or_else(|| PyValueError::new_err("a node"))?;

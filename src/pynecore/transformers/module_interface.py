@@ -236,6 +236,11 @@ def _export_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, key: str,
     """
     The published signature of one definition.
 
+    A group's implementations are published without the positions that carry
+    no annotation (``ImplSig.bare``): the payload does not hold them, and the
+    shape an importer reads has to be the same whether it comes from the
+    payload or from this module's own run.
+
     :param node: The definition
     :param key: Its scope-qualified id in the table
     :param table: The module's type table
@@ -244,7 +249,7 @@ def _export_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, key: str,
     func = table.funcs.get(key)
     if func is None:
         return None
-    impls = table.groups.get(key, ())
+    impls = tuple(impl._replace(bare='') for impl in table.groups.get(key, ()))
     if impls:
         first = impls[0]
         return ExportSig(

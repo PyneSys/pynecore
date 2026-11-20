@@ -198,6 +198,7 @@ impl<'py> Classes<'py> {
             ret: string(&get("ret")?)?,
             fits: string(&get("fits")?)?,
             names: tuple(&get("names")?, string)?,
+            bare: string(&get("bare")?)?,
         })
     }
 
@@ -398,6 +399,7 @@ impl<'py> Classes<'py> {
             kwargs.set_item("ret", &imp.ret)?;
             kwargs.set_item("fits", &imp.fits)?;
             kwargs.set_item("names", PyTuple::new(py, &imp.names)?)?;
+            kwargs.set_item("bare", &imp.bare)?;
             items.push(self.impl_sig.call((), Some(&kwargs))?);
         }
         PyTuple::new(py, items)?.into_bound_py_any(py)

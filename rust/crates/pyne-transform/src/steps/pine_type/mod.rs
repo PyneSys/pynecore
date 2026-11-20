@@ -148,6 +148,11 @@ struct Engine<'a, 'h> {
     defs: IndexMap<String, Vec<NodeId>>,
     rebound: HashMap<String, HashSet<String>>,
     walked: HashSet<i64>,
+    /// The generic overload implementations, instantiated per call (`_generic_impls`).
+    generic_impls: HashSet<i64>,
+    /// The generic implementations walked in their declaration context
+    /// (`_generic_declared`).
+    generic_declared: HashSet<i64>,
     /// The definitions no walk ever enters (`_uninstantiated_def`).
     uninstantiated: HashSet<NodeId>,
     /// The nodes every walk typed, with types that have no join (`_restamped`).
@@ -265,6 +270,8 @@ impl<'a, 'h> Engine<'a, 'h> {
             defs: IndexMap::new(),
             rebound: HashMap::new(),
             walked: HashSet::new(),
+            generic_impls: HashSet::new(),
+            generic_declared: HashSet::new(),
             uninstantiated: HashSet::new(),
             varying: HashSet::new(),
             context_stack: vec![0],

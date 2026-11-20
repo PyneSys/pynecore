@@ -1524,6 +1524,14 @@ pub struct ImplSig {
     pub fits: String,
     /// Name of each positional parameter
     pub names: Vec<String>,
+    /// One character per positional parameter, `'1'` where it has no annotation and
+    /// the selector takes every value; empty where the shape does not say
+    pub bare: String,
+}
+
+/// Whether an implementation's positional parameter has no annotation (`_is_bare`).
+fn is_bare(imp: &ImplSig, index: usize) -> bool {
+    imp.bare.as_bytes().get(index) == Some(&b'1')
 }
 
 /// The characters of a pin as one-character strings, as Python's `tuple(pin)`.
@@ -1699,6 +1707,9 @@ fn takes<S: AsRef<str>>(
     }
     let mut verdict = Verdict::Yes;
     for (index, (declared, want)) in imp.params.iter().zip(wanted).enumerate() {
+        if is_bare(imp, index) {
+            continue;
+        }
         let taken = takes_position(declared, want, shape_at(shapes, index));
         if taken == Verdict::No {
             return Verdict::No;
@@ -1821,6 +1832,9 @@ fn binds<S: AsRef<str>>(
     let mut verdict = Verdict::Yes;
     let mut bound: Vec<usize> = (0..wanted.len()).collect();
     for (index, (declared, want)) in imp.params.iter().zip(wanted).enumerate() {
+        if is_bare(imp, index) {
+            continue;
+        }
         let taken = takes_position(declared, want, shape_at(shapes, index));
         if taken == Verdict::No {
             return Verdict::No;
@@ -1838,6 +1852,9 @@ fn binds<S: AsRef<str>>(
             return Verdict::No;
         }
         bound.push(index);
+        if is_bare(imp, index) {
+            continue;
+        }
         let given = kw_shapes
             .iter()
             .find(|(known, _)| known == name)
@@ -1920,8 +1937,11 @@ pub fn impl_sig(
     let default_of =
         |name: &str| defaults.iter().find(|(known, _)| known == name).map(|&(_, default)| default);
     let mut types = Vec::with_capacity(found.positional.len());
+    let mut bare = String::with_capacity(found.positional.len());
     for &arg in &found.positional {
-        types.push(annotation_type(ast, arg_parts(ast, arg).1, classes)?);
+        let annotation = arg_parts(ast, arg).1;
+        types.push(annotation_type(ast, annotation, classes)?);
+        bare.push(if annotation.is_none() { '1' } else { '0' });
     }
     let mut fits = String::new();
     for &arg in found.positional.iter().chain(found.kwonly) {
@@ -1935,6 +1955,7 @@ pub fn impl_sig(
         ret: ret.to_string(),
         fits,
         names: found.positional.iter().map(|&arg| arg_parts(ast, arg).0.to_string()).collect(),
+        bare,
     })
 }
 

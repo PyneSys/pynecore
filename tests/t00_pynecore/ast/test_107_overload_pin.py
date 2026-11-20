@@ -965,3 +965,32 @@ def main():
 '''), 'test')
     types = {name: binding.ty for name, binding in table.bindings['main'].items()}
     assert (types['n'], types['f'], types['t'], types['u']) == ('i', '?', 's', 'i')
+
+
+@pytest.mark.parametrize("bare,expected", [
+    # Unannotated: the selector checks the position against ``Any``
+    ('11', 0),
+    # A type this pass cannot read may reject the value: nothing is claimed
+    ('', None),
+    ('10', None),
+])
+def __test_an_unannotated_position_takes_every_argument__(bare: str, expected: int | None):
+    """ The exact pass takes any value for a parameter without an annotation """
+    impls = [ImplSig(params=('?', '?'), required=2, open_ended=False, ret='f', fits='nn',
+                     names=('x', 'y'), bare=bare),
+             ImplSig(params=('i',), required=1, open_ended=False, ret='i', fits='n',
+                     names=('x',))]
+    choice = overload_choice(impls, '*f', ['a:i', 'f'])
+    assert (None if choice is None else impls.index(choice)) == expected
+    # Either way it is the only implementation the call can reach
+    assert overload_candidates(impls, '*f', ['a:i', 'f']) == [0]
+
+
+@pytest.mark.parametrize("bare,expected", [('11', 0), ('', None)])
+def __test_an_unannotated_position_takes_every_keyword_argument__(bare: str,
+                                                                  expected: int | None):
+    """ A keyword bound to a parameter without an annotation is taken like a positional one """
+    impls = [ImplSig(params=('?', '?'), required=2, open_ended=False, ret='f', fits='nn',
+                     names=('x', 'y'), bare=bare)]
+    choice = overload_binding(impls, '*', ['a:i'], {'y': '*'}, {'y': 'o:m#A'})
+    assert (None if choice is None else impls.index(choice)) == expected

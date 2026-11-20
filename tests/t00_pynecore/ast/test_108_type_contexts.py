@@ -20,9 +20,10 @@ import pytest
 from pynecore.core.instance_state import _make_state
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.layout_emit import apply_layout
+from pynecore.transformers.module_interface import build_interface
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.pine_type_infer import infer_module
-from pynecore.transformers.pine_type_rules import get_pin, get_pins
+from pynecore.transformers.pine_type_rules import get_pin, get_pins, get_ty
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
 from pynecore.transformers.slot_layout import ModuleLayout
@@ -1255,3 +1256,164 @@ def __test_a_store_through_a_nonlocal_declaration_still_shadows__():
     reasons = {diag.origin.reason for diag in table.diags if diag.origin is not None}
     assert 'rebound-name' in reasons
     assert [call for call in table.calls if call.callee == 'g'] == []
+
+
+GENERIC_GROUP = '''
+from pynecore import lib
+from pynecore.core.overload import overload
+from pynecore.core.pine_method import method, method_call
+from pynecore.core.pine_udt import udt
+
+
+@udt
+class Span:
+    low: float = lib.na
+    high: float = lib.na
+
+
+def main():
+    @overload
+    def wider(x, y, up):
+        return x if up else y
+
+    @overload
+    @method
+    def wider(this: Span, up):
+        return this.high if up else this.low
+
+    a = wider(1, 2, True)
+    b = wider(1.5, 2.5, False)
+    c = wider(Span.new(1.0, 2.0), True)
+    d = method_call(wider, Span.new(1.0, 2.0), False)
+'''
+
+
+def __test_an_implementation_without_annotations_is_typed_per_call__():
+    """
+    An implementation whose parameters declare no type is instantiated by each call
+    that reaches it alone, under the arguments that call binds -- Pine's rule for
+    any function without one -- and the call evaluates to that instance's return.
+    """
+    table = infer_module(ast.parse(GENERIC_GROUP), 'test')
+    assert table.diags == []
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert (types['a'], types['b'], types['c'], types['d']) == ('i', 'f', 'f', 'f')
+
+
+def __test_each_argument_shape_is_its_own_instance__():
+    """Two calls with different argument types instantiate the implementation twice"""
+    table = infer_module(ast.parse(GENERIC_GROUP), 'test')
+    contexts = sorted(result.params for result in table.contexts.values()
+                      if result.key == 'main·wider')
+    assert contexts == [('f', 'f', 'b'), ('i', 'i', 'b'), ('o:test#Span', 'b')]
+    # The group's own shape keeps an instantiated implementation's return open:
+    # no single call's answer stands for the others
+    rets = [impl.ret for impl in table.groups['main·wider']]
+    assert rets == ['?', '?']
+    assert [impl.bare for impl in table.groups['main·wider']] == ['111', '01']
+
+
+UNCALLED_GENERIC = '''
+from pynecore.core.overload import overload
+
+
+def main():
+    @overload
+    def pick(x, y, z):
+        return x + y + z
+
+    @overload
+    def pick(x: int):
+        return x
+
+    a = pick(1)
+'''
+
+
+def __test_a_generic_implementation_nothing_calls_is_not_reported__():
+    """
+    An implementation no call selects has no instance: its body is typed the way
+    its own definition describes it, which keeps the code it emits, and the gaps of
+    its untyped parameters are not reported.
+    """
+    tree = ast.parse(UNCALLED_GENERIC)
+    table = infer_module(tree, 'test')
+    assert table.diags == []
+    contexts = sorted(result.params for result in table.contexts.values()
+                      if result.key == 'main·pick')
+    assert contexts == [('?', '?', '?'), ('i',)]
+    total = next(node for node in ast.walk(tree)
+                 if isinstance(node, ast.BinOp) and isinstance(node.left, ast.BinOp))
+    assert get_ty(total) == '?'
+
+
+EXPORTED_GENERIC = '''
+from pynecore.core.overload import overload
+from pynecore.core.pine_export import export
+
+
+@export
+@overload
+def pick(x, y):
+    return x + y
+
+
+@export
+@overload
+def pick(x: int):
+    return x
+'''
+
+
+def __test_an_exported_implementation_keeps_its_declaration_context__():
+    """
+    An exported implementation publishes the shape its own definition describes:
+    it is typed once, in its declaration context, and the published group does not
+    carry which of its positions are unannotated.
+    """
+    tree = ast.parse(EXPORTED_GENERIC)
+    table = infer_module(tree, 'test')
+    assert [diag.code for diag in table.diags] == ['E0012', 'E0012']
+    contexts = sorted(result.params for result in table.contexts.values())
+    assert contexts == [('?', '?'), ('i',)]
+    assert [impl.bare for impl in table.groups['pick']] == ['11', '0']
+    published = build_interface(tree, table, 'exported_generic.py').exports['pick']
+    assert [impl.bare for impl in published.impls] == ['', '']
+
+
+OWN_EXPORT_BY_NAME = '''
+from pynecore.core.pine_export import Exported, export
+from pynecore import lib
+from pynecore.core.pine_method import method, method_call
+
+scaled = Exported()
+
+
+@lib.script.library("own_export_by_name")
+def main():
+    @export
+    @method
+    def scaled(arr: list[float], type__ren__: float):
+        return lib.array.get(arr, 0) * type__ren__
+
+    @export
+    def twice(arr: list[float]):
+        out = method_call('scaled', arr, {keyword}=2.0)
+        return out
+'''
+
+
+@pytest.mark.parametrize("keyword,expected,codes", [
+    # Pine's spelling of a parameter the library declares renamed: the proxy
+    # hands it to the renamed parameter (``core/pine_method._adapt_exported_kwargs``)
+    ('type', 'f', []),
+    ('type__ren__', 'f', []),
+    # A name the definition declares under neither spelling is still no parameter
+    ('kind', '?', ['E0063']),
+])
+def __test_an_own_export_called_by_name_binds_a_renamed_keyword__(keyword: str, expected: str,
+                                                                  codes: list[str]):
+    """A keyword of a call by name binds the parameter the proxy hands it to"""
+    table = infer_module(ast.parse(OWN_EXPORT_BY_NAME.format(keyword=keyword)), 'test')
+    assert [diag.code for diag in table.diags] == codes
+    assert table.bindings['main·twice']['out'].ty == expected

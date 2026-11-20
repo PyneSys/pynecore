@@ -144,9 +144,12 @@ impl Engine<'_, '_> {
         let impls = if is_group { Some(self.impl_sigs(&key)?) } else { None };
         let pin = self.pin(node, is_group, impls.as_deref())?;
         let ty = if is_group {
-            self.group_type(&key, pin.as_deref(), &args, &keywords)?
+            match self.generic_call(&key, frame, node, &args)? {
+                Some(ty) => ty,
+                None => self.group_type(&key, pin.as_deref(), &args, &keywords)?,
+            }
         } else {
-            self.call_context(&key, node, frame, None, true)?
+            self.call_context(&key, node, frame, None, true, None)?
         };
         self.calls.push(CallSite { callee: name, line, col, argc, ty: ty.clone(), pin });
         Ok(ty)
@@ -468,9 +471,12 @@ impl Engine<'_, '_> {
             let settled =
                 lib_calls::settled(Some(&impls), pin.as_deref(), shapes.as_deref().unwrap_or(&[]));
             self.record_pin(node, pin.clone(), true, settled)?;
+            if let Some(ty) = self.generic_call(&key, frame, node, &args)? {
+                return Ok(Some(ty));
+            }
             return self.group_type(&key, pin.as_deref(), &args, &keywords).map(Some);
         }
-        self.call_context(&key, node, frame, Some(&args), true).map(Some)
+        self.call_context(&key, node, frame, Some(&args), true, None).map(Some)
     }
 
     /// Report a `method_call` that reaches no method, naming the method
@@ -688,7 +694,8 @@ impl Engine<'_, '_> {
 
     /// Type a call by name to an export of this module (`_own_export_result`): a
     /// group answers where the implementations the receiver reaches agree, a
-    /// single definition in the context the call describes.
+    /// single definition in the context the call describes, each keyword bound to
+    /// the parameter the proxy hands it to.
     fn own_export_result(
         &mut self,
         key: &str,
@@ -716,7 +723,24 @@ impl Engine<'_, '_> {
                 .collect();
             return Ok(overload_result(&returns).to_string());
         }
-        self.call_context(key, node, frame, Some(args), false)
+        let declared: HashSet<String> = self
+            .defs
+            .get(key)
+            .and_then(|defs| defs.last())
+            .map(|&target| every_param(self.ast, target))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|param| facts::arg_name(self.ast, param))
+            .collect();
+        let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
+        let renames: HashMap<String, String> = keywords
+            .iter()
+            .filter_map(|&keyword| keyword_parts(self.ast, keyword).0)
+            .map(|arg| {
+                (arg.to_string(), facts::runtime_keyword(arg, |known| declared.contains(known)))
+            })
+            .collect();
+        self.call_context(key, node, frame, Some(args), false, Some(&renames))
     }
 
     /// Type a call to a method its class declares in its own body (`_member_result`):
@@ -739,7 +763,7 @@ impl Engine<'_, '_> {
             };
             let (func, _, _) = facts::call_parts(self.ast, node).expect("a call");
             let record = self.dotted(func).as_deref() != Some("method_call");
-            return self.call_context(&key, node, frame, Some(args), record).map(Some);
+            return self.call_context(&key, node, frame, Some(args), record, None).map(Some);
         }
         let Some(sig) = self.class_sig(cid, node)? else { return Ok(None) };
         let Some(published) = sig.members.get(name).cloned() else { return Ok(None) };
@@ -852,7 +876,8 @@ impl Engine<'_, '_> {
     /// Walk the implementations of a group a call can reach that no walk has typed
     /// yet (`_ensure_group`): the one the static selection settles on, the ones that
     /// take the receiver of a call by name, or all of them where the selection leaves
-    /// the call open. False when the call is a recursion, reported here.
+    /// the call open. False when the call is a recursion, reported here. A generic
+    /// implementation the call reaches alone is left to the call (`generic_call`).
     fn ensure_group(
         &mut self,
         key: &str,
@@ -869,7 +894,7 @@ impl Engine<'_, '_> {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|&imp| !self.nid(imp).is_some_and(|nid| self.walked.contains(&nid)))
+            .filter(|&imp| self.owes_walk(imp))
             .collect();
         if pending.is_empty() {
             return Ok(true);
@@ -897,6 +922,9 @@ impl Engine<'_, '_> {
             }
             Some(found) if found.len() == 1 && !by_name => {
                 let chosen = defs[found[0]];
+                if self.nid(chosen).is_some_and(|nid| self.generic_impls.contains(&nid)) {
+                    return Ok(true);
+                }
                 if !pending.contains(&chosen) {
                     return Ok(true);
                 }
@@ -930,6 +958,102 @@ impl Engine<'_, '_> {
             self.unsure_walks -= 1;
         }
         walked.map(|()| true)
+    }
+
+    /// Whether an implementation of a group still waits for its declaration-context
+    /// walk (`_owes_walk`).
+    fn owes_walk(&self, imp: NodeId) -> bool {
+        let Some(nid) = self.nid(imp) else { return true };
+        if self.generic_impls.contains(&nid) {
+            !self.generic_declared.contains(&nid)
+        } else {
+            !self.walked.contains(&nid)
+        }
+    }
+
+    /// Type a call that reaches one generic implementation of a group alone
+    /// (`_generic_call`): the implementation instantiated for the call like a plain
+    /// definition, outside the per-instance channel. `None` where the call does not
+    /// reach one generic implementation alone.
+    fn generic_call(
+        &mut self,
+        key: &str,
+        frame: usize,
+        node: NodeId,
+        args: &[NodeId],
+    ) -> R<Option<String>> {
+        if self.generic_impls.is_empty() {
+            return Ok(None);
+        }
+        let (func, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
+        let keywords = keywords.to_vec();
+        let (defs, sigs): (Vec<NodeId>, Vec<ImplSig>) = self.group_impls(key)?.into_iter().unzip();
+        let Some(found) = self.reached(&sigs, args, &keywords, false) else { return Ok(None) };
+        let [only] = found[..] else { return Ok(None) };
+        let target = defs[only];
+        if !self.nid(target).is_some_and(|nid| self.generic_impls.contains(&nid)) {
+            return Ok(None);
+        }
+        self.widen_group_nas(&sigs[only], args, &keywords)?;
+        let parents: Vec<usize> = self.stack[..=frame].to_vec();
+        let declared: HashSet<String> = self
+            .defs
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|&imp| every_param(self.ast, imp))
+            .map(|param| facts::arg_name(self.ast, param))
+            .collect();
+        let renames: HashMap<String, String> = keywords
+            .iter()
+            .filter_map(|&keyword| keyword_parts(self.ast, keyword).0)
+            .map(|arg| {
+                (arg.to_string(), facts::runtime_keyword(arg, |known| declared.contains(known)))
+            })
+            .collect();
+        let params = self.call_params(target, node, args, false, Some(&renames))?;
+        let nid = self.nid(node);
+        let Some(params) = params else {
+            let declared = self.declared_params(target)?;
+            let Some(settled) = self.analyse(key, target, declared, Some(parents), None, None)?
+            else {
+                return Ok(Some(UNKNOWN.to_string()));
+            };
+            let (cid, ret, ret_qual) = {
+                let result = &self.results[settled];
+                (result.cid, result.ret.clone(), result.ret_qual)
+            };
+            self.unvectored.insert(cid);
+            if let Some(nid) = nid {
+                self.call_q.insert(nid, ret_qual);
+            }
+            return Ok(Some(ret));
+        };
+        let spelled = self.dotted(func).unwrap_or_else(|| "None".to_string());
+        let guard = (key.to_string(), params.clone(), self.nid(target));
+        if self.in_progress.contains(&guard) {
+            let origin = self.unknown("recursion", node, key);
+            self.diag(&pynecore_codes::TYPE_RECURSION, &[&spelled], node, Some(origin), "");
+            return Ok(Some(UNKNOWN.to_string()));
+        }
+        let quals = self.call_quals(target, node, args, Some(&renames))?;
+        let Some(result) =
+            self.analyse(key, target, params, Some(parents), Some(node), Some(quals))?
+        else {
+            let origin = self.unknown("context-budget", node, key);
+            self.diag(&pynecore_codes::TYPE_CONTEXT_LIMIT, &[&spelled], node, Some(origin), "");
+            return Ok(Some(UNKNOWN.to_string()));
+        };
+        let (cid, ret, ret_qual) = {
+            let found = &self.results[result];
+            (found.cid, found.ret.clone(), found.ret_qual)
+        };
+        self.unvectored.insert(cid);
+        if let Some(nid) = nid {
+            self.call_q.insert(nid, ret_qual);
+        }
+        Ok(Some(ret))
     }
 
     /// Type of a call to a user overload group (`_group_type`): what the
@@ -1066,7 +1190,8 @@ impl Engine<'_, '_> {
     /// (`_call_context`).
     ///
     /// A site with `record` false (a method a `method_call` finds by name on the
-    /// receiver's class) takes no part in the per-instance channel.
+    /// receiver's class) takes no part in the per-instance channel; `renames` as in
+    /// [`Self::call_params`].
     fn call_context(
         &mut self,
         key: &str,
@@ -1074,6 +1199,7 @@ impl Engine<'_, '_> {
         frame: usize,
         args: Option<&[NodeId]>,
         record: bool,
+        renames: Option<&HashMap<String, String>>,
     ) -> R<String> {
         let Some(definitions) = self.defs.get(key).filter(|defs| !defs.is_empty()).cloned() else {
             return Ok(self.funcs[key].ret.clone());
@@ -1082,7 +1208,7 @@ impl Engine<'_, '_> {
         let parents: Vec<usize> = self.stack[..=frame].to_vec();
         let (func, own_args, _) = facts::call_parts(self.ast, node).expect("a call");
         let positional: Vec<NodeId> = args.unwrap_or(own_args).to_vec();
-        let params = self.call_params(target, node, &positional, true, None)?;
+        let params = self.call_params(target, node, &positional, true, renames)?;
         let nid = self.nid(node);
         let Some(params) = params else {
             if self.bad_calls.contains(&node) {
@@ -1110,7 +1236,7 @@ impl Engine<'_, '_> {
             self.diag(&pynecore_codes::TYPE_RECURSION, &[&spelled], node, Some(origin), "");
             return Ok(UNKNOWN.to_string());
         }
-        let quals = self.call_quals(target, node, &positional)?;
+        let quals = self.call_quals(target, node, &positional, renames)?;
         let Some(result) =
             self.analyse(key, target, params, Some(parents), Some(node), Some(quals))?
         else {
@@ -1264,8 +1390,14 @@ impl Engine<'_, '_> {
     }
 
     /// The parameter qualifiers one call site instantiates the callee with
-    /// (`_call_quals`).
-    fn call_quals(&self, target: NodeId, node: NodeId, args: &[NodeId]) -> R<Vec<u8>> {
+    /// (`_call_quals`); `renames` as in [`Self::call_params`].
+    fn call_quals(
+        &self,
+        target: NodeId,
+        node: NodeId,
+        args: &[NodeId],
+        renames: Option<&HashMap<String, String>>,
+    ) -> R<Vec<u8>> {
         let positional =
             facts::args_of(self.ast, target).map(|a| a.positional()).unwrap_or_default();
         let mut bound: std::collections::HashMap<String, NodeId> = std::collections::HashMap::new();
@@ -1276,7 +1408,9 @@ impl Engine<'_, '_> {
         for &keyword in keywords {
             let (arg, value) = keyword_parts(self.ast, keyword);
             if let Some(arg) = arg {
-                bound.insert(arg.to_string(), value);
+                let pname =
+                    renames.and_then(|renames| renames.get(arg)).map_or(arg, String::as_str);
+                bound.insert(pname.to_string(), value);
             }
         }
         let defaults = param_defaults(self.ast, target)?;

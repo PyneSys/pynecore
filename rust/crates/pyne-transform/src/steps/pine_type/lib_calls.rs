@@ -159,6 +159,7 @@ pub(super) fn lib_impl_sig(entry: &LibEntry) -> ImplSig {
         ret: entry.ret.clone().unwrap_or_else(|| UNKNOWN.to_string()),
         fits,
         names: entry.names.clone().unwrap_or_default(),
+        bare: String::new(),
     }
 }
 
