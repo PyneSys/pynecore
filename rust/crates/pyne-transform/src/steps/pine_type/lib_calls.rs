@@ -472,12 +472,7 @@ impl Engine<'_, '_> {
                 && twice.iter().all(Option::is_some)
             {
                 let name = name.to_string();
-                self.bad_call(
-                    node,
-                    callee,
-                    &pynecore_codes::CALL_ARGUMENT_TWICE,
-                    &[&name, callee],
-                );
+                self.bad_call(node, callee, &pynecore_codes::CALL_ARGUMENT_TWICE, &[&name, callee]);
                 return Ok(false);
             }
         }
@@ -1053,8 +1048,8 @@ impl Engine<'_, '_> {
             );
         }
         if let Some(receiver) = receiver
-            && let Kind::Name { id, .. } = self.kind(receiver).clone()
-            && let Some(found) = self.lookup_mut(&id)
+            && let Kind::Name { .. } = self.kind(receiver)
+            && let Some(found) = self.lookup_mut(&self.key(receiver))
             && found.ty != UNKNOWN
         {
             found.ty = UNKNOWN.to_string();

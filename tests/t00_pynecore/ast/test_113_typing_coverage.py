@@ -758,3 +758,92 @@ def __test_a_keyword_naming_a_filled_lib_parameter_is_reported__(statement: str)
 def __test_a_keyword_naming_a_free_lib_parameter_is_taken__(statement: str):
     """A group is called wrongly only where no implementation binds the call"""
     assert not _codes(statement)
+
+
+# --- the variables one local name spells --------------------------------------
+
+
+def _main_types(tmp_path: Path, body: str) -> tuple[dict[str, str], list[str]]:
+    """Analyse a script whose ``main`` holds a body: its bindings and its diagnostic codes."""
+    lines = ''.join(f'    {line}\n' for line in body.splitlines())
+    script = tmp_path / 'segmented.py'
+    script.write_text('"""@pyne"""\nfrom pynecore import lib\nfrom pynecore.lib import script\n\n\n'
+                      f'@script.indicator("segmented")\ndef main():\n{lines}')
+    analysed = analyse_module(str(script))
+    assert analysed is not None, "the analysis did not recognize the script"
+    table = analysed[1]
+    return ({name: binding.ty for name, binding in table.bindings['main'].items()},
+            [diag.code for diag in table.diags])
+
+
+@pytest.mark.parametrize('body,expected', [
+    # Two blocks each declaring their own: Pine scopes a variable to its block
+    ('if lib.bar_index > 0:\n    v = 1\n    lib.math.abs(v)\n'
+     'if lib.bar_index > 1:\n    v = "s"\n    w = v + "x"',
+     {'v': INT, 'v@2': STR}),
+    # ... and so does a loop, for the variable it steps
+    ('for v in lib.array.new_int(1, 0):\n    lib.math.abs(v)\n'
+     'for v in lib.array.new_string(1, "s"):\n    w = v + "x"',
+     {'v': INT, 'v@2': STR}),
+    # A statement of the same block storing a type the variable cannot hold
+    # starts another variable: nothing read above it is stored below
+    ('v = 1\nlib.math.abs(v)\nv = "s"\nw = v + "x"\nv = 2\nlib.math.abs(v)',
+     {'v': INT, 'v@2': STR, 'v@3': INT}),
+    # Two blocks may hold a number each without the float reaching the int
+    ('if lib.bar_index > 0:\n    v = 1\n    lib.math.abs(v)\n'
+     'if lib.bar_index > 1:\n    v = 2.5\n    lib.math.abs(v)',
+     {'v': INT, 'v@2': FLOAT}),
+])
+def __test_a_local_name_spelling_several_variables_is_bound_once_per_variable__(
+        tmp_path: Path, body: str, expected: dict[str, str]):
+    types, codes = _main_types(tmp_path, body)
+    assert {name: ty for name, ty in types.items() if name != 'w'} == expected
+    assert not codes
+
+
+@pytest.mark.parametrize('body,expected', [
+    # Pine's ``:=`` on a variable declared above: one variable, a float from the start
+    ('v = 1\nlib.math.abs(v)\nv = 2.5\nlib.math.abs(v)', {'v': FLOAT}),
+    # A value read where no variable of the name was declared in the block
+    ('if lib.bar_index > 0:\n    v = 1\nelse:\n    v = 2.5\nlib.math.abs(v)', {'v': FLOAT}),
+    # A loop reads above the store what the round before stored
+    ('n = 0\nwhile n < 3:\n    n = n + 1\n    v = n\n    lib.math.abs(v)', {'n': INT, 'v': INT}),
+])
+def __test_a_local_name_spelling_one_variable_keeps_one_binding__(
+        tmp_path: Path, body: str, expected: dict[str, str]):
+    types, codes = _main_types(tmp_path, body)
+    assert types == expected
+    assert not codes
+
+
+@pytest.mark.parametrize('body', [
+    # A branch that assigns leaves the variable holding either value
+    'v = 1.0\nif lib.bar_index > 0:\n    v = "s"',
+    # Two branches read after them are one variable
+    'if lib.bar_index > 0:\n    v = 1\nelse:\n    v = "s"\nw = v + "x"',
+    # A loop body storing what the next round reads above it
+    'v = 1\nwhile lib.bar_index > 0:\n    lib.math.abs(v)\n    v = "s"',
+])
+def __test_a_variable_holding_two_types_is_still_reported__(tmp_path: Path, body: str):
+    """Pine rejects a variable whose assignments disagree"""
+    _, codes = _main_types(tmp_path, body)
+    assert codes[:1] == ['E0023']
+
+
+def __test_a_name_a_nested_function_reads_is_one_variable__():
+    """The nested body reads whichever store ran last, so the stores are not kept apart"""
+    table = infer_module(ast.parse(
+        'def main():\n    v = 1\n    def read():\n        return v\n    v = "s"\n    read()\n'
+        'main()\n'), 'test')
+    assert set(table.bindings['main']) == {'v'}
+    assert table.diags[0].code == 'E0023'
+
+
+def __test_a_nested_function_splits_its_own_locals__(tmp_path: Path):
+    """A segment belongs to its function: the enclosing one's same-named segments say nothing"""
+    types, codes = _main_types(
+        tmp_path,
+        'v = "a"\nw = v + "x"\nv = "b"\nw = v + "x"\n'
+        'def inner():\n    v = "a"\n    w = v + "x"\n    v = 2\n    return v + 1\ninner()')
+    assert not codes
+    assert types == {'v': STR, 'w': STR}

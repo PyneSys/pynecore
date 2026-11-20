@@ -117,7 +117,10 @@ impl Engine<'_, '_> {
     fn expr_qual(&mut self, node: NodeId) -> R<u8> {
         Ok(match self.kind(node).clone() {
             Kind::Constant { .. } => CONST,
-            Kind::Name { id, .. } => self.name_qual(&id),
+            Kind::Name { id, .. } => {
+                let key = self.key(node);
+                self.name_qual(&id, &key)
+            }
             Kind::Attribute { .. } => self.attribute_qual(node)?,
             Kind::Call { .. } => self.call_qual(node),
             Kind::Subscript { value, .. } => {
@@ -156,11 +159,11 @@ impl Engine<'_, '_> {
     }
 
     /// The qualifier of a bare name read (`_name_qual`).
-    fn name_qual(&mut self, id: &str) -> u8 {
+    fn name_qual(&mut self, id: &str, key: &str) -> u8 {
         if id == DYN_DEFAULT {
             return CONST;
         }
-        if let Some(found) = self.lookup_mut(id) {
+        if let Some(found) = self.lookup_mut(key) {
             found.min_read = found.min_read.min(found.qual);
             return found.qual;
         }
@@ -205,7 +208,7 @@ impl Engine<'_, '_> {
             return qual;
         }
         if let Kind::Name { id, .. } = self.kind(func)
-            && self.lookup(id).is_none()
+            && self.lookup(&self.key(func)).is_none()
             && let Some(builtin) = builtin_call_qualifier(id, arguments)
         {
             return builtin;
@@ -231,7 +234,7 @@ impl Engine<'_, '_> {
         if id == DYN_DEFAULT {
             return Ok(TYPELESS.to_string());
         }
-        if let Some(found) = self.lookup(id) {
+        if let Some(found) = self.lookup(&self.key(node)) {
             return Ok(found.ty.clone());
         }
         if let Some(entry) = data::lib_entries().get(id.as_str()) {
@@ -262,8 +265,8 @@ impl Engine<'_, '_> {
 
     /// Whether an expression in value position names a type (`_names_type`).
     pub(super) fn names_type(&self, node: NodeId) -> R<bool> {
-        if let Kind::Name { id, .. } = self.kind(node)
-            && self.lookup(id).is_some()
+        if let Kind::Name { .. } = self.kind(node)
+            && self.lookup(&self.key(node)).is_some()
         {
             return Ok(false);
         }
@@ -433,8 +436,12 @@ impl Engine<'_, '_> {
     /// The recorded counter type of a loop object, by the name that holds it
     /// (`_loop_counter`).
     pub(super) fn loop_counter(&self, receiver: NodeId) -> Option<String> {
-        let Kind::Name { id, .. } = self.kind(receiver) else { return None };
-        self.stack.iter().rev().find_map(|&frame| self.frames[frame].loop_counters.get(id).cloned())
+        let Kind::Name { .. } = self.kind(receiver) else { return None };
+        let key = self.key(receiver);
+        self.stack
+            .iter()
+            .rev()
+            .find_map(|&frame| self.frames[frame].loop_counters.get(&key).cloned())
     }
 
     /// Join a loop counter with the bounds one call passes (`_loop_bound`).
@@ -526,7 +533,8 @@ impl Engine<'_, '_> {
         args: &[NodeId],
     ) -> R<()> {
         let counter = self.loop_counter(receiver);
-        if let (Some(counter), Kind::Name { id, .. }) = (counter, self.kind(receiver).clone()) {
+        if let (Some(counter), Kind::Name { .. }) = (counter, self.kind(receiver).clone()) {
+            let id = self.key(receiver);
             let joined = self.loop_bound(node, what, args, Some(counter))?;
             for index in (0..self.stack.len()).rev() {
                 let frame = self.stack[index];
@@ -542,7 +550,9 @@ impl Engine<'_, '_> {
     /// Whether an attribute's base is a module or a namespace (`_is_reference`).
     pub(super) fn is_reference(&self, node: NodeId) -> bool {
         let Kind::Name { id, .. } = self.kind(node) else { return false };
-        self.imports.contains_key(id) || self.shadowed.contains_key(id) || self.lookup(id).is_none()
+        self.imports.contains_key(id)
+            || self.shadowed.contains_key(id)
+            || self.lookup(&self.key(node)).is_none()
     }
 
     fn e_binop(&mut self, node: NodeId) -> R<String> {
@@ -647,7 +657,7 @@ impl Engine<'_, '_> {
     /// Whether an expression reads a series (`_is_series`).
     fn is_series(&self, node: NodeId) -> bool {
         if let Kind::Name { id, .. } = self.kind(node) {
-            if let Some(found) = self.lookup(id) {
+            if let Some(found) = self.lookup(&self.key(node)) {
                 return found.series || self.frames[self.top()].declared_series.contains(id);
             }
             return data::lib_entries().contains_key(id.as_str());

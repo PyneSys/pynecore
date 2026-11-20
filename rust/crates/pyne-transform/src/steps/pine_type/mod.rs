@@ -31,9 +31,11 @@ mod finish;
 mod imports;
 mod lib_calls;
 mod report;
+mod segments;
 mod stmts;
 mod user_calls;
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -81,6 +83,10 @@ struct Frame {
     local_names: HashSet<String>,
     loop_counters: HashMap<String, String>,
     na_stores: HashMap<String, Vec<(NodeId, Vec<usize>)>>,
+    /// Binding key of a segment -> the key of the segment it replaced
+    segment_parents: Rc<HashMap<String, String>>,
+    /// Binding key of a segment -> the key of the binding it turned out to continue
+    continued: HashMap<String, String>,
 }
 
 impl Frame {
@@ -150,6 +156,11 @@ struct Engine<'a, 'h> {
     free: HashMap<i64, FreeLists>,
     scope_free_memo: HashMap<NodeId, facts::FreeNames>,
     facts_memo: HashMap<NodeId, Rc<ScopeFacts>>,
+    /// Name node -> the key it is bound under, for every occurrence of a local outside
+    /// its first segment (`_segment_keys`)
+    segment_keys: HashMap<NodeId, String>,
+    /// Definition -> its segments' parents, once scanned (`_segments_memo`)
+    segments_memo: HashMap<NodeId, Rc<HashMap<String, String>>>,
     returns_memo: HashMap<NodeId, Rc<Vec<NodeId>>>,
     called_memo: HashMap<NodeId, Rc<HashSet<String>>>,
     anchors: HashMap<Anchor, ContextKey>,
@@ -245,6 +256,8 @@ impl<'a, 'h> Engine<'a, 'h> {
             free: HashMap::new(),
             scope_free_memo: HashMap::new(),
             facts_memo: HashMap::new(),
+            segment_keys: HashMap::new(),
+            segments_memo: HashMap::new(),
             returns_memo: HashMap::new(),
             called_memo: HashMap::new(),
             anchors: HashMap::new(),
@@ -422,6 +435,9 @@ impl<'a, 'h> Engine<'a, 'h> {
     /// The frame and the binding a name reads (`_lookup`).
     fn lookup_at(&self, name: &str) -> Option<usize> {
         let current = &self.frames[self.top()];
+        if name.contains(segments::SEGMENT_SEP) {
+            return current.names.contains_key(name).then_some(self.top());
+        }
         if (!current.declared_global.is_empty() || !current.declared_nonlocal.is_empty())
             && let Some(home) = self.declared_home(name)
         {
@@ -431,12 +447,70 @@ impl<'a, 'h> Engine<'a, 'h> {
     }
 
     fn lookup(&self, name: &str) -> Option<&Binding> {
-        self.lookup_at(name).and_then(|frame| self.frames[frame].names.get(name))
+        let name = self.canonical(name);
+        self.lookup_at(&name).and_then(|frame| self.frames[frame].names.get(name.as_ref()))
     }
 
     fn lookup_mut(&mut self, name: &str) -> Option<&mut Binding> {
-        let frame = self.lookup_at(name)?;
-        self.frames[frame].names.get_mut(name)
+        let name = self.canonical(name).into_owned();
+        let frame = self.lookup_at(&name)?;
+        self.frames[frame].names.get_mut(&name)
+    }
+
+    /// The key a name node's binding is kept under (`_key`).
+    fn key(&self, node: NodeId) -> String {
+        if let Some(key) = self.segment_keys.get(&node) {
+            return key.clone();
+        }
+        match self.kind(node) {
+            Kind::Name { id, .. } => id.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// The key a segment's binding is kept under, once its first store decided it
+    /// (`_canonical`).
+    fn canonical<'k>(&self, key: &'k str) -> Cow<'k, str> {
+        if !key.contains(segments::SEGMENT_SEP) {
+            return Cow::Borrowed(key);
+        }
+        // A segment key is spelled per function, and only that function's own frame
+        // ever asks for it: no nested scope reaches a name that splits
+        match self.frames[self.top()].continued.get(key) {
+            Some(found) => Cow::Owned(found.clone()),
+            None => Cow::Borrowed(key),
+        }
+    }
+
+    /// The key a store finds the variable it may continue under (`_continued_key`).
+    fn continued_key(&self, name: &str) -> String {
+        let frame = &self.frames[self.top()];
+        let mut key = Some(self.canonical(name).into_owned());
+        while let Some(current) = &key {
+            if frame.names.contains_key(current) {
+                break;
+            }
+            key = frame
+                .segment_parents
+                .get(current)
+                .map(|parent| self.canonical(parent).into_owned());
+        }
+        key.unwrap_or_else(|| name.to_string())
+    }
+
+    /// The key a segment's first store binds under: its own, or the one it continues
+    /// (`_continued`).
+    fn continued(&mut self, name: &str, ty: &str) -> String {
+        let top = self.top();
+        if !self.frames[top].segment_parents.contains_key(name) {
+            return name.to_string();
+        }
+        let found = self.continued_key(name);
+        if found == name || segments::conflicting(&self.frames[top].names[&found].ty, ty) {
+            return name.to_string();
+        }
+        self.frames[top].continued.insert(name.to_string(), found.clone());
+        found
     }
 
     /// Record an assignment (`_bind`).
@@ -451,7 +525,12 @@ impl<'a, 'h> Engine<'a, 'h> {
         qual: u8,
         persistent: bool,
     ) -> R<()> {
-        let home = self.declared_home(name).unwrap_or_else(|| self.top());
+        let mut name = self.canonical(name).into_owned();
+        let home = self.declared_home(&name).unwrap_or_else(|| self.top());
+        if !self.frames[home].names.contains_key(&name) {
+            name = self.continued(&name, ty);
+        }
+        let name = name.as_str();
         let line = self.line(node);
         let series = series || self.frames[self.top()].declared_series.contains(name);
         let decl = self.nid(node);
@@ -485,13 +564,12 @@ impl<'a, 'h> Engine<'a, 'h> {
             }
             (existing.ty.clone(), existing.unknown.is_some())
         };
-        let joined = self.joined(&before, ty, node, &format!("`{name}`"))?;
+        let joined =
+            self.joined(&before, ty, node, &format!("`{}`", segments::plain_name(name)))?;
         let unknown_now = if joined == UNKNOWN && !existing_unknown {
-            Some(
-                self.shape_unknown(&before, ty, node)
-                    .or(unknown)
-                    .unwrap_or_else(|| self.unknown("joined-branches", node, name)),
-            )
+            Some(self.shape_unknown(&before, ty, node).or(unknown).unwrap_or_else(|| {
+                self.unknown("joined-branches", node, segments::plain_name(name))
+            }))
         } else {
             None
         };

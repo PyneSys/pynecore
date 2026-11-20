@@ -365,6 +365,13 @@ class _Frame:
     #: literal): the na of whatever type the name's assignments join to at that
     #: position, re-decided on each assignment
     na_stores: dict[str, list[tuple[ast.expr, tuple[int, ...]]]] = field(default_factory=dict)
+    #: Binding key of a segment -> the key of the segment that was open where it
+    #: started (``_Segments``): the variable it continues unless their types
+    #: say they are two
+    segment_parents: dict[str, str] = field(default_factory=dict)
+    #: Binding key of a segment -> the key of the binding it turned out to
+    #: continue, decided at its first store (``_continued``)
+    continued: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -504,6 +511,12 @@ class _Inference:
         #: the free-name scan all ask it, and none of the answers depends on the
         #: context. The frames only ever read the sets.
         self._facts_memo: dict[int, tuple[_Scope, _ScopeFacts]] = {}
+        #: id(name node) -> the key it is bound under, for every occurrence of a
+        #: local outside its first segment (``_Segments``); every other name is
+        #: bound under its own spelling
+        self._segment_keys: dict[int, str] = {}
+        #: id(definition) -> the definition and its segments' parents, once scanned
+        self._segments_memo: dict[int, tuple[ast.AST, dict[str, str]]] = {}
         #: id(def node) -> the node and its own ``return`` statements, in the
         #: order the return type joins them. A body is analysed once per context,
         #: but where its returns stand does not move
@@ -768,7 +781,10 @@ class _Inference:
 
     def _lookup(self, name: str) -> Binding | None:
         """Find a name in the innermost live scope that has it."""
+        name = self._canonical(name)
         current = self._frames[-1]
+        if SEGMENT_SEP in name:
+            return current.names.get(name)
         if current.declared_global or current.declared_nonlocal:
             declared = self._declared_home(name)
             if declared is not None:
@@ -796,11 +812,18 @@ class _Inference:
         A ``global``/``nonlocal`` name is written where it LIVES, not here --
         otherwise the scope that widens it and the closure that reads it would
         be looking at two different bindings.
+
+        ``name`` is the binding KEY (``_key``): a local that splits into
+        segments is bound once per segment.
         """
+        name = self._canonical(name)
         bindings = self._declared_home(name)
         if bindings is None:
             bindings = self._bindings()
         existing = bindings.get(name)
+        if existing is None:
+            name = self._continued(name, ty)
+            existing = bindings.get(name)
         line = getattr(node, 'lineno', 0)
         series = series or name in self._frames[-1].declared_series
         decl = node_id(node)
@@ -822,13 +845,67 @@ class _Inference:
             existing.qual = max(existing.qual, qual,
                                 max(self._conds[existing.depth:], default=CONST))
         before = existing.ty
-        joined = self._joined(before, ty, node, f'`{name}`')
+        joined = self._joined(before, ty, node, f'`{_plain_name(name)}`')
         existing.ty = joined
         if joined == UNKNOWN and existing.unknown is None:
             existing.unknown = self._shape_unknown(before, ty, node) or unknown \
-                or self._unknown('joined-branches', node, name)
+                or self._unknown('joined-branches', node, _plain_name(name))
         self._note_na_store(bindings, name, ty, node)
         self._settle_na_stores(bindings, name, joined)
+
+    def _canonical(self, key: str) -> str:
+        """
+        The key a segment's binding is kept under, once its first store decided it.
+
+        :param key: The binding key of a name node (``_key``)
+        :return: The key of the binding it continues, or the key itself
+        """
+        if SEGMENT_SEP not in key:
+            return key
+        # A segment key is spelled per function, and only that function's own
+        # frame ever asks for it: no nested scope reaches a name that splits
+        return self._frames[-1].continued.get(key, key)
+
+    def _continued_key(self, name: str) -> str:
+        """
+        The key a store finds the variable it may continue under.
+
+        :param name: The key about to be stored
+        :return: The key itself once it is bound or decided, else the nearest
+                 bound segment it replaced
+        """
+        frame = self._frames[-1]
+        key: str | None = self._canonical(name)
+        while key is not None and key not in frame.names:
+            parent = frame.segment_parents.get(key)
+            key = None if parent is None else self._canonical(parent)
+        return name if key is None else key
+
+    def _continued(self, name: str, ty: str) -> str:
+        """
+        The key a segment's first store binds under: its own, or the one it continues.
+
+        A segment opens at every store that reads nothing of the name, and most
+        of those are Pine's ``:=`` on a variable declared above: ``x = 1`` and,
+        further down, ``x = 2.5`` are one variable, and it is a float from the
+        start. So a segment takes the binding of the one it replaced, and the
+        two are joined the way any reassignment is. Only a store whose type
+        CONFLICTS with that binding proves a second variable -- Pine has no
+        variable holding both -- and gets a binding of its own. The first
+        segment of a block replaces nothing: it is another block's variable.
+
+        :param name: The key being bound for the first time
+        :param ty: The type stored
+        :return: The key to bind under
+        """
+        frame = self._frames[-1]
+        if name not in frame.segment_parents:
+            return name
+        found = self._continued_key(name)
+        if found == name or _conflicting(frame.names[found].ty, ty):
+            return name
+        frame.continued[name] = found
+        return found
 
     def _frame_of(self, bindings: dict[str, Binding]) -> _Frame | None:
         """The live frame whose names these are, if it is one of the walk's."""
@@ -1500,7 +1577,7 @@ class _Inference:
                 if isinstance(target, (ast.Tuple, ast.List)):
                     ty = self._leading(target, ty, stmt.value)
                 if isinstance(target, ast.Name):
-                    found = self._lookup(target.id)
+                    found = self._lookup(self._continued_key(self._key(target)))
                     if found is not None:
                         ty = self._declared_constructor(found.ty, stmt.value, ty)
                 qual = self._qual(stmt.value)
@@ -1510,7 +1587,7 @@ class _Inference:
                             and isinstance(stmt.value, ast.Call):
                         func = stmt.value.func
                         what = func.id if isinstance(func, ast.Name) else 'pine_loop'
-                        self._frames[-1].loop_counters[target.id] = \
+                        self._frames[-1].loop_counters[self._key(target)] = \
                             self._loop_bound(stmt.value, what, stmt.value.args, None)
             case ast.AnnAssign():
                 declared: str | None = annotation_type(stmt.annotation, self._classes)
@@ -1923,7 +2000,8 @@ class _Inference:
         self._frames = env + [_Frame(key, declared_global=facts.declared_global,
                                      declared_nonlocal=facts.declared_nonlocal,
                                      local_names=facts.bound - facts.declared_global
-                                     - facts.declared_nonlocal)]
+                                     - facts.declared_nonlocal,
+                                     segment_parents=self._segments(node))]
         self._contexts.append(cid)
         self._pin_sink.append(result.pins)
         self._pending.append([])
@@ -2089,6 +2167,27 @@ class _Inference:
             self._free[nid] = free
         return free
 
+    def _segments(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, str]:
+        """
+        Split one definition's locals into segments, once.
+
+        :param node: The definition about to be analysed
+        :return: Segment key -> the key of the segment it may continue
+        """
+        cached = self._segments_memo.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        keys, parents = _Segments(
+            node, lambda scope: _scope_free(scope, self._scope_free_memo, self._scope_facts)[0]
+        ).result()
+        self._segment_keys.update(keys)
+        self._segments_memo[id(node)] = (node, parents)
+        return parents
+
+    def _key(self, node: ast.Name) -> str:
+        """The key a name node's binding is kept under."""
+        return self._segment_keys.get(id(node), node.id)
+
     def _scope_facts(self, node: _Scope) -> _ScopeFacts:
         """
         What one scope's own statements bind, declare and read, computed once.
@@ -2244,7 +2343,7 @@ class _Inference:
             self._stamp(target, ty)
             if ty == UNKNOWN and unknown is None:
                 unknown = self._unknown('unknown-value', source)
-            self._bind(target.id, ty, source, unknown, series, qual, persistent)
+            self._bind(self._key(target), ty, source, unknown, series, qual, persistent)
         elif isinstance(target, (ast.Tuple, ast.List)):
             self._stamp(target, ty if is_tuple(ty) else OBJECT)
             self._distribute(target, ty, source, qual)
@@ -2363,14 +2462,14 @@ class _Inference:
     def _target_qual(self, target: ast.expr) -> int:
         """Current qualifier of an augmented-assignment target."""
         if isinstance(target, ast.Name):
-            found = self._lookup(target.id)
+            found = self._lookup(self._key(target))
             return found.qual if found is not None else SERIES
         return SERIES
 
     def _target_type(self, target: ast.expr) -> str:
         """Current type of an augmented-assignment target."""
         if isinstance(target, ast.Name):
-            found = self._lookup(target.id)
+            found = self._lookup(self._key(target))
             return found.ty if found is not None else UNKNOWN
         if isinstance(target, ast.Attribute):
             # ``point.price += x`` reads the field before it writes it
@@ -2567,7 +2666,7 @@ class _Inference:
         """The qualifier of a bare name read, resolved the way ``_e_name`` types it."""
         if node.id == _DYN_DEFAULT:
             return CONST
-        found = self._lookup(node.id)
+        found = self._lookup(self._key(node))
         if found is not None:
             found.min_read = min(found.min_read, found.qual)
             return found.qual
@@ -2600,7 +2699,7 @@ class _Inference:
         nid = node_id(node)
         if nid is not None and nid in self._call_q:
             return self._call_q[nid]
-        if isinstance(node.func, ast.Name) and self._lookup(node.func.id) is None:
+        if isinstance(node.func, ast.Name) and self._lookup(self._key(node.func)) is None:
             builtin = builtin_call_qualifier(node.func.id, arguments)
             if builtin is not None:
                 return builtin
@@ -2647,7 +2746,7 @@ class _Inference:
             # parameter holds nothing yet, and the prologue that tests for it
             # assigns the real default -- typeless, so that assignment decides
             return TYPELESS
-        found = self._lookup(node.id)
+        found = self._lookup(self._key(node))
         if found is not None:
             return found.ty
         entry = lib_types().get(node.id)
@@ -2692,7 +2791,7 @@ class _Inference:
         :param node: The expression to test
         :return: True when it resolves to a type
         """
-        if isinstance(node, ast.Name) and self._lookup(node.id) is not None:
+        if isinstance(node, ast.Name) and self._lookup(self._key(node)) is not None:
             return False
         return annotation_type(node, self._classes) != UNKNOWN
 
@@ -2873,7 +2972,7 @@ class _Inference:
         if not isinstance(receiver, ast.Name):
             return None
         for frame in reversed(self._frames):
-            found = frame.loop_counters.get(receiver.id)
+            found = frame.loop_counters.get(self._key(receiver))
             if found is not None:
                 return found
         return None
@@ -2946,9 +3045,10 @@ class _Inference:
         counter = self._loop_counter(func.value)
         if counter is not None and isinstance(func.value, ast.Name):
             joined = self._loop_bound(node, what, node.args, counter)
+            key = self._key(func.value)
             for frame in reversed(self._frames):
-                if func.value.id in frame.loop_counters:
-                    frame.loop_counters[func.value.id] = joined
+                if key in frame.loop_counters:
+                    frame.loop_counters[key] = joined
                     break
 
     def _is_reference(self, node: ast.expr) -> bool:
@@ -2969,7 +3069,7 @@ class _Inference:
         if not isinstance(node, ast.Name):
             return False
         return node.id in self._imports or node.id in self._shadowed \
-            or self._lookup(node.id) is None
+            or self._lookup(self._key(node)) is None
 
     def _node_diag(self, code: Code, args: tuple[str, ...], node: ast.AST, reason: str,
                    detail: str, fix: str = '') -> None:
@@ -3113,7 +3213,7 @@ class _Inference:
         :return: True for a series
         """
         if isinstance(node, ast.Name):
-            found = self._lookup(node.id)
+            found = self._lookup(self._key(node))
             if found is not None:
                 return found.series or node.id in self._frames[-1].declared_series
             return node.id in lib_types()
@@ -4010,7 +4110,7 @@ class _Inference:
         if self._pins_suppressed is None:
             self._pins_suppressed = self._diag_at(where) or self.table.diags[-1]
         if isinstance(receiver, ast.Name):
-            found = self._lookup(receiver.id)
+            found = self._lookup(self._key(receiver))
             if found is not None and found.ty != UNKNOWN:
                 found.ty = UNKNOWN
                 found.unknown = unknown
@@ -6569,6 +6669,295 @@ def _scope_free(node: _Scope, memo: dict[int, tuple[_Scope, frozenset[str], froz
     answer = frozenset(free), frozenset(module_free)
     memo[id(node)] = (node, *answer)
     return answer
+
+
+#: Separator between a local's name and its segment number in a binding key. No
+#: identifier holds it, so a key never collides with a name a script spells
+SEGMENT_SEP: Final = '@'
+
+#: Expression nodes that open a scope of their own without being a ``_Scope``
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _plain_name(key: str) -> str:
+    """The name a binding key is spelled with in the source."""
+    return key.partition(SEGMENT_SEP)[0]
+
+
+@dataclass(slots=True)
+class _SegmentedName:
+    """What the scan knows about one local name."""
+    #: The block whose own statement opened the segment that is open now, None
+    #: when none is
+    block: int | None = None
+    #: Number of the open segment
+    current: int = -1
+    #: Every occurrence with the number of the segment it belongs to
+    nodes: list[tuple[ast.Name, int]] = field(default_factory=list)
+    #: Segment number -> the segment it replaced in its block, None for the
+    #: first one a block opens
+    parents: list[int | None] = field(default_factory=list)
+
+
+class _Segments:
+    """
+    Split the locals of one function into the variables they spell.
+
+    Pine scopes a variable to its block, Python to its function, so two blocks
+    that each declare an ``l`` -- a line in one, a label in the other -- reach
+    the type pass as ONE name. Joining their types reports a conflict the
+    program does not have. A segment is the stretch one such variable lives in:
+    it opens at a statement of a block that stores the name without reading it
+    (``x = value``, ``x: T = value``, the target of a ``for``), and runs to the
+    next such statement of the SAME block or to the block's end. Whatever a
+    nested block stores belongs to the segment open around it: a branch that
+    assigns leaves the variable holding either value, so it is one variable.
+
+    No value flows between two segments, which is what makes the split hold for
+    a hand-written body as well: every occurrence stands in the block of its
+    segment, after the store that opened it, and that store reads nothing of
+    the name. A name with an occurrence no segment is open for keeps the one
+    binding it has always had -- and so does every name a nested scope reaches,
+    a parameter, a ``var`` or series declaration, and anything a ``try``, a
+    ``match``, a ``del``, an import or a ``global`` touches.
+
+    :param node: The definition to scan
+    :param free_of: The names a nested scope reads from outside itself
+    """
+
+    def __init__(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
+                 free_of: Callable[[_Scope], frozenset[str]]):
+        self._free_of = free_of
+        self._excluded: set[str] = set()
+        self._names: dict[str, _SegmentedName] = {}
+        self._blocks = 0
+        #: Block -> the names whose open segment it opened
+        self._opened: dict[int, list[str]] = {}
+        args = node.args
+        self._excluded.update(arg.arg for arg in args.posonlyargs + args.args + args.kwonlyargs)
+        self._excluded.update(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
+        self._body(node.body)
+
+    def result(self) -> tuple[dict[int, str], dict[str, str]]:
+        """
+        The binding keys of the names that split.
+
+        :return: id(name node) -> its key, for every occurrence outside the
+                 name's first segment, and key -> the key of the segment it
+                 replaced
+        """
+        keys: dict[int, str] = {}
+        parents: dict[str, str] = {}
+        for name, found in self._names.items():
+            if name in self._excluded or len(found.parents) < 2:
+                continue
+            for node, index in found.nodes:
+                if index:
+                    keys[id(node)] = _segment_key(name, index)
+            for index, parent in enumerate(found.parents):
+                if parent is not None:
+                    parents[_segment_key(name, index)] = _segment_key(name, parent)
+        return keys, parents
+
+    def _plain(self, node: ast.Name) -> None:
+        """An occurrence that opens nothing: it belongs to the open segment."""
+        name = node.id
+        if name in self._excluded:
+            return
+        found = self._names.get(name)
+        if found is None or found.block is None:
+            self._excluded.add(name)
+            return
+        found.nodes.append((node, found.current))
+
+    def _declare(self, node: ast.Name, block: int) -> None:
+        """A store of one block's own statement that reads nothing of the name."""
+        name = node.id
+        if name in self._excluded:
+            return
+        found = self._names.setdefault(name, _SegmentedName())
+        if found.block is None:
+            self._opened.setdefault(block, []).append(name)
+            found.parents.append(None)
+        elif found.block == block:
+            found.parents.append(found.current)
+        else:
+            # A nested block storing into the variable open around it
+            found.nodes.append((node, found.current))
+            return
+        found.block = block
+        found.current = len(found.parents) - 1
+        found.nodes.append((node, found.current))
+
+    def _exclude(self, node: ast.AST) -> None:
+        """Take every name under a node out of the split."""
+        self._excluded.update(sub.id for sub in ast.walk(node) if isinstance(sub, ast.Name))
+
+    def _expr(self, node: ast.AST | None) -> None:
+        """Take the occurrences of an expression, in source order."""
+        if node is None:
+            return
+        stack: list[ast.AST] = [node]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, ast.Name):
+                self._plain(current)
+            elif isinstance(current, _SCOPE_NODES):
+                self._scope(current)
+            elif isinstance(current, _COMPREHENSIONS):
+                self._exclude(current)
+            else:
+                stack.extend(reversed(list(ast_walk.iter_child_nodes(current))))
+
+    def _scope(self, node: _Scope) -> None:
+        """A nested scope: what it reaches from here is not split."""
+        for header in _scope_header(node):
+            self._exclude(header)
+        self._excluded.update(self._free_of(node))
+        if not isinstance(node, ast.Lambda):
+            self._excluded.add(node.name)
+
+    def _store(self, target: ast.expr, value: ast.expr, block: int) -> None:
+        """
+        Take an assignment target after its value.
+
+        :param target: The target expression
+        :param value: The value stored, already taken
+        :param block: The block a segment of the target opens in
+        """
+        names = _target_names(target)
+        if names is None:
+            self._expr(target)
+            return
+        read = {sub.id for sub in ast.walk(value) if isinstance(sub, ast.Name)}
+        seen: set[str] = set()
+        for name in names:
+            if name.id in read or name.id in seen:
+                self._plain(name)
+            else:
+                self._declare(name, block)
+            seen.add(name.id)
+
+    def _block(self, stmts: list[ast.stmt], block: int) -> None:
+        """Scan one statement list, and close the segments it opened."""
+        for stmt in stmts:
+            self._stmt(stmt, block)
+        for name in self._opened.pop(block, ()):
+            self._names[name].block = None
+
+    def _new_block(self) -> int:
+        self._blocks += 1
+        return self._blocks
+
+    def _body(self, stmts: list[ast.stmt]) -> None:
+        self._block(stmts, self._new_block())
+
+    def _stmt(self, stmt: ast.stmt, block: int) -> None:
+        match stmt:
+            case ast.Assign():
+                self._expr(stmt.value)
+                if len(stmt.targets) == 1:
+                    self._store(stmt.targets[0], stmt.value, block)
+                else:
+                    for target in stmt.targets:
+                        self._expr(target)
+            case ast.AnnAssign():
+                self._expr(stmt.annotation)
+                self._expr(stmt.value)
+                if stmt.value is None or not isinstance(stmt.target, ast.Name) \
+                        or _spells_persistent(stmt.annotation) or _spells_series(stmt.annotation):
+                    self._exclude(stmt.target)
+                else:
+                    self._store(stmt.target, stmt.value, block)
+            case ast.For() | ast.AsyncFor():
+                self._expr(stmt.iter)
+                body = self._new_block()
+                self._store(stmt.target, stmt.iter, body)
+                self._block(stmt.body, body)
+                self._body(stmt.orelse)
+            case ast.While():
+                self._expr(stmt.test)
+                self._body(stmt.body)
+                self._body(stmt.orelse)
+            case ast.If():
+                self._expr(stmt.test)
+                self._body(stmt.body)
+                self._body(stmt.orelse)
+            case ast.With() | ast.AsyncWith():
+                for item in stmt.items:
+                    self._expr(item.context_expr)
+                    self._expr(item.optional_vars)
+                self._body(stmt.body)
+            case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.ClassDef():
+                self._scope(stmt)
+            case ast.Import() | ast.ImportFrom():
+                self._excluded.update((alias.asname or alias.name).split('.')[0]
+                                      for alias in stmt.names)
+            case ast.Global() | ast.Nonlocal():
+                self._excluded.update(stmt.names)
+            case _ if isinstance(stmt, ast.Delete) or next(_statement_lists(stmt), None) is not None:
+                # A ``try``, a ``match``, a ``del``: nothing under it is split
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.Name):
+                        self._excluded.add(sub.id)
+                    elif isinstance(sub, _SCOPE_NODES):
+                        self._scope(sub)
+                    elif isinstance(sub, ast.ExceptHandler) and sub.name is not None:
+                        self._excluded.add(sub.name)
+                    elif isinstance(sub, (ast.MatchAs, ast.MatchStar)) and sub.name is not None:
+                        self._excluded.add(sub.name)
+                    elif isinstance(sub, ast.MatchMapping) and sub.rest is not None:
+                        self._excluded.add(sub.rest)
+            case _:
+                for child in ast_walk.iter_child_nodes(stmt):
+                    self._expr(child)
+
+
+def _segment_key(name: str, index: int) -> str:
+    """
+    The key one segment of a name is bound under.
+
+    :param name: The name as the source spells it
+    :param index: The segment's number, 0 for the first
+    :return: The name itself for the first segment, a numbered key for the rest
+    """
+    return name if index == 0 else f'{name}{SEGMENT_SEP}{index + 1}'
+
+
+def _target_names(target: ast.expr) -> list[ast.Name] | None:
+    """
+    The names an assignment target binds, when names are all it binds.
+
+    :param target: The target expression
+    :return: Its names in source order, or None when it stores anywhere else
+    """
+    if isinstance(target, ast.Name):
+        return [target]
+    if not isinstance(target, (ast.Tuple, ast.List)):
+        return None
+    names: list[ast.Name] = []
+    for element in target.elts:
+        inner = _target_names(element)
+        if inner is None:
+            return None
+        names.extend(inner)
+    return names
+
+
+def _conflicting(left: str, right: str) -> bool:
+    """
+    Whether two types are ones no single variable holds: what ``_joined`` reports.
+
+    :param left: One type
+    :param right: The other
+    :return: True when joining them is a conflict
+    """
+    if is_tuple(left) and is_tuple(right) and len(elements_of(left)) == len(elements_of(right)):
+        return any(_conflicting(item, other)
+                   for item, other in zip(elements_of(left), elements_of(right)))
+    if shape_conflict(left, right) is not None:
+        return True
+    return join(left, right) == UNKNOWN and left not in _UNCHECKED and right not in _UNCHECKED
 
 
 def _scope_header(node: _Scope) -> list[ast.expr]:

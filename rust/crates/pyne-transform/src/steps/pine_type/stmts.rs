@@ -42,8 +42,8 @@ impl Engine<'_, '_> {
                     ty = self.leading(targets[0], ty, value);
                 }
                 if targets.len() == 1
-                    && let Kind::Name { id, .. } = self.kind(targets[0])
-                    && let Some(found) = self.lookup(id)
+                    && let Kind::Name { .. } = self.kind(targets[0])
+                    && let Some(found) = self.lookup(&self.continued_key(&self.key(targets[0])))
                 {
                     let declared = found.ty.clone();
                     ty = self.declared_constructor(&declared, value, &ty)?;
@@ -52,9 +52,10 @@ impl Engine<'_, '_> {
                 for &target in &targets {
                     self.store(target, &ty, value, false, None, qual, false)?;
                     if ty == PINE_LOOP
-                        && let Kind::Name { id, .. } = self.kind(target).clone()
+                        && let Kind::Name { .. } = self.kind(target)
                         && let Kind::Call { func, args, .. } = self.kind(value).clone()
                     {
+                        let id = self.key(target);
                         let what = match self.kind(func) {
                             Kind::Name { id, .. } => id.clone(),
                             _ => "pine_loop".to_string(),
@@ -304,7 +305,8 @@ impl Engine<'_, '_> {
         persistent: bool,
     ) -> R<()> {
         match self.kind(target).clone() {
-            Kind::Name { id, .. } => {
+            Kind::Name { .. } => {
+                let id = self.key(target);
                 self.stamp(target, ty);
                 let unknown = match unknown {
                     None if ty == UNKNOWN => Some(self.unknown("unknown-value", source, "")),
@@ -468,7 +470,7 @@ impl Engine<'_, '_> {
     /// Current qualifier of an augmented-assignment target (`_target_qual`).
     fn target_qual(&self, target: NodeId) -> u8 {
         match self.kind(target) {
-            Kind::Name { id, .. } => self.lookup(id).map_or(SERIES, |found| found.qual),
+            Kind::Name { .. } => self.lookup(&self.key(target)).map_or(SERIES, |found| found.qual),
             _ => SERIES,
         }
     }
@@ -476,7 +478,8 @@ impl Engine<'_, '_> {
     /// Current type of an augmented-assignment target (`_target_type`).
     fn target_type(&mut self, target: NodeId) -> R<String> {
         match self.kind(target).clone() {
-            Kind::Name { id, .. } => {
+            Kind::Name { .. } => {
+                let id = self.key(target);
                 Ok(self.lookup(&id).map_or(UNKNOWN.to_string(), |found| found.ty.clone()))
             }
             Kind::Attribute { .. } => self.e_attribute(target),

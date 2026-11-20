@@ -8,6 +8,7 @@ use pyne_ast::walk::child_statements;
 use pyne_ast::{Kind, NodeId, Unsupported};
 
 use super::facts::{self, arg_parts, every_param, spells_series};
+use super::segments::Segments;
 use super::{Anchor, Engine, Frame, R};
 use crate::pine_qualifier::{CONST, NOT_READ, SERIES};
 use crate::pine_type_rules::{TYPELESS, UNKNOWN, VOID, join, overload_result, param_defaults};
@@ -205,6 +206,7 @@ impl Engine<'_, '_> {
                 })
                 .cloned()
                 .collect(),
+            segment_parents: self.segments(node),
             ..Frame::default()
         };
         let outer = std::mem::replace(&mut self.stack, env);
@@ -368,6 +370,41 @@ impl Engine<'_, '_> {
             self.free.insert(nid, free.clone());
         }
         free
+    }
+
+    /// Split one definition's locals into segments, once (`_segments`): segment key ->
+    /// the key of the segment it may continue.
+    fn segments(&mut self, node: NodeId) -> Rc<HashMap<String, String>> {
+        if let Some(found) = self.segments_memo.get(&node) {
+            return found.clone();
+        }
+        let body = facts::def_body(self.ast, node).to_vec();
+        let scopes = Segments::new(self.ast, node, &body).scopes;
+        let mut free: Vec<facts::FreeNames> = Vec::new();
+        let mut memo = std::mem::take(&mut self.scope_free_memo);
+        {
+            let ast: &pyne_ast::Ast = self.ast;
+            let facts_memo = &mut self.facts_memo;
+            let mut facts_of = |scope: NodeId| -> Rc<facts::ScopeFacts> {
+                facts_memo
+                    .entry(scope)
+                    .or_insert_with(|| Rc::new(facts::scope_facts(ast, scope)))
+                    .clone()
+            };
+            for scope in scopes {
+                free.push(facts::scope_free(ast, scope, &mut memo, &mut facts_of));
+            }
+        }
+        self.scope_free_memo = memo;
+        let mut scan = Segments::new(self.ast, node, &body);
+        for (lexical, _) in &free {
+            scan.exclude(lexical.iter());
+        }
+        let (keys, parents) = scan.result();
+        self.segment_keys.extend(keys);
+        let parents = Rc::new(parents);
+        self.segments_memo.insert(node, parents.clone());
+        parents
     }
 
     /// What one scope's own statements bind, declare and read, computed once
