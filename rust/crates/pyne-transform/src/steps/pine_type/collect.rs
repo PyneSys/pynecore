@@ -301,16 +301,20 @@ impl Engine<'_, '_> {
     }
 
     /// The classes this module declares and still holds, by name (`_own_class_nodes`).
-    fn own_class_nodes(&self, tree: NodeId) -> IndexMap<String, NodeId> {
+    fn own_class_nodes(&mut self, tree: NodeId) -> IndexMap<String, NodeId> {
         // A library export's signature shim is typing scaffolding, no class
         let protocols = self.imported_as(tree, "typing", "Protocol");
         let mut declared: IndexMap<String, Vec<NodeId>> = IndexMap::new();
         for node in walk_statements(self.ast, tree) {
-            if let Kind::ClassDef { name, bases, .. } = self.kind(node)
-                && !bases.iter().any(
-                    |&base| matches!(self.kind(base), Kind::Name { id, .. } if protocols.contains(id)),
-                )
-            {
+            let Kind::ClassDef { name, bases, .. } = self.kind(node) else { continue };
+            let shim = bases.iter().any(
+                |&base| matches!(self.kind(base), Kind::Name { id, .. } if protocols.contains(id)),
+            );
+            if shim {
+                // Nothing in a shim is a value of the program: a parameter that
+                // is required after a defaulted one stands there as `= ...`
+                self.uninstantiated.insert(node);
+            } else {
                 declared.entry(name.clone()).or_default().push(node);
             }
         }

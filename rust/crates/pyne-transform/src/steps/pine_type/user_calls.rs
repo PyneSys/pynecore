@@ -16,8 +16,8 @@ use crate::pine_qualifier::SERIES;
 use crate::pine_type_rules::ImplSig;
 use crate::pine_type_rules::{
     NUMERIC, OBJECT, PINE_LOOP, TYPELESS, UNKNOWN, array_of, builtin_call_type, class_of,
-    elements_of, impl_sig, join, namespace_of, object_ty, overload_result, param_defaults, pin_for,
-    render_ty, tuple_of,
+    elements_of, impl_sig, is_map, join, namespace_of, object_ty, overload_result, param_defaults,
+    pin_for, render_ty, tuple_of,
 };
 use crate::pine_type_table::{CallSite, ClassSig, ExportSig};
 
@@ -67,6 +67,13 @@ impl Engine<'_, '_> {
             }
             if let Some(invoked) = self.method_of(node)? {
                 return Ok(invoked);
+            }
+            if let Some(pairs) = facts::map_items(self.ast, node)
+                && is_map(&self.ty_of(pairs))
+            {
+                // What a `for [key, value] in map` iterates; the loop types its
+                // two halves from the map (`_store_iteration`)
+                return Ok(OBJECT.to_string());
             }
             if let Some(imported) = self.imported_call(node, &name)? {
                 return Ok(imported);

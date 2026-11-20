@@ -150,6 +150,8 @@ struct Engine<'a, 'h> {
     walked: HashSet<i64>,
     /// The definitions no walk ever enters (`_uninstantiated_def`).
     uninstantiated: HashSet<NodeId>,
+    /// The nodes every walk typed, with types that have no join (`_restamped`).
+    varying: HashSet<NodeId>,
     context_stack: Vec<i64>,
     next_context: i64,
     in_progress: HashSet<(String, Vec<String>, Option<i64>)>,
@@ -250,6 +252,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             rebound: HashMap::new(),
             walked: HashSet::new(),
             uninstantiated: HashSet::new(),
+            varying: HashSet::new(),
             context_stack: vec![0],
             next_context: 1,
             in_progress: HashSet::new(),
@@ -740,7 +743,19 @@ impl<'a, 'h> Engine<'a, 'h> {
 
     fn join_stamp(&mut self, node: NodeId, ty: &str) {
         let stamped = match self.ast.extra(node, TY_ATTR) {
-            Some(Value::Str(existing)) => join(existing, ty),
+            Some(Value::Str(existing)) => {
+                let joined = join(existing, ty);
+                // `_restamped`: two walks whose types have no join leave a node
+                // that is typed in every instance, which one stamp cannot spell
+                if joined == UNKNOWN {
+                    if ty == UNKNOWN {
+                        self.varying.remove(&node);
+                    } else if existing != UNKNOWN {
+                        self.varying.insert(node);
+                    }
+                }
+                joined
+            }
             _ => ty.to_string(),
         };
         set_ty(self.ast, node, &stamped);

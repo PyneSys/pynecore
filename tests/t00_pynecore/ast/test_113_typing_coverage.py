@@ -847,3 +847,71 @@ def __test_a_nested_function_splits_its_own_locals__(tmp_path: Path):
         'def inner():\n    v = "a"\n    w = v + "x"\n    v = 2\n    return v + 1\ninner()')
     assert not codes
     assert types == {'v': STR, 'w': STR}
+
+
+# --- a body typed differently per call site, scaffolding, a loop over a map ---
+
+@pytest.mark.parametrize('body', [
+    # A scalar of another type at each call site
+    'def pick(value, other):\n    return other if lib.bar_index > 0 else value\n'
+    'a = pick(1, 2)\nb = pick("x", "y")',
+    # A container of another element type at each call site
+    'def push(values, value):\n    lib.array.remove(values, 0)\n'
+    '    return lib.array.unshift(values, value)\n'
+    'push(lib.array.new_int(1, 0), 1)\npush(lib.array.new_float(1, 0.0), 1.5)',
+])
+def __test_a_body_typed_differently_per_call_site_is_typed__(tmp_path: Path, body: str):
+    """Pine instantiates a function per call: what one stamp cannot spell is still no gap"""
+    _, codes = _main_types(tmp_path, body)
+    assert not codes
+
+
+def __test_a_value_one_call_site_leaves_untyped_is_still_reported__():
+    """A call site passing a value of no known type is a gap, whatever the others pass"""
+    table = infer_module(ast.parse(
+        'def main(untyped):\n    def pick(value):\n        return value\n'
+        '    a = pick(1)\n    b = pick("x")\n    c = pick(untyped)\n'), 'test')
+    # The read inside the helper, and the argument that brought the gap
+    assert [(diag.code, diag.line) for diag in table.diags] == [('E0012', 3), ('E0012', 6)]
+
+
+SHIM_WITH_A_REQUIRED_TAIL = '''"""
+@pyne edge
+"""
+from pynecore.core.pine_export import Exported, export
+from pynecore.lib import script
+from typing import Protocol, Any
+
+
+__all__ = ['scaled']
+
+
+class _ProtocolScaled(Protocol):
+    def __call__(self, factor: int = 2, length: int = ...) -> Any: ...
+
+
+scaled: _ProtocolScaled = Exported()
+
+
+@script.library('probe')
+def main():
+    @export
+    def scaled(factor: int = 2, length: int = 1):
+        return length * factor
+'''
+
+
+def __test_an_export_shim_holds_no_value__():
+    """A parameter required after a defaulted one stands in the shim as ``= ...``"""
+    table = infer_module(ast.parse(SHIM_WITH_A_REQUIRED_TAIL), 'test')
+    assert not [diag.code for diag in table.diags]
+
+
+def __test_a_loop_over_a_map_types_the_key_and_the_value__(tmp_path: Path):
+    """``for [key, value] in m`` compiles to ``for key, value in m.items()``"""
+    types, codes = _main_types(
+        tmp_path,
+        'm: dict[str, float] = lib.map.new()\n'
+        'for key, value in m.items():\n    w = key + "x"\n    lib.math.abs(value)')
+    assert not codes
+    assert (types['key'], types['value']) == (STR, FLOAT)

@@ -79,26 +79,32 @@ _FIXES: dict[str, str] = {
 
 
 def unknown_diags(tree: ast.Module, table: PineTypeTable,
-                  uninstantiated: Container[int] = frozenset()) -> list[Diag]:
+                  uninstantiated: Container[int] = frozenset(),
+                  varying: Container[int] = frozenset()) -> list[Diag]:
     """
     One diagnostic per root cause of an UNKNOWN value in the module.
 
     :param tree: The analysed, type-stamped module
     :param table: Its type table, for the provenance of the names
     :param uninstantiated: ``id()`` of the definitions the inference left
-                           untyped because nothing calls them; their bodies
-                           hold no value of the program
+                           untyped because nothing calls them, and of the
+                           export signature shims; their bodies hold no value
+                           of the program
+    :param varying: ``id()`` of the nodes every context typed, with types
+                    that have no join; such a node is typed, per instance
     :return: The diagnostics, in source order of the roots
     """
-    return _Report(tree, table, uninstantiated).run()
+    return _Report(tree, table, uninstantiated, varying).run()
 
 
 class _Report:
     """One pass over one stamped module."""
 
-    def __init__(self, tree: ast.Module, table: PineTypeTable, uninstantiated: Container[int]):
+    def __init__(self, tree: ast.Module, table: PineTypeTable, uninstantiated: Container[int],
+                 varying: Container[int]):
         self.tree = tree
         self.uninstantiated = uninstantiated
+        self.varying = varying
         self.factory = FactoryFields(tree)
         self.table = table
         self.parent_of: dict[int, ast.AST] = {}
@@ -170,7 +176,7 @@ class _Report:
             position += 1
             cls = type(node)
             if isinstance(node, ast.expr):
-                if getattr(node, TY_ATTR, UNKNOWN) == UNKNOWN:
+                if getattr(node, TY_ATTR, UNKNOWN) == UNKNOWN and id(node) not in self.varying:
                     parent_of[id(node)] = parent
                     untyped.append((depth, position, node))
                 if isinstance(node, ast.Name):
@@ -184,8 +190,10 @@ class _Report:
                 scope = self._mark(node, scope)
             depth += 1
             if id(node) in self.uninstantiated:
-                # Only the defaults are values: they belong to the enclosing scope
-                push((node.args, node, scope, depth))
+                # Only a function's defaults are values: they belong to the
+                # enclosing scope. A signature shim holds none at all
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    push((node.args, node, scope, depth))
                 continue
             # Reversed, so the children come off the stack in source order
             for name in reversed(node._fields):
@@ -296,8 +304,12 @@ class _Report:
             # An argument of the transforms' own call is theirs, not the user's
             if node is not parent.func and _is_plumbing(parent):
                 return False
-            return node is parent.func or get_ty(parent) != UNKNOWN
-        return not (isinstance(parent, ast.expr) and get_ty(parent) == UNKNOWN)
+            return node is parent.func or not self._untyped(parent)
+        return not (isinstance(parent, ast.expr) and self._untyped(parent))
+
+    def _untyped(self, node: ast.AST) -> bool:
+        """Whether no walk found a type for a node (a varying node has one per instance)."""
+        return get_ty(node) == UNKNOWN and id(node) not in self.varying
 
     # --- the root of a cascade -------------------------------------------
 
@@ -312,7 +324,7 @@ class _Report:
         expression that has a position.
         """
         below = [child for child in self._value_children(node)
-                 if get_ty(child) == UNKNOWN and not _is_plumbing(child)
+                 if self._untyped(child) and not _is_plumbing(child)
                  and getattr(child, 'lineno', 0) and id(child) not in self.skip]
         if not below:
             return [node]
@@ -370,7 +382,7 @@ class _Report:
         if origin.reason != 'unknown-value':
             return None
         for candidate in self._positions().get((origin.line, origin.col), ()):
-            if get_ty(candidate) == UNKNOWN and id(candidate) not in self.skip:
+            if self._untyped(candidate) and id(candidate) not in self.skip:
                 return candidate
         return None
 

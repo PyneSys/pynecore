@@ -490,8 +490,12 @@ class _Inference:
         self._rebound: dict[str, set[str]] = {}
         #: Def node ids that already have at least one context
         self._walked: set[int] = set()
-        #: ``id()`` of the definitions no walk ever enters, see ``_uninstantiated_def``
+        #: ``id()`` of the definitions no walk ever enters, see ``_uninstantiated_def``,
+        #: and of the export signature shims, see ``_own_class_nodes``
         self._uninstantiated: set[int] = set()
+        #: ``id()`` of the nodes every walk typed, with types that have no join,
+        #: see ``_restamped``
+        self._varying: set[int] = set()
         #: Context ids, innermost last; 0 is the module body itself
         self._contexts: list[int] = [0]
         self._next_context = 1
@@ -1083,8 +1087,31 @@ class _Inference:
         if nid is not None:
             self._ty[nid] = ty
         existing = getattr(node, TY_ATTR, None)
-        set_ty(node, ty if existing is None else join(existing, ty))
+        set_ty(node, ty if existing is None else self._restamped(node, existing, ty))
         return ty
+
+    def _restamped(self, node: ast.AST, existing: str, ty: str) -> str:
+        """
+        The stamp of a node an earlier walk already typed.
+
+        Two walks that each found a type the other's does not join with leave
+        the stamp without one, and the node is recorded as varying: a helper's
+        parameter given an int array at one call site and a float array at
+        another is typed in every instance, which a single stamp cannot spell.
+        A walk that found no type at all takes the node out again.
+
+        :param node: The node being typed
+        :param existing: Its stamp so far
+        :param ty: Its type in the running context
+        :return: The new stamp
+        """
+        joined = join(existing, ty)
+        if joined == UNKNOWN:
+            if ty == UNKNOWN:
+                self._varying.discard(id(node))
+            elif existing != UNKNOWN:
+                self._varying.add(id(node))
+        return joined
 
     # --- entry point -----------------------------------------------------
 
@@ -1124,7 +1151,8 @@ class _Inference:
         self._report_unhandled_widens()
         # Where the types ran out, once per cause: the coverage meter of a
         # hand-written script, the first error of an edge module
-        self.table.diags.extend(unknown_diags(tree, self.table, self._uninstantiated))
+        self.table.diags.extend(unknown_diags(
+            tree, self.table, self._uninstantiated, self._varying))
         # The implementations are only final once every body has been walked:
         # an unannotated return only gets its type from the walk. Published
         # here so a consumer -- the module interface, and through it another
@@ -1410,9 +1438,13 @@ class _Inference:
         protocols = _imported_as(tree, 'typing', 'Protocol')
         declared: dict[str, list[ast.ClassDef]] = {}
         for node in ast_walk.walk_statements(tree):
-            if isinstance(node, ast.ClassDef) \
-                    and not any(isinstance(base, ast.Name) and base.id in protocols
-                                for base in node.bases):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if any(isinstance(base, ast.Name) and base.id in protocols for base in node.bases):
+                # Nothing in a shim is a value of the program: a parameter that
+                # is required after a defaulted one stands there as ``= ...``
+                self._uninstantiated.add(id(node))
+            else:
                 declared.setdefault(node.name, []).append(node)
         out: dict[str, ast.ClassDef] = {}
         for name, nodes in declared.items():
@@ -2509,7 +2541,9 @@ class _Inference:
 
         ``for [i, x] in arr`` compiles to ``for i, x in enumerate(arr)``, whose
         two halves are typed apart: the index is an int and the value is the
-        array's element. Storing the pair as one opaque tuple lost both.
+        array's element. Storing the pair as one opaque tuple lost both. Over a
+        map the same loop compiles to ``for key, value in m.items()``, and the
+        halves are the map's key and value.
 
         :param stmt: The loop statement
         :param iter_ty: Type of the expression being iterated
@@ -2522,6 +2556,14 @@ class _Inference:
             self._stamp(target, OBJECT)
             self._store(target.elts[0], INT, stmt, qual=self._qual(stmt.iter))
             self._store(target.elts[1], element, stmt, qual=self._qual(stmt.iter))
+            return
+        pairs = _map_items(stmt.iter)
+        if isinstance(target, (ast.Tuple, ast.List)) and pairs is not None \
+                and len(target.elts) == 2 and is_map(self._ty_of(pairs)):
+            mapped = self._ty_of(pairs)
+            self._stamp(target, OBJECT)
+            self._store(target.elts[0], key_of(mapped), stmt, qual=self._qual(stmt.iter))
+            self._store(target.elts[1], value_of(mapped), stmt, qual=self._qual(stmt.iter))
             return
         self._store(target, self._element_type(stmt.iter, iter_ty), stmt,
                     qual=self._qual(stmt.iter))
@@ -2552,7 +2594,7 @@ class _Inference:
             self._q[nid] = self._expr_qual(node)
             self._ty[nid] = ty
         existing = getattr(node, TY_ATTR, None)
-        setattr(node, TY_ATTR, ty if existing is None else join(existing, ty))
+        setattr(node, TY_ATTR, ty if existing is None else self._restamped(node, existing, ty))
         return ty
 
     # --- qualifiers --------------------------------------------------------
@@ -4245,6 +4287,11 @@ class _Inference:
             invoked = self._method_of(node)
             if invoked is not None:
                 return invoked
+            pairs = _map_items(node)
+            if pairs is not None and is_map(self._ty_of(pairs)):
+                # What a ``for [key, value] in map`` iterates; the loop types
+                # its two halves from the map (``_store_iteration``)
+                return OBJECT
             imported = self._imported_call(node, name)
             if imported is not None:
                 return imported
@@ -7633,6 +7680,22 @@ def _per_context(call: ast.Call) -> bool:
     """Whether a call site's answer differs between the contexts reaching it."""
     return get_pins(call) is not None or get_series_lens(call) is not None \
         or get_widens(call) is not None
+
+
+def _map_items(node: ast.expr) -> ast.expr | None:
+    """
+    What an ``x.items()`` call iterates, when the expression is one.
+
+    ``for [key, value] in m`` over a map is the Pine spelling PyneComp emits as
+    ``for key, value in m.items()``, and the key and value types live on ``m``.
+
+    :param node: The expression being iterated
+    :return: The receiver of the call, or None
+    """
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
+        return None
+    func = node.func
+    return func.value if isinstance(func, ast.Attribute) and func.attr == 'items' else None
 
 
 def _enumerated(node: ast.expr) -> ast.expr | None:

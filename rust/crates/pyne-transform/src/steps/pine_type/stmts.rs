@@ -5,13 +5,13 @@ use pyne_ast::walk::children;
 use pyne_ast::{Kind, NodeId};
 
 use super::facts::{
-    self, enumerated, is_export_proxy, spells_persistent, spells_series, unchecked,
+    self, enumerated, is_export_proxy, map_items, spells_persistent, spells_series, unchecked,
 };
 use super::{Engine, Frame, R};
 use crate::pine_qualifier::{CONST, SERIES};
 use crate::pine_type_rules::{
     FLOAT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, UNKNOWN, array_of, bare_wrapper, class_of,
-    element_of, elements_of, is_matrix, is_tuple, render_ty, tuple_of,
+    element_of, elements_of, is_map, is_matrix, is_tuple, key_of, render_ty, tuple_of, value_of,
 };
 use crate::pine_type_table::{Unknown, qualify};
 use crate::steps::security_default::is_requested;
@@ -531,6 +531,17 @@ impl Engine<'_, '_> {
             let qual = self.qual(iter);
             self.store(second, &element, stmt, false, None, qual, false)?;
             return Ok(());
+        }
+        if let (Some((first, second)), Some(pairs)) = (pair, map_items(self.ast, iter)) {
+            let mapped = self.ty_of(pairs);
+            if is_map(&mapped) {
+                self.stamp(target, OBJECT);
+                let qual = self.qual(iter);
+                self.store(first, key_of(&mapped), stmt, false, None, qual, false)?;
+                let qual = self.qual(iter);
+                self.store(second, value_of(&mapped), stmt, false, None, qual, false)?;
+                return Ok(());
+            }
         }
         let element = self.element_type(iter, iter_ty);
         let qual = self.qual(iter);

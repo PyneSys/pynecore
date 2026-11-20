@@ -418,6 +418,18 @@ pub fn is_method(ast: &Ast, node: NodeId) -> bool {
     decorated(ast, node, "method")
 }
 
+/// What an `x.items()` call iterates: the receiver (`_map_items`).
+pub fn map_items(ast: &Ast, node: NodeId) -> Option<NodeId> {
+    let (func, args, keywords) = call_parts(ast, node)?;
+    if !args.is_empty() || !keywords.is_empty() {
+        return None;
+    }
+    match ast.kind(func) {
+        Kind::Attribute { value, attr, .. } if attr == "items" => Some(*value),
+        _ => None,
+    }
+}
+
 /// What an `enumerate(x)` call iterates (`_enumerated`).
 pub fn enumerated(ast: &Ast, node: NodeId) -> Option<NodeId> {
     let (func, args, _) = call_parts(ast, node)?;

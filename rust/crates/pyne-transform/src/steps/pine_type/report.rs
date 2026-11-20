@@ -159,7 +159,7 @@ impl<'e> Report<'e, '_, '_> {
         while let Some((node, parent, mut scope, mut depth)) = stack.pop() {
             position += 1;
             if is_expr(ast, node) {
-                if untyped(ast, node) {
+                if untyped(ast, node) && !self.engine.varying.contains(&node) {
                     self.parent_of.insert(node, parent);
                     self.untyped.push((depth, position, node));
                 }
@@ -315,9 +315,15 @@ impl<'e> Report<'e, '_, '_> {
             if node != *func && is_plumbing(ast, parent) {
                 return false;
             }
-            return node == *func || get_ty(ast, parent) != UNKNOWN;
+            return node == *func || !self.lost(parent);
         }
-        !(is_expr(ast, parent) && get_ty(ast, parent) == UNKNOWN)
+        !(is_expr(ast, parent) && self.lost(parent))
+    }
+
+    /// Whether no walk found a type for a node (`_untyped`): a varying node has
+    /// one per instance.
+    fn lost(&self, node: NodeId) -> bool {
+        get_ty(self.ast(), node) == UNKNOWN && !self.engine.varying.contains(&node)
     }
 
     /// Descend through unknown children to the expressions that started it (`_roots`).
@@ -327,7 +333,7 @@ impl<'e> Report<'e, '_, '_> {
             .value_children(node)
             .into_iter()
             .filter(|&child| {
-                get_ty(ast, child) == UNKNOWN
+                self.lost(child)
                     && !is_plumbing(ast, child)
                     && self.line(child) != 0
                     && !self.skip.contains(&child)
@@ -411,10 +417,9 @@ impl<'e> Report<'e, '_, '_> {
         }
         let candidates =
             self.positions().get(&(origin.line, origin.col)).cloned().unwrap_or_default();
-        let ast = self.ast();
         candidates
             .into_iter()
-            .find(|&candidate| get_ty(ast, candidate) == UNKNOWN && !self.skip.contains(&candidate))
+            .find(|&candidate| self.lost(candidate) && !self.skip.contains(&candidate))
     }
 
     fn report(&mut self, node: NodeId) -> R<()> {
