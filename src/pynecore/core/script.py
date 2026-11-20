@@ -375,7 +375,7 @@ class Script:
             if 'value' not in arg_data:
                 continue
             _old_input_values[arg_name] = arg_data['value']
-            _old_input_values[arg_name + '__global__'] = arg_data['value']  # For strict mode
+            _old_input_values[arg_name + '__global__'] = arg_data['value']  # A renamed input
 
     #
     # decorators
@@ -428,9 +428,9 @@ class Script:
             setattr(func, 'script', self)
 
             if is_runnable:
-                # The inputs are only known once the defaults of main() have run. Strict
-                # compilation suffixes the input ids with ``__global__``; an override is
-                # keyed by the plain name, the way the toml spells it.
+                # The inputs are only known once the defaults of main() have run. The
+                # compiler suffixes an input id it moves aside with ``__global__``; an
+                # override is keyed by the plain name, the way the toml spells it.
                 input_names = {key.removesuffix('__global__') for key in self.inputs}
                 unknown = input_overrides - input_names - self.inputs.keys()
                 if unknown:

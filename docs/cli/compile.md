@@ -2,7 +2,7 @@
 ---
 weight: 304
 title: "Compiling Pine Scripts"
-description: "Convert Pine Script files to Pyne code with the pyne compile command and PyneSys API. Configure your API key, output path, strict checks and compilation options."
+description: "Convert Pine Script files to Pyne code with the pyne compile command and PyneSys API. Configure your API key, output path and compilation options."
 icon: "code"
 date: "2025-08-03"
 lastmod: "2026-09-26"
@@ -76,14 +76,13 @@ pyne compile my_strategy.pine --output ./compiled/my_strategy.py
 
 ### Compilation Options
 
-- `--strict`, `-s`: Enable strict compilation mode with enhanced error checking
 - `--force`, `-f`: Force recompilation even if output file is up-to-date
 - `--api-key`, `-a`: PyneSys API key (overrides configuration file)
 
 Example:
 ```bash
-# Compile with strict mode and force recompilation
-pyne compile my_strategy.pine --strict --force
+# Force recompilation
+pyne compile my_strategy.pine --force
 ```
 
 ### Usage Statistics
@@ -134,13 +133,6 @@ pyne compile my_strategy.pine
 ```bash
 # Compile with API key provided via command line
 pyne compile my_strategy.pine --api-key "your-api-key"
-```
-
-### Strict Mode Compilation
-
-```bash
-# Compile with enhanced error checking
-pyne compile my_strategy.pine --strict
 ```
 
 ### Force Recompilation

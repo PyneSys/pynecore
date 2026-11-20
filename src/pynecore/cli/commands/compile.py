@@ -101,8 +101,8 @@ def compile(
             help="Output Python file path (defaults to same name with .py extension)"
         ),
         strict: bool = typer.Option(
-            False, "--strict", '-s',
-            help="Enable strict compilation mode with enhanced error checking"
+            False, "--strict", '-s', hidden=True,
+            help="No effect; accepted so existing command lines keep working"
         ),
         force: bool = typer.Option(
             False, "--force", "-f",
@@ -130,6 +130,7 @@ def compile(
 
     If no script is provided, will print usage statistics and exit.
     """
+    del strict
 
     # Read api.toml configuration
     api_config = {}
@@ -185,7 +186,7 @@ def compile(
             task = progress.add_task("Compiling Pine Script...", total=1)
 
             # Compile the .pine file to .py
-            out_path = compiler.compile(script, out_path, force=force, strict=strict)
+            out_path = compiler.compile(script, out_path, force=force)
 
             progress.update(task, completed=1)
 

@@ -35,12 +35,13 @@ class PyneComp:
         :param pine_path: Path to the .pine file
         :param output_path: Optional output path (defaults to .py extension)
         :param force: Force recompilation even if file hasn't changed
-        :param strict: Enable strict compilation mode
+        :param strict: No effect; accepted so existing callers keep working
         :return: Path to the compiled .py file
         :raises FileNotFoundError: If pine file doesn't exist
         :raises CompilationError: If compilation fails
         :raises APIError: If API request fails
         """
+        del strict
         # Validate input file
         if not pine_path.exists():
             raise FileNotFoundError(f"Pine file not found: {pine_path}")
@@ -65,8 +66,7 @@ class PyneComp:
 
         # Compile via API
         try:
-            response = self.api_client.compile_script(script_content, strict=strict,
-                                                      sourcemap=True)
+            response = self.api_client.compile_script(script_content, sourcemap=True)
 
             if not response.success:
                 raise CompilationError(
@@ -80,7 +80,7 @@ class PyneComp:
             resolved_output.parent.mkdir(parents=True, exist_ok=True)
             with open(resolved_output, 'w', encoding='utf-8') as f:
                 f.write(response.compiled_code)
-            self.write_sourcemap(resolved_output, response, script_content, strict)
+            self.write_sourcemap(resolved_output, response, script_content)
 
             # No need to update tracking info with mtime approach
             return resolved_output
@@ -105,8 +105,7 @@ class PyneComp:
         return self.api_client.verify_token_local()
 
     @staticmethod
-    def write_sourcemap(output_path: Path, response: CompileResponse, pine: str,
-                        strict: bool) -> None:
+    def write_sourcemap(output_path: Path, response: CompileResponse, pine: str) -> None:
         """
         Write the compile's sourcemap beside the output as ``<output>.map``, in the form
         PyneIDE writes it: stamped with the hashes of the Python code and the Pine source, so a
@@ -116,7 +115,6 @@ class PyneComp:
         :param output_path: The compiled ``.py`` file
         :param response: The successful compile response
         :param pine: The Pine Script source
-        :param strict: Whether the compile was strict
         """
         map_path = output_path.with_name(output_path.name + '.map')
         if response.sourcemap is None:
@@ -126,7 +124,6 @@ class PyneComp:
         # The file as written, which on Windows has the platform's line endings
         stored['py_sha256'] = hashlib.sha256(output_path.read_bytes()).hexdigest()
         stored['pine_sha256'] = hashlib.sha256(pine.encode('utf-8')).hexdigest()
-        stored['strict'] = strict
         pine_version = stored.get('pine_version')
         if isinstance(pine_version, int) and pine_version < 6:
             # The mappings point at the lines of the v6 script the compiler converted it to

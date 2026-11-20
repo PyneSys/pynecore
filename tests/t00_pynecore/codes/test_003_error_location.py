@@ -181,15 +181,15 @@ def __test_a_compile_writes_its_sourcemap_stamped__(tmp_path: Path):
     py.write_text('code\n', encoding='utf-8')
     response = CompileResponse(success=True, compiled_code='code\n', sourcemap={
         'version': 1, 'pine_version': 5, 'mappings': [[1, 2]]})
-    PyneComp.write_sourcemap(py, response, '//@version=5\n', strict=True)
+    PyneComp.write_sourcemap(py, response, '//@version=5\n')
     stored = json.loads((tmp_path / 'script.py.map').read_text(encoding='utf-8'))
     assert stored == {
-        'version': 1, 'pine_version': 5, 'mappings': [[1, 2]], 'strict': True,
+        'version': 1, 'pine_version': 5, 'mappings': [[1, 2]],
         'py_sha256': hashlib.sha256(b'code\n').hexdigest(),
         'pine_sha256': hashlib.sha256(b'//@version=5\n').hexdigest(),
         'converted_source': True,
     }
-    PyneComp.write_sourcemap(py, CompileResponse(success=True, compiled_code='code\n'), '', False)
+    PyneComp.write_sourcemap(py, CompileResponse(success=True, compiled_code='code\n'), '')
     assert not (tmp_path / 'script.py.map').exists()
 
 

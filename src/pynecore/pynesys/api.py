@@ -378,7 +378,7 @@ class APIClient:
         Compile Pine Script to Python via API.
 
         :param script: Pine Script code to compile
-        :param strict: Whether to use strict compilation mode
+        :param strict: No effect; accepted so existing callers keep working
         :param sourcemap: Also ask for the line-level sourcemap; a server that does not know
                           the flag answers with the code alone, and the response has none
         :return: CompileResponse with compiled code or error details
@@ -388,11 +388,11 @@ class APIClient:
         :raises NetworkError: If network request fails
         :raises APIError: For other API errors
         """
+        del strict
         try:
             # Prepare form data
             data = {
                 "script": script,
-                "strict": str(strict).lower()
             }
             if sourcemap:
                 data["sourcemap"] = "true"
