@@ -1164,6 +1164,17 @@ impl Engine<'_, '_> {
         shapes: Option<&[String]>,
         kw_shapes: Option<&IndexMap<String, String>>,
     ) -> Option<ImplSig> {
+        self.choice_at(impls, pin, shapes, kw_shapes).map(|index| impls[index].clone())
+    }
+
+    /// [`Self::choice`] as the index of the selected implementation in `impls`.
+    pub(super) fn choice_at(
+        &self,
+        impls: &[ImplSig],
+        pin: Option<&str>,
+        shapes: Option<&[String]>,
+        kw_shapes: Option<&IndexMap<String, String>>,
+    ) -> Option<usize> {
         let (shapes, kw_shapes) = (shapes?, kw_shapes?);
         let any = |chars: String| chars.replace(FLOAT, &PIN_ANY.to_string());
         if !kw_shapes.is_empty() {
@@ -1180,13 +1191,12 @@ impl Engine<'_, '_> {
                 .collect();
             let kw_types: Vec<(String, String)> =
                 kw_shapes.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect();
-            return overload_binding(impls, &chars, shapes, &kw_chars, &kw_types)
-                .map(|index| impls[index].clone());
+            return overload_binding(impls, &chars, shapes, &kw_chars, &kw_types);
         }
         let chars = match pin {
             Some(pin) => pin.to_string(),
             None => any(pin_chars(shapes)),
         };
-        overload_choice(impls, &chars, shapes).map(|index| impls[index].clone())
+        overload_choice(impls, &chars, shapes)
     }
 }

@@ -502,6 +502,10 @@ class _Inference:
         #: (function id, parameter tuple, def node id) whose analysis has not
         #: returned yet
         self._in_progress: set[tuple[str, tuple[str, ...], int | None]] = set()
+        #: How many of the walks in progress were started for implementations a
+        #: group call may not reach (``_ensure_group``); under one, a call that
+        #: selects an implementation in progress is not known to be a recursion
+        self._unsure_walks = 0
         #: Def node id -> the enclosing-scope names its body reads, computed
         #: once per definition: the lexically resolved ones and the ones a
         #: ``global`` declaration sends straight to the module scope
@@ -4363,8 +4367,8 @@ class _Inference:
             # A group is per-signature already; the pin is what selects among
             # its implementations, so there is no context to instantiate --
             # but a call no implementation takes is an error before any pin
-            self._ensure_group(key, frame)
-            if not self._group_call_fits(key, name, node):
+            if not self._ensure_group(key, frame, name, node) \
+                    or not self._group_call_fits(key, name, node):
                 self.table.calls.append(CallSite(
                     callee=name, line=_line(node), col=_col(node),
                     argc=_call_arity(node), ty=UNKNOWN, pin=None))
@@ -4768,8 +4772,8 @@ class _Inference:
             # binds the group with it (``core/pine_method``). Without it the
             # method spelling would select from the VALUES, and take the float
             # implementation for an int-typed fractional argument
-            self._ensure_group(key, frame)
-            if not self._group_call_fits(key, name, node, args):
+            if not self._ensure_group(key, frame, spelled, node, args) \
+                    or not self._group_call_fits(key, name, node, args):
                 self._record_pin(node, None)
                 return UNKNOWN
             shapes = self._shapes(args)
@@ -5052,7 +5056,7 @@ class _Inference:
         :return: The type the call evaluates to
         """
         if key in self._overload_groups:
-            self._ensure_group(key, frame)
+            self._ensure_group(key, frame, name, node, args, by_name=True)
             if not self._group_call_fits(key, name, node, args):
                 return UNKNOWN
             receiver = self._ty_of(args[0]) if args else UNKNOWN
@@ -5306,20 +5310,88 @@ class _Inference:
             return OBJECT
         return tuple_of(elements[:width.value])
 
-    def _ensure_group(self, key: str, frame: int) -> None:
+    def _ensure_group(self, key: str, frame: int, name: str, node: ast.Call,
+                      args: Sequence[ast.expr] | None = None, by_name: bool = False) -> bool:
         """
-        Walk any implementation of a group the call got ahead of.
+        Walk the implementations of a group a call can reach that no walk has typed yet.
 
-        Its defaults are typed first, in the scope they belong to: the selection
-        checks them against the parameters a call omits (``impl_sig``), and the
-        walk that types them where the definition stands has not reached it.
+        The defaults of every such implementation are typed first, in the scope
+        they belong to: the selection checks them against the parameters a call
+        omits (``impl_sig``), and the walk that types them where the definition
+        stands has not reached it.
+
+        Only the implementations the call can run are walked. Where the static
+        selection settles one for the call (``_choice``, under the pin the site
+        justifies), that one alone is; a call by name, which the runtime selects
+        from the values, reaches every implementation that can take its
+        receiver (``_takes_receiver``); and a call the selection leaves open
+        reaches them all. An implementation the call cannot run has nothing to
+        tell it, and walking it from here puts the group in a cycle the script
+        does not have: a body of it that calls back into the implementation
+        being walked would read that one's return before it is known, and the
+        UNKNOWN would stay in what the body is typed with.
+
+        An implementation the selection settles on that is being walked already
+        is the one the call is made from, directly or through the functions it
+        calls: a recursion, which is reported the way ``_call_context`` reports
+        one. That holds only where every walk in progress is one the script
+        makes: under a walk of an implementation the call that started it may
+        not reach (the last two cases above), the cycle may run through a call
+        that never selects it, and the call is left to read the return as it
+        stands.
+
+        :param key: Scope-qualified id of the group
+        :param frame: Index of the frame whose scope declares the group
+        :param name: The callee as written, for the report
+        :param node: The call node
+        :param args: The positional arguments, when they are not the node's
+                     own (a method call binds the receiver first)
+        :param by_name: Whether the call found the group by its name, which
+                        the runtime selects from the values without a pin
+        :return: False when the call is a recursion, reported here
         """
         parents = self._frames[:frame + 1]
-        for impl in self._defs.get(key, ()):
-            nid = node_id(impl)
-            if nid is None or nid not in self._walked:
-                self._type_defaults(impl, parents)
+        pending = [impl for impl in self._defs.get(key, ())
+                   if node_id(impl) is None or node_id(impl) not in self._walked]
+        if not pending:
+            return True
+        for impl in pending:
+            self._type_defaults(impl, parents)
+        positional = node.args if args is None else args
+        group = self._group_impls(key)
+        reached = pending
+        unsure = True
+        if by_name:
+            receiver = self._ty_of(positional[0]) if positional else UNKNOWN
+            sigs = {id(impl): sig for impl, sig in group}
+            reached = [impl for impl in pending
+                       if id(impl) not in sigs or _takes_receiver(sigs[id(impl)], receiver)]
+        else:
+            shapes = self._shapes(positional)
+            pin = None if shapes is None or node.keywords else pin_for(shapes)
+            choice = self._choice([sig for _, sig in group], pin, shapes,
+                                  self._keyword_shapes(node.keywords))
+            chosen = next((impl for impl, sig in group if sig is choice), None)
+            if chosen is not None:
+                if not any(impl is chosen for impl in pending):
+                    return True
+                if (key, self._declared_params(chosen), node_id(chosen)) in self._in_progress:
+                    if self._unsure_walks:
+                        return True
+                    self._diag(TYPE_RECURSION, (name,), node,
+                               self._unknown('recursion', node, key))
+                    return False
+                reached = [chosen]
+                unsure = False
+        if unsure:
+            self._unsure_walks += 1
+        try:
+            for impl in reached:
                 self._analyse(key, impl, self._declared_params(impl), parents)
+        finally:
+            if unsure:
+                self._unsure_walks -= 1
+        return True
 
     def _group_type(self, key: str, pin: str | None, args: Sequence[ast.expr],
                     keywords: Sequence[ast.keyword]) -> str:
@@ -5448,14 +5520,28 @@ class _Inference:
         :param key: Scope-qualified id of the group
         :return: One entry per implementation, in declaration order
         """
+        return [sig for _, sig in self._group_impls(key)]
+
+    def _group_impls(
+            self, key: str) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ImplSig]]:
+        """
+        Every implementation of a user group the static selection reads, with its definition.
+
+        The implementations are the ones ``_impl_sigs`` reads, each paired with
+        the definition it was measured from, so a selected shape can be traced
+        back to the body that runs for it.
+
+        :param key: Scope-qualified id of the group
+        :return: (definition, shape) per implementation, in declaration order
+        """
         returns = self._group_returns.get(key, [])
-        out: list[ImplSig] = []
+        out: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ImplSig]] = []
         for impl in self._defs.get(key, ()):
             if any(default is None for default in impl.args.kw_defaults):
                 continue
             slot = self._group_slot.get(node_id(impl) or -1)
             ret = returns[slot] if slot is not None and slot < len(returns) else UNKNOWN
-            out.append(impl_sig(impl, ret, self._ty_of, self._classes))
+            out.append((impl, impl_sig(impl, ret, self._ty_of, self._classes)))
         return out
 
     def _call_context(self, key: str, node: ast.Call, frame: int,

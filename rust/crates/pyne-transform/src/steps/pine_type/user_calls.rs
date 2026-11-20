@@ -127,19 +127,19 @@ impl Engine<'_, '_> {
         }
         let is_group = self.overload_groups.contains(&key);
         let argc = call_arity(self.ast, node);
-        if is_group {
-            self.ensure_group(&key, frame)?;
-            if !self.group_call_fits(&key, &name, node, None)? {
-                self.calls.push(CallSite {
-                    callee: name,
-                    line,
-                    col,
-                    argc,
-                    ty: UNKNOWN.to_string(),
-                    pin: None,
-                });
-                return Ok(UNKNOWN.to_string());
-            }
+        if is_group
+            && (!self.ensure_group(&key, frame, &name, node, None, false)?
+                || !self.group_call_fits(&key, &name, node, None)?)
+        {
+            self.calls.push(CallSite {
+                callee: name,
+                line,
+                col,
+                argc,
+                ty: UNKNOWN.to_string(),
+                pin: None,
+            });
+            return Ok(UNKNOWN.to_string());
         }
         let pin = self.pin(node, is_group)?;
         let ty = if is_group {
@@ -450,8 +450,9 @@ impl Engine<'_, '_> {
             return Ok(Some(UNKNOWN.to_string()));
         }
         if self.overload_groups.contains(&key) {
-            self.ensure_group(&key, frame)?;
-            if !self.group_call_fits(&key, &name, node, Some(&args))? {
+            if !self.ensure_group(&key, frame, &spelled, node, Some(&args), false)?
+                || !self.group_call_fits(&key, &name, node, Some(&args))?
+            {
                 self.record_pin(node, None, true)?;
                 return Ok(Some(UNKNOWN.to_string()));
             }
@@ -693,7 +694,7 @@ impl Engine<'_, '_> {
         args: &[NodeId],
     ) -> R<String> {
         if self.overload_groups.contains(key) {
-            self.ensure_group(key, frame)?;
+            self.ensure_group(key, frame, name, node, Some(args), true)?;
             if !self.group_call_fits(key, name, node, Some(args))? {
                 return Ok(UNKNOWN.to_string());
             }
@@ -834,18 +835,87 @@ impl Engine<'_, '_> {
         self.dotted(default).as_deref() == Some("lib._na_none")
     }
 
-    /// Walk any implementation of a group the call got ahead of (`_ensure_group`).
-    fn ensure_group(&mut self, key: &str, frame: usize) -> R<()> {
+    /// Walk the implementations of a group a call can reach that no walk has typed
+    /// yet (`_ensure_group`): the one the static selection settles on, the ones that
+    /// take the receiver of a call by name, or all of them where the selection leaves
+    /// the call open. False when the call is a recursion, reported here.
+    fn ensure_group(
+        &mut self,
+        key: &str,
+        frame: usize,
+        name: &str,
+        node: NodeId,
+        args: Option<&[NodeId]>,
+        by_name: bool,
+    ) -> R<bool> {
         let parents: Vec<usize> = self.stack[..=frame].to_vec();
-        for imp in self.defs.get(key).cloned().unwrap_or_default() {
-            let walked = self.nid(imp).is_some_and(|nid| self.walked.contains(&nid));
-            if !walked {
-                self.type_defaults(imp, Some(parents.clone()))?;
+        let pending: Vec<NodeId> = self
+            .defs
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|&imp| !self.nid(imp).is_some_and(|nid| self.walked.contains(&nid)))
+            .collect();
+        if pending.is_empty() {
+            return Ok(true);
+        }
+        for &imp in &pending {
+            self.type_defaults(imp, Some(parents.clone()))?;
+        }
+        let (_, own_args, keywords) = facts::call_parts(self.ast, node).expect("a call");
+        let positional: Vec<NodeId> = args.unwrap_or(own_args).to_vec();
+        let keywords = keywords.to_vec();
+        let (defs, sigs): (Vec<NodeId>, Vec<ImplSig>) = self.group_impls(key)?.into_iter().unzip();
+        let mut reached = pending.clone();
+        let mut unsure = true;
+        if by_name {
+            let receiver = positional.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
+            reached.retain(|imp| match defs.iter().position(|known| known == imp) {
+                None => true,
+                Some(at) => takes_receiver(&sigs[at], &receiver),
+            });
+        } else {
+            let shapes = self.shapes(&positional);
+            let pin = match &shapes {
+                Some(shapes) if keywords.is_empty() => pin_for(shapes),
+                _ => None,
+            };
+            let kw_shapes = self.keyword_shapes(&keywords);
+            if let Some(at) =
+                self.choice_at(&sigs, pin.as_deref(), shapes.as_deref(), kw_shapes.as_ref())
+            {
+                let chosen = defs[at];
+                if !pending.contains(&chosen) {
+                    return Ok(true);
+                }
+                let guard = (key.to_string(), self.declared_params(chosen)?, self.nid(chosen));
+                if self.in_progress.contains(&guard) {
+                    if self.unsure_walks > 0 {
+                        return Ok(true);
+                    }
+                    let origin = self.unknown("recursion", node, key);
+                    self.diag(&pynecore_codes::TYPE_RECURSION, &[name], node, Some(origin), "");
+                    return Ok(false);
+                }
+                reached = vec![chosen];
+                unsure = false;
+            }
+        }
+        if unsure {
+            self.unsure_walks += 1;
+        }
+        let walked = (|| {
+            for imp in reached {
                 let params = self.declared_params(imp)?;
                 self.analyse(key, imp, params, Some(parents.clone()), None, None)?;
             }
+            Ok(())
+        })();
+        if unsure {
+            self.unsure_walks -= 1;
         }
-        Ok(())
+        walked.map(|()| true)
     }
 
     /// Type of a call to a user overload group (`_group_type`).
@@ -899,6 +969,12 @@ impl Engine<'_, '_> {
     /// Every implementation of a user group, as the static selection reads it
     /// (`_impl_sigs`).
     pub(super) fn impl_sigs(&mut self, key: &str) -> R<Vec<ImplSig>> {
+        Ok(self.group_impls(key)?.into_iter().map(|(_, sig)| sig).collect())
+    }
+
+    /// Every implementation of a user group the static selection reads, with its
+    /// definition (`_group_impls`).
+    fn group_impls(&mut self, key: &str) -> R<Vec<(NodeId, ImplSig)>> {
         let returns = self.group_returns.get(key).cloned().unwrap_or_default();
         let mut out = Vec::new();
         for imp in self.defs.get(key).cloned().unwrap_or_default() {
@@ -913,13 +989,10 @@ impl Engine<'_, '_> {
                 Some(slot) if slot < returns.len() => returns[slot].clone(),
                 _ => UNKNOWN.to_string(),
             };
-            out.push(impl_sig(
-                self.ast,
+            out.push((
                 imp,
-                &ret,
-                &|value| self.ty_of(value),
-                &self.classes_lookup,
-            )?);
+                impl_sig(self.ast, imp, &ret, &|value| self.ty_of(value), &self.classes_lookup)?,
+            ));
         }
         Ok(out)
     }

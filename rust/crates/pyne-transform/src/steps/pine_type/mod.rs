@@ -155,6 +155,9 @@ struct Engine<'a, 'h> {
     context_stack: Vec<i64>,
     next_context: i64,
     in_progress: HashSet<(String, Vec<String>, Option<i64>)>,
+    /// How many of the walks in progress were started for implementations a group
+    /// call may not reach (`_unsure_walks`).
+    unsure_walks: usize,
     free: HashMap<i64, FreeLists>,
     scope_free_memo: HashMap<NodeId, facts::FreeNames>,
     facts_memo: HashMap<NodeId, Rc<ScopeFacts>>,
@@ -259,6 +262,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             context_stack: vec![0],
             next_context: 1,
             in_progress: HashSet::new(),
+            unsure_walks: 0,
             free: HashMap::new(),
             scope_free_memo: HashMap::new(),
             facts_memo: HashMap::new(),

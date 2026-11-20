@@ -224,6 +224,107 @@ def __test_a_recursive_call_is_reported__():
     assert 'recursion' in reasons
 
 
+CROSSING_GROUPS = '''
+from pynecore import lib
+from pynecore.core.overload import overload
+from pynecore.core.pine_udt import udt
+
+
+@udt
+class P:
+    a: float = lib.na
+
+
+@udt
+class Q:
+    b: int = 0
+
+
+def main():
+    @overload
+    def show(this: Q) -> str:
+        return lib.string.tostring(this.b)
+
+    @overload
+    def get(this: P, key: str):
+        return show(Q.new()) if key == 'q' else lib.string.tostring(this.a)
+
+    @overload
+    def show(this: P):
+        out: list[str] = lib.array.new_string()
+        lib.array.push(out, get(this, 'a'))
+        return lib.array.join(out, ',')
+
+    s = show(P.new(1.0))
+'''
+
+
+def __test_a_group_call_walks_only_the_implementation_it_selects__():
+    """
+    Two groups calling each other settle without a stale UNKNOWN.
+
+    ``get`` calls ``show`` with a ``Q``, which selects the implementation declared
+    before it. The ``P`` one, declared after ``get`` and calling back into it,
+    is not reached from there: walking it while ``get`` is in progress would
+    read ``get``'s return as UNKNOWN and keep the report it causes.
+    """
+    table = infer_module(ast.parse(CROSSING_GROUPS), 'test')
+    assert table.diags == []
+    assert table.bindings['main']['s'].ty == 's'
+    walks = [(result.key, result.params) for result in table.contexts.values()
+             if result.key in ('main·show', 'main·get')]
+    assert sorted(walks) == sorted(set(walks))
+    assert len(walks) == 3
+
+
+GROUP_RECURSION = '''
+from pynecore.core.overload import overload
+from pynecore.core.pine_udt import udt
+
+
+@udt
+class A:
+    v: int = 0
+
+
+@udt
+class B:
+    a: A = None
+
+
+def main():
+    @overload
+    def init(this: A) -> A:
+        this.v = 1
+        return this
+
+    @overload
+    def init(this: B) -> B:
+        this.a = init(A.new())
+        return {self_call}
+
+    @overload
+    def init(this: int) -> int:
+        return this
+
+    b = init(B.new())
+'''
+
+
+@pytest.mark.parametrize("self_call,recursive", [
+    # The B implementation selects itself
+    ('init(this)', True),
+    # ... and another implementation of the group is an ordinary call
+    ('this', False),
+])
+def __test_a_group_implementation_selecting_itself_is_reported__(self_call: str,
+                                                                 recursive: bool):
+    """A call the static selection hands to the implementation it is made from is a recursion"""
+    table = infer_module(ast.parse(GROUP_RECURSION.format(self_call=self_call)), 'test')
+    reasons = [diag.origin.reason for diag in table.diags if diag.origin is not None]
+    assert reasons == (['recursion'] if recursive else [])
+
+
 def __test_a_loop_body_with_a_context_call_converges__():
     """
     A generic helper called from a loop body gets both of the loop's contexts.
