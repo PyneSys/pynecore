@@ -578,6 +578,23 @@ pub fn constant_scalar(ty: &str) -> &str {
     scalars.get(ty).map_or(ty, String::as_str)
 }
 
+/// Whether a type is a lib class that derives from `StrLiteral` (`is_str_literal`): the
+/// selector takes any string for a parameter of one, in both of its passes.
+pub fn is_str_literal(ty: &str) -> bool {
+    static LITERALS: OnceLock<HashSet<String>> = OnceLock::new();
+    if !ty.starts_with("o:") {
+        return false;
+    }
+    LITERALS
+        .get_or_init(|| {
+            crate::data::str_literals()
+                .iter()
+                .map(|name| object_ty(&builtin_class_id(name)))
+                .collect()
+        })
+        .contains(ty)
+}
+
 /// Whether two types cannot both be right where one value goes.
 pub fn shape_mismatch(left: &str, right: &str) -> bool {
     if left == right || left == UNKNOWN || left == TYPELESS || right == UNKNOWN || right == TYPELESS
@@ -1463,6 +1480,16 @@ pub const PIN_ANY: char = '*';
 /// the implementation by its position in the group's registration order.
 pub const PIN_INDEX: char = '=';
 
+/// Every pin character the runtime has a witness value for (`PIN_WITNESSED`).
+pub const PIN_WITNESSED: &str = "ifbsIFBS1234";
+
+/// Separator of the two passes of an acceptance spec (`ACCEPTS_SEP`).
+pub const ACCEPTS_SEP: char = '/';
+
+/// The acceptance spec of a parameter whose check of a witness is not known
+/// (`ACCEPTS_UNKNOWN`).
+pub const ACCEPTS_UNKNOWN: &str = "?";
+
 /// The pin that names one implementation of a group by its registration index
 /// (`indexed_pin`).
 pub fn indexed_pin<S: AsRef<str>>(arg_types: &[S], slot: i64) -> String {
@@ -1582,6 +1609,20 @@ pub fn default_fit(declared: &str, default: Option<&str>, takes_none: bool) -> c
     if head(default) == head(declared) { FIT_OMISSIBLE } else { FIT_REQUIRED }
 }
 
+/// What a parameter contributes to a call that leaves it to its default, in the
+/// widening pass (`_default_fit_wide`): an int default for a float and a float default
+/// for an int are taken there too.
+fn default_fit_wide(declared: &str, default: Option<&str>, takes_none: bool) -> char {
+    let fit = default_fit(declared, default, takes_none);
+    if fit == FIT_REQUIRED
+        && default.is_some_and(|default| is_numeric(head(default)))
+        && is_numeric(head(declared))
+    {
+        return FIT_OMISSIBLE;
+    }
+    fit
+}
+
 /// One overload implementation's shape, as the static selection reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ImplSig {
@@ -1604,6 +1645,16 @@ pub struct ImplSig {
     /// Position of the implementation in its group's registration order, the ones the
     /// static selection leaves out included; -1 where it is not known
     pub slot: i64,
+    /// How the selector checks a witness at each positional parameter where its type
+    /// does not say it: `""` reads the type, `ACCEPTS_UNKNOWN` knows nothing, otherwise
+    /// `<exact>/<widening>`; empty where no position needs one
+    pub accepts: Vec<String>,
+    /// The `fits` of the widening pass; empty where not known (`_wide_fits`)
+    pub wide_fits: String,
+    /// Whether a `**kwargs` parameter is among the ones the selector counts
+    pub kwarg: bool,
+    /// How many implementations the group registers; -1 where it is not known
+    pub size: i64,
 }
 
 /// Whether an implementation's positional parameter has no annotation (`_is_bare`).
@@ -1628,14 +1679,70 @@ pub fn overload_pick<'a, S: AsRef<str>>(
 /// The implementation a pinned call site selects, by its index in `impls`
 /// (`overload_choice`): the selector's exact pass, positional half first.
 pub fn overload_choice<S: AsRef<str>>(impls: &[ImplSig], pin: &str, shapes: &[S]) -> Option<usize> {
-    let wanted = pin_items(pin);
+    pass_choice(impls, &pin_items(pin), shapes, true).1
+}
+
+/// How one pass of the selector answers a call, positional half first (`_pass_choice`).
+fn pass_choice<S: AsRef<str>>(
+    impls: &[ImplSig],
+    wanted: &[&str],
+    shapes: &[S],
+    strict: bool,
+) -> (Verdict, Option<usize>) {
     for exact_arity in [true, false] {
         for (index, imp) in impls.iter().enumerate() {
-            match takes(imp, &wanted, exact_arity, shapes) {
+            match takes(imp, wanted, exact_arity, shapes, strict, false) {
                 Verdict::No => continue,
-                Verdict::Yes => return Some(index),
-                Verdict::Maybe => return None,
+                Verdict::Yes => return (Verdict::Yes, Some(index)),
+                Verdict::Maybe => return (Verdict::Maybe, None),
             }
+        }
+    }
+    (Verdict::No, None)
+}
+
+/// The implementation the runtime runs for a pin, decided statically, by its index in
+/// `impls` (`resolve_pin`): the witnesses' exact pass then widening pass, or the
+/// wildcard rule; `None` where unsure, or where `impls` are not the whole group.
+pub fn resolve_pin(impls: &[ImplSig], pin: &str) -> Option<usize> {
+    let chars = pin.split_once(PIN_INDEX).map_or(pin, |(chars, _)| chars);
+    let size = impls.len();
+    if size == 0
+        || impls
+            .iter()
+            .enumerate()
+            .any(|(slot, imp)| imp.size != size as i64 || imp.slot != slot as i64)
+        || chars.chars().any(|char| !PIN_WITNESSED.contains(char) && char != PIN_ANY)
+    {
+        return None;
+    }
+    let wanted = pin_items(chars);
+    let no_shapes: &[&str] = &[];
+    if chars.contains(PIN_ANY) {
+        for strict in [true, false] {
+            let verdicts: Vec<Verdict> = impls
+                .iter()
+                .map(|imp| takes(imp, &wanted, false, no_shapes, strict, true))
+                .collect();
+            let found: Vec<usize> = verdicts
+                .iter()
+                .enumerate()
+                .filter(|(_, verdict)| **verdict == Verdict::Yes)
+                .map(|(index, _)| index)
+                .collect();
+            if verdicts.contains(&Verdict::Maybe) || found.len() > 1 {
+                return None;
+            }
+            if let Some(&index) = found.first() {
+                return Some(index);
+            }
+        }
+        return None;
+    }
+    for strict in [true, false] {
+        let (verdict, chosen) = pass_choice(impls, &wanted, no_shapes, strict);
+        if verdict != Verdict::No {
+            return chosen;
         }
     }
     None
@@ -1654,7 +1761,7 @@ pub fn overload_candidates<S: AsRef<str>>(
     let mut found: Vec<usize> = Vec::new();
     for exact_arity in [true, false] {
         for (index, imp) in impls.iter().enumerate() {
-            let verdict = takes(imp, &wanted, exact_arity, shapes);
+            let verdict = takes(imp, &wanted, exact_arity, shapes, true, false);
             if verdict == Verdict::No {
                 continue;
             }
@@ -1677,7 +1784,7 @@ pub fn overload_candidates<S: AsRef<str>>(
 /// (`_out_of_reach`): the call's arity rules it out, or a parameter it fills takes no
 /// value of the argument's type in that pass either.
 fn out_of_reach<S: AsRef<str>>(imp: &ImplSig, wanted: &[&str], shapes: &[S]) -> bool {
-    if imp.open_ended {
+    if imp.open_ended || imp.kwarg {
         return false;
     }
     let argc = wanted.len();
@@ -1848,31 +1955,42 @@ fn shape_at<S: AsRef<str>>(shapes: &[S], index: usize) -> &str {
     shapes.get(index).map_or(UNKNOWN, AsRef::as_ref)
 }
 
-/// How one implementation answers a pin in one half of the exact pass (`_takes`).
+/// How one implementation answers a pin in one half of one pass of the selector
+/// (`_takes`).
+///
+/// :param strict: The exact pass; the widening pass otherwise
+/// :param wild: Whether a wildcard position is left out of the match (`_select_pinned`)
 fn takes<S: AsRef<str>>(
     imp: &ImplSig,
     wanted: &[&str],
     exact_arity: bool,
     shapes: &[S],
+    strict: bool,
+    wild: bool,
 ) -> Verdict {
-    if imp.open_ended {
+    if imp.open_ended || imp.kwarg {
         return Verdict::Maybe;
     }
-    let fits: Vec<char> = imp.fits.chars().collect();
+    let argc = wanted.len();
+    let fits: Vec<char> = if strict { imp.fits.chars().collect() } else { wide_fits(imp) };
     if exact_arity {
-        // The positional half counts EVERY visible parameter against the arguments
-        if fits.len() != wanted.len() || imp.params.len() != wanted.len() {
+        // The positional half counts EVERY visible parameter against the arguments, a
+        // keyword-only one included
+        if imp.fits.chars().count() != argc {
             return Verdict::No;
         }
-    } else if !(imp.required <= wanted.len() && wanted.len() <= imp.params.len()) {
+        if imp.params.len() != argc {
+            return Verdict::Maybe;
+        }
+    } else if !(imp.required <= argc && argc <= imp.params.len()) {
         return Verdict::No;
     }
     let mut verdict = Verdict::Yes;
     for (index, (declared, want)) in imp.params.iter().zip(wanted).enumerate() {
-        if is_bare(imp, index) {
+        if is_bare(imp, index) || (wild && is_pin_any(want)) {
             continue;
         }
-        let taken = takes_position(declared, want, shape_at(shapes, index));
+        let taken = position(imp, index, declared, want, shape_at(shapes, index), strict);
         if taken == Verdict::No {
             return Verdict::No;
         }
@@ -1881,7 +1999,7 @@ fn takes<S: AsRef<str>>(
     if exact_arity {
         return verdict;
     }
-    for &fit in fits.iter().skip(wanted.len()) {
+    for &fit in fits.iter().skip(argc) {
         if fit == FIT_REQUIRED {
             return Verdict::No;
         }
@@ -1890,6 +2008,76 @@ fn takes<S: AsRef<str>>(
         }
     }
     verdict
+}
+
+/// Whether a pin character is the wildcard.
+fn is_pin_any(want: &str) -> bool {
+    one_char(want) && want.starts_with(PIN_ANY)
+}
+
+/// What each parameter contributes to the widening pass when it is omitted
+/// (`_wide_fits`): the shape's own, else what the exact pass's say of it.
+fn wide_fits(imp: &ImplSig) -> Vec<char> {
+    if imp.wide_fits.chars().count() == imp.fits.chars().count() {
+        return imp.wide_fits.chars().collect();
+    }
+    imp.fits
+        .chars()
+        .enumerate()
+        .map(
+            |(index, fit)| {
+                if fit != FIT_REQUIRED || index < imp.required { fit } else { FIT_UNSURE }
+            },
+        )
+        .collect()
+}
+
+/// How one positional parameter answers one argument in one pass (`_position`).
+fn position(
+    imp: &ImplSig,
+    index: usize,
+    declared: &str,
+    want: &str,
+    given: &str,
+    strict: bool,
+) -> Verdict {
+    if is_pin_any(want) {
+        return if strict { takes_position(declared, want, given) } else { Verdict::Maybe };
+    }
+    let spec = imp.accepts.get(index).map_or("", String::as_str);
+    if spec == ACCEPTS_UNKNOWN {
+        return Verdict::Maybe;
+    }
+    if !spec.is_empty() {
+        let (exact, wide) = spec.split_once(ACCEPTS_SEP).unwrap_or((spec, ""));
+        let taken = if strict { exact } else { wide };
+        return if taken.contains(want) { Verdict::Yes } else { Verdict::No };
+    }
+    if strict { takes_position(declared, want, given) } else { widens_position(declared, want) }
+}
+
+/// How one parameter answers a witness in the widening pass, by its declared type
+/// (`_widens_position`).
+fn widens_position(declared: &str, want: &str) -> Verdict {
+    let exact = takes_position(declared, want, UNKNOWN);
+    if exact != Verdict::No {
+        return exact;
+    }
+    let Some(shaped) = pin_container_type(want) else {
+        return if is_numeric(head(declared)) && is_numeric(want) {
+            Verdict::Yes
+        } else {
+            Verdict::No
+        };
+    };
+    if (is_array(declared) && is_array(shaped)) || (is_matrix(declared) && is_matrix(shaped)) {
+        return if is_numeric(element_of(declared)) && is_numeric(element_of(shaped)) {
+            Verdict::Yes
+        } else {
+            Verdict::No
+        };
+    }
+    Verdict::No
 }
 
 /// How one parameter answers one argument of the exact pass (`_takes_position`).
@@ -1924,6 +2112,13 @@ fn takes_position(declared: &str, want: &str, given: &str) -> Verdict {
         if declared == shaped {
             return Verdict::Yes;
         }
+        if element_of(shaped) == STR
+            && is_str_literal(element_of(declared))
+            && ((is_array(declared) && is_array(shaped))
+                || (is_matrix(declared) && is_matrix(shaped)))
+        {
+            return Verdict::Yes;
+        }
         if declared == UNKNOWN
             || declared == OBJECT
             || (((is_array(declared) && is_array(shaped))
@@ -1933,6 +2128,10 @@ fn takes_position(declared: &str, want: &str, given: &str) -> Verdict {
             return Verdict::Maybe;
         }
         return Verdict::No;
+    }
+    if want == STR && is_str_literal(declared) {
+        // The selector takes any string for a ``StrLiteral`` subclass
+        return Verdict::Yes;
     }
     let declared = head(declared);
     if declared == UNKNOWN {
@@ -1985,7 +2184,7 @@ fn binds<S: AsRef<str>>(
     kw_chars: &[(String, String)],
     kw_shapes: &[(String, String)],
 ) -> Verdict {
-    if imp.open_ended {
+    if imp.open_ended || imp.kwarg {
         return Verdict::Maybe;
     }
     if wanted.len() > imp.params.len() {
@@ -1997,7 +2196,7 @@ fn binds<S: AsRef<str>>(
         if is_bare(imp, index) {
             continue;
         }
-        let taken = takes_position(declared, want, shape_at(shapes, index));
+        let taken = position(imp, index, declared, want, shape_at(shapes, index), true);
         if taken == Verdict::No {
             return Verdict::No;
         }
@@ -2022,7 +2221,7 @@ fn binds<S: AsRef<str>>(
             .find(|(known, _)| known == name)
             .map_or(UNKNOWN, |(_, shape)| shape.as_str());
         let declared = imp.params.get(index).map_or(UNKNOWN, String::as_str);
-        let taken = takes_position(declared, want, given);
+        let taken = position(imp, index, declared, want, given, true);
         if taken == Verdict::No {
             return Verdict::No;
         }
@@ -2052,6 +2251,7 @@ pub const DYN_DEFAULT: &str = "__dyn_default__";
 struct Params<'a> {
     positional: Vec<NodeId>,
     vararg: bool,
+    kwarg: bool,
     kwonly: &'a [NodeId],
     kw_defaults: &'a [Option<NodeId>],
     defaults: &'a [NodeId],
@@ -2062,7 +2262,7 @@ fn params(ast: &Ast, func: NodeId) -> Result<Params<'_>, Unsupported> {
         Kind::FunctionDef { args, .. } | Kind::AsyncFunctionDef { args, .. } => *args,
         _ => return Err(Unsupported(format!("a definition expected, not {}", ast.name(func)))),
     };
-    let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kw_defaults, defaults, .. } =
+    let Kind::Arguments { posonlyargs, args, vararg, kwonlyargs, kw_defaults, kwarg, defaults } =
         ast.kind(args)
     else {
         return Err(Unsupported("a definition without arguments".into()));
@@ -2070,6 +2270,7 @@ fn params(ast: &Ast, func: NodeId) -> Result<Params<'_>, Unsupported> {
     Ok(Params {
         positional: posonlyargs.iter().chain(args).copied().collect(),
         vararg: vararg.is_some(),
+        kwarg: kwarg.is_some(),
         kwonly: kwonlyargs,
         kw_defaults,
         defaults,
@@ -2101,15 +2302,23 @@ pub fn impl_sig(
         |name: &str| defaults.iter().find(|(known, _)| known == name).map(|&(_, default)| default);
     let mut types = Vec::with_capacity(found.positional.len());
     let mut bare = String::with_capacity(found.positional.len());
+    let mut accepts = Vec::with_capacity(found.positional.len());
     for &arg in &found.positional {
         let annotation = arg_parts(ast, arg).1;
-        types.push(annotation_type(ast, annotation, classes, enums)?);
+        let declared = annotation_type(ast, annotation, classes, enums)?;
+        accepts.push(own_accepts(ast, annotation, &declared, classes)?);
+        types.push(declared);
         bare.push(if annotation.is_none() { '1' } else { '0' });
     }
     let mut fits = String::new();
+    let mut wide_fits = String::new();
     for &arg in found.positional.iter().chain(found.kwonly) {
         let default = default_of(arg_parts(ast, arg).0);
-        fits.push(param_fit(ast, arg, default, ty_of, classes, enums)?);
+        fits.push(param_fit(ast, arg, default, ty_of, classes, enums, true)?);
+        wide_fits.push(param_fit(ast, arg, default, ty_of, classes, enums, false)?);
+    }
+    if accepts.iter().all(String::is_empty) {
+        accepts.clear();
     }
     Ok(ImplSig {
         params: types,
@@ -2120,10 +2329,16 @@ pub fn impl_sig(
         names: found.positional.iter().map(|&arg| arg_parts(ast, arg).0.to_string()).collect(),
         bare,
         slot: -1,
+        accepts,
+        wide_fits,
+        kwarg: found.kwarg,
+        size: -1,
     })
 }
 
 /// What one parameter contributes to a call that omits it (`param_fit`).
+///
+/// :param strict: The selector's exact pass; its widening pass otherwise
 pub fn param_fit(
     ast: &Ast,
     arg: NodeId,
@@ -2131,6 +2346,7 @@ pub fn param_fit(
     ty_of: &dyn Fn(NodeId) -> String,
     classes: &Classes,
     enums: &Enums,
+    strict: bool,
 ) -> Result<char, Unsupported> {
     let Some(default) = default else {
         return Ok(FIT_REQUIRED);
@@ -2140,8 +2356,210 @@ pub fn param_fit(
     };
     let declared = annotation_type(ast, Some(annotation), classes, enums)?;
     let default = default_ty(ast, default, ty_of);
+    if PINNABLE.contains(&default.as_str()) {
+        let spec = own_accepts(ast, Some(annotation), &declared, classes)?;
+        if spec == ACCEPTS_UNKNOWN {
+            return Ok(FIT_UNSURE);
+        }
+        if !spec.is_empty() {
+            let (exact, wide) = spec.split_once(ACCEPTS_SEP).unwrap_or((&spec, ""));
+            let taken = if strict { exact } else { wide };
+            return Ok(if taken.contains(default.as_str()) { FIT_OMISSIBLE } else { FIT_REQUIRED });
+        }
+    }
     let takes_none = annotation_takes_none(ast, Some(annotation))?;
-    Ok(default_fit(&declared, Some(&default), takes_none))
+    Ok(if strict {
+        default_fit(&declared, Some(&default), takes_none)
+    } else {
+        default_fit_wide(&declared, Some(&default), takes_none)
+    })
+}
+
+/// The acceptance spec `ImplSig.accepts` records for one parameter (`_own_accepts`):
+/// nothing where the declared type reads the witnesses the way the selector checks
+/// them, or where the type is not known.
+fn own_accepts(
+    ast: &Ast,
+    annotation: Option<NodeId>,
+    declared: &str,
+    classes: &Classes,
+) -> Result<String, Unsupported> {
+    let Some(annotation) = annotation else {
+        return Ok(String::new());
+    };
+    if declared == UNKNOWN {
+        return Ok(String::new());
+    }
+    let spec = annotation_accepts(ast, annotation, classes)?;
+    Ok(if derived_accepts(declared).as_deref() == Some(spec.as_str()) {
+        String::new()
+    } else {
+        spec
+    })
+}
+
+/// The acceptance spec a declared type reads as (`_derived_accepts`), `None` where it
+/// leaves a witness undecided.
+fn derived_accepts(declared: &str) -> Option<String> {
+    let mut passes = Vec::with_capacity(2);
+    for strict in [true, false] {
+        let mut taken = String::new();
+        for want in pin_items(PIN_WITNESSED) {
+            let verdict = if strict {
+                takes_position(declared, want, UNKNOWN)
+            } else {
+                widens_position(declared, want)
+            };
+            match verdict {
+                Verdict::Maybe => return None,
+                Verdict::Yes => taken.push_str(want),
+                Verdict::No => {}
+            }
+        }
+        passes.push(taken);
+    }
+    Some(passes.join(&ACCEPTS_SEP.to_string()))
+}
+
+/// Every witness character in both passes: what `Any` and `object` take.
+const EVERY_WITNESS: &str = "ifbsIFBS1234/ifbsIFBS1234";
+
+/// No witness in either pass: what a class, a map, a tuple and `None` take.
+const NO_WITNESS: &str = "/";
+
+/// The acceptance spec of an annotation name, measured (`_NAME_ACCEPTS`).
+const NAME_ACCEPTS: &[(&str, &str)] = &[
+    ("int", "i/if"),
+    ("float", "f/if"),
+    ("bool", "b/b"),
+    ("str", "s/s"),
+    ("PyneInt", "if/if"),
+    ("PyneFloat", "f/if"),
+    ("PyneBool", "b/b"),
+    ("PyneStr", "s/s"),
+    ("Any", EVERY_WITNESS),
+    ("object", EVERY_WITNESS),
+    ("StrLiteral", "s/s"),
+    ("list", "IFBS/IFBS"),
+    ("Matrix", "1234/1234"),
+    ("Color", NO_WITNESS),
+    ("NA", NO_WITNESS),
+    ("dict", NO_WITNESS),
+    ("tuple", NO_WITNESS),
+    ("set", NO_WITNESS),
+    ("NoneType", NO_WITNESS),
+];
+
+/// Annotation heads whose payload is checked as the annotation itself
+/// (`_SAME_ACCEPTS_SUBSCRIPTS`).
+const SAME_ACCEPTS_SUBSCRIPTS: &[&str] = &["Persistent", "IBPersistent", "Optional", "Series"];
+
+/// Annotation heads that take no witness whatever their payload (`_NO_WITNESS_SUBSCRIPTS`).
+const NO_WITNESS_SUBSCRIPTS: &[&str] = &["NA", "dict", "tuple", "Tuple", "set"];
+
+/// Container annotation head -> the witness character of each scalar element
+/// (`_CONTAINER_WITNESSES`).
+fn container_witnesses(name: &str) -> Option<[(char, char); 4]> {
+    match name {
+        "list" => Some([('i', 'I'), ('f', 'F'), ('b', 'B'), ('s', 'S')]),
+        "Matrix" => Some([('i', '1'), ('f', '2'), ('b', '3'), ('s', '4')]),
+        _ => None,
+    }
+}
+
+/// Which witness values a parameter annotation takes, in each pass of the selector
+/// (`annotation_accepts`): `<exact>/<widening>`, or `ACCEPTS_UNKNOWN`.
+pub fn annotation_accepts(
+    ast: &Ast,
+    node: NodeId,
+    classes: &Classes,
+) -> Result<String, Unsupported> {
+    let unknown = || Ok(ACCEPTS_UNKNOWN.to_string());
+    match ast.kind(node) {
+        Kind::Constant { value, .. } => match value {
+            Constant::None => Ok(NO_WITNESS.to_string()),
+            Constant::Str(text) => match forward_reference(text)? {
+                Some((parsed, body)) => annotation_accepts(&parsed, body, classes),
+                None => unknown(),
+            },
+            _ => unknown(),
+        },
+        &Kind::BinOp { left, op: Operator::BitOr, right } => {
+            union_accepts(ast, &[left, right], classes)
+        }
+        &Kind::Subscript { value, slice, .. } => {
+            let name = leaf_name(ast, value);
+            if name == "Union" {
+                let single = [slice];
+                return union_accepts(ast, tuple_elts(ast, slice).unwrap_or(&single), classes);
+            }
+            if SAME_ACCEPTS_SUBSCRIPTS.contains(&name) {
+                return annotation_accepts(ast, slice, classes);
+            }
+            if NO_WITNESS_SUBSCRIPTS.contains(&name) {
+                return Ok(NO_WITNESS.to_string());
+            }
+            let Some(witnesses) = container_witnesses(name) else {
+                return unknown();
+            };
+            let element = annotation_accepts(ast, slice, classes)?;
+            if element == ACCEPTS_UNKNOWN {
+                return unknown();
+            }
+            let passes: Vec<String> = element
+                .split(ACCEPTS_SEP)
+                .map(|taken| {
+                    taken
+                        .chars()
+                        .filter_map(|char| {
+                            witnesses.iter().find(|(scalar, _)| *scalar == char).map(|(_, c)| *c)
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(passes.join(&ACCEPTS_SEP.to_string()))
+        }
+        Kind::Name { .. } | Kind::Attribute { .. } => {
+            let leaf = leaf_name(ast, node);
+            let mut found = dotted(ast, node).and_then(|spelled| classes.get(&spelled).cloned());
+            if found.is_none()
+                && let Some(&(_, spec)) = NAME_ACCEPTS.iter().find(|&&(known, _)| known == leaf)
+            {
+                return Ok(spec.to_string());
+            }
+            if found.is_none() {
+                found = classes.get(leaf).cloned();
+            }
+            let ty = match found {
+                Some(found) => object_ty(&found),
+                None => match builtin_class(leaf) {
+                    Some(builtin) => builtin,
+                    None => return unknown(),
+                },
+            };
+            Ok(if is_str_literal(&ty) { "s/s".to_string() } else { NO_WITNESS.to_string() })
+        }
+        _ => unknown(),
+    }
+}
+
+/// The acceptance spec of a union: what any of its members takes (`_union_accepts`).
+fn union_accepts(ast: &Ast, members: &[NodeId], classes: &Classes) -> Result<String, Unsupported> {
+    let mut exact = String::new();
+    let mut wide = String::new();
+    for &member in members {
+        let spec = annotation_accepts(ast, member, classes)?;
+        if spec == ACCEPTS_UNKNOWN {
+            return Ok(spec);
+        }
+        let (member_exact, member_wide) = spec.split_once(ACCEPTS_SEP).unwrap_or((&spec, ""));
+        exact.push_str(member_exact);
+        wide.push_str(member_wide);
+    }
+    let order = |taken: &str| -> String {
+        PIN_WITNESSED.chars().filter(|char| taken.contains(*char)).collect()
+    };
+    Ok(format!("{}{ACCEPTS_SEP}{}", order(&exact), order(&wide)))
 }
 
 /// Type of a default expression, as the overload selector reads it (`default_ty`).

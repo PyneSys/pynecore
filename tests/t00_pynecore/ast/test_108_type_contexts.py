@@ -379,7 +379,7 @@ a = wrapper(1)
 b = wrapper(2)
 ''', 'g')
     assert len(calls) == 1
-    assert get_pin(calls[0]) == 'i'
+    assert get_pin(calls[0]) == 'i=0'
     assert get_pins(calls[0]) is None
 
 
@@ -402,7 +402,7 @@ b = wrapper(2.0)
     assert get_pin(calls[0]) is None
     pins = get_pins(calls[0])
     assert pins is not None
-    assert sorted(pins.values(), key=str) == [None, 'i']
+    assert sorted(pins.values(), key=str) == [None, 'i=0']
 
     table = infer_module(ast.parse(source), 'test')
     reasons = {diag.origin.reason for diag in table.diags if diag.origin is not None}
@@ -430,7 +430,7 @@ def main():
     b = wrapper(2.0)
 '''
     _, calls = _calls(source, 'g')
-    assert sorted(get_pins(calls[0]).values(), key=str) == [None, 'i']
+    assert sorted(get_pins(calls[0]).values(), key=str) == [None, 'i=0']
     assert not __test_helper_context_pin_reported(source)
 
 
@@ -493,7 +493,7 @@ a = wrapper(1, A())
 b = wrapper(2.0, B())
 '''
     _, calls = _calls(source, 'g')
-    assert sorted(get_pins(calls[0]).values(), key=str) == [None, 'i*']
+    assert sorted(get_pins(calls[0]).values(), key=str) == [None, 'i*=0']
     assert not __test_helper_context_pin_reported(source)
 
 
@@ -547,7 +547,7 @@ b = wrapper(2.0)
     assert get_pin(calls[0]) is None
     pins = get_pins(calls[0])
     assert pins is not None
-    assert sorted(pins.values()) == ['fi', 'ii']
+    assert sorted(pins.values()) == ['fi=0', 'ii=0']
 
 
 def _run(source: str, mod_name: str):
@@ -795,7 +795,7 @@ def main(n: int):
     return outer(n)
 '''
     _, calls = _calls(source, 'g')
-    assert get_pin(calls[0]) == 'i'
+    assert get_pin(calls[0]) == 'i=0'
 
     ns = _run(source, 'ctx_mod_global_skip')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
@@ -824,7 +824,7 @@ def main(n: int):
 '''
     tree, calls = _calls(source, 'g')
     assert get_pin(calls[0]) is None
-    assert sorted(str(pin) for pin in (get_pins(calls[0]) or {}).values()) == ['None', 'i']
+    assert sorted(str(pin) for pin in (get_pins(calls[0]) or {}).values()) == ['None', 'i=0']
 
     table = infer_module(ast.parse(source), 'test')
     assert [result.params for result in table.contexts.values()
@@ -863,7 +863,7 @@ def main(r: int):
     return take([1], r), take([1.0], r)
 '''
     _, calls = _calls(source, 'g')
-    assert [get_pin(call) for call in calls] == ['i', 'i']
+    assert [get_pin(call) for call in calls] == ['i=0', 'i=0']
 
     table = infer_module(ast.parse(source), 'test')
     assert [result.params for result in table.contexts.values()
@@ -925,7 +925,7 @@ result = g(1 / 2)
 g = other
 '''
     _, calls = _calls(source, 'g')
-    assert get_pin(calls[0]) == 'i'
+    assert get_pin(calls[0]) == 'i=0'
 
     table = infer_module(ast.parse(source), 'test')
     # The call site itself is clean; what is reported is the alias, since a
@@ -991,7 +991,7 @@ def __test_a_module_loop_completes_before_the_rebinding__(body: str, name: str):
     """
     source = REBOUND_GROUP + body
     _, calls = _calls(source, 'g')
-    assert [get_pin(call) for call in calls] == ['i'], name
+    assert [get_pin(call) for call in calls] == ['i=0'], name
 
     table = infer_module(ast.parse(source), 'test')
     assert [diag.origin.reason for diag in table.diags
@@ -1038,7 +1038,7 @@ def __test_a_rebinding_in_a_branch_the_call_cannot_share_reaches_nothing__(body:
     """
     source = REBOUND_GROUP + body
     _, calls = _calls(source, 'g')
-    assert [get_pin(call) for call in calls] == ['i'], name
+    assert [get_pin(call) for call in calls] == ['i=0'], name
 
     table = infer_module(ast.parse(source), 'test')
     # The call site is clean; what is reported is the alias, a function read
@@ -1185,7 +1185,7 @@ def main(n: int):
     return g(1 / 2)
 '''
     _, calls = _calls(source, 'g')
-    assert [get_pin(call) for call in calls] == ['i']
+    assert [get_pin(call) for call in calls] == ['i=0']
 
     table = infer_module(ast.parse(source), 'test')
     assert [diag.origin.reason for diag in table.diags
@@ -1243,7 +1243,7 @@ def __test_a_nonlocal_declaration_alone_is_not_a_rebinding__():
     """ ``nonlocal g`` alone leaves the enclosing group reachable """
     source = NESTED_GROUP % ''
     _, calls = _calls(source, 'g')
-    assert [get_pin(call) for call in calls] == ['i']
+    assert [get_pin(call) for call in calls] == ['i=0']
 
     table = infer_module(ast.parse(source), 'test')
     assert [diag.origin.reason for diag in table.diags

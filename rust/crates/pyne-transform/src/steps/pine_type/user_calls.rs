@@ -18,7 +18,8 @@ use crate::pine_type_rules::ImplSig;
 use crate::pine_type_rules::{
     NUMERIC, OBJECT, PINE_LOOP, TYPELESS, UNKNOWN, array_of, builtin_call_type, class_of,
     elements_of, impl_sig, indexed_pin, is_map, join, namespace_of, object_ty, overload_candidates,
-    overload_result, param_defaults, pin_for, pin_index, render_ty, tuple_of, value_chars,
+    overload_result, param_defaults, pin_for, pin_index, render_ty, resolve_pin, tuple_of,
+    value_chars,
 };
 use crate::pine_type_table::{CallSite, ClassSig, ExportSig};
 
@@ -498,7 +499,7 @@ impl Engine<'_, '_> {
             );
         }
         let settled = lib_calls::settled(Some(impls), pin.as_deref(), &shapes);
-        self.record_pin(node, pin, true, settled)
+        self.record_pin(node, lib_calls::resolved_pin(Some(impls), pin), true, settled)
     }
 
     /// The pin of a `method_call` site that reaches another module's group or its own
@@ -1164,6 +1165,9 @@ impl Engine<'_, '_> {
         if let Some(index) = lib_calls::pine_index(sigs, &shapes, pin.as_deref(), by_name) {
             return Some(vec![index]);
         }
+        if let Some(index) = pin.as_deref().and_then(|pin| resolve_pin(sigs, pin)) {
+            return Some(vec![index]);
+        }
         let chars = pin.unwrap_or_else(|| value_chars(&shapes));
         overload_candidates(sigs, &chars, &shapes)
     }
@@ -1230,6 +1234,7 @@ impl Engine<'_, '_> {
                 &self.enums,
             )?;
             sig.slot = slot.and_then(|slot| i64::try_from(slot).ok()).unwrap_or(-1);
+            sig.size = i64::try_from(returns.len()).unwrap_or(-1);
             out.push((imp, sig));
         }
         Ok(out)

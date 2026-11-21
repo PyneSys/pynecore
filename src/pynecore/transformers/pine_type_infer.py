@@ -89,6 +89,7 @@ from .pine_type_rules import (
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
     overload_result, ImplSig, overload_choice, overload_binding, overload_candidates,
     indexed_pin, pin_index, pine_choice, value_rival, value_chars, default_fit, FIT_REQUIRED,
+    resolve_pin, PIN_INDEX,
     impl_sig, _param_defaults, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, is_array,
@@ -3473,7 +3474,7 @@ class _Inference:
         # Only a group that dispatches has implementations to select among: the
         # others spell the types of one function, which every context runs
         dispatches = callee in lib_dispatchers()
-        impls = [_lib_impl_sig(impl) for impl in entry['impls']] \
+        impls = _lib_impl_sigs(entry) \
             if dispatches and isinstance(entry, dict) and entry['kind'] == 'overloads' else None
         pin = self._pin(node, dispatches, impls)
         ty = self._lib_call_type(callee, node.args, node.keywords, argc, pin)
@@ -3727,7 +3728,8 @@ class _Inference:
                 indexed = self._pine_index(impls, shapes, pin)
                 if indexed is not None:
                     return self._record_pin(node, indexed_pin(shapes, indexed.slot))
-        return self._record_pin(node, pin, settled=self._settled(impls, pin, shapes))
+        return self._record_pin(node, _resolved_pin(impls, pin),
+                                settled=self._settled(impls, pin, shapes))
 
     @staticmethod
     def _pine_index(impls: Sequence[ImplSig], shapes: Sequence[str], pin: str | None,
@@ -4135,8 +4137,8 @@ class _Inference:
         # reach speak, with the call's type being what they agree on
         if argc is None:
             return UNKNOWN
-        choice = self._choice([_lib_impl_sig(impl) for impl in entry['impls']], pin,
-                              self._shapes(args), self._keyword_shapes(keywords))
+        choice = self._choice(_lib_impl_sigs(entry), pin, self._shapes(args),
+                              self._keyword_shapes(keywords))
         if choice is not None:
             return choice.ret
         return overload_result([impl['ret'] for impl in entry['impls']
@@ -5005,7 +5007,8 @@ class _Inference:
         indexed = self._pine_index(impls, shapes, pin, by_name)
         if indexed is not None:
             return self._record_pin(node, indexed_pin(shapes, indexed.slot))
-        return self._record_pin(node, pin, settled=self._settled(impls, pin, shapes))
+        return self._record_pin(node, _resolved_pin(impls, pin),
+                                settled=self._settled(impls, pin, shapes))
 
     def _by_name_pin(self, node: ast.Call, args: Sequence[ast.expr],
                      impls: Sequence[ImplSig]) -> str | None:
@@ -5762,6 +5765,8 @@ class _Inference:
                 else [index for index, sig in enumerate(sigs) if sig is choice]
         pin = None if by_name else pin_for(shapes)
         indexed = self._pine_index(sigs, shapes, pin, by_name)
+        if indexed is None and pin is not None:
+            indexed = resolve_pin(sigs, pin)
         if indexed is not None:
             return [index for index, sig in enumerate(sigs) if sig is indexed]
         return overload_candidates(sigs, pin if pin is not None else value_chars(shapes), shapes)
@@ -5953,8 +5958,9 @@ class _Inference:
                 continue
             slot = self._group_slot.get(node_id(impl) or -1)
             ret = returns[slot] if slot is not None and slot < len(returns) else UNKNOWN
-            out.append((impl, impl_sig(impl, ret, self._ty_of, self._classes, self._enums,
-                                       -1 if slot is None else slot)))
+            sig = impl_sig(impl, ret, self._ty_of, self._classes, self._enums,
+                           -1 if slot is None else slot)
+            out.append((impl, sig._replace(size=len(returns))))
         return out
 
     def _call_context(self, key: str, node: ast.Call, frame: int,
@@ -6977,6 +6983,26 @@ def _element_at(ty: str, path: Sequence[int]) -> str:
             return UNKNOWN
         ty = elements[index]
     return ty
+
+
+def _resolved_pin(impls: Sequence[ImplSig] | None, pin: str | None) -> str | None:
+    """
+    A pin with the implementation it resolves to named by its index.
+
+    The runtime resolves a pin without an index from its witness values; where
+    that resolution is decided here already (``resolve_pin``), the pin names
+    its answer instead, the registration index after ``PIN_INDEX``, and the
+    runtime runs that implementation without selecting.
+
+    :param impls: The group's implementations, in registration order, where the
+                  static selection reads them
+    :param pin: The pin the call site justified, or None
+    :return: The pin, indexed where it resolves
+    """
+    if pin is None or impls is None:
+        return pin
+    resolved = resolve_pin(impls, pin)
+    return pin if resolved is None else f'{pin}{PIN_INDEX}{resolved.slot}'
 
 
 def _selected(impls: Sequence[ImplSig], chars: str, shapes: Sequence[str]) -> list[int] | None:
@@ -8244,31 +8270,52 @@ def _bound_arg(args: Sequence[ast.expr], keywords: Sequence[ast.keyword], index:
     return None
 
 
-def _lib_impl_sig(impl: dict[str, Any]) -> ImplSig:
+def _lib_impl_sig(impl: dict[str, Any], slot: int = -1, size: int = -1) -> ImplSig:
     """
     One registry implementation, as the static selection reads it.
 
-    The registry has no keyword-only parameters -- ``lib_type_collector``
-    records the positional ones only -- so the fits string is exactly as long
-    as ``params``.
+    The implementation of a group that dispatches carries what the collector
+    measured on the registered one (``measure_dispatchers``): how each
+    positional parameter checks a witness, and the fits of both passes over
+    every parameter, the keyword-only ones included. Any other one records its
+    positional parameters only, so its fits string is exactly as long as
+    ``params``, read off the default types.
 
     ``default_none_ok`` is absent unless the implementation has a literal
     ``None`` default, which is the only default whose fit the annotation's
     None-acceptance decides; where it is absent the flag is never read.
 
     :param impl: The generated entry of one implementation
+    :param slot: Its position in the group's registration order, -1 for none
+    :param size: How many implementations the group registers, -1 for unknown
     :return: Its shape
     """
     params = tuple(impl['params'])
     required = len(params) - impl['defaults']
-    default_ty = impl.get('default_ty', ())
-    none_ok = impl.get('default_none_ok') or [False] * len(default_ty)
-    fits = [FIT_REQUIRED] * required
-    fits += [default_fit(declared, ty, takes_none)
-             for declared, ty, takes_none in zip(params[required:], default_ty, none_ok)]
+    fits = impl.get('fits')
+    if fits is None:
+        default_ty = impl.get('default_ty', ())
+        none_ok = impl.get('default_none_ok') or [False] * len(default_ty)
+        fits = FIT_REQUIRED * required + ''.join(
+            default_fit(declared, ty, takes_none)
+            for declared, ty, takes_none in zip(params[required:], default_ty, none_ok))
     return ImplSig(params=params, required=required,
                    open_ended=impl.get('vararg') is not None, ret=impl['ret'],
-                   fits=''.join(fits), names=tuple(impl.get('names') or ()))
+                   fits=fits, names=tuple(impl.get('names') or ()), slot=slot,
+                   accepts=tuple(impl.get('accepts') or ()),
+                   wide_fits=impl.get('wide_fits', ''), kwarg=bool(impl.get('kwarg')),
+                   size=size)
+
+
+def _lib_impl_sigs(entry: dict[str, Any]) -> list[ImplSig]:
+    """
+    Every implementation of a registry group, in registration order.
+
+    :param entry: The generated entry of the group
+    :return: Their shapes, each with its registration index
+    """
+    impls = entry['impls']
+    return [_lib_impl_sig(impl, slot, len(impls)) for slot, impl in enumerate(impls)]
 
 
 def _lib_param_takes(declared: str, passed: str) -> bool:

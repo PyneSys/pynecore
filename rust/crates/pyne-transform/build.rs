@@ -135,6 +135,9 @@ impl Gen {
                 format!("({start},{})", index(items.len(), "bools"))
             }
         };
+        let accepts = self.list(&texts(entry, "accepts").unwrap_or_default());
+        let fits = self.opt_s(text("fits"));
+        let wide_fits = self.opt_s(text("wide_fits"));
         let vararg = entry.get("vararg").is_some_and(|value| !value.is_null());
         let kwarg = entry.get("kwarg").is_some_and(|value| match value {
             Value::Null => false,
@@ -156,6 +159,7 @@ impl Gen {
             "LibStatic {{kind: {kind},ty: {ty},callable: {callable},ret: {ret},params: {params},\
              names: {names},defaults: {defaults},default_ty: {default_ty},\
              default_none_ok: {default_none_ok},vararg: {vararg},kwarg: {kwarg},\
+             accepts: {accepts},fits: {fits},wide_fits: {wide_fits},\
              impls: ({start},{count})}}"
         )
     }
@@ -247,6 +251,9 @@ impl Gen {
 
         let bit_sets = self.list(&strings(section(document, "bit_sets"), "bit_sets"));
         writeln!(out, "pub(super) static BIT_SETS: (u16, u16) = {bit_sets};").unwrap();
+
+        let literals = self.list(&strings(section(document, "str_literals"), "str_literals"));
+        writeln!(out, "pub(super) static STR_LITERALS: (u16, u16) = {literals};").unwrap();
 
         let dispatchers = self.list(&strings(section(document, "dispatchers"), "dispatchers"));
         writeln!(out, "pub(super) static DISPATCHERS: (u16, u16) = {dispatchers};").unwrap();

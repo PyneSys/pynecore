@@ -419,8 +419,12 @@ pub fn interface_digest(interface: &Interface) -> String {
 
 /// One published signature, in the payload's shape (`_export_json`).
 fn export_json(sig: &ExportSig) -> Value {
-    let impls: Vec<Value> =
-        sig.impls.iter().enumerate().map(|(position, imp)| impl_json(imp, position)).collect();
+    let impls: Vec<Value> = sig
+        .impls
+        .iter()
+        .enumerate()
+        .map(|(position, imp)| impl_json(imp, position, sig.impls.len()))
+        .collect();
     json!({
         "kind": sig.kind,
         "params": sig.params,
@@ -435,8 +439,11 @@ fn export_json(sig: &ExportSig) -> Value {
 }
 
 /// One implementation of a published group, in the payload's shape (`_impl_json`): the
-/// registration index is written only where it is not the position in the list.
-fn impl_json(imp: &ImplSig, position: usize) -> Value {
+/// registration index is written only where it is not the position in the list, the
+/// group's size only where it is not the list's length, the widening pass's fits only
+/// where they are not the exact pass's, and the acceptance specs and the `**kwargs`
+/// flag only where they say something.
+fn impl_json(imp: &ImplSig, position: usize, published: usize) -> Value {
     let mut data = json!({
         "params": imp.params,
         "required": imp.required,
@@ -447,6 +454,18 @@ fn impl_json(imp: &ImplSig, position: usize) -> Value {
     });
     if i64::try_from(position).ok() != Some(imp.slot) {
         data["slot"] = json!(imp.slot);
+    }
+    if i64::try_from(published).ok() != Some(imp.size) {
+        data["size"] = json!(imp.size);
+    }
+    if imp.wide_fits != imp.fits {
+        data["wide_fits"] = json!(imp.wide_fits);
+    }
+    if !imp.accepts.is_empty() {
+        data["accepts"] = json!(imp.accepts);
+    }
+    if imp.kwarg {
+        data["kwarg"] = json!(true);
     }
     data
 }

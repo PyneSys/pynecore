@@ -65,22 +65,27 @@ impl<'py> Args<'_, 'py> {
         dict.iter().map(|(key, item)| Ok((key.extract()?, item.extract()?))).collect()
     }
 
-    /// `ImplSig` tuples: `(params, required, open_ended, ret, fits, names, bare, slot)`.
+    /// `ImplSig` tuples: `(params, required, open_ended, ret, fits, names, bare, slot,
+    /// accepts, wide_fits, kwarg, size)`.
     fn impls(&self, index: usize) -> PyResult<Vec<rules::ImplSig>> {
         let mut out = Vec::new();
         for item in self.get(index)?.try_iter()? {
             let item = item?;
-            let (params, required, open_ended, ret, fits, names, bare, slot): (
-                Vec<String>,
-                usize,
-                bool,
-                String,
-                String,
-                Vec<String>,
-                String,
-                i64,
-            ) = item.extract()?;
-            out.push(rules::ImplSig { params, required, open_ended, ret, fits, names, bare, slot });
+            let at = |position: usize| item.get_item(position);
+            out.push(rules::ImplSig {
+                params: at(0)?.extract()?,
+                required: at(1)?.extract()?,
+                open_ended: at(2)?.extract()?,
+                ret: at(3)?.extract()?,
+                fits: at(4)?.extract()?,
+                names: at(5)?.extract()?,
+                bare: at(6)?.extract()?,
+                slot: at(7)?.extract()?,
+                accepts: at(8)?.extract()?,
+                wide_fits: at(9)?.extract()?,
+                kwarg: at(10)?.extract()?,
+                size: at(11)?.extract()?,
+            });
         }
         Ok(out)
     }
@@ -281,12 +286,15 @@ pub fn call<'py>(
                 ("PINE_LOOP", rules::PINE_LOOP),
                 ("NONE_DEFAULT", rules::NONE_DEFAULT),
                 ("_DYN_DEFAULT", rules::DYN_DEFAULT),
+                ("PIN_WITNESSED", rules::PIN_WITNESSED),
+                ("ACCEPTS_UNKNOWN", rules::ACCEPTS_UNKNOWN),
             ] {
                 dict.set_item(key, text)?;
             }
             for (key, char) in [
                 ("PIN_ANY", rules::PIN_ANY),
                 ("PIN_INDEX", rules::PIN_INDEX),
+                ("ACCEPTS_SEP", rules::ACCEPTS_SEP),
                 ("FIT_OMISSIBLE", rules::FIT_OMISSIBLE),
                 ("FIT_REQUIRED", rules::FIT_REQUIRED),
                 ("FIT_UNSURE", rules::FIT_UNSURE),
@@ -401,6 +409,8 @@ pub fn call<'py>(
             rules::overload_candidates(&a.impls(0)?, &a.str(1)?, &a.strs(2)?).into_bound_py_any(py)
         }
         "pine_choice" => rules::pine_choice(&a.impls(0)?, &a.strs(1)?).into_bound_py_any(py),
+        "resolve_pin" => rules::resolve_pin(&a.impls(0)?, &a.str(1)?).into_bound_py_any(py),
+        "is_str_literal" => rules::is_str_literal(&a.str(0)?).into_bound_py_any(py),
         "value_rival" => {
             let impls = a.impls(0)?;
             let Some(imp) = impls.first() else {
@@ -474,8 +484,28 @@ fn tree_call<'py>(py: Python<'py>, name: &str, a: &Args<'_, 'py>) -> PyResult<Bo
             let sig = ty_of.finish(sig)?;
             let params = PyTuple::new(py, sig.params)?;
             let names = PyTuple::new(py, sig.names)?;
-            (params, sig.required, sig.open_ended, sig.ret, sig.fits, names, sig.bare, sig.slot)
-                .into_bound_py_any(py)
+            let accepts = PyTuple::new(py, sig.accepts)?;
+            let items: Vec<Bound<'py, PyAny>> = vec![
+                params.into_any(),
+                sig.required.into_bound_py_any(py)?,
+                sig.open_ended.into_bound_py_any(py)?,
+                sig.ret.into_bound_py_any(py)?,
+                sig.fits.into_bound_py_any(py)?,
+                names.into_any(),
+                sig.bare.into_bound_py_any(py)?,
+                sig.slot.into_bound_py_any(py)?,
+                accepts.into_any(),
+                sig.wide_fits.into_bound_py_any(py)?,
+                sig.kwarg.into_bound_py_any(py)?,
+                sig.size.into_bound_py_any(py)?,
+            ];
+            PyTuple::new(py, items)?.into_bound_py_any(py)
+        }
+        "annotation_accepts" => {
+            let node = a.node(&mut from, 0)?.ok_or_else(|| PyValueError::new_err("a node"))?;
+            let classes = a.classes(1)?;
+            let spec = rules::annotation_accepts(&from.ast, node, &classes).map_err(unsupported)?;
+            spec.into_bound_py_any(py)
         }
         "param_fit" => {
             let arg = a.node(&mut from, 0)?.ok_or_else(|| PyValueError::new_err("a node"))?;
@@ -483,9 +513,17 @@ fn tree_call<'py>(py: Python<'py>, name: &str, a: &Args<'_, 'py>) -> PyResult<Bo
             let callable = Some(a.get(2)?).filter(|value| !value.is_none());
             let classes = a.classes(3)?;
             let enums = a.enums(4)?;
+            let strict = if a.items.len() > 5 { a.flag(5)? } else { true };
             let ty_of = TyOf { callable, from: &from, failure: RefCell::new(None) };
-            let fit =
-                rules::param_fit(&from.ast, arg, default, &|id| ty_of.ty(id), &classes, &enums);
+            let fit = rules::param_fit(
+                &from.ast,
+                arg,
+                default,
+                &|id| ty_of.ty(id),
+                &classes,
+                &enums,
+                strict,
+            );
             ty_of.finish(fit)?.to_string().into_bound_py_any(py)
         }
         "default_ty" => {

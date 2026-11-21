@@ -931,7 +931,7 @@
     true
    ],
    "default_ty": [
-    "?",
+    "o:lib#Order",
     "0"
    ],
    "defaults": 2,
@@ -954,7 +954,7 @@
     true
    ],
    "default_ty": [
-    "?",
+    "o:lib#Order",
     "0"
    ],
    "defaults": 2,
@@ -1251,21 +1251,21 @@
    "impls": [
     {
      "default_ty": [
-      "?",
+      "c",
       "i",
-      "?",
-      "?",
-      "?",
-      "?",
+      "o:lib#LineEnum",
+      "o:lib#Extend",
+      "o:lib#XLoc",
+      "c",
       "s",
-      "?",
-      "?",
-      "?",
-      "?",
-      "?",
-      "?",
+      "o:lib#Size",
+      "c",
+      "o:lib#AlignEnum",
+      "o:lib#AlignEnum",
+      "o:lib#WrapEnum",
+      "o:lib#FontFamilyEnum",
       "b",
-      "?"
+      "o:lib#FormatEnum"
      ],
      "defaults": 15,
      "names": [
@@ -1310,21 +1310,21 @@
     },
     {
      "default_ty": [
-      "?",
+      "c",
       "i",
-      "?",
-      "?",
-      "?",
-      "?",
+      "o:lib#LineEnum",
+      "o:lib#Extend",
+      "o:lib#XLoc",
+      "c",
       "s",
-      "?",
-      "?",
-      "?",
-      "?",
-      "?",
-      "?",
+      "o:lib#Size",
+      "c",
+      "o:lib#AlignEnum",
+      "o:lib#AlignEnum",
+      "o:lib#WrapEnum",
+      "o:lib#FontFamilyEnum",
       "b",
-      "?"
+      "o:lib#FormatEnum"
      ],
      "defaults": 15,
      "names": [
@@ -2623,17 +2623,17 @@
     {
      "default_ty": [
       "s",
+      "o:lib#XLoc",
+      "o:lib#YLoc",
+      "c",
       "?",
-      "?",
-      "?",
-      "?",
-      "?",
-      "?",
-      "?",
+      "c",
+      "o:lib#Size",
+      "o:lib#AlignEnum",
       "s",
-      "?",
+      "o:lib#FontFamilyEnum",
       "b",
-      "?"
+      "o:lib#FormatEnum"
      ],
      "defaults": 12,
      "names": [
@@ -2671,17 +2671,17 @@
     {
      "default_ty": [
       "s",
+      "o:lib#XLoc",
+      "o:lib#YLoc",
+      "c",
       "?",
-      "?",
-      "?",
-      "?",
-      "?",
-      "?",
-      "?",
+      "c",
+      "o:lib#Size",
+      "o:lib#AlignEnum",
       "s",
-      "?",
+      "o:lib#FontFamilyEnum",
       "b",
-      "?"
+      "o:lib#FormatEnum"
      ],
      "defaults": 12,
      "names": [
@@ -3100,9 +3100,9 @@
    "impls": [
     {
      "default_ty": [
-      "?",
-      "?",
-      "?",
+      "o:lib#XLoc",
+      "o:lib#Extend",
+      "c",
       "?",
       "i",
       "b"
@@ -3132,9 +3132,9 @@
     },
     {
      "default_ty": [
-      "?",
-      "?",
-      "?",
+      "o:lib#XLoc",
+      "o:lib#Extend",
+      "c",
       "?",
       "i",
       "b"
@@ -5405,8 +5405,8 @@
    "default_ty": [
     "b",
     "b",
-    "?",
-    "?",
+    "o:lib#XLoc",
+    "c",
     "0",
     "?",
     "i",
@@ -6849,7 +6849,7 @@
   },
   "strategy.risk.max_drawdown": {
    "default_ty": [
-    "?",
+    "o:lib#QtyType",
     "?"
    ],
    "defaults": 2,
@@ -6884,7 +6884,7 @@
   },
   "strategy.risk.max_intraday_loss": {
    "default_ty": [
-    "?",
+    "o:lib#QtyType",
     "?"
    ],
    "defaults": 2,
@@ -7656,6 +7656,14 @@
   "ta.highest": {
    "impls": [
     {
+     "accepts": [
+      "f/if",
+      "i/if",
+      "b/b",
+      "b/b",
+      "b/b",
+      "b/b"
+     ],
      "default_ty": [
       "b",
       "b",
@@ -7663,6 +7671,7 @@
       "b"
      ],
      "defaults": 4,
+     "fits": "nnyyyy",
      "names": [
       "source",
       "length",
@@ -7679,13 +7688,19 @@
       "b",
       "b"
      ],
-     "ret": "f"
+     "ret": "f",
+     "wide_fits": "nnyyyy"
     },
     {
+     "accepts": [
+      "i/if",
+      "b/b"
+     ],
      "default_ty": [
       "b"
      ],
      "defaults": 1,
+     "fits": "ny",
      "names": [
       "length",
       "_series_length"
@@ -7694,7 +7709,8 @@
       "i",
       "b"
      ],
-     "ret": "f"
+     "ret": "f",
+     "wide_fits": "ny"
     }
    ],
    "kind": "overloads"
@@ -7702,10 +7718,16 @@
   "ta.highestbars": {
    "impls": [
     {
+     "accepts": [
+      "f/if",
+      "i/if",
+      "b/b"
+     ],
      "default_ty": [
       "b"
      ],
      "defaults": 1,
+     "fits": "nny",
      "names": [
       "source",
       "length",
@@ -7716,13 +7738,19 @@
       "i",
       "b"
      ],
-     "ret": "i"
+     "ret": "i",
+     "wide_fits": "nny"
     },
     {
+     "accepts": [
+      "i/if",
+      "b/b"
+     ],
      "default_ty": [
       "b"
      ],
      "defaults": 1,
+     "fits": "ny",
      "names": [
       "length",
       "_series_length"
@@ -7731,7 +7759,8 @@
       "i",
       "b"
      ],
-     "ret": "i"
+     "ret": "i",
+     "wide_fits": "ny"
     }
    ],
    "kind": "overloads"
@@ -7817,6 +7846,14 @@
   "ta.lowest": {
    "impls": [
     {
+     "accepts": [
+      "f/if",
+      "i/if",
+      "b/b",
+      "b/b",
+      "b/b",
+      "b/b"
+     ],
      "default_ty": [
       "b",
       "b",
@@ -7824,6 +7861,7 @@
       "b"
      ],
      "defaults": 4,
+     "fits": "nnyyyy",
      "names": [
       "source",
       "length",
@@ -7840,13 +7878,19 @@
       "b",
       "b"
      ],
-     "ret": "f"
+     "ret": "f",
+     "wide_fits": "nnyyyy"
     },
     {
+     "accepts": [
+      "i/if",
+      "b/b"
+     ],
      "default_ty": [
       "b"
      ],
      "defaults": 1,
+     "fits": "ny",
      "names": [
       "length",
       "_series_length"
@@ -7855,7 +7899,8 @@
       "i",
       "b"
      ],
-     "ret": "f"
+     "ret": "f",
+     "wide_fits": "ny"
     }
    ],
    "kind": "overloads"
@@ -7863,10 +7908,16 @@
   "ta.lowestbars": {
    "impls": [
     {
+     "accepts": [
+      "f/if",
+      "i/if",
+      "b/b"
+     ],
      "default_ty": [
       "b"
      ],
      "defaults": 1,
+     "fits": "nny",
      "names": [
       "source",
       "length",
@@ -7877,13 +7928,19 @@
       "i",
       "b"
      ],
-     "ret": "i"
+     "ret": "i",
+     "wide_fits": "nny"
     },
     {
+     "accepts": [
+      "i/if",
+      "b/b"
+     ],
      "default_ty": [
       "b"
      ],
      "defaults": 1,
+     "fits": "ny",
      "names": [
       "length",
       "_series_length"
@@ -7892,7 +7949,8 @@
       "i",
       "b"
      ],
-     "ret": "i"
+     "ret": "i",
+     "wide_fits": "ny"
     }
    ],
    "kind": "overloads"
@@ -8062,7 +8120,13 @@
   "ta.pivothigh": {
    "impls": [
     {
+     "accepts": [
+      "f/if",
+      "i/if",
+      "i/if"
+     ],
      "defaults": 0,
+     "fits": "nnn",
      "names": [
       "source",
       "leftbars",
@@ -8073,10 +8137,16 @@
       "i",
       "i"
      ],
-     "ret": "f"
+     "ret": "f",
+     "wide_fits": "nnn"
     },
     {
+     "accepts": [
+      "i/if",
+      "i/if"
+     ],
      "defaults": 0,
+     "fits": "nn",
      "names": [
       "leftbars",
       "rightbars"
@@ -8085,7 +8155,8 @@
       "i",
       "i"
      ],
-     "ret": "f"
+     "ret": "f",
+     "wide_fits": "nn"
     }
    ],
    "kind": "overloads"
@@ -8093,7 +8164,13 @@
   "ta.pivotlow": {
    "impls": [
     {
+     "accepts": [
+      "f/if",
+      "i/if",
+      "i/if"
+     ],
      "defaults": 0,
+     "fits": "nnn",
      "names": [
       "source",
       "leftbars",
@@ -8104,10 +8181,16 @@
       "i",
       "i"
      ],
-     "ret": "f"
+     "ret": "f",
+     "wide_fits": "nnn"
     },
     {
+     "accepts": [
+      "i/if",
+      "i/if"
+     ],
      "defaults": 0,
+     "fits": "nn",
      "names": [
       "leftbars",
       "rightbars"
@@ -8116,7 +8199,8 @@
       "i",
       "i"
      ],
-     "ret": "f"
+     "ret": "f",
+     "wide_fits": "nn"
     }
    ],
    "kind": "overloads"
@@ -8429,14 +8513,14 @@
     "s",
     "i",
     "i",
-    "?",
-    "?",
-    "?",
-    "?",
+    "c",
+    "o:lib#AlignEnum",
+    "o:lib#AlignEnum",
+    "o:lib#Size",
     "0",
     "s",
-    "?",
-    "?"
+    "o:lib#FontFamilyEnum",
+    "o:lib#FormatEnum"
    ],
    "defaults": 11,
    "kind": "function",
@@ -9192,32 +9276,52 @@
   "timestamp": {
    "impls": [
     {
+     "accepts": [
+      "s/s"
+     ],
      "defaults": 0,
+     "fits": "n",
      "names": [
       "date_string"
      ],
      "params": [
       "?"
      ],
-     "ret": "i"
+     "ret": "i",
+     "wide_fits": "n"
     },
     {
+     "accepts": [
+      "s/s"
+     ],
      "defaults": 0,
+     "fits": "n",
      "names": [
       "dateString"
      ],
      "params": [
       "?"
      ],
-     "ret": "i"
+     "ret": "i",
+     "wide_fits": "n"
     },
     {
+     "accepts": [
+      "s/s",
+      "if/if",
+      "if/if",
+      "if/if",
+      "if/if",
+      "if/if",
+      "if/if"
+     ],
      "default_ty": [
       "i",
       "i",
       "i"
      ],
      "defaults": 3,
+     "fits": "nnnnyyy",
      "names": [
       "timezone",
       "year",
@@ -9236,15 +9340,25 @@
       "f",
       "f"
      ],
-     "ret": "i"
+     "ret": "i",
+     "wide_fits": "nnnnyyy"
     },
     {
+     "accepts": [
+      "if/if",
+      "if/if",
+      "if/if",
+      "if/if",
+      "if/if",
+      "if/if"
+     ],
      "default_ty": [
       "i",
       "i",
       "i"
      ],
      "defaults": 3,
+     "fits": "nnnyyy",
      "names": [
       "year",
       "month",
@@ -9261,7 +9375,8 @@
       "f",
       "f"
      ],
-     "ret": "i"
+     "ret": "i",
+     "wide_fits": "nnnyyy"
     }
    ],
    "kind": "overloads"
@@ -9973,5 +10088,35 @@
    "period"
   ]
  },
- "v": 11
+ "str_literals": [
+  "AlertEnum",
+  "AlignEnum",
+  "Commission",
+  "Currency",
+  "Direction",
+  "Dividends",
+  "Earnings",
+  "Extend",
+  "FontFamilyEnum",
+  "Format",
+  "HLineEnum",
+  "LabelStyleEnum",
+  "LineEnum",
+  "Location",
+  "Oca",
+  "Order",
+  "PivotPointType",
+  "Position",
+  "QtyType",
+  "Session",
+  "Shape",
+  "Size",
+  "Splits",
+  "Spread",
+  "StrLiteral",
+  "WrapEnum",
+  "XLoc",
+  "YLoc"
+ ],
+ "v": 12
 }

@@ -931,7 +931,7 @@ def main(n: int):
             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.ta.highest'][-1]
 
     assert [get_ty(arg) for arg in call.args] == [FLOAT, INT]
-    assert get_pin(call) == 'fi'
+    assert get_pin(call) == 'fi=0'
 
 
 #: An int-TYPED element with a fractional VALUE: the one case where the static
@@ -1180,7 +1180,7 @@ def take(a: shp_coll_one.Settings, b: shp_coll_two.Settings):
     # ... and the pin follows: two int-typed arguments pin as ints
     pins = [get_pin(node) for node in ast.walk(tree)
             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.ta.highest']
-    assert pins == ['ii', 'fi']
+    assert pins == ['ii=0', 'fi=0']
 
 
 #: A library that declares a UDT, and one that declares a METHOD on it. Pine
@@ -2450,7 +2450,7 @@ def main():
     pins = {node.targets[0].id: get_pin(node.value) for node in ast.walk(tree)
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Name) and node.value.func.id == 'method_call'}
-    assert pins == {'x': None, 'y': 'ii', 'z': None, 'w': None}
+    assert pins == {'x': None, 'y': 'ii=0', 'z': None, 'w': None}
 
 
 def __test_a_builtin_winning_a_closure_method_call_takes_no_captures__(tmp_path):

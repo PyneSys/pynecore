@@ -52,6 +52,8 @@ __all__ = [
     'pin_chars', 'pin_for', 'value_chars', 'overload_result', 'ImplSig', 'overload_pick',
     'overload_bind', 'overload_choice', 'overload_candidates', 'overload_binding',
     'PIN_INDEX', 'indexed_pin', 'pin_index', 'pine_choice', 'value_rival',
+    'resolve_pin', 'PIN_WITNESSED', 'ACCEPTS_SEP', 'ACCEPTS_UNKNOWN', 'annotation_accepts',
+    'is_str_literal',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
     'default_fit', 'annotation_takes_none', 'impl_sig', 'param_fit', 'default_ty',
 ]
@@ -832,6 +834,30 @@ def constant_scalar(ty: str) -> str:
     return _CONSTANT_SCALARS.get(ty, ty)
 
 
+#: The types of the lib's ``StrLiteral`` classes, filled on first use
+_STR_LITERALS: Final[set[str]] = set()
+
+
+def is_str_literal(ty: str) -> bool:
+    """
+    Whether a type is a lib class that derives from ``StrLiteral``.
+
+    The overload selector takes any string for a parameter of such a class, in
+    both of its passes (``core/overload._check_type``): ``xloc.bar_index`` and
+    ``'bar_index'`` are the same argument to it. Another string class of the
+    lib takes only its own instances.
+
+    :param ty: Any type
+    :return: True for the object type of such a class
+    """
+    if not ty.startswith(_OBJ):
+        return False
+    if not _STR_LITERALS:
+        _STR_LITERALS.update(object_ty(builtin_class_id(name))
+                             for name in lib_registry().get('str_literals') or ())
+    return ty in _STR_LITERALS
+
+
 def shape_mismatch(left: str, right: str) -> bool:
     """
     Whether two types are objects of DIFFERENT shape.
@@ -1569,6 +1595,18 @@ PIN_ANY: Final = '*'
 #: characters before it keep their meaning, one per positional argument.
 PIN_INDEX: Final = '='
 
+#: Every pin character the runtime has a witness value for, in the order of
+#: ``core/overload.py``'s ``_PIN_WITNESSES``: the scalars, then their arrays,
+#: then their matrices
+PIN_WITNESSED: Final = 'ifbsIFBS1234'
+
+#: Separator of the two passes of an acceptance spec (``ImplSig.accepts``):
+#: ``<characters the exact pass takes>/<characters the widening pass takes>``
+ACCEPTS_SEP: Final = '/'
+
+#: The acceptance spec of a parameter whose check of a witness is not known
+ACCEPTS_UNKNOWN: Final = '?'
+
 
 def indexed_pin(arg_types: Sequence[str], slot: int) -> str:
     """
@@ -1731,6 +1769,27 @@ def default_fit(declared: str, default: str | None, takes_none: bool) -> str:
     return FIT_OMISSIBLE if head(default) == head(declared) else FIT_REQUIRED
 
 
+def _default_fit_wide(declared: str, default: str | None, takes_none: bool) -> str:
+    """
+    What a parameter contributes to a call that leaves it to its default, in the widening pass.
+
+    The selector's second pass checks the defaults the way it checks the
+    arguments, with an int taken where a float is declared and a float where
+    an int is (``core/overload._check_type``); everything ``default_fit`` says
+    of the exact pass holds here otherwise.
+
+    :param declared: The parameter's declared type character
+    :param default: The default's type character, as ``default_fit`` reads it
+    :param takes_none: Whether the parameter's annotation accepts ``None``
+    :return: One of the ``FIT_*`` characters
+    """
+    fit = default_fit(declared, default, takes_none)
+    if fit == FIT_REQUIRED and default is not None and head(default) in NUMERIC \
+            and head(declared) in NUMERIC:
+        return FIT_OMISSIBLE
+    return fit
+
+
 #: Annotation names that accept ``None`` whatever they wrap.
 _NONE_TAKING_NAMES: Final = frozenset({'Any', 'object', 'NoneType'})
 
@@ -1821,6 +1880,21 @@ class ImplSig(NamedTuple):
     #: selection leaves out included -- which is what an indexed pin names
     #: (``PIN_INDEX``); -1 where it is not known
     slot: int = -1
+    #: How the selector checks a witness value at each positional parameter,
+    #: where its declared type does not say it (``_position``): ``''`` reads the
+    #: type, ``ACCEPTS_UNKNOWN`` knows nothing, and otherwise the witness
+    #: characters each pass takes, ``ACCEPTS_SEP`` between them -- ``'if/if'``
+    #: for an ``int | float``, ``'s/s'`` for a ``StrLiteral``. Empty where no
+    #: position needs one.
+    accepts: tuple[str, ...] = ()
+    #: The ``fits`` of the selector's widening pass, one character per parameter
+    #: in the same order; empty where it is not known (``_wide_fits``)
+    wide_fits: str = ''
+    #: Whether a ``**kwargs`` parameter is among the ones the selector counts
+    kwarg: bool = False
+    #: How many implementations the group registers, the ones the static
+    #: selection leaves out included; -1 where it is not known
+    size: int = -1
 
 
 def _is_bare(impl: ImplSig, index: int) -> bool:
@@ -1878,19 +1952,84 @@ def overload_choice(impls: list[ImplSig], pin: str,
     value it is, and by its whole declared type where every value of that type
     passes the selector's check of it.
 
+    It is the exact pass of ``resolve_pin``, the same rules read the same way.
+
     :param impls: Every implementation of the group, in declaration order
     :param pin: The call site's pin, one character per positional argument
     :param shapes: The static type of each positional argument, where the caller
                    has them; empty when it does not
     :return: The selected implementation, or None
     """
-    wanted = tuple(pin)
+    return _pass_choice(impls, tuple(pin), shapes, True)[1]
+
+
+def _pass_choice(impls: Sequence[ImplSig], wanted: tuple[str, ...], shapes: Sequence[str],
+                 strict: bool) -> tuple[int, ImplSig | None]:
+    """
+    How one pass of the selector answers a call: its positional half, then its binding half.
+
+    Each half takes the first implementation, in declaration order, that takes
+    the call; an earlier one that may take it too leaves the pass unanswered.
+
+    :param impls: Every implementation of the group, in declaration order
+    :param wanted: One character per positional argument
+    :param shapes: The static type of each positional argument, or nothing
+    :param strict: The exact pass; the widening pass otherwise
+    :return: ``(_YES, implementation)`` where the pass runs it, ``(_MAYBE, None)``
+             where it may run one this cannot name, ``(_NO, None)`` where it runs none
+    """
     for exact_arity in (True, False):
         for impl in impls:
-            verdict = _takes(impl, wanted, exact_arity, shapes)
+            verdict = _takes(impl, wanted, exact_arity, shapes, strict)
             if verdict == _NO:
                 continue
-            return impl if verdict == _YES else None
+            return (_YES, impl) if verdict == _YES else (_MAYBE, None)
+    return _NO, None
+
+
+def resolve_pin(impls: Sequence[ImplSig], pin: str) -> ImplSig | None:
+    """
+    The implementation the runtime runs for a pin, decided statically.
+
+    This is ``core/overload.py``'s ``_anchored`` resolving a pin without an
+    index from its witness values, rule for rule. A pin without a wildcard runs
+    the ordinary selector on the witnesses: its exact pass (``overload_choice``),
+    and where no implementation takes them there, its widening pass, which
+    takes an int where a float is declared and a float where an int is, the
+    defaults checked the same way. A pin with wildcards ignores those positions
+    and is an answer only where exactly one implementation takes the rest, in
+    the first pass any implementation does (``_select_pinned``).
+
+    There is no answer where the runtime has no witness for a character, where
+    a declared type or a default does not say how the selector checks a value
+    (``_MAYBE``), and where the implementations are not the whole group in its
+    registration order (``ImplSig.slot``, ``ImplSig.size``): the one the static
+    selection leaves out may still be the one the runtime runs.
+
+    :param impls: Every implementation of the group, in registration order
+    :param pin: The call site's pin; an index after it is not read
+    :return: The implementation the runtime runs, or None where this cannot say
+             or the runtime runs none by the pin
+    """
+    chars = pin.partition(PIN_INDEX)[0]
+    size = len(impls)
+    if not size or any(impl.size != size or impl.slot != slot for slot, impl in enumerate(impls)) \
+            or any(char not in PIN_WITNESSED and char != PIN_ANY for char in chars):
+        return None
+    wanted = tuple(chars)
+    if PIN_ANY in wanted:
+        for strict in (True, False):
+            verdicts = [_takes(impl, wanted, False, (), strict, True) for impl in impls]
+            found = [impl for impl, verdict in zip(impls, verdicts) if verdict == _YES]
+            if _MAYBE in verdicts or len(found) > 1:
+                return None
+            if found:
+                return found[0]
+        return None
+    for strict in (True, False):
+        verdict, chosen = _pass_choice(impls, wanted, (), strict)
+        if verdict != _NO:
+            return chosen
     return None
 
 
@@ -1953,7 +2092,7 @@ def _out_of_reach(impl: ImplSig, wanted: tuple[str, ...], shapes: Sequence[str])
     :param shapes: The static type of each positional argument, or nothing
     :return: True when the widening pass never runs the implementation
     """
-    if impl.open_ended:
+    if impl.open_ended or impl.kwarg:
         return False
     argc = len(wanted)
     if not impl.required <= argc <= len(impl.params) and argc != len(impl.fits):
@@ -2006,46 +2145,131 @@ def _widening_rejects(declared: str, given: str) -> bool:
 
 
 def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool,
-           shapes: Sequence[str] = ()) -> int:
+           shapes: Sequence[str] = (), strict: bool = True, wild: bool = False) -> int:
     """
-    How one implementation answers a pin in one half of the exact pass.
+    How one implementation answers a pin in one half of one pass of the selector.
 
     A position without an annotation takes every argument (``ImplSig.bare``);
-    every other one answers by its type (``_takes_position``).
+    every other one answers by its type (``_position``).
+
+    The positional half reaches an implementation whose visible parameters the
+    call's arguments number exactly, and checks each argument against the
+    parameter in its position: where a keyword-only parameter is among them, it
+    is checked against that one, which is not read here. A ``*args`` or a
+    ``**kwargs`` counts as a parameter there and takes a shape this does not
+    model in the binding half either.
 
     :param impl: The implementation's shape
     :param wanted: The pin, one character per positional argument
     :param exact_arity: The positional half, which only reaches an
                         implementation whose every parameter the call fills
     :param shapes: The static type of each positional argument, or nothing
+    :param strict: The exact pass; the widening pass otherwise
+    :param wild: Whether a wildcard position is left out of the match, the way
+                 the runtime resolves a pin with wildcards (``_select_pinned``),
+                 instead of being read from its static type
     :return: ``_YES``, ``_MAYBE`` or ``_NO``
     """
-    if impl.open_ended:
+    if impl.open_ended or impl.kwarg:
         return _MAYBE
+    argc = len(wanted)
     if exact_arity:
         # The positional half counts EVERY visible parameter against the
-        # argument count, so a keyword-only one puts the implementation out
-        # of its reach however it is defaulted
-        if len(impl.fits) != len(wanted) or len(impl.params) != len(wanted):
+        # argument count, a keyword-only one included
+        if len(impl.fits) != argc:
             return _NO
-    elif not impl.required <= len(wanted) <= len(impl.params):
+        if len(impl.params) != argc:
+            return _MAYBE
+    elif not impl.required <= argc <= len(impl.params):
         return _NO
     verdict = _YES
     for index, (declared, want) in enumerate(zip(impl.params, wanted)):
-        if _is_bare(impl, index):
+        if _is_bare(impl, index) or (wild and want == PIN_ANY):
             continue
-        taken = _takes_position(declared, want, shapes[index] if index < len(shapes) else UNKNOWN)
+        taken = _position(impl, index, declared, want,
+                          shapes[index] if index < len(shapes) else UNKNOWN, strict)
         if taken == _NO:
             return _NO
         verdict = min(verdict, taken)
     if exact_arity:
         return verdict
-    for fit in impl.fits[len(wanted):]:
+    for fit in (impl.fits if strict else _wide_fits(impl))[argc:]:
         if fit == FIT_REQUIRED:
             return _NO
         if fit == FIT_UNSURE:
             verdict = _MAYBE
     return verdict
+
+
+def _wide_fits(impl: ImplSig) -> str:
+    """
+    What each parameter of an implementation contributes to the widening pass when it is omitted.
+
+    Where the shape does not carry it (``ImplSig.wide_fits``), it follows from
+    the exact pass's: a default that pass takes is taken here too, a parameter
+    with no default at all is required in both, and a default that pass rejects
+    may or may not be taken.
+
+    :param impl: The implementation's shape
+    :return: One ``FIT_*`` character per parameter, ``ImplSig.fits`` order
+    """
+    if len(impl.wide_fits) == len(impl.fits):
+        return impl.wide_fits
+    return ''.join(fit if fit != FIT_REQUIRED or index < impl.required else FIT_UNSURE
+                   for index, fit in enumerate(impl.fits))
+
+
+def _position(impl: ImplSig, index: int, declared: str, want: str, given: str,
+              strict: bool) -> int:
+    """
+    How one positional parameter of an implementation answers one argument in one pass.
+
+    A witness is checked the way the shape's acceptance spec says
+    (``ImplSig.accepts``), or else the way the declared type says
+    (``_takes_position``, ``_widens_position``). A wildcard position is read
+    from its static type in the exact pass and is not modelled in the widening
+    pass.
+
+    :param impl: The implementation's shape
+    :param index: The parameter's position
+    :param declared: The parameter's type
+    :param want: The argument's pin character
+    :param given: The argument's static type, for a position without a witness
+    :param strict: The exact pass; the widening pass otherwise
+    :return: ``_YES``, ``_MAYBE`` or ``_NO``
+    """
+    if want == PIN_ANY:
+        return _takes_position(declared, want, given) if strict else _MAYBE
+    spec = impl.accepts[index] if index < len(impl.accepts) else ''
+    if spec == ACCEPTS_UNKNOWN:
+        return _MAYBE
+    if spec:
+        exact, _, wide = spec.partition(ACCEPTS_SEP)
+        return _YES if want in (exact if strict else wide) else _NO
+    return _takes_position(declared, want, given) if strict else _widens_position(declared, want)
+
+
+def _widens_position(declared: str, want: str) -> int:
+    """
+    How one parameter answers a witness in the selector's widening pass, by its declared type.
+
+    The pass takes what the exact pass takes (``_takes_position``), and an int
+    where a float is declared or a float where an int is: a number, and the
+    sampled element of an array or a matrix of numbers alike.
+
+    :param declared: The parameter's type
+    :param want: The argument's pin character, one with a witness
+    :return: ``_YES``, ``_MAYBE`` or ``_NO``
+    """
+    exact = _takes_position(declared, want, UNKNOWN)
+    if exact != _NO:
+        return exact
+    shaped = _PIN_CONTAINER_TYPES.get(want)
+    if shaped is None:
+        return _YES if head(declared) in NUMERIC and want in NUMERIC else _NO
+    if (is_array(declared) and is_array(shaped)) or (is_matrix(declared) and is_matrix(shaped)):
+        return _YES if element_of(declared) in NUMERIC and element_of(shaped) in NUMERIC else _NO
+    return _NO
 
 
 def _takes_position(declared: str, want: str, given: str) -> int:
@@ -2105,12 +2329,19 @@ def _takes_position(declared: str, want: str, given: str) -> int:
         # takes it, a bare or element-unknown one of the same container may
         if declared == shaped:
             return _YES
+        if element_of(shaped) == STR and is_str_literal(element_of(declared)) and (
+                is_array(declared) and is_array(shaped)
+                or is_matrix(declared) and is_matrix(shaped)):
+            return _YES
         if declared in (UNKNOWN, OBJECT) or (
                 (is_array(declared) and is_array(shaped)
                  or is_matrix(declared) and is_matrix(shaped))
                 and element_of(declared) == UNKNOWN):
             return _MAYBE
         return _NO
+    if want == STR and is_str_literal(declared):
+        # The selector takes any string for a ``StrLiteral`` subclass
+        return _YES
     declared = head(declared)
     if declared == UNKNOWN:
         return _MAYBE
@@ -2338,7 +2569,7 @@ def _binds(impl: ImplSig, chars: str, shapes: Sequence[str],
     :param kw_shapes: Parameter name -> the keyword argument's static type
     :return: ``_YES``, ``_MAYBE`` or ``_NO``
     """
-    if impl.open_ended:
+    if impl.open_ended or impl.kwarg:
         return _MAYBE
     if len(chars) > len(impl.params):
         return _NO
@@ -2347,7 +2578,8 @@ def _binds(impl: ImplSig, chars: str, shapes: Sequence[str],
     for index, (declared, want) in enumerate(zip(impl.params, chars)):
         if _is_bare(impl, index):
             continue
-        taken = _takes_position(declared, want, shapes[index] if index < len(shapes) else UNKNOWN)
+        taken = _position(impl, index, declared, want,
+                          shapes[index] if index < len(shapes) else UNKNOWN, True)
         if taken == _NO:
             return _NO
         verdict = min(verdict, taken)
@@ -2362,7 +2594,8 @@ def _binds(impl: ImplSig, chars: str, shapes: Sequence[str],
         bound.add(index)
         if _is_bare(impl, index):
             continue
-        taken = _takes_position(impl.params[index], want, kw_shapes.get(name, UNKNOWN))
+        taken = _position(impl, index, impl.params[index], want, kw_shapes.get(name, UNKNOWN),
+                          True)
         if taken == _NO:
             return _NO
         verdict = min(verdict, taken)
@@ -2406,21 +2639,29 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
     """
     args = node.args
     positional = list(args.posonlyargs) + list(args.args)
+    every = positional + list(args.kwonlyargs)
     defaults = _param_defaults(node)
+    params = tuple(annotation_type(a.annotation, classes, enums) for a in positional)
+    accepts = tuple(_own_accepts(arg, declared, classes)
+                    for arg, declared in zip(positional, params))
     return ImplSig(
-        params=tuple(annotation_type(a.annotation, classes, enums) for a in positional),
+        params=params,
         required=len(positional) - len(args.defaults),
         open_ended=args.vararg is not None, ret=ret,
         fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes, enums)
-                     for arg in positional + list(args.kwonlyargs)),
+                     for arg in every),
         names=tuple(a.arg for a in positional),
-        bare=''.join('1' if a.annotation is None else '0' for a in positional), slot=slot)
+        bare=''.join('1' if a.annotation is None else '0' for a in positional), slot=slot,
+        accepts=accepts if any(accepts) else (),
+        wide_fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes, enums, False)
+                          for arg in every),
+        kwarg=args.kwarg is not None)
 
 
 def param_fit(arg: ast.arg, default: ast.expr | None,
               ty_of: Callable[[ast.AST], str] = get_ty,
               classes: Mapping[str, str] = NO_CLASSES,
-              enums: frozenset[str] = NO_ENUMS) -> str:
+              enums: frozenset[str] = NO_ENUMS, strict: bool = True) -> str:
     """
     What one parameter contributes to a call that omits it.
 
@@ -2429,19 +2670,192 @@ def param_fit(arg: ast.arg, default: ast.expr | None,
     That is not the same as an annotation this pass cannot read, which
     ``default_fit`` declines on.
 
+    A scalar default of a parameter whose annotation the selector checks
+    otherwise than its Pine type says (``annotation_accepts``: a union, a
+    ``StrLiteral``) is checked the way the annotation says, like a witness of
+    its type.
+
     :param arg: The parameter
     :param default: Its default expression, or None when it has none
     :param ty_of: Types the default expression
     :param classes: Class name -> class id, visible where the annotation stands
     :param enums: The class ids of the enums among them
+    :param strict: The selector's exact pass; its widening pass otherwise
     :return: One of the ``FIT_*`` characters
     """
     if default is None:
         return FIT_REQUIRED
     if arg.annotation is None:
         return FIT_OMISSIBLE
-    return default_fit(annotation_type(arg.annotation, classes, enums), default_ty(default, ty_of),
-                       annotation_takes_none(arg.annotation))
+    declared = annotation_type(arg.annotation, classes, enums)
+    ty = default_ty(default, ty_of)
+    if ty in PINNABLE:
+        spec = _own_accepts(arg, declared, classes)
+        if spec == ACCEPTS_UNKNOWN:
+            return FIT_UNSURE
+        if spec:
+            exact, _, wide = spec.partition(ACCEPTS_SEP)
+            return FIT_OMISSIBLE if ty in (exact if strict else wide) else FIT_REQUIRED
+    fit = default_fit if strict else _default_fit_wide
+    return fit(declared, ty, annotation_takes_none(arg.annotation))
+
+
+def _own_accepts(arg: ast.arg, declared: str, classes: Mapping[str, str]) -> str:
+    """
+    The acceptance spec ``ImplSig.accepts`` records for one parameter.
+
+    Nothing where the declared type reads the witnesses the way the selector
+    checks them (``_derived_accepts``), so a shape stays as it was wherever the
+    annotation is an ordinary one, and nothing for an annotation whose type is
+    not known either, which reads every witness as undecided already.
+
+    :param arg: The parameter
+    :param declared: Its declared type
+    :param classes: Class name -> class id, visible where the annotation stands
+    :return: ``''``, ``ACCEPTS_UNKNOWN`` or a spec
+    """
+    if arg.annotation is None or declared == UNKNOWN:
+        return ''
+    spec = annotation_accepts(arg.annotation, classes)
+    return '' if spec == _derived_accepts(declared) else spec
+
+
+def _derived_accepts(declared: str) -> str | None:
+    """
+    The acceptance spec a declared type reads as (``_takes_position``, ``_widens_position``).
+
+    :param declared: A parameter's declared type
+    :return: The spec, or None where the type leaves a witness undecided
+    """
+    passes: list[str] = []
+    for strict in (True, False):
+        taken = ''
+        for want in PIN_WITNESSED:
+            verdict = _takes_position(declared, want, UNKNOWN) if strict \
+                else _widens_position(declared, want)
+            if verdict == _MAYBE:
+                return None
+            if verdict == _YES:
+                taken += want
+        passes.append(taken)
+    return ACCEPTS_SEP.join(passes)
+
+
+#: Every witness character, in both passes: what ``Any`` and ``object`` take
+_EVERY_WITNESS: Final = PIN_WITNESSED + ACCEPTS_SEP + PIN_WITNESSED
+
+#: No witness, in either pass: what a class, a map, a tuple and ``None`` take
+_NO_WITNESS: Final = ACCEPTS_SEP
+
+#: The acceptance spec of an annotation NAME, MEASURED with
+#: ``core/overload._check_type`` on the witness values (``test_107`` checks it).
+#: ``PyneInt`` is ``float | int | Series[int]``, so it takes a float in the exact
+#: pass; an ``NA`` takes no witness at all.
+_NAME_ACCEPTS: Final[dict[str, str]] = {
+    'int': 'i/if', 'float': 'f/if', 'bool': 'b/b', 'str': 's/s',
+    'PyneInt': 'if/if', 'PyneFloat': 'f/if', 'PyneBool': 'b/b', 'PyneStr': 's/s',
+    'Any': _EVERY_WITNESS, 'object': _EVERY_WITNESS, 'StrLiteral': 's/s',
+    'list': 'IFBS/IFBS', 'Matrix': '1234/1234',
+    'Color': _NO_WITNESS, 'NA': _NO_WITNESS, 'dict': _NO_WITNESS,
+    'tuple': _NO_WITNESS, 'set': _NO_WITNESS, 'NoneType': _NO_WITNESS,
+}
+
+#: Annotation heads whose payload is checked as the annotation itself: the
+#: ``Persistent`` wrappers are ``T | NA[T] | Series[T]``, and only ``T`` takes a
+#: witness; a parameter's ``Series[T]`` is ``T`` at run time, the series
+#: transform leaves the payload in its place (``SeriesTransformer``)
+_SAME_ACCEPTS_SUBSCRIPTS: Final = frozenset({'Persistent', 'IBPersistent', 'Optional', 'Series'})
+
+#: Annotation heads that take no witness whatever their payload
+_NO_WITNESS_SUBSCRIPTS: Final = frozenset({'NA', 'dict', 'tuple', 'Tuple', 'set'})
+
+#: Container annotation head -> the witness character of each scalar element
+_CONTAINER_WITNESSES: Final[dict[str, dict[str, str]]] = {
+    'list': {INT: 'I', FLOAT: 'F', BOOL: 'B', STR: 'S'},
+    'Matrix': {INT: '1', FLOAT: '2', BOOL: '3', STR: '4'},
+}
+
+
+def annotation_accepts(node: ast.expr, classes: Mapping[str, str] = NO_CLASSES) -> str:
+    """
+    Which witness values a parameter annotation takes, in each pass of the selector.
+
+    This is ``core/overload._check_type`` read off the annotation: a union
+    takes what any of its members takes, ``list[E]`` the array witness whose
+    element ``E`` takes, a class none (no witness is an instance of a class) --
+    except a lib ``StrLiteral`` class, which takes any string. An annotation
+    this does not model is ``ACCEPTS_UNKNOWN``.
+
+    :param node: The annotation expression
+    :param classes: Class spelling -> class id, visible where the annotation stands
+    :return: ``<exact>/<widening>``, the witness characters each pass takes, or
+             ``ACCEPTS_UNKNOWN``
+    """
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return _NO_WITNESS
+        if isinstance(node.value, str):
+            try:
+                return annotation_accepts(ast.parse(node.value, mode='eval').body, classes)
+            except SyntaxError:
+                return ACCEPTS_UNKNOWN
+        return ACCEPTS_UNKNOWN
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _union_accepts([node.left, node.right], classes)
+    if isinstance(node, ast.Subscript):
+        value = node.value
+        name = value.id if isinstance(value, ast.Name) else \
+            (value.attr if isinstance(value, ast.Attribute) else '')
+        if name == 'Union':
+            members = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            return _union_accepts(list(members), classes)
+        if name in _SAME_ACCEPTS_SUBSCRIPTS:
+            return annotation_accepts(node.slice, classes)
+        if name in _NO_WITNESS_SUBSCRIPTS:
+            return _NO_WITNESS
+        witnesses = _CONTAINER_WITNESSES.get(name)
+        if witnesses is None:
+            return ACCEPTS_UNKNOWN
+        element = annotation_accepts(node.slice, classes)
+        if element == ACCEPTS_UNKNOWN:
+            return ACCEPTS_UNKNOWN
+        return ACCEPTS_SEP.join(
+            ''.join(witnesses[char] for char in taken if char in witnesses)
+            for taken in element.split(ACCEPTS_SEP))
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        spelled = dotted_name(node)
+        leaf = node.id if isinstance(node, ast.Name) else node.attr
+        found = classes.get(spelled) if spelled is not None else None
+        if found is None and leaf in _NAME_ACCEPTS:
+            return _NAME_ACCEPTS[leaf]
+        if found is None:
+            found = classes.get(leaf)
+        if found is None and leaf in BUILTIN_CLASSES:
+            return 's/s' if is_str_literal(BUILTIN_CLASSES[leaf]) else _NO_WITNESS
+        if found is None:
+            return ACCEPTS_UNKNOWN
+        return 's/s' if is_str_literal(object_ty(found)) else _NO_WITNESS
+    return ACCEPTS_UNKNOWN
+
+
+def _union_accepts(members: list[ast.expr], classes: Mapping[str, str]) -> str:
+    """
+    The acceptance spec of a union: what any of its members takes.
+
+    :param members: The union's members
+    :param classes: Class spelling -> class id, visible where the annotation stands
+    :return: The spec, or ``ACCEPTS_UNKNOWN`` where a member's is not known
+    """
+    exact = wide = ''
+    for member in members:
+        spec = annotation_accepts(member, classes)
+        if spec == ACCEPTS_UNKNOWN:
+            return ACCEPTS_UNKNOWN
+        member_exact, _, member_wide = spec.partition(ACCEPTS_SEP)
+        exact += member_exact
+        wide += member_wide
+    return ''.join(char for char in PIN_WITNESSED if char in exact) + ACCEPTS_SEP + \
+        ''.join(char for char in PIN_WITNESSED if char in wide)
 
 
 def default_ty(default: ast.expr, ty_of: Callable[[ast.AST], str] = get_ty) -> str:

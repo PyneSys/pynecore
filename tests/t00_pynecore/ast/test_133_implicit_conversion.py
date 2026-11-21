@@ -549,7 +549,7 @@ def main():
                     target = stmt.targets[0]
                     if isinstance(target, ast.Name):
                         pins[target.id] = get_pin(stmt.value)
-    assert pins == {'i': 'I', 'x': 'F', 'e': 'F', 'm': '2', 'k': '1'}
+    assert pins == {'i': 'I=0', 'x': 'F=1', 'e': 'F=1', 'm': '2=1', 'k': '1=0'}
 
 
 def __test_a_container_pin_settles_the_overload_return_type__():
@@ -579,8 +579,8 @@ def main():
     infer_module(tree, 'test')
     main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
     outer = cast(ast.Call, cast(ast.Assign, main.body[0]).value)
-    assert get_pin(outer.args[0]) == 'I'
-    assert get_pin(outer) == 'i'
+    assert get_pin(outer.args[0]) == 'I=0'
+    assert get_pin(outer) == 'i=0'
 
 
 @pytest.mark.parametrize("body,expected", [

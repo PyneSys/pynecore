@@ -34,6 +34,7 @@ Usage:
 """
 import ast
 import importlib
+import inspect
 import json
 import pkgutil
 import sys
@@ -44,16 +45,18 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
 import pynecore.lib  # noqa: E402
+from pynecore.core.instance_state import __dyn_default__  # noqa: E402
+from pynecore.core.overload import Implementation, _check_type, _PIN_WITNESSES  # noqa: E402
 from pynecore.transformers.function_isolation import classify_callee  # noqa: E402
 from pynecore.transformers.pine_type_rules import (  # noqa: E402
     annotation_takes_none, annotation_type, builtin_class_id, constant_type, join,
-    object_ty, ANNOTATION_TYPES, BOOL, FLOAT, INT, NONE_DEFAULT, OBJECT, STR, TYPELESS,
-    UNKNOWN, VOID,
+    object_ty, ACCEPTS_SEP, ANNOTATION_TYPES, BOOL, FIT_OMISSIBLE, FIT_REQUIRED, FLOAT, INT,
+    NONE_DEFAULT, OBJECT, PIN_WITNESSED, STR, TYPELESS, UNKNOWN, VOID,
 )
 
 #: Registry format version. Bump whenever the shape below changes; the
 #: consumers (the inference engine, and the PyneAOT front end) pin it.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 #: The route ``classify_callee`` gives a callee it proves nothing about. The
 #: ``routes`` section leaves such paths out, and the transform reads a path it
@@ -99,11 +102,13 @@ class LibTypeCollector:
         per_module: dict[str, dict[str, Any]] = {}
         reexports: dict[str, list[tuple[str, str, str]]] = {}
         packages: dict[str, str] = {}
+        imported: dict[str, dict[str, str]] = {}
         for file_path in sorted(self.lib_path.rglob('*.py')):
             prefix = self._module_prefix(file_path)
             tree = ast.parse(file_path.read_text(), filename=str(file_path))
             per_module[prefix] = collect_module_types(tree)
             reexports[prefix] = _sibling_reexports(tree, prefix)
+            imported[prefix] = _module_imports(tree, prefix, file_path.stem == '__init__')
             packages[prefix] = prefix if file_path.stem == '__init__' \
                 else prefix.rpartition('.')[0]
 
@@ -138,11 +143,15 @@ class LibTypeCollector:
                 names[f'{parent}.{leaf}' if parent else leaf] = entries[leaf]
 
         _resolve_aliases(names, aliases)
+        _resolve_default_refs(per_module, imported, names)
         modules = self._import_lib()
+        dispatchers = collect_dispatchers(names)
+        measure_dispatchers(names, dispatchers)
         return {'v': SCHEMA_VERSION, 'names': names, 'classes': self._collect_fields(),
                 'scalar_classes': self._collect_scalars(),
+                'str_literals': self._collect_str_literals(),
                 'bit_sets': self._collect_bit_sets(),
-                'dispatchers': collect_dispatchers(names),
+                'dispatchers': dispatchers,
                 'routes': collect_routes(), 'star_exports': collect_star_exports(modules)}
 
     def _import_lib(self) -> list[types.ModuleType]:
@@ -215,6 +224,28 @@ class LibTypeCollector:
                     scalars[name] = found
                     settled = False
         return {name: scalar for name, scalar in sorted(scalars.items()) if name in bases}
+
+    def _collect_str_literals(self) -> list[str]:
+        """
+        The classes of the type package that derive from ``StrLiteral``.
+
+        The overload selector takes any string for a parameter of such a class
+        (``core/overload._check_type``), and the static selection reads a
+        parameter of one the same way (``pine_type_rules.is_str_literal``); a
+        string class of another lineage takes only its own instances.
+
+        :return: The class names, sorted
+        """
+        bases = self._type_bases()
+        found = {'StrLiteral'}
+        settled = False
+        while not settled:
+            settled = True
+            for name, parents in bases.items():
+                if name not in found and any(parent in found for parent in parents):
+                    found.add(name)
+                    settled = False
+        return sorted(found)
 
     def _collect_bit_sets(self) -> list[str]:
         """
@@ -319,19 +350,112 @@ def collect_dispatchers(names: dict[str, dict[str, Any]]) -> list[str]:
     :param names: The registry's ``names`` section
     :return: The registry keys of the dispatching groups, sorted
     """
-    found: list[str] = []
-    for key, entry in names.items():
-        if entry['kind'] != 'overloads':
-            continue
-        value: object = pynecore.lib
-        for part in key.split('.'):
-            value = getattr(value, part)
-        if isinstance(value, types.ModuleType):
-            # ``lib/plot.py::plot`` is spelled ``plot``
-            value = getattr(value, key.rpartition('.')[2])
-        if getattr(value, '__pyne_bind__', None) is not None:
-            found.append(key)
-    return sorted(found)
+    return sorted(key for key, entry in names.items()
+                  if entry['kind'] == 'overloads'
+                  and getattr(_lib_object(key), '__pyne_bind__', None) is not None)
+
+
+def _lib_object(key: str) -> object:
+    """
+    The imported lib object a registry key names.
+
+    :param key: A registry key, as a script spells it (``ta.highest``)
+    :return: The object
+    """
+    value: object = pynecore.lib
+    for part in key.split('.'):
+        value = getattr(value, part)
+    if isinstance(value, types.ModuleType):
+        # ``lib/plot.py::plot`` is spelled ``plot``
+        value = getattr(value, key.rpartition('.')[2])
+    return value
+
+
+def measure_dispatchers(names: dict[str, dict[str, Any]], dispatchers: list[str]) -> None:
+    """
+    Record how the selector checks each implementation of every dispatching group.
+
+    The static resolution of a pin (``pine_type_rules.resolve_pin``) has to
+    answer exactly what the runtime selector answers on the pin's witness
+    values, and an annotation's Pine type does not always say it: an ``int |
+    float`` takes an int in the exact pass, a ``str`` alias is a string, a
+    default the lib computes (``_xloc.bar_index``) has a type only once it is
+    computed. So it is MEASURED here, with the selector's own check
+    (``core/overload._check_type``) on the implementations the import
+    registered, and recorded per implementation:
+
+    * ``accepts`` -- per positional parameter, the witness characters the exact
+      pass takes, then ``ACCEPTS_SEP``, then the ones the widening pass takes;
+    * ``fits`` and ``wide_fits`` -- per parameter, the positional ones then the
+      keyword-only ones, whether the default an omitted argument binds passes
+      that pass's check (``FIT_OMISSIBLE``) or not (``FIT_REQUIRED``, also for
+      no default at all).
+
+    The registered implementations must be the source's, one for one: their
+    order is the registration order an indexed pin names.
+
+    :param names: The registry's ``names`` section, its group entries edited in place
+    :param dispatchers: The registry keys of the dispatching groups
+    :raises RuntimeError: Where the imported group is not the collected one
+    """
+    if ''.join(_PIN_WITNESSES) != PIN_WITNESSED:
+        raise RuntimeError(f"the runtime's witnesses are {''.join(_PIN_WITNESSES)!r}, "
+                           f"not {PIN_WITNESSED!r}")
+    for key in dispatchers:
+        registered: list[Implementation] = getattr(_lib_object(key), '__pyne_impls__')
+        collected = names[key]['impls']
+        if len(registered) != len(collected):
+            raise RuntimeError(f"{key}: {len(registered)} implementations registered, "
+                               f"{len(collected)} collected")
+        for impl, entry in zip(registered, collected):
+            positional = [param for param in impl.sig.parameters.values()
+                          if param.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                            inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+            if [param.name for param in positional] != entry['names']:
+                raise RuntimeError(f"{key}: registered {[p.name for p in positional]}, "
+                                   f"collected {entry['names']}")
+            entry.update(_measured(impl, positional))
+
+
+def _measured(impl: Implementation, positional: list[inspect.Parameter]) -> dict[str, Any]:
+    """
+    How the selector checks one registered implementation (``measure_dispatchers``).
+
+    :param impl: The implementation
+    :param positional: Its positional parameters
+    :return: Its ``accepts``, ``fits`` and ``wide_fits``
+    """
+    accepts = []
+    for param in positional:
+        hint = impl.type_hints.get(param.name, Any)
+        accepts.append(ACCEPTS_SEP.join(
+            ''.join(char for char, witness in _PIN_WITNESSES.items()
+                    if _check_type(witness, hint, strict))
+            for strict in (True, False)))
+    visible = [param for param in impl.sig.parameters.values()
+               if param.kind not in (inspect.Parameter.VAR_POSITIONAL,
+                                     inspect.Parameter.VAR_KEYWORD)]
+    fits = []
+    for strict in (True, False):
+        fits.append(''.join(_measured_fit(impl, param, strict) for param in visible))
+    return {'accepts': accepts, 'fits': fits[0], 'wide_fits': fits[1]}
+
+
+def _measured_fit(impl: Implementation, param: inspect.Parameter, strict: bool) -> str:
+    """
+    Whether the default of one parameter passes one pass of the selector.
+
+    :param impl: The implementation
+    :param param: One of its visible parameters
+    :param strict: The exact pass; the widening pass otherwise
+    :return: ``FIT_OMISSIBLE`` or ``FIT_REQUIRED``
+    """
+    if param.default is inspect.Parameter.empty:
+        return FIT_REQUIRED
+    if param.name not in impl.type_hints or param.default is __dyn_default__:
+        return FIT_OMISSIBLE
+    taken = _check_type(param.default, impl.type_hints[param.name], strict)
+    return FIT_OMISSIBLE if taken else FIT_REQUIRED
 
 
 def _record_routes(path: str, owner: object, routes: dict[str, str]) -> None:
@@ -659,6 +783,11 @@ def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef, classes: dict[str, 
     if args.defaults:
         default_ty = [_default_type(d) for d in args.defaults]
         signature['default_ty'] = default_ty
+        refs = [_dotted(d) if ty == UNKNOWN else None for d, ty in zip(args.defaults, default_ty)]
+        if any(refs):
+            # Resolved against the registry once every module is collected
+            # (``_resolve_default_refs``), and never written out
+            signature[_DEFAULT_REFS] = refs
         if NONE_DEFAULT in default_ty:
             signature['default_none_ok'] = [
                 annotation_takes_none(p.annotation)
@@ -674,16 +803,90 @@ def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef, classes: dict[str, 
     return signature
 
 
+#: Key of the dotted spellings of the defaults ``_default_type`` cannot type,
+#: per default, None for the rest; it lives only until ``_resolve_default_refs``
+_DEFAULT_REFS = '_default_refs'
+
+
+def _module_imports(tree: ast.Module, prefix: str, package: bool) -> dict[str, str]:
+    """
+    The lib modules one lib module imports, by the name it binds them to.
+
+    ``from ..lib import xloc as _xloc`` binds ``_xloc`` to the ``xloc``
+    namespace, which is what a default spelled ``_xloc.bar_index`` reads.
+
+    :param tree: Parsed module AST
+    :param prefix: Dotted lib path of the module
+    :param package: Whether the module is a package's ``__init__``
+    :return: Bound name -> dotted lib path of what it names (``''`` for lib itself)
+    """
+    parts = prefix.split('.') if prefix else []
+    if not package and parts:
+        parts = parts[:-1]
+    found: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or not node.level:
+            continue
+        # One level is the module's own package, which is ``lib`` plus ``parts``;
+        # every further level climbs one package, out of ``lib`` at the last one
+        base: list[str] | None = ['lib'] + parts
+        for _ in range(node.level - 1):
+            base = base[:-1] if base else None
+        if base is None:
+            continue
+        base = base + (node.module.split('.') if node.module else [])
+        if not base or base[0] != 'lib':
+            continue
+        for alias in node.names:
+            path = '.'.join(base[1:] + [alias.name])
+            found[alias.asname or alias.name] = path
+    return found
+
+
+def _resolve_default_refs(per_module: dict[str, dict[str, Any]],
+                          imported: dict[str, dict[str, str]],
+                          names: dict[str, Any]) -> None:
+    """
+    Type the defaults that name a constant of another lib namespace.
+
+    A default the lib spells as another module's constant (``xloc:
+    _xloc.XLoc = _xloc.bar_index``) is typed by the registry entry of that
+    constant, through the name the defining module imports its namespace as.
+    A spelling that resolves to no value entry stays UNKNOWN. Either way the
+    note ``_default_type`` left is removed.
+
+    :param per_module: Every module's collected entries, by dotted lib path
+    :param imported: Every module's imported lib modules (``_module_imports``)
+    :param names: The registry's ``names`` section
+    """
+    for prefix, entries in per_module.items():
+        aliases = imported.get(prefix, {})
+        for entry in entries.values():
+            for signature in [entry, *entry.get('impls', ())]:
+                refs = signature.pop(_DEFAULT_REFS, None)
+                if refs is None:
+                    continue
+                for index, ref in enumerate(refs):
+                    first, _, rest = (ref or '').partition('.')
+                    target = aliases.get(first)
+                    if target is None or not rest:
+                        continue
+                    found = names.get(f'{target}.{rest}' if target else rest)
+                    if isinstance(found, dict) and found.get('kind') == 'value':
+                        signature['default_ty'][index] = found['ty']
+
+
 def _default_type(node: ast.expr) -> str:
     """
     Pine type of one parameter default, as the overload selector reads it.
 
-    Only what a pure extractor can decide: a literal carries its own type,
+    What a pure extractor can decide: a literal carries its own type,
     ``na`` carries none at all, and a literal ``None`` carries its own
     character, because whether it fits is a question about the ANNOTATION and
     not about the annotation's Pine type. Anything the lib computes
-    (``_color.blue``, ``_xloc.bar_index``) stays UNKNOWN, which is what makes
-    the inference decline to pick rather than pick wrong.
+    (``_color.blue``, ``_xloc.bar_index``) is UNKNOWN here, which is what makes
+    the inference decline to pick rather than pick wrong, until
+    ``_resolve_default_refs`` types the constants of another namespace.
 
     :param node: The default expression
     :return: Its type character, ``NONE_DEFAULT``, ``TYPELESS``, or UNKNOWN

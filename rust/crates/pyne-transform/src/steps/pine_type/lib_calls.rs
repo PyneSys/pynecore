@@ -14,13 +14,14 @@ use crate::data::{self, LibEntry};
 use crate::pine_qualifier::{SERIES, SERIES_LENGTH_KEYWORD, WINDOW_CALLS, window_length};
 use crate::pine_type_rules::{
     BOOL, CONTAINER_NA_WIDENS, CallRule, FIT_REQUIRED, FLOAT, INT, ImplSig, NUMERIC, OBJECT,
-    PIN_ANY, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_BOOL, WIDEN_BOOL_NA,
-    WIDEN_FLOAT, WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA, array_of, class_of,
-    default_fit, element_of, get_ty, indexed_pin, is_array, is_map, is_matrix, is_na_text_param,
-    is_na_widen, is_not_pine_string, join, key_of, lib_type_override, matrix_of, object_ty,
-    overload_binding, overload_candidates, overload_choice, overload_result, override_param_names,
-    pin_chars, pin_for, pin_index, pine_choice, render_ty, set_na_class, set_pin, set_pins,
-    set_widen, shape_conflict, tuple_of, value_chars, value_of, value_rival,
+    PIN_ANY, PIN_INDEX, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_BOOL,
+    WIDEN_BOOL_NA, WIDEN_FLOAT, WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA,
+    array_of, class_of, default_fit, element_of, get_ty, indexed_pin, is_array, is_map, is_matrix,
+    is_na_text_param, is_na_widen, is_not_pine_string, join, key_of, lib_type_override, matrix_of,
+    object_ty, overload_binding, overload_candidates, overload_choice, overload_result,
+    override_param_names, pin_chars, pin_for, pin_index, pine_choice, render_ty, resolve_pin,
+    set_na_class, set_pin, set_pins, set_widen, shape_conflict, tuple_of, value_chars, value_of,
+    value_rival,
 };
 use crate::pine_type_table::{CallSite, Diag, Unknown};
 
@@ -137,21 +138,32 @@ fn lib_param_takes(declared: &str, passed: &str) -> bool {
     true
 }
 
-/// One registry implementation, as the static selection reads it (`_lib_impl_sig`).
-pub(super) fn lib_impl_sig(entry: &LibEntry) -> ImplSig {
+/// One registry implementation, as the static selection reads it (`_lib_impl_sig`):
+/// what the collector measured on a dispatching group's, the default types read
+/// otherwise.
+///
+/// :param slot: Its position in the group's registration order, -1 for none
+/// :param size: How many implementations the group registers, -1 for unknown
+pub(super) fn lib_impl_sig(entry: &LibEntry, slot: i64, size: i64) -> ImplSig {
     let params: Vec<String> = entry.params.clone().unwrap_or_default();
     let required = (params.len() as i64 - entry.defaults).max(0) as usize;
-    let none_ok = entry
-        .default_none_ok
-        .clone()
-        .filter(|flags| !flags.is_empty())
-        .unwrap_or_else(|| vec![false; entry.default_ty.len()]);
-    let mut fits: String = std::iter::repeat_n(FIT_REQUIRED, required).collect();
-    for ((declared, ty), takes_none) in
-        params.iter().skip(required).zip(&entry.default_ty).zip(none_ok)
-    {
-        fits.push(default_fit(declared, Some(ty), takes_none));
-    }
+    let fits = match &entry.fits {
+        Some(fits) => fits.clone(),
+        None => {
+            let none_ok = entry
+                .default_none_ok
+                .clone()
+                .filter(|flags| !flags.is_empty())
+                .unwrap_or_else(|| vec![false; entry.default_ty.len()]);
+            let mut fits: String = std::iter::repeat_n(FIT_REQUIRED, required).collect();
+            for ((declared, ty), takes_none) in
+                params.iter().skip(required).zip(&entry.default_ty).zip(none_ok)
+            {
+                fits.push(default_fit(declared, Some(ty), takes_none));
+            }
+            fits
+        }
+    };
     ImplSig {
         params,
         required,
@@ -160,7 +172,32 @@ pub(super) fn lib_impl_sig(entry: &LibEntry) -> ImplSig {
         fits,
         names: entry.names.clone().unwrap_or_default(),
         bare: String::new(),
-        slot: -1,
+        slot,
+        accepts: entry.accepts.clone(),
+        wide_fits: entry.wide_fits.clone().unwrap_or_default(),
+        kwarg: entry.kwarg,
+        size,
+    }
+}
+
+/// Every implementation of a registry group, in registration order, each with its
+/// registration index (`_lib_impl_sigs`).
+pub(super) fn lib_impl_sigs(entry: &LibEntry) -> Vec<ImplSig> {
+    let size = i64::try_from(entry.impls.len()).unwrap_or(-1);
+    entry
+        .impls
+        .iter()
+        .enumerate()
+        .map(|(slot, imp)| lib_impl_sig(imp, i64::try_from(slot).unwrap_or(-1), size))
+        .collect()
+}
+
+/// A pin with the implementation it resolves to named by its index (`_resolved_pin`).
+pub(super) fn resolved_pin(impls: Option<&[ImplSig]>, pin: Option<String>) -> Option<String> {
+    let (Some(impls), Some(pin)) = (impls, pin.as_deref()) else { return pin };
+    match resolve_pin(impls, pin) {
+        Some(index) => Some(format!("{pin}{PIN_INDEX}{}", impls[index].slot)),
+        None => Some(pin.to_string()),
     }
 }
 
@@ -263,9 +300,8 @@ impl Engine<'_, '_> {
         // Only a group that dispatches has implementations to select among: the
         // others spell the types of one function, which every context runs
         let dispatches = data::dispatchers().contains(callee);
-        let impls: Option<Vec<ImplSig>> = entry
-            .filter(|entry| dispatches && entry.kind == "overloads")
-            .map(|entry| entry.impls.iter().map(lib_impl_sig).collect());
+        let impls: Option<Vec<ImplSig>> =
+            entry.filter(|entry| dispatches && entry.kind == "overloads").map(lib_impl_sigs);
         let pin = self.pin(node, dispatches, impls.as_deref())?;
         let (_, args, keywords) = facts::call_parts(self.ast, node).expect("a call");
         let (args, keywords) = (args.to_vec(), keywords.to_vec());
@@ -611,7 +647,7 @@ impl Engine<'_, '_> {
             }
         }
         let settled = settled(impls, pin.as_deref(), &shapes);
-        self.record_pin(node, pin, true, settled)
+        self.record_pin(node, resolved_pin(impls, pin), true, settled)
     }
 
     /// The pin of an `inline_series` call site in the running context
@@ -879,7 +915,7 @@ impl Engine<'_, '_> {
             _ => {}
         }
         let Some(argc) = argc else { return Ok(UNKNOWN.to_string()) };
-        let impls: Vec<ImplSig> = entry.impls.iter().map(lib_impl_sig).collect();
+        let impls: Vec<ImplSig> = lib_impl_sigs(entry);
         let shapes = self.shapes(args);
         let kw_shapes = self.keyword_shapes(keywords);
         if let Some(choice) = self.choice(&impls, pin, shapes.as_deref(), kw_shapes.as_ref()) {

@@ -64,6 +64,12 @@ pub(crate) struct LibStatic {
     default_none_ok: (u16, u16),
     vararg: bool,
     kwarg: bool,
+    /// The measured acceptance spec of each positional parameter, empty where none
+    accepts: (u16, u16),
+    /// The measured fits of the exact pass, `NONE` where not measured
+    fits: u16,
+    /// The measured fits of the widening pass, `NONE` where not measured
+    wide_fits: u16,
     /// A range of `IMPLS`
     impls: (u16, u16),
 }
@@ -170,6 +176,12 @@ pub fn bit_sets() -> &'static [String] {
     BIT_SETS.get_or_init(|| list(tables::BIT_SETS))
 }
 
+/// `lib_types.json`'s `str_literals`: the lib classes that derive from `StrLiteral`.
+pub fn str_literals() -> &'static [String] {
+    static LITERALS: OnceLock<Vec<String>> = OnceLock::new();
+    LITERALS.get_or_init(|| list(tables::STR_LITERALS))
+}
+
 /// `lib_types.json`'s `dispatchers`: the lib overload groups that select an
 /// implementation at run time (`lib_registry.lib_dispatchers()`).
 pub fn dispatchers() -> &'static HashSet<String> {
@@ -242,6 +254,13 @@ pub struct LibEntry {
     pub vararg: bool,
     /// Whether a `**kwargs` follows (`bool(entry.get('kwarg'))`)
     pub kwarg: bool,
+    /// How the selector checks a witness at each positional parameter, measured for a
+    /// dispatching group's implementation (`entry.get('accepts') or ()`)
+    pub accepts: Vec<String>,
+    /// The measured fits of the exact pass (`entry.get('fits')`)
+    pub fits: Option<String>,
+    /// The measured fits of the widening pass (`entry.get('wide_fits')`)
+    pub wide_fits: Option<String>,
     /// The implementations of an overload group, in order
     pub impls: Vec<LibEntry>,
 }
@@ -262,6 +281,9 @@ fn lib_entry(entry: &LibStatic) -> LibEntry {
         }),
         vararg: entry.vararg,
         kwarg: entry.kwarg,
+        accepts: list(entry.accepts),
+        fits: opt_s(entry.fits),
+        wide_fits: opt_s(entry.wide_fits),
         impls: entry.impls().iter().map(lib_entry).collect(),
     }
 }

@@ -111,7 +111,7 @@ def main(r: int):
                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'f']
     # The all-None vector IS the layout default, so it is never stamped: an
     # unconfigured instance already dispatches from the values
-    assert vectors == [('i',), None]
+    assert vectors == [('i=0',), None]
 
 
 def __test_two_sites_of_one_closure_get_a_vector_each__():
@@ -141,7 +141,7 @@ def main(r: int):
     infer_module(tree, 'test')
     vectors = [get_vector(node) for node in ast.walk(tree)
                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'f']
-    assert vectors == [('i',), None]
+    assert vectors == [('i=0',), None]
 
     ns, _ = _transform(source, 'pin_mod_two_sites')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
@@ -159,7 +159,7 @@ def main(r: int):
 ''', 'ipin_mod_emit')
     assert "'pin': 0" in dump
     assert '__bind_any·__(__state__, 1, g, __state__[0][0])' in dump
-    assert "__resolve_slot·__(__state__, 0, f, ('i',))" in dump
+    assert "__resolve_slot·__(__state__, 0, f, ('i=0',))" in dump
     assert '__resolve_slot·__(__state__, 1, f)' in dump
 
 
@@ -228,7 +228,7 @@ def __test_the_comprehension_iterable_site_configures_it_too__():
 def main(r: int):
     return [v for v in f(r)], [v for v in f(r * 1.5)]
 ''', 'ipin_mod_comp')
-    assert "__slot_state·__(__state__, 0, f, ('i',))" in dump
+    assert "__slot_state·__(__state__, 0, f, ('i=0',))" in dump
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state, 1) == ([1.0], [2.0])
 
@@ -251,7 +251,7 @@ def main(r: int):
 ''', 'ipin_mod_uniform')
     # The pin position is filled in with None: the binder takes them
     # positionally, and this site has a vector but nothing to pin
-    assert "__bind_any·__(__state__, 0, f, None, ('i',))" in dump
+    assert "__bind_any·__(__state__, 0, f, None, ('i=0',))" in dump
     assert '__bind_any·__(__state__, 1, f)' in dump
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state, 1) == (1.0, 2.0)
@@ -271,7 +271,7 @@ def main(r: int):
 ''', 'ipin_mod_chain')
     # ``helper`` varies with what ITS instance of ``inner`` resolves to, so its
     # vector holds the inner vector, and the inner site reads it out of the slot
-    assert "__resolve_slot·__(__state__, 0, helper, (('i',),))" in dump
+    assert "__resolve_slot·__(__state__, 0, helper, (('i=0',),))" in dump
     assert '__resolve_slot·__(__state__, 1, inner, __state__[0][0])' in dump
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state, 1) == (1.0, 2.0)
@@ -515,7 +515,7 @@ def main(a: list[float]):
              if isinstance(node, ast.FunctionDef) and node.name == 'push']
     vectors = [get_vector(node) for impl in impls for node in ast.walk(impl)
                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'helper']
-    assert vectors == [('F',), ('I',), ('*=2',)]
+    assert vectors == [('F=0',), ('I=1',), ('*=2',)]
     group_sites = [node for node in ast.walk(tree)
                    if isinstance(node, ast.Call) and ast.unparse(node.func) == 'push']
     assert [get_vector(node) for node in group_sites] == [None]
@@ -570,7 +570,7 @@ def push(xs: list[int]) -> float:
 def main(a: list[float], b: list[int]):
     return push(a), push(b)
 ''', 'ipin_mod_impl_out')
-    assert "__resolve_slot·__(__state__, 0, helper, ('F',))" in dump
-    assert "__resolve_slot·__(__state__, 0, helper, ('I',))" in dump
+    assert "__resolve_slot·__(__state__, 0, helper, ('F=0',))" in dump
+    assert "__resolve_slot·__(__state__, 0, helper, ('I=1',))" in dump
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state, [], []) == (1.0, 2.0)

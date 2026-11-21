@@ -340,9 +340,9 @@ def __test_an_exported_overload_group_is_pinned__(tmp_path, monkeypatch):
 
     pins = [call.pin for call in table.calls if call.callee == 'pick']
     # ``r / 8`` is int-TYPED while its value is fractional -- the whole point
-    assert pins == [INT, None, INT]
+    assert pins == ['i=0', None, 'i=0']
     assert [call.ty for call in table.calls if call.callee == 'pick'] == [FLOAT] * 3
-    assert get_pin(_call(tree, 'pick')) == INT
+    assert get_pin(_call(tree, 'pick')) == 'i=0'
 
 
 def __test_the_pin_reaches_the_binder_across_modules__(tmp_path, monkeypatch, capsys):
@@ -355,9 +355,9 @@ def __test_the_pin_reaches_the_binder_across_modules__(tmp_path, monkeypatch, ca
     _compile(app)
 
     dump = capsys.readouterr().out
-    assert "__bind_any·__(__state__, 0, pick, 'i')" in dump
+    assert "__bind_any·__(__state__, 0, pick, 'i=0')" in dump
     assert '__bind_any·__(__state__, 1, pick)' in dump
-    assert "__bind_any·__(__state__, 2, pick, 'i')" in dump
+    assert "__bind_any·__(__state__, 2, pick, 'i=0')" in dump
 
 
 def __test_an_exported_group_dispatches_on_the_type_at_runtime__(tmp_path, monkeypatch):
@@ -420,7 +420,7 @@ def main(r: int):
     tree, table = _analysed(app)
 
     pinned = [call for call in table.calls if call.callee == 'pick']
-    assert [call.pin for call in pinned] == [INT, None]
+    assert [call.pin for call in pinned] == ['i=0', None]
     # The implementations disagree on their return, so only the pinned site
     # can say which one runs
     assert [call.ty for call in pinned] == [INT, UNKNOWN]

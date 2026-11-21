@@ -368,6 +368,17 @@ impl ExportSig {
                         Some(slot) => slot,
                         None => i64::try_from(position).map_err(|_| "slot")?,
                     },
+                    accepts: match item.get("accepts") {
+                        Some(_) => json_strs(item, "accepts")?,
+                        None => Vec::new(),
+                    },
+                    wide_fits: item
+                        .get("wide_fits")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    kwarg: item.get("kwarg").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                    size: item.get("size").and_then(serde_json::Value::as_i64).unwrap_or(-1),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

@@ -17,20 +17,33 @@ import ast
 
 import pytest
 
+import json
+from typing import Any, Optional
+
+from pynecore import lib
+from pynecore.lib import ta as lib_ta
+from pynecore.core import overload as overload_module
 from pynecore.core.instance_state import _make_state
-from pynecore.core.overload import Implementation, _anchored, _select  # noqa: internal API
+from pynecore.core.overload import (  # noqa: internal API
+    Implementation, _anchored, _check_type, _select, _PIN_WITNESSES,
+)
 from pynecore.errorcodes import WrongOperandTypeError
 from pynecore.transformers.function_isolation import FunctionIsolationTransformer
 from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.layout_emit import apply_layout
 from pynecore.transformers.persistent import PersistentTransformer
 from pynecore.transformers.pine_type_infer import infer_module
+from pynecore.transformers.lib_registry import lib_types
+from pynecore.transformers.pine_type_infer import _lib_impl_sigs  # noqa: internal API
 from pynecore.transformers.pine_type_rules import (
-    FIT_OMISSIBLE, FIT_REQUIRED, INT, ImplSig, NONE_DEFAULT, OBJECT, TYPELESS,
-    annotation_takes_none, class_id, default_fit, get_pin, get_ty, object_ty, overload_bind,
-    overload_binding, overload_candidates, overload_choice, overload_pick, pin_index,
-    pine_choice,
+    FIT_OMISSIBLE, FIT_REQUIRED, INT, ImplSig, NONE_DEFAULT, OBJECT, PIN_WITNESSED, TYPELESS,
+    annotation_accepts, annotation_takes_none, class_id, default_fit, get_pin, get_ty,
+    object_ty, overload_bind, overload_binding, overload_candidates, overload_choice,
+    overload_pick, pin_index, pine_choice, resolve_pin,
 )
+from pynecore.types.base import StrLiteral
+from pynecore.types.matrix import Matrix
+from pynecore.types.pine_types import PyneBool, PyneFloat, PyneInt, PyneStr
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
 from pynecore.transformers.slot_layout import ModuleLayout
@@ -115,7 +128,8 @@ def __test_the_measured_overload_table__(expression: str, expected: str):
     node, calls = _call_site(MEASURED_SETUP.format(expression=expression))
     assert get_ty(node.args[0]) == expected, expression
     pin = [call.pin for call in calls if call.callee == 'f'][-1]
-    assert pin == ('i' if expected == 'i' else None), expression
+    # The pin names the int implementation by its registration index as well
+    assert pin == ('i=0' if expected == 'i' else None), expression
     assert get_pin(node) == pin
 
 
@@ -141,7 +155,8 @@ from pynecore import lib
 R = lib.input.int(14)
 result = lib.ta.highest(R / 8)
 ''', 'lib.ta.highest')
-    assert get_pin(node) == 'i'
+    # ... and name the implementation they resolve to: the length-only one
+    assert get_pin(node) == 'i=1'
 
 
 @pytest.mark.parametrize("call", [
@@ -207,7 +222,7 @@ def __test_the_pin_reaches_the_binder__():
 def main(r: int):
     return f(r / 8), f(r * 1.0)
 ''', 'pin_mod_a')
-    assert "__bind_any·__(__state__, 0, f, 'i')" in dump
+    assert "__bind_any·__(__state__, 0, f, 'i=0')" in dump
     assert '__bind_any·__(__state__, 1, f)' in dump
 
 
@@ -219,8 +234,8 @@ def main(r: int):
         f(r / 8)
     return [f(r / 8) for _ in [0]]
 ''', 'pin_mod_b')
-    assert "__bind_loop·__(__state__, 0, f, 'i')" in dump
-    assert "__bind_loop·__(__state__, 1, f, 'i')" in dump
+    assert "__bind_loop·__(__state__, 0, f, 'i=0')" in dump
+    assert "__bind_loop·__(__state__, 1, f, 'i=0')" in dump
 
     # A comprehension ITERABLE forbids the walrus guard, so the whole site
     # folds into the slot helper -- which takes the pin in that position too
@@ -230,7 +245,7 @@ def main(r: int):
 def main(r: int):
     return [v for v in f(r / 8)]
 ''', 'pin_mod_b2')
-    assert "__bind_slot·__(__state__, 0, f, 'i')" in dump
+    assert "__bind_slot·__(__state__, 0, f, 'i=0')" in dump
 
 
 # --- runtime -------------------------------------------------------------
@@ -335,9 +350,9 @@ def main(r: int):
     return g(h(r), r)
 '''
     table = infer_module(ast.parse(source), 'test')
-    assert [call.pin for call in table.calls if call.callee == 'h'] == ['i']
+    assert [call.pin for call in table.calls if call.callee == 'h'] == ['i=0']
     assert [call.ty for call in table.calls if call.callee == 'h'] == ['i']
-    assert [call.pin for call in table.calls if call.callee == 'g'] == ['ii']
+    assert [call.pin for call in table.calls if call.callee == 'g'] == ['ii=0']
 
     ns, _ = _transform(source, 'pin_mod_join')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
@@ -459,7 +474,7 @@ def main(r: int):
 '''), 'test')
     assert table.funcs['h'].ret == '?'
     assert [call.ty for call in table.calls if call.callee == 'h'] == ['i']
-    assert [call.pin for call in table.calls if call.callee == 'g'] == ['i']
+    assert [call.pin for call in table.calls if call.callee == 'g'] == ['i=0']
 
 
 def __test_the_composed_pin_reaches_the_int_implementation__():
@@ -478,7 +493,8 @@ def main(r: int):
     ([ImplSig(('f',), 1, False, 'f', 'n'), ImplSig(('i',), 1, False, 'i', 'n')], 'i', 'i'),
     ([ImplSig(('i', 'i'), 2, False, 'A', 'nn'),
       ImplSig(('f', 'i'), 2, False, 'B', 'nn')], 'ii', 'A'),
-    # No exact match: the widening pass is the runtime's business, not this one
+    # No exact match: the exact pass answers nothing, and the widening pass that
+    # takes the int for the float is ``resolve_pin``'s (``RESOLVED_PINS`` below)
     ([ImplSig(('f',), 1, False, 'f', 'n')], 'i', None),
     # An earlier implementation that takes anything would win on declaration
     # order, so the site is unanswerable rather than overruled
@@ -549,7 +565,7 @@ def main(r: int):
     return g(h(1))
 '''), 'test')
     assert [call.ty for call in table.calls if call.callee == 'h'] == ['i']
-    assert [call.pin for call in table.calls if call.callee == 'g'] == ['i']
+    assert [call.pin for call in table.calls if call.callee == 'g'] == ['i=0']
 
 
 def __test_a_defaulted_pin_reaches_the_int_implementation__():
@@ -601,12 +617,17 @@ def __test_a_none_default_the_annotation_rejects_answers_nothing__():
     the static pass answer ``h(1)`` with the int implementation while the
     selector ran the float one, and the pin that inconsistency handed to
     ``g(h(1))`` forced the int implementation on a float value.
+
+    The widening pass is the one that answers, as it does at run time: it takes
+    the int witness for ``h(x: float, ...)``, so ``h(1)`` is a float, and the
+    float-typed argument of ``g`` takes no pin.
     """
     table = infer_module(ast.parse(NONE_DEFAULT_GROUPS + '''
 def main(r: int):
     return g(h(1))
 '''), 'test')
-    assert [call.ty for call in table.calls if call.callee == 'h'] == ['?']
+    assert [call.pin for call in table.calls if call.callee == 'h'] == ['i=1']
+    assert [call.ty for call in table.calls if call.callee == 'h'] == ['f']
     assert [call.pin for call in table.calls if call.callee == 'g'] == [None]
 
 
@@ -627,7 +648,7 @@ def main(r: int):
     return g(h(1))
 '''), 'test')
     assert [call.ty for call in table.calls if call.callee == 'h'] == ['i']
-    assert [call.pin for call in table.calls if call.callee == 'g'] == ['i']
+    assert [call.pin for call in table.calls if call.callee == 'g'] == ['i=0']
 
     ns, _ = _transform(OPTIONAL_DEFAULT_GROUPS + '''
 def main(r: int):
@@ -688,8 +709,9 @@ def __test_a_required_parameter_beyond_the_pin_answers_nothing__():
     """
     A parameter the call does not fill and no default covers is a non-match.
 
-    ``h(1)`` cannot bind ``h(x: int, y: int)`` at all, so the group's own type
-    is what is left -- and its implementations disagree, so that is UNKNOWN.
+    ``h(1)`` cannot bind ``h(x: int, y: int)`` at all, in either pass, so the
+    selector's widening pass takes the int witness for ``h(x: float)``: the call
+    is a float, the way the runtime selects it.
     """
     table = infer_module(ast.parse('''
 from pynecore.core.overload import overload
@@ -705,7 +727,8 @@ def h(x: float) -> float:
 def main(r: int):
     return h(1)
 '''), 'test')
-    assert [call.ty for call in table.calls if call.callee == 'h'] == ['?']
+    assert [call.pin for call in table.calls if call.callee == 'h'] == ['i=1']
+    assert [call.ty for call in table.calls if call.callee == 'h'] == ['f']
 
 
 def __test_a_module_level_pin_binds_in_place__():
@@ -721,7 +744,7 @@ R = 14
 pinned = f(R / 8)
 plain = f(R * 1.0)
 ''', 'pin_mod_module')
-    assert "pinned = __bind_pinned·__(f, 'i')(R / 8)" in dump
+    assert "pinned = __bind_pinned·__(f, 'i=0')(R / 8)" in dump
     assert 'plain = f(R * 1.0)' in dump
     assert ns['pinned'] == 1.0
     assert ns['plain'] == 2.0
@@ -1188,3 +1211,233 @@ def __test_the_indexed_route_keeps_the_shape_guards__():
     impls.insert(0, Implementation(floats))
     assert bound([]) == 'floats'
 
+
+
+# --- the static resolution of a pin ----------------------------------------
+
+def _group(*impls: ImplSig) -> list[ImplSig]:
+    """The shapes as one whole group, each with its registration index."""
+    return [impl._replace(slot=slot, size=len(impls)) for slot, impl in enumerate(impls)]
+
+
+#: A ``ta.highest``-shaped group: ``(source: float, length: int)`` and ``(length: int)``
+HIGHEST = (ImplSig(('f', 'i'), 2, False, 'src', 'nn'), ImplSig(('i',), 1, False, 'len', 'n'))
+
+
+@pytest.mark.parametrize("impls,pin,expected", [
+    # The exact pass first: the int implementation of either declaration order
+    ((ImplSig(('f',), 1, False, 'f', 'n'), ImplSig(('i',), 1, False, 'i', 'n')), 'i', 'i'),
+    # No exact match: the widening pass takes the int witness for the float
+    ((ImplSig(('f',), 1, False, 'f', 'n'),), 'i', 'f'),
+    # ... and the float witness for an int
+    ((ImplSig(('i',), 1, False, 'i', 'n'),), 'f', 'i'),
+    # ... but nothing else: a bool is no number to either pass
+    ((ImplSig(('i',), 1, False, 'i', 'n'),), 'b', None),
+    # ``ta.highest(int_source, 14)``: no implementation takes two ints exactly,
+    # and the widening pass takes the int source for ``source: float``
+    (HIGHEST, 'ii', 'src'),
+    (HIGHEST, 'i', 'len'),
+    # The wildcard rule: the witnessed positions alone, and only a single
+    # implementation taking them is an answer
+    (HIGHEST, '*i', 'src'),
+    ((ImplSig(('f', 'i'), 2, False, 'A', 'nn'),
+     ImplSig(('s', 'i'), 2, False, 'B', 'nn')), '*i', None),
+    # ... in the first pass any implementation answers, the widening one too
+    ((ImplSig(('f', 'f'), 2, False, 'A', 'nn'),
+     ImplSig(('s', 'b'), 2, False, 'B', 'nn')), '*i', 'A'),
+    # A default the exact pass rejects is checked again by the widening pass
+    ((ImplSig(('i', 'f'), 1, False, 'x', 'nn', wide_fits='ny'),), 'i', 'x'),
+    # ... and where the shape does not say how, there is no answer
+    ((ImplSig(('i', 'f'), 1, False, 'x', 'nn'),), 'i', None),
+    # An acceptance spec decides a position its Pine type does not: ``int | float``
+    ((ImplSig(('f',), 1, False, 'union', 'n', accepts=('if/if',)),
+     ImplSig(('i',), 1, False, 'i', 'n')), 'i', 'union'),
+    ((ImplSig(('f',), 1, False, 'unknown', 'n', accepts=('?',)),), 'i', None),
+    # A keyword-only parameter is what the positional half checks the second
+    # argument against, and this shape does not say how
+    ((ImplSig(('i',), 1, False, 'x', 'nn'), ImplSig(('i', 'i'), 2, False, 'y', 'nn')),
+     'ii', None),
+    # A ``**kwargs`` takes shapes this does not model
+    ((ImplSig(('i',), 1, False, 'x', 'n', kwarg=True),), 'i', None),
+    # An unwitnessable character
+    (HIGHEST, 'ix', None),
+])
+def __test_the_pin_resolves_the_way_the_runtime_does__(impls: tuple[ImplSig, ...], pin: str,
+                                                       expected: str | None):
+    """ ``resolve_pin``: both passes, the wildcard rule, and no answer where unsure """
+    resolved = resolve_pin(_group(*impls), pin)
+    assert (None if resolved is None else resolved.ret) == expected
+
+
+def __test_only_a_whole_group_resolves_a_pin__():
+    """ Shapes that are not the whole group in its order answer nothing """
+    whole = _group(*HIGHEST)
+    assert resolve_pin(whole, 'ii') is whole[0]
+    # A group the static selection leaves an implementation out of
+    assert resolve_pin([impl._replace(size=3) for impl in whole], 'ii') is None
+    # ... and shapes without their registration index
+    assert resolve_pin([impl._replace(slot=-1) for impl in whole], 'ii') is None
+
+
+@pytest.mark.parametrize("key,pin,expected", [
+    ('ta.highest', 'ii', 0),
+    ('ta.highest', '*i', 0),
+    ('ta.highest', 'fi', 0),
+    ('ta.highest', 'i', 1),
+    ('ta.pivothigh', '*ii', 0),
+    # ``timestamp``: the strings are ``str`` aliases, the components ``int | float``
+    ('timestamp', 's', 0),
+    ('timestamp', 'iii', 3),
+    ('timestamp', 'fff', 3),
+    ('timestamp', 'siii', 2),
+    ('timestamp', 'siiiiii', 2),
+    ('timestamp', 'ii', None),
+])
+def __test_a_lib_pin_resolves_from_the_measured_table__(key: str, pin: str,
+                                                       expected: int | None):
+    """ The registry's measurements answer exactly what the runtime witnesses do """
+    resolved = resolve_pin(_lib_impl_sigs(lib_types()[key]), pin)
+    assert (None if resolved is None else resolved.slot) == expected
+    group = lib_ta.highest if key == 'ta.highest' else \
+        lib_ta.pivothigh if key == 'ta.pivothigh' else lib.timestamp
+    impls = group.__pyne_impls__
+    witnessed = overload_module._witnessed(impls, pin)
+    assert (None if witnessed is None else impls.index(witnessed)) == expected
+
+
+#: Annotation spellings, and the names they need to be evaluated
+ACCEPTS_NAMESPACE = {'Any': Any, 'Optional': Optional, 'Matrix': Matrix, 'StrLiteral': StrLiteral,
+                     'PyneInt': PyneInt, 'PyneFloat': PyneFloat, 'PyneBool': PyneBool,
+                     'PyneStr': PyneStr, 'Color': Color, 'NA': NA, 'Line': Line}
+
+
+@pytest.mark.parametrize("annotation", [
+    'int', 'float', 'bool', 'str', 'int | float', 'float | int', 'str | None', 'Optional[float]',
+    'PyneInt', 'PyneFloat', 'PyneBool', 'PyneStr', 'Any', 'object', 'StrLiteral', 'Color',
+    'NA', 'NA[int]', 'int | NA', 'Line', 'list', 'list[int]', 'list[float]', 'list[PyneFloat]',
+    'list[int | float]', 'Matrix', 'Matrix[int]', 'Matrix[float]', 'Matrix[str]', 'dict[str, int]',
+    'tuple[int, int]',
+])
+def __test_an_annotation_accepts_what_the_selector_checks__(annotation: str):
+    """ ``annotation_accepts`` is ``_check_type`` on every witness, in both passes """
+    hint = eval(annotation, dict(ACCEPTS_NAMESPACE))  # noqa: S307
+    measured = '/'.join(''.join(char for char, witness in _PIN_WITNESSES.items()
+                                if _check_type(witness, hint, strict))
+                        for strict in (True, False))
+    assert ''.join(_PIN_WITNESSES) == PIN_WITNESSED
+    classes = {'Line': class_id('lib', 'Line')}
+    assert annotation_accepts(ast.parse(annotation, mode='eval').body, classes) == measured
+
+
+def __test_an_ordinary_pin_names_its_implementation__():
+    """ A pin the witnesses resolve carries the index, and the call is typed by it """
+    source = PIN_SRC + '''
+@overload
+def k(x: float, y: float) -> str:
+    return 'float-impl'
+
+@overload
+def k(x: str, y: int) -> int:
+    return 1
+
+def main(r: int):
+    a = f(r)
+    b = k(r, r)
+    return a, b
+'''
+    table = infer_module(ast.parse(source), 'test')
+    assert [call.pin for call in table.calls if call.callee == 'f'] == ['i=0']
+    # ``k(r, r)``: only the widening pass takes two ints, as the float implementation
+    assert [call.pin for call in table.calls if call.callee == 'k'] == ['ii=0']
+    assert table.bindings['main']['b'].ty == 's'
+    ns, dump = _transform(source, 'pin_mod_ordinary')
+    assert "'ii=0'" in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state, 3)[1] == 'float-impl'
+
+
+def __test_a_lib_pin_names_its_implementation__():
+    """ ``timestamp`` and ``ta.highest`` sites carry the index the registry resolves """
+    _, calls = _call_site('''
+from pynecore import lib
+R = lib.input.int(14)
+stamp = lib.timestamp(2020, 1, R)
+top = lib.ta.highest(lib.bar_index, R)
+''', 'lib.timestamp')
+    pins = {call.callee: call.pin for call in calls}
+    assert pins['timestamp'] == 'iii=3'
+    assert pins['ta.highest'] == 'ii=0'
+    assert {call.callee: call.ty for call in calls}['ta.highest'] == 'f'
+
+
+@pytest.mark.parametrize("pin", ['iii', 'iii=3', 'siii=2', 'fff=3'])
+def __test_an_indexed_pin_keeps_the_stateless_fast_path__(pin: str):
+    """ A fully witnessed indexed pin binds through ``__pyne_pinned_bind__`` as before """
+    bound = lib.timestamp.__pyne_bind__(pin)
+    assert bound.__qualname__.endswith('_bind_timestamp_components.<locals>.cached')
+
+
+def __test_an_indexed_wildcard_pin_keeps_its_check__():
+    """ A wildcard position is still checked on the first call, so no fast path """
+    bound = lib.timestamp.__pyne_bind__('*iii=2')
+    assert bound.__qualname__.endswith('dispatch_pinned')
+
+
+def _numbers_group() -> list[Implementation]:
+    """An int and a float implementation, built without the decorator."""
+    def ints(x: int) -> str:
+        return 'int'
+
+    def floats(x: float) -> str:
+        return 'float'
+    return [Implementation(ints), Implementation(floats)]
+
+
+def __test_an_index_the_witnesses_contradict_is_bound_by_its_index__(monkeypatch):
+    """
+    Without the verify mode the index is what runs: it is the type pass's own
+    resolution of the pin, and the runtime does not select again
+    """
+    monkeypatch.setattr(overload_module, '_PIN_VERIFY', False)
+    bound = _anchored(_numbers_group(), 'test.contradicted', pin='i=1')
+    assert bound(1) == 'float'
+
+
+def __test_an_index_whose_witness_the_implementation_rejects_falls_back__(monkeypatch):
+    """ A string implementation takes no int witness: the index is not this group's """
+    monkeypatch.setattr(overload_module, '_PIN_VERIFY', False)
+    def strings(x: str) -> str:
+        return 'str'
+    impls = _numbers_group() + [Implementation(strings)]
+    assert _anchored(impls, 'test.foreign_index', pin='i=2')(1) == 'int'
+
+
+def __test_the_verify_mode_raises_on_a_forged_index__(monkeypatch):
+    """ ``PYNE_PIN_VERIFY``: an index the witnesses name another implementation for is an error """
+    monkeypatch.setattr(overload_module, '_PIN_VERIFY', True)
+    with pytest.raises(RuntimeError, match=r"'i=1' of test.forged.*\[1\] .*floats.*\[0\] .*ints"):
+        _anchored(_numbers_group(), 'test.forged', pin='i=1')
+
+
+@pytest.mark.parametrize("pin", ['i=0', 'f=1', '*=1', 's=0'])
+def __test_the_verify_mode_accepts_an_index_the_witnesses_agree_with__(monkeypatch, pin: str):
+    """ An agreeing index, and one where the witnesses decide nothing, are silent """
+    monkeypatch.setattr(overload_module, '_PIN_VERIFY', True)
+    _anchored(_numbers_group(), 'test.agreeing', pin=pin)
+
+
+def __test_the_verify_log_records_every_pinned_bind__(monkeypatch, tmp_path):
+    """ ``PYNE_PIN_VERIFY_LOG``: one line per bound pinned site, index and witness decision """
+    log = tmp_path / 'pins.jsonl'
+    monkeypatch.setattr(overload_module, '_PIN_VERIFY', True)
+    monkeypatch.setattr(overload_module, '_PIN_VERIFY_LOG', str(log))
+    impls = _numbers_group()
+    _anchored(impls, 'test.logged', pin='i=0')
+    _anchored(impls, 'test.logged', pin='f')
+    _anchored(impls, 'test.logged', pin='*')
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert records == [
+        {'group': 'test.logged', 'pin': 'i=0', 'index': 0, 'witness': 0},
+        {'group': 'test.logged', 'pin': 'f', 'index': None, 'witness': 1},
+        {'group': 'test.logged', 'pin': '*', 'index': None, 'witness': None},
+    ]

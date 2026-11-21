@@ -436,8 +436,10 @@ half = ta.highest(a, 1)
     # The tuple says nothing about which implementation to take, so its
     # position is left out of the selection instead of blocking the int one
     # next to it (the runtime checks it against the chosen implementation
-    # before it trusts the pin)
-    assert pins == [PIN_ANY + 'i', 'ii']
+    # before it trusts the pin). Both resolve to the source implementation:
+    # the wildcard one as the only implementation of two arguments, the int
+    # one by the widening pass, and each pin names it by its index
+    assert pins == [PIN_ANY + 'i=0', 'ii=0']
 
 
 # --- 3. the lib table ------------------------------------------------------
@@ -469,7 +471,7 @@ picked = ta.highest(direction, 1)
 ''')
     pins = [get_pin(node) for node in ast.walk(tree)
             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'lib.ta.highest']
-    assert pins == ['fi']
+    assert pins == ['fi=0']
 
 
 # --- 4. request.security ---------------------------------------------------
@@ -859,7 +861,7 @@ def main(x: int):
     return fine
 ''')
     assert table.pins_suppressed is None
-    assert any(get_pin(node) == 'ii' for node in ast.walk(tree) if isinstance(node, ast.Call))
+    assert any(get_pin(node) == 'ii=0' for node in ast.walk(tree) if isinstance(node, ast.Call))
 
 
 def __test_a_spoiled_module_takes_its_importers_pins_too__(tmp_path, monkeypatch):

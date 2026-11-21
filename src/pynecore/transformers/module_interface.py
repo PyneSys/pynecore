@@ -1435,22 +1435,28 @@ def _export_json(sig: ExportSig) -> dict:
     return {
         'kind': sig.kind, 'params': list(sig.params), 'required': sig.required,
         'open_ended': sig.open_ended, 'ret': sig.ret, 'annotated': sig.annotated,
-        'impls': [_impl_json(impl, position) for position, impl in enumerate(sig.impls)],
+        'impls': [_impl_json(impl, position, len(sig.impls))
+                  for position, impl in enumerate(sig.impls)],
         'line': sig.line, 'names': list(sig.names),
     }
 
 
-def _impl_json(impl: ImplSig, position: int) -> dict:
+def _impl_json(impl: ImplSig, position: int, published: int) -> dict:
     """
     One implementation of a published group, in the payload's shape.
 
     The registration index (``ImplSig.slot``) is written only where it is not
     the implementation's position in the published list -- where the static
     selection leaves an earlier implementation of the group out -- and a
-    reader takes the position where it is absent.
+    reader takes the position where it is absent. The group's size
+    (``ImplSig.size``) is written only where it is not the published list's
+    length, the widening pass's fits only where they are not the exact pass's,
+    and the acceptance specs and the ``**kwargs`` flag only where they say
+    something.
 
     :param impl: The implementation
     :param position: Its position in the published list
+    :param published: How many implementations the published list holds
     :return: Its JSON form
     """
     data = {'params': list(impl.params), 'required': impl.required,
@@ -1458,6 +1464,14 @@ def _impl_json(impl: ImplSig, position: int) -> dict:
             'names': list(impl.names)}
     if impl.slot != position:
         data['slot'] = impl.slot
+    if impl.size != published:
+        data['size'] = impl.size
+    if impl.wide_fits != impl.fits:
+        data['wide_fits'] = impl.wide_fits
+    if impl.accepts:
+        data['accepts'] = list(impl.accepts)
+    if impl.kwarg:
+        data['kwarg'] = True
     return data
 
 
@@ -1479,8 +1493,13 @@ def _export_from_json(name: str, data: dict) -> ExportSig:
                             open_ended=bool(impl.get('open_ended')),
                             ret=impl.get('ret', UNKNOWN), fits=impl.get('fits', ''),
                             names=tuple(impl.get('names') or ()),
-                            slot=impl.get('slot', position))
-                    for position, impl in enumerate(data.get('impls') or [])),
+                            slot=impl.get('slot', position),
+                            accepts=tuple(impl.get('accepts') or ()),
+                            wide_fits=impl.get('wide_fits', impl.get('fits', '')),
+                            kwarg=bool(impl.get('kwarg')),
+                            size=impl.get('size', len(impls)))
+                    for impls in [data.get('impls') or []]
+                    for position, impl in enumerate(impls)),
         line=data.get('line', 0), names=tuple(data.get('names') or ()))
 
 

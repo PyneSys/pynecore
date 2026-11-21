@@ -391,6 +391,44 @@ def __test_native_overload_selection_matches__():
     assert answered > 1_000, answered
 
 
+def __test_native_pin_resolution_matches__():
+    """The static resolution of a pin, with acceptance specs and both fits, over random groups."""
+    __test_helper_require_native()
+    rng = random.Random(137)
+    specs = ['', '', '', '?', 'if/if', 's/s', '/', 'i/if', 'IF/IF', 'f/fi']
+    answered = 0
+    for _ in range(40_000):
+        impls = []
+        for _ in range(rng.randint(1, 4)):
+            impl = __test_helper_impl(rng)
+            impl = impl._replace(
+                accepts=tuple(rng.choice(specs) for _ in impl.params) if rng.random() < 0.5 else (),
+                wide_fits=''.join(rng.choice('yn?') for _ in impl.fits) if rng.random() < 0.6
+                else '', kwarg=rng.random() < 0.05)
+            impls.append(impl)
+        size = len(impls) if rng.random() < 0.9 else len(impls) + 1
+        slots = list(range(len(impls))) if rng.random() < 0.9 else [-1] * len(impls)
+        impls = [impl._replace(slot=slot, size=size) for impl, slot in zip(impls, slots)]
+        pin = ''.join(rng.choice(__test_helper_PIN_CHARS) for _ in range(rng.randint(0, 4)))
+        if rng.random() < 0.1:
+            pin += '=0'
+        native_impls = __test_helper_impl_tuples(impls)
+        resolved = rules.resolve_pin(impls, pin)
+        assert (__test_helper_native('resolve_pin', native_impls, pin)
+                == __test_helper_index(impls, resolved)), (impls, pin)
+        shapes = [rng.choice(__test_helper_PARAM_TYPES) for _ in range(rng.randint(0, len(pin)))]
+        choice = rules.overload_choice(impls, pin.partition('=')[0], shapes)
+        assert (__test_helper_native('overload_choice', native_impls, pin.partition('=')[0], shapes)
+                == __test_helper_index(impls, choice)), (impls, pin, shapes)
+        candidates = rules.overload_candidates(impls, pin.partition('=')[0], shapes)
+        assert (__test_helper_native('overload_candidates', native_impls, pin.partition('=')[0],
+                                     shapes) == candidates), (impls, pin, shapes)
+        answered += resolved is not None
+    assert answered > 1_000, answered
+    for ty in __test_helper_PARAM_TYPES + ['o:lib#XLoc', 'a:o:lib#XLoc', 'o:lib#Line']:
+        assert __test_helper_native('is_str_literal', ty) == rules.is_str_literal(ty), ty
+
+
 def __test_native_pine_selection_matches__():
     """Pine's static selection, the value rivals and the indexed pin over random groups."""
     __test_helper_require_native()
@@ -558,6 +596,13 @@ def __test_helper_compare_definition(func, classes, ty_of, stats: Counter, where
         assert got == rules.param_fit(arg, default, ty_of or rules.get_ty, classes, enums), \
             (where, func.name, arg.arg)
         stats['param_fit'] += 1
+        wide = __test_helper_native('param_fit', arg, default, ty_of, dict(classes), enums, False)
+        assert wide == rules.param_fit(arg, default, ty_of or rules.get_ty, classes, enums,
+                                       False), (where, func.name, arg.arg)
+        if arg.annotation is not None:
+            assert (__test_helper_native('annotation_accepts', arg.annotation, dict(classes))
+                    == rules.annotation_accepts(arg.annotation, classes)), (where, arg.arg)
+            stats['annotation_accepts'] += 1
         if default is not None:
             assert (__test_helper_native('default_ty', default, ty_of)
                     == rules.default_ty(default, ty_of or rules.get_ty)), (where, arg.arg)
@@ -613,7 +658,8 @@ def __test_native_definitions_match__():
         assert __test_helper_native('is_na_literal', node) == rules.is_na_literal(node), source
         assert __test_helper_native('bare_wrapper', node) == rules.bare_wrapper(node), source
     print(dict(stats))
-    assert stats['impl_sig'] > 500 and stats['factory calls'] >= 7, stats
+    assert stats['impl_sig'] > 500 and stats['annotation_accepts'] > 500 \
+        and stats['factory calls'] >= 7, stats
 
 
 #: Lowering-shaped expressions for ``stamp_lowering``
