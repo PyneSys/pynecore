@@ -379,6 +379,9 @@ pub fn call<'py>(
         "key_of" => rules::key_of(&a.str(0)?).into_bound_py_any(py),
         "value_of" => rules::value_of(&a.str(0)?).into_bound_py_any(py),
         "shape_mismatch" => rules::shape_mismatch(&a.str(0)?, &a.str(1)?).into_bound_py_any(py),
+        "ternary_takes_first" => {
+            rules::ternary_takes_first(&a.str(0)?, &a.str(1)?).into_bound_py_any(py)
+        }
         "shape_conflict" => {
             let (left, right) = (a.str(0)?, a.str(1)?);
             rules::shape_conflict(&left, &right).into_bound_py_any(py)

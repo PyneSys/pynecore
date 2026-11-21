@@ -32,7 +32,8 @@ __all__ = [
     'LIB_MODULE', 'CLASS_SEP', 'class_id', 'builtin_class_id', 'object_ty',
     'array_of', 'matrix_of', 'map_of', 'tuple_of', 'head', 'is_shaped', 'is_array',
     'is_matrix', 'is_map', 'is_tuple', 'arity', 'elements_of', 'class_of',
-    'element_of', 'key_of', 'value_of', 'shape_mismatch', 'shape_conflict', 'render_ty',
+    'element_of', 'key_of', 'value_of', 'shape_mismatch', 'shape_conflict', 'ternary_takes_first',
+    'render_ty',
     'BUILTIN_CLASSES', 'BUILTIN_NAMESPACES', 'namespace_of',
     'join', 'binop_type', 'unaryop_type', 'compare_type',
     'annotation_type', 'bare_wrapper', 'ANNOTATION_TYPES', 'LIB_TYPE_OVERRIDES',
@@ -856,6 +857,30 @@ def is_str_literal(ty: str) -> bool:
         _STR_LITERALS.update(object_ty(builtin_class_id(name))
                              for name in lib_registry().get('str_literals') or ())
     return ty in _STR_LITERALS
+
+
+def ternary_takes_first(body: str, orelse: str) -> bool:
+    """
+    Whether a ternary of two container types has its first branch's type.
+
+    MEASURED on TradingView: ``cond ? <float container> : <int container>``
+    compiles, and the expression is the float container -- ``float[] c = cond ?
+    floats : ints`` is accepted and ``int[] c = ...`` is not. It holds for an
+    array, a matrix and a map's value, for this element pair and this order
+    only: ``cond ? ints : floats`` is rejected, and so is every other pair of
+    element types in either order. Nothing is converted, the second branch's
+    container is the value as it is.
+
+    :param body: The first branch's type
+    :param orelse: The second branch's type
+    :return: True when the ternary is of ``body``'s type
+    """
+    if is_array(body) and is_array(orelse) or is_matrix(body) and is_matrix(orelse):
+        return element_of(body) == FLOAT and element_of(orelse) == INT
+    if is_map(body) and is_map(orelse):
+        return key_of(body) == key_of(orelse) \
+            and value_of(body) == FLOAT and value_of(orelse) == INT
+    return False
 
 
 def shape_mismatch(left: str, right: str) -> bool:

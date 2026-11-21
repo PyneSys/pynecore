@@ -14,8 +14,8 @@ use crate::pine_qualifier::{
 use crate::pine_type_rules::{
     BOOL, CallRule, DYN_DEFAULT, INT, NUMERIC, OBJECT, PINE_LOOP, SCALARS, TY_ATTR, TYPELESS,
     UNKNOWN, VOID, builtin_name_type, class_of, compare_type, constant_type, elements_of, is_array,
-    is_map, is_matrix, is_tuple, join, lib_type_override, object_ty, render_ty, tuple_of,
-    unaryop_type,
+    is_map, is_matrix, is_tuple, join, lib_type_override, object_ty, render_ty,
+    ternary_takes_first, tuple_of, unaryop_type,
 };
 use crate::pine_type_table::ClassSig;
 
@@ -592,6 +592,9 @@ impl Engine<'_, '_> {
             orelse_ty = self.declared_constructor(&body_ty, orelse, &orelse_ty)?;
         } else if is_map(&orelse_ty) && body_ty == OBJECT {
             body_ty = self.declared_constructor(&orelse_ty, body, &body_ty)?;
+        }
+        if ternary_takes_first(&body_ty, &orelse_ty) {
+            return Ok(body_ty);
         }
         let joined = self.joined(&body_ty, &orelse_ty, node, "the ternary")?;
         for (arm, arm_ty) in [(body, &body_ty), (orelse, &orelse_ty)] {

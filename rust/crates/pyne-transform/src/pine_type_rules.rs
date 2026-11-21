@@ -595,6 +595,21 @@ pub fn is_str_literal(ty: &str) -> bool {
         .contains(ty)
 }
 
+/// Whether a ternary of two container types has its first branch's type
+/// (`ternary_takes_first`): a float array, matrix or map value before the same
+/// container of ints.
+pub fn ternary_takes_first(body: &str, orelse: &str) -> bool {
+    if is_array(body) && is_array(orelse) || is_matrix(body) && is_matrix(orelse) {
+        return element_of(body) == FLOAT && element_of(orelse) == INT;
+    }
+    if is_map(body) && is_map(orelse) {
+        return key_of(body) == key_of(orelse)
+            && value_of(body) == FLOAT
+            && value_of(orelse) == INT;
+    }
+    false
+}
+
 /// Whether two types cannot both be right where one value goes.
 pub fn shape_mismatch(left: &str, right: &str) -> bool {
     if left == right || left == UNKNOWN || left == TYPELESS || right == UNKNOWN || right == TYPELESS

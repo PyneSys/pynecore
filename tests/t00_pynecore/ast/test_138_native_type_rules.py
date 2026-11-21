@@ -169,8 +169,8 @@ def __test_native_lattice_matches__():
                         [((),)] + [(tuple(items),) for items in
                                    itertools.product(types[:25], repeat=2)], stats)
     pairs = list(itertools.product(__test_helper_pair_types(), repeat=2))
-    for name in ('join', 'shape_mismatch', 'shape_conflict', 'compare_type', 'map_of',
-                 'class_id'):
+    for name in ('join', 'shape_mismatch', 'shape_conflict', 'ternary_takes_first',
+                 'compare_type', 'map_of', 'class_id'):
         __test_helper_check(name, getattr(rules, name), pairs, stats)
     for enums in (frozenset(), __test_helper_ENUMS, frozenset({'x', '/x/zigzag.py#Pivot'})):
         __test_helper_check('map_of', rules.map_of,
@@ -737,7 +737,8 @@ def __test_native_overload_candidates_match__():
 __test_helper_RECORDED = (
     'join', 'binop_type', 'unaryop_type', 'compare_type', 'head', 'array_of', 'matrix_of',
     'map_of', 'tuple_of', 'elements_of', 'class_of', 'element_of', 'key_of', 'value_of',
-    'shape_mismatch', 'shape_conflict', 'render_ty', 'namespace_of', 'object_ty', 'class_id',
+    'shape_mismatch', 'shape_conflict', 'ternary_takes_first', 'render_ty', 'namespace_of',
+    'object_ty', 'class_id',
     'builtin_class_id', 'is_tuple', 'is_array', 'is_matrix', 'is_map', 'is_shaped', 'arity',
     'is_na_widen', 'pin_for', 'pin_chars', 'overload_result', 'default_fit', 'is_int_typed',
     'constant_type', 'overload_choice', 'overload_binding', 'overload_candidates', 'value_chars',

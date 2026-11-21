@@ -51,7 +51,7 @@ from pynecore.transformers.pine_type_rules import (
     BOOL, FLOAT, INT, OBJECT, PIN_ANY, PINE_LOOP, STR, TYPELESS, UNKNOWN, VOID,
     annotation_type, array_of, builtin_class_id, class_id, class_of, element_of,
     get_pin, get_ty, head, is_int_typed, is_shaped, join, key_of, map_of, matrix_of,
-    object_ty, pin_for, render_ty, shape_mismatch, tuple_of, value_of,
+    object_ty, pin_for, render_ty, shape_mismatch, ternary_takes_first, tuple_of, value_of,
 )
 from pynecore.transformers.pine_type_report import unknown_diags
 from pynecore.transformers.pine_type_table import PineTypeTable
@@ -1023,6 +1023,52 @@ def main(flag: bool):
     return a
 ''', 'main')
     assert types['a'] == UNKNOWN
+
+
+TERNARY_SRC = '''
+from pynecore.lib import array, map, matrix
+
+
+def main(flag: bool):
+    floats = array.new_float(1, 0.0)
+    ints = array.new_int(1, 0)
+    first = floats if flag else ints
+    second = ints if flag else floats
+    grid = matrix.new(1, 1, 0.0) if flag else matrix.new(1, 1, 0)
+    texts = array.new_string(1, '') if flag else ints
+    bools = floats if flag else array.new_bool(1, False)
+    return first, second, grid, texts, bools
+'''
+
+
+def __test_a_float_container_before_an_int_one_is_the_ternarys_type__():
+    """
+    MEASURED on TradingView: ``cond ? floats : ints`` is the float container;
+    the other order and every other element pair are still a conflict
+    """
+    types = _types(TERNARY_SRC, 'main')
+    assert types['first'] == array_of(FLOAT)
+    assert types['grid'] == matrix_of(FLOAT)
+    assert types['second'] == types['texts'] == types['bools'] == UNKNOWN
+    _, table = _infer(TERNARY_SRC)
+    assert [(diag.code, diag.args[1:]) for diag in table.diags] == [
+        ('E0023', ('array<int>', 'array<float>')),
+        ('E0023', ('array<string>', 'array<int>')),
+        ('E0023', ('array<float>', 'array<bool>')),
+    ]
+
+
+@pytest.mark.parametrize("body,orelse,expected", [
+    ('a:f', 'a:i', True), ('m:f', 'm:i', True), ('M:s:f', 'M:s:i', True),
+    # The other order, another element pair, another key, two different containers
+    ('a:i', 'a:f', False), ('a:f', 'a:b', False), ('a:s', 'a:i', False),
+    ('M:s:f', 'M:i:i', False), ('a:f', 'm:i', False), ('a:f', 'a:f', False),
+    # Scalars join by the ordinary rule
+    ('f', 'i', False),
+])
+def __test_which_ternary_takes_its_first_branch__(body: str, orelse: str, expected: bool):
+    """ ``ternary_takes_first``: a float array, matrix or map value before the int one """
+    assert ternary_takes_first(body, orelse) is expected
 
 
 # --- 7. across modules -----------------------------------------------------

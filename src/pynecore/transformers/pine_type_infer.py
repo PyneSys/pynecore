@@ -94,7 +94,7 @@ from .pine_type_rules import (
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, is_array,
     is_map, is_matrix, is_tuple, key_of, matrix_of, namespace_of,
-    object_ty, render_ty, shape_conflict, tuple_of, value_of,
+    object_ty, render_ty, shape_conflict, ternary_takes_first, tuple_of, value_of,
 )
 from .pine_type_table import (
     Analyser, Binding, CallSite, ClassSig, ContextKey, ContextResult, Diag, ExportSig,
@@ -3276,6 +3276,8 @@ class _Inference:
             orelse = self._declared_constructor(body, node.orelse, orelse)
         elif is_map(orelse) and body == OBJECT:
             body = self._declared_constructor(orelse, node.body, body)
+        if ternary_takes_first(body, orelse):
+            return body
         joined = self._joined(body, orelse, node, 'the ternary')
         # A typeless na arm next to a string is the string na, next to a number the
         # numeric na
