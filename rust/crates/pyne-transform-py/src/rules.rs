@@ -65,12 +65,12 @@ impl<'py> Args<'_, 'py> {
         dict.iter().map(|(key, item)| Ok((key.extract()?, item.extract()?))).collect()
     }
 
-    /// `ImplSig` tuples: `(params, required, open_ended, ret, fits, names, bare)`.
+    /// `ImplSig` tuples: `(params, required, open_ended, ret, fits, names, bare, slot)`.
     fn impls(&self, index: usize) -> PyResult<Vec<rules::ImplSig>> {
         let mut out = Vec::new();
         for item in self.get(index)?.try_iter()? {
             let item = item?;
-            let (params, required, open_ended, ret, fits, names, bare): (
+            let (params, required, open_ended, ret, fits, names, bare, slot): (
                 Vec<String>,
                 usize,
                 bool,
@@ -78,8 +78,9 @@ impl<'py> Args<'_, 'py> {
                 String,
                 Vec<String>,
                 String,
+                i64,
             ) = item.extract()?;
-            out.push(rules::ImplSig { params, required, open_ended, ret, fits, names, bare });
+            out.push(rules::ImplSig { params, required, open_ended, ret, fits, names, bare, slot });
         }
         Ok(out)
     }
@@ -285,6 +286,7 @@ pub fn call<'py>(
             }
             for (key, char) in [
                 ("PIN_ANY", rules::PIN_ANY),
+                ("PIN_INDEX", rules::PIN_INDEX),
                 ("FIT_OMISSIBLE", rules::FIT_OMISSIBLE),
                 ("FIT_REQUIRED", rules::FIT_REQUIRED),
                 ("FIT_UNSURE", rules::FIT_UNSURE),
@@ -398,6 +400,19 @@ pub fn call<'py>(
         "overload_candidates" => {
             rules::overload_candidates(&a.impls(0)?, &a.str(1)?, &a.strs(2)?).into_bound_py_any(py)
         }
+        "pine_choice" => rules::pine_choice(&a.impls(0)?, &a.strs(1)?).into_bound_py_any(py),
+        "value_rival" => {
+            let impls = a.impls(0)?;
+            let Some(imp) = impls.first() else {
+                return Err(Unsupported::new_err("value_rival takes one implementation"));
+            };
+            rules::value_rival(imp, &a.strs(1)?, a.flag(2)?).into_bound_py_any(py)
+        }
+        "indexed_pin" => {
+            let slot: i64 = a.get(1)?.extract()?;
+            rules::indexed_pin(&a.strs(0)?, slot).into_bound_py_any(py)
+        }
+        "pin_index" => rules::pin_index(a.opt_str(0)?.as_deref()).into_bound_py_any(py),
         "overload_pick" => {
             let impls = a.impls(0)?;
             rules::overload_pick(&impls, &a.str(1)?, &a.strs(2)?).into_bound_py_any(py)
@@ -459,7 +474,7 @@ fn tree_call<'py>(py: Python<'py>, name: &str, a: &Args<'_, 'py>) -> PyResult<Bo
             let sig = ty_of.finish(sig)?;
             let params = PyTuple::new(py, sig.params)?;
             let names = PyTuple::new(py, sig.names)?;
-            (params, sig.required, sig.open_ended, sig.ret, sig.fits, names, sig.bare)
+            (params, sig.required, sig.open_ended, sig.ret, sig.fits, names, sig.bare, sig.slot)
                 .into_bound_py_any(py)
         }
         "param_fit" => {

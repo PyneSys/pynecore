@@ -391,6 +391,29 @@ def __test_native_overload_selection_matches__():
     assert answered > 1_000, answered
 
 
+def __test_native_pine_selection_matches__():
+    """Pine's static selection, the value rivals and the indexed pin over random groups."""
+    __test_helper_require_native()
+    rng = random.Random(152)
+    answered = 0
+    for _ in range(20_000):
+        impls = [__test_helper_impl(rng)._replace(slot=rng.randint(-1, 5))
+                 for _ in range(rng.randint(1, 4))]
+        shapes = [rng.choice(__test_helper_PARAM_TYPES) for _ in range(rng.randint(0, 3))]
+        native_impls = __test_helper_impl_tuples(impls)
+        choice = rules.pine_choice(impls, shapes)
+        assert __test_helper_native('pine_choice', native_impls, shapes) == choice, (impls, shapes)
+        answered += choice is not None
+        numbers = rng.random() < 0.5
+        assert (__test_helper_native('value_rival', native_impls[:1], shapes, numbers)
+                == rules.value_rival(impls[0], shapes, numbers)), (impls[0], shapes)
+        assert (__test_helper_native('indexed_pin', shapes, impls[0].slot)
+                == rules.indexed_pin(shapes, impls[0].slot))
+    for pin in (None, '', 'i', '*=', '*=1', 'if=12', '=0', '*=x', '*=1=2'):
+        assert __test_helper_native('pin_index', pin) == rules.pin_index(pin), pin
+    assert answered > 1_000, answered
+
+
 def __test_native_selection_over_unannotated_positions_matches__():
     """The selection and the candidate walk over random groups with unannotated positions."""
     __test_helper_require_native()

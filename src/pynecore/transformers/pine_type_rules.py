@@ -51,6 +51,7 @@ __all__ = [
     'get_widens', 'set_widens',
     'pin_chars', 'pin_for', 'value_chars', 'overload_result', 'ImplSig', 'overload_pick',
     'overload_bind', 'overload_choice', 'overload_candidates', 'overload_binding',
+    'PIN_INDEX', 'indexed_pin', 'pin_index', 'pine_choice', 'value_rival',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
     'default_fit', 'annotation_takes_none', 'impl_sig', 'param_fit', 'default_ty',
 ]
@@ -1562,6 +1563,36 @@ _PIN_CONTAINER_CHARS: Final = frozenset(_PIN_CONTAINER_TYPES)
 #: Pin character for a position the runtime has no witness value for
 PIN_ANY: Final = '*'
 
+#: Separator of a pin's implementation index: ``<characters>=<index>`` names the
+#: implementation the runtime runs by its position in the group's registration
+#: order (``core/overload.py``'s ``_anchored``). It is no pin character, so the
+#: characters before it keep their meaning, one per positional argument.
+PIN_INDEX: Final = '='
+
+
+def indexed_pin(arg_types: Sequence[str], slot: int) -> str:
+    """
+    The pin that names one implementation of a group by its registration index.
+
+    :param arg_types: Type of each positional argument, in order
+    :param slot: The implementation's position in the group's registration order
+    :return: ``pin_chars`` of the arguments, then ``PIN_INDEX`` and the index
+    """
+    return f'{pin_chars(arg_types)}{PIN_INDEX}{slot}'
+
+
+def pin_index(pin: str | None) -> int | None:
+    """
+    The implementation index a pin names, where it names one.
+
+    :param pin: A pin, or None
+    :return: The registration index after ``PIN_INDEX``, or None
+    """
+    if pin is None:
+        return None
+    _, separator, index = pin.partition(PIN_INDEX)
+    return int(index) if separator and index.isdigit() else None
+
 
 def pin_for(arg_types: list[str]) -> str | None:
     """
@@ -1785,6 +1816,11 @@ class ImplSig(NamedTuple):
     #: takes every value in both of its passes. Empty where the shape does not
     #: say (a published one), which reads every position by its type.
     bare: str = ''
+    #: Position of the implementation in its group's REGISTRATION order -- every
+    #: ``@overload`` definition of the name in its scope, the ones the static
+    #: selection leaves out included -- which is what an indexed pin names
+    #: (``PIN_INDEX``); -1 where it is not known
+    slot: int = -1
 
 
 def _is_bare(impl: ImplSig, index: int) -> bool:
@@ -2133,6 +2169,114 @@ def _strictly_held(ty: str) -> bool:
     return class_of(ty) is not None and constant_scalar(ty) == ty
 
 
+def pine_choice(impls: Sequence[ImplSig], shapes: Sequence[str]) -> int | None:
+    """
+    The implementation Pine itself selects for a positional call, by its index in ``impls``.
+
+    Pine resolves an overload from the STATIC argument types: an implementation
+    whose every parameter declares exactly the type of its argument first, and
+    only where none does, one that takes them with an int argument where a
+    float is declared. That is decided only where every argument has a settled
+    type (``_pine_settled``) and every implementation the call's arity reaches
+    declares every position the call fills -- an unannotated or unreadable
+    parameter, or a ``*args``, takes arguments by a rule this does not model --
+    and where exactly one implementation answers the first of the two passes
+    that any implementation answers.
+
+    The runtime's value dispatch can run another implementation for the same
+    types (an empty container matches the first implementation of its kind, a
+    float-typed value holding a Python int takes an int parameter); an indexed
+    pin (``indexed_pin``) is what makes it run this one.
+
+    :param impls: Every implementation of the group the static selection reads,
+                  in declaration order
+    :param shapes: The static type of each positional argument
+    :return: The index of the selected implementation in ``impls``, or None
+    """
+    argc = len(shapes)
+    if not all(_pine_settled(given) for given in shapes):
+        return None
+    reachable: list[int] = []
+    for index, impl in enumerate(impls):
+        if impl.open_ended:
+            return None
+        if not impl.required <= argc <= len(impl.params):
+            continue
+        if any(_is_bare(impl, position) or not _pine_settled(impl.params[position])
+               for position in range(argc)):
+            return None
+        reachable.append(index)
+    for widening in (False, True):
+        found = [index for index in reachable
+                 if all(_pine_takes(impls[index].params[position], given, widening)
+                        for position, given in enumerate(shapes))]
+        if found:
+            return found[0] if len(found) == 1 else None
+    return None
+
+
+def value_rival(impl: ImplSig, shapes: Sequence[str], numbers: bool) -> bool:
+    """
+    Whether the value dispatch may run an implementation for a reason only an indexed pin overrules.
+
+    Pine never selects such an implementation for these argument types, and
+    the selector can still run it from the values: where it declares another
+    element type of the container kind an argument is (an empty container
+    matches the first implementation of its kind, ``_takes_position``), and,
+    for a call no pin reaches (``numbers``), where it declares an int for a
+    float argument or the other way round (a float-typed value may be a Python
+    int, an int-typed one a Python float).
+
+    :param impl: The implementation's shape
+    :param shapes: The static type of each positional argument
+    :param numbers: Whether the call is selected from its values alone
+    :return: True when one of its positions is such a rival of the argument
+    """
+    for declared, given in zip(impl.params, shapes):
+        if declared == given:
+            continue
+        if is_array(given) or is_matrix(given) or is_map(given):
+            if _kind(declared) == _kind(given):
+                return True
+        elif numbers and given in (INT, FLOAT) and declared in (INT, FLOAT):
+            return True
+    return False
+
+
+def _pine_settled(ty: str) -> bool:
+    """
+    Whether a type is one Pine's overload resolution compares as it stands.
+
+    :param ty: Any type
+    :return: True for a scalar, a color, an object of a known class, and a
+             container whose element types are all of those
+    """
+    if ty in (INT, FLOAT, BOOL, STR, COLOR):
+        return True
+    if is_array(ty) or is_matrix(ty):
+        return _pine_settled(element_of(ty))
+    if is_map(ty):
+        return _pine_settled(key_of(ty)) and _pine_settled(value_of(ty))
+    return class_of(ty) is not None
+
+
+def _pine_takes(declared: str, given: str, widening: bool) -> bool:
+    """
+    Whether Pine passes an argument of one type to a parameter of another.
+
+    A lib constant (``format.volume``, ``text.align_right``) is the scalar Pine
+    spells it as (``constant_scalar``).
+
+    :param declared: The parameter's type
+    :param given: The argument's static type
+    :param widening: The second pass, which takes an int for a float
+    :return: True when the parameter takes the argument in that pass
+    """
+    if declared == given or constant_scalar(given) == declared:
+        return True
+    return widening and given == INT and declared == FLOAT
+
+
 def overload_bind(impls: list[ImplSig], chars: str, shapes: Sequence[str],
                   kw_chars: Mapping[str, str], kw_shapes: Mapping[str, str]) -> str | None:
     """
@@ -2243,7 +2387,7 @@ _DYN_DEFAULT: Final = '__dyn_default__'
 def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
              ty_of: Callable[[ast.AST], str] = get_ty,
              classes: Mapping[str, str] = NO_CLASSES,
-             enums: frozenset[str] = NO_ENUMS) -> ImplSig:
+             enums: frozenset[str] = NO_ENUMS, slot: int = -1) -> ImplSig:
     """
     One definition's shape, as the static overload selection reads it.
 
@@ -2257,6 +2401,7 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
                   consumer reading a finished tree the node stamps
     :param classes: Class name -> class id, visible in the definition's module
     :param enums: The class ids of the enums among them
+    :param slot: Its position in its group's registration order, -1 for none
     :return: The implementation's shape
     """
     args = node.args
@@ -2269,7 +2414,7 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
         fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes, enums)
                      for arg in positional + list(args.kwonlyargs)),
         names=tuple(a.arg for a in positional),
-        bare=''.join('1' if a.annotation is None else '0' for a in positional))
+        bare=''.join('1' if a.annotation is None else '0' for a in positional), slot=slot)
 
 
 def param_fit(arg: ast.arg, default: ast.expr | None,

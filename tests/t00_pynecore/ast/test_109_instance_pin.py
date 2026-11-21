@@ -489,9 +489,10 @@ def __test_a_call_out_of_an_overload_implementation_gets_its_vector__():
     The untyped ``helper`` is instantiated once per ``push`` implementation, and
     each implementation's call to it is analysed in the implementation's own
     context, never the module's. The vector is the pin that context justified;
-    the drawing implementation pins nothing, and the all-None vector is the
-    layout default, so it is not stamped. The group's own call site still
-    gets none: the dispatcher creates the implementations' state itself.
+    the drawing implementation's names its ``clear`` by index, since an empty
+    array of labels would match the first array implementation by its values.
+    The group's own call site still gets none: the dispatcher creates the
+    implementations' state itself.
     """
     tree = ast.parse(CONTAINER_GROUP + '''
 @overload
@@ -514,7 +515,7 @@ def main(a: list[float]):
              if isinstance(node, ast.FunctionDef) and node.name == 'push']
     vectors = [get_vector(node) for impl in impls for node in ast.walk(impl)
                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'helper']
-    assert vectors == [('F',), ('I',), None]
+    assert vectors == [('F',), ('I',), ('*=2',)]
     group_sites = [node for node in ast.walk(tree)
                    if isinstance(node, ast.Call) and ast.unparse(node.func) == 'push']
     assert [get_vector(node) for node in group_sites] == [None]

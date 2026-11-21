@@ -35,6 +35,7 @@ from ..types.na import NA
 
 from .instance_state import (_configure, _make_state, _StateMethodBinding,  # noqa: internal API
                              register_shared_cache)
+from .overload import _PIN_INDEX  # noqa: internal API
 from .pine_export import Exported, in_module_bool_mode, unset_proxy_error
 
 
@@ -208,8 +209,10 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
     :param pin: The call site's overload pin, which the type pass stamps where it
         resolved the method to an overload group of the calling module: it
         selects from the static argument types, like a direct call's pin does.
-        It reaches only the method handed over as a function -- the one the
-        type pass resolved; a builtin the receiver reaches first ignores it.
+        It reaches the method handed over as a function -- the one the type
+        pass resolved -- and, where it names its implementation by index, the
+        export a method called by name finds; a builtin the receiver reaches
+        first ignores it.
     :param vector: The call site's instance vector, which the type pass stamps
         where it resolved the method to a generic function of the calling module
         whose instance varies with its caller (an implicit conversion, a pin of
@@ -217,6 +220,7 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
         over as a function.
     :return: The dispatch entry.
     """
+    indexed = pin if pin is not None and _PIN_INDEX in pin else None
 
     # noinspection PyShadowingNames
     def method_call(method: str | Callable, var: Any, *args,
@@ -304,7 +308,11 @@ def _dispatcher(cache: dict[str, tuple[Any, list | None, Callable]],
                             if isinstance(_method, Exported):
                                 break
                 if isinstance(_method, Exported):
-                    return _bound_method(_method, cache)(
+                    # Only an indexed pin reaches an export found by name: the
+                    # type pass writes one only where it resolved the export
+                    # this search finds, and the value dispatch would run
+                    # another implementation than the one Pine selects
+                    return _bound_method(_method, cache, indexed)(
                         var, *args, **_adapt_exported_kwargs(_method, kwargs))
 
             # A method no export answers is a no-op on na, with an na result: an

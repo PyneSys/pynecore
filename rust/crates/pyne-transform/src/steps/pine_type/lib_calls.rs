@@ -16,11 +16,11 @@ use crate::pine_type_rules::{
     BOOL, CONTAINER_NA_WIDENS, CallRule, FIT_REQUIRED, FLOAT, INT, ImplSig, NUMERIC, OBJECT,
     PIN_ANY, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_BOOL, WIDEN_BOOL_NA,
     WIDEN_FLOAT, WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA, array_of, class_of,
-    default_fit, element_of, get_ty, is_array, is_map, is_matrix, is_na_text_param, is_na_widen,
-    is_not_pine_string, join, key_of, lib_type_override, matrix_of, object_ty, overload_binding,
-    overload_candidates, overload_choice, overload_result, override_param_names, pin_for,
-    render_ty, set_na_class, set_pin, set_pins, set_widen, shape_conflict, tuple_of, value_chars,
-    value_of,
+    default_fit, element_of, get_ty, indexed_pin, is_array, is_map, is_matrix, is_na_text_param,
+    is_na_widen, is_not_pine_string, join, key_of, lib_type_override, matrix_of, object_ty,
+    overload_binding, overload_candidates, overload_choice, overload_result, override_param_names,
+    pin_chars, pin_for, pin_index, pine_choice, render_ty, set_na_class, set_pin, set_pins,
+    set_widen, shape_conflict, tuple_of, value_chars, value_of, value_rival,
 };
 use crate::pine_type_table::{CallSite, Diag, Unknown};
 
@@ -160,6 +160,7 @@ pub(super) fn lib_impl_sig(entry: &LibEntry) -> ImplSig {
         fits,
         names: entry.names.clone().unwrap_or_default(),
         bare: String::new(),
+        slot: -1,
     }
 }
 
@@ -172,6 +173,50 @@ pub(super) fn settled(impls: Option<&[ImplSig]>, pin: Option<&str>, shapes: &[St
     let Some(pinned) = overload_candidates(impls, pin, shapes) else { return false };
     let values = value_chars(shapes).replace(INT, &PIN_ANY.to_string());
     pinned.len() == 1 && overload_candidates(impls, &values, shapes) == Some(pinned)
+}
+
+/// The implementation a call site's pin has to name by its index, by its index in
+/// `impls` (`_pine_index`): Pine's static selection (`pine_choice`), where the selection
+/// the pin without an index or the values make does not settle on it and does once the
+/// implementations only the values can make it run are out of the way (`value_rival`).
+pub(super) fn pine_index(
+    impls: &[ImplSig],
+    shapes: &[String],
+    pin: Option<&str>,
+    by_name: bool,
+) -> Option<usize> {
+    let position = pine_choice(impls, shapes)?;
+    if impls[position].slot < 0 {
+        return None;
+    }
+    let chars = match pin {
+        Some(pin) => pin.to_string(),
+        None => value_chars(shapes),
+    };
+    if selected(impls, &chars, shapes) == Some(vec![position]) {
+        return None;
+    }
+    let kept: Vec<usize> = (0..impls.len())
+        .filter(|&index| index == position || !value_rival(&impls[index], shapes, by_name))
+        .collect();
+    if kept.len() == impls.len() {
+        return None;
+    }
+    let kept_impls: Vec<ImplSig> = kept.iter().map(|&index| impls[index].clone()).collect();
+    // With its numeric rivals out of the way, a call by name reads its numbers by
+    // their types, as the index makes the runtime do
+    let kept_chars = if by_name { pin_chars(shapes) } else { chars };
+    let at = kept.iter().position(|&index| index == position)?;
+    (selected(&kept_impls, &kept_chars, shapes) == Some(vec![at])).then_some(position)
+}
+
+/// The implementations a positional call can run, by index (`_selected`): the one the
+/// exact pass settles on, else the candidates.
+pub(super) fn selected(impls: &[ImplSig], chars: &str, shapes: &[String]) -> Option<Vec<usize>> {
+    match overload_choice(impls, chars, shapes) {
+        Some(index) => Some(vec![index]),
+        None => overload_candidates(impls, chars, shapes),
+    }
 }
 
 impl Engine<'_, '_> {
@@ -558,6 +603,12 @@ impl Engine<'_, '_> {
         {
             shapes = args.iter().map(|&arg| self.ty_of(arg)).collect();
             pin = pin_for(&shapes);
+            if let Some(impls) = impls
+                && let Some(index) = pine_index(impls, &shapes, pin.as_deref(), false)
+            {
+                let indexed = indexed_pin(&shapes, impls[index].slot);
+                return self.record_pin(node, Some(indexed), true, false);
+            }
         }
         let settled = settled(impls, pin.as_deref(), &shapes);
         self.record_pin(node, pin, true, settled)
@@ -1223,6 +1274,10 @@ impl Engine<'_, '_> {
         kw_shapes: Option<&IndexMap<String, String>>,
     ) -> Option<usize> {
         let (shapes, kw_shapes) = (shapes?, kw_shapes?);
+        if let Some(index) = pin_index(pin) {
+            // The runtime runs the implementation the index names
+            return impls.iter().position(|imp| imp.slot == index);
+        }
         if !kw_shapes.is_empty() {
             let declares =
                 |known: &str| impls.iter().any(|imp| imp.names.iter().any(|named| named == known));

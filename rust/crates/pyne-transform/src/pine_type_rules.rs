@@ -1459,6 +1459,27 @@ pub const PIN_CONTAINERS: &[(&str, char)] = &[
 /// Pin character for a position the runtime has no witness value for.
 pub const PIN_ANY: char = '*';
 
+/// Separator of a pin's implementation index (`PIN_INDEX`): `<characters>=<index>` names
+/// the implementation by its position in the group's registration order.
+pub const PIN_INDEX: char = '=';
+
+/// The pin that names one implementation of a group by its registration index
+/// (`indexed_pin`).
+pub fn indexed_pin<S: AsRef<str>>(arg_types: &[S], slot: i64) -> String {
+    format!("{}{PIN_INDEX}{slot}", pin_chars(arg_types))
+}
+
+/// The implementation index a pin names, where it names one (`pin_index`).
+pub fn pin_index(pin: Option<&str>) -> Option<i64> {
+    let (_, index) = pin?.split_once(PIN_INDEX)?;
+    // Python's ``str.isdigit`` then ``int``: ASCII digits only here, which is all the
+    // type pass ever writes
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    index.parse().ok()
+}
+
 /// The pin character of a scalar container type.
 fn pin_container(ty: &str) -> Option<char> {
     PIN_CONTAINERS.iter().find(|&&(shaped, _)| shaped == ty).map(|&(_, char)| char)
@@ -1580,6 +1601,9 @@ pub struct ImplSig {
     /// One character per positional parameter, `'1'` where it has no annotation and
     /// the selector takes every value; empty where the shape does not say
     pub bare: String,
+    /// Position of the implementation in its group's registration order, the ones the
+    /// static selection leaves out included; -1 where it is not known
+    pub slot: i64,
 }
 
 /// Whether an implementation's positional parameter has no annotation (`_is_bare`).
@@ -1733,6 +1757,91 @@ fn strictly_held(ty: &str) -> bool {
             && strictly_held(value_of(ty));
     }
     class_of(ty).is_some() && constant_scalar(ty) == ty
+}
+
+/// The implementation Pine itself selects for a positional call, by its index in
+/// `impls` (`pine_choice`): an exact match of every declared type first, then one taking
+/// an int for a float; decided only where every argument type is settled, every
+/// implementation the arity reaches declares the positions the call fills, and exactly
+/// one implementation answers the first pass any answers.
+pub fn pine_choice<S: AsRef<str>>(impls: &[ImplSig], shapes: &[S]) -> Option<usize> {
+    let argc = shapes.len();
+    if !shapes.iter().all(|given| pine_settled(given.as_ref())) {
+        return None;
+    }
+    let mut reachable: Vec<usize> = Vec::new();
+    for (index, imp) in impls.iter().enumerate() {
+        if imp.open_ended {
+            return None;
+        }
+        if !(imp.required <= argc && argc <= imp.params.len()) {
+            continue;
+        }
+        if (0..argc).any(|position| is_bare(imp, position) || !pine_settled(&imp.params[position]))
+        {
+            return None;
+        }
+        reachable.push(index);
+    }
+    for widening in [false, true] {
+        let found: Vec<usize> = reachable
+            .iter()
+            .copied()
+            .filter(|&index| {
+                shapes.iter().enumerate().all(|(position, given)| {
+                    pine_takes(&impls[index].params[position], given.as_ref(), widening)
+                })
+            })
+            .collect();
+        if !found.is_empty() {
+            return if found.len() == 1 { Some(found[0]) } else { None };
+        }
+    }
+    None
+}
+
+/// Whether the value dispatch may run an implementation for a reason only an indexed pin
+/// overrules (`value_rival`): it declares another element type of an argument's container
+/// kind, or, where `numbers`, an int for a float argument or the other way round.
+pub fn value_rival<S: AsRef<str>>(imp: &ImplSig, shapes: &[S], numbers: bool) -> bool {
+    for (declared, given) in imp.params.iter().zip(shapes) {
+        let given = given.as_ref();
+        if declared == given {
+            continue;
+        }
+        if is_array(given) || is_matrix(given) || is_map(given) {
+            if kind_of(declared) == kind_of(given) {
+                return true;
+            }
+        } else if numbers && NUMERIC.contains(&given) && NUMERIC.contains(&declared.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a type is one Pine's overload resolution compares as it stands
+/// (`_pine_settled`).
+fn pine_settled(ty: &str) -> bool {
+    if SCALARS.contains(&ty) {
+        return true;
+    }
+    if is_array(ty) || is_matrix(ty) {
+        return pine_settled(element_of(ty));
+    }
+    if is_map(ty) {
+        return pine_settled(key_of(ty)) && pine_settled(value_of(ty));
+    }
+    class_of(ty).is_some()
+}
+
+/// Whether Pine passes an argument of one type to a parameter of another
+/// (`_pine_takes`).
+fn pine_takes(declared: &str, given: &str, widening: bool) -> bool {
+    if declared == given || constant_scalar(given) == declared {
+        return true;
+    }
+    widening && given == INT && declared == FLOAT
 }
 
 fn shape_at<S: AsRef<str>>(shapes: &[S], index: usize) -> &str {
@@ -2010,6 +2119,7 @@ pub fn impl_sig(
         fits,
         names: found.positional.iter().map(|&arg| arg_parts(ast, arg).0.to_string()).collect(),
         bare,
+        slot: -1,
     })
 }
 

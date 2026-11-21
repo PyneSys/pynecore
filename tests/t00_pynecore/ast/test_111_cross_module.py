@@ -848,3 +848,101 @@ def __test_a_class_imported_by_name_is_a_type__(tmp_path, monkeypatch):
     reasons = [diag.origin.reason for diag in table.diags if diag.origin is not None]
     assert reasons == ['bad-call']
     assert (table.diags[0].code, table.diags[0].args) == ('E0068', ('Cfg', '2', '3'))
+
+
+# --- a group found by name, pinned by index ---------------------------------
+
+
+BY_NAME_GROUP_LIB = '''"""
+@pyne
+"""
+from pynecore.core.overload import overload
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_method import method
+from pynecore.core.pine_udt import udt
+
+__all__ = ['Bag', 'put']
+put = Exported()
+
+
+@udt
+class Bag:
+    level: int = 0
+
+
+def setup():
+    @export
+    @overload
+    @method
+    def put(this: Bag, v: int) -> int:
+        return 1
+
+    @export
+    @overload
+    @method
+    def put(this: Bag, v: float) -> str:
+        return 'float'
+'''
+
+BY_NAME_GROUP_APP = '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method_call
+import {lib} as bags
+
+
+def main(r: float, n: int):
+    bag = bags.Bag.new(0)
+    a = method_call('put', bag, r)
+    b = method_call('put', bag, n)
+    return a, b
+'''
+
+
+def __test_a_group_found_by_name_is_pinned_by_index__(tmp_path, monkeypatch):
+    """
+    A float argument may be a Python int at run time, which the value dispatch hands to
+    the int implementation: the by-name site names the float one Pine selects by index,
+    and is typed by it; the int argument already runs the int one and stays unpinned
+    """
+    monkeypatch.syspath_prepend(tmp_path)
+    _write(tmp_path, 'xm_byname_lib', BY_NAME_GROUP_LIB)
+    app = _write(tmp_path, 'xm_byname_app', BY_NAME_GROUP_APP.format(lib='xm_byname_lib'))
+
+    tree, table = _analysed(app)
+
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'method_call']
+    assert [get_pin(call) for call in calls] == ['*f=1', None]
+    types = {name: binding.ty for name, binding in table.bindings['main'].items()}
+    assert (types['a'], types['b']) == ('s', INT)
+
+
+def __test_the_index_reaches_the_export_found_by_name__(tmp_path, monkeypatch):
+    """An int VALUE in the float-typed argument runs the float implementation"""
+    monkeypatch.syspath_prepend(tmp_path)
+    _write(tmp_path, 'xm_byname_run_lib', BY_NAME_GROUP_LIB)
+    _write(tmp_path, 'xm_byname_run_app', BY_NAME_GROUP_APP.format(lib='xm_byname_run_lib'))
+
+    library = importlib.import_module('xm_byname_run_lib')
+    module = importlib.import_module('xm_byname_run_app')
+    library.setup()
+
+    state = _make_state(module.__pyne_slot_layout__['main'])
+    assert module.main(state, 3, 2) == ('float', 1)
+
+
+def __test_the_by_name_index_can_be_switched_off__(tmp_path, monkeypatch):
+    """``PYNE_NO_TYPE_PIN=1``: the int value runs the int implementation again"""
+    monkeypatch.setenv('PYNE_NO_TYPE_PIN', '1')
+    monkeypatch.syspath_prepend(tmp_path)
+    _write(tmp_path, 'xm_byname_off_lib', BY_NAME_GROUP_LIB)
+    _write(tmp_path, 'xm_byname_off_app', BY_NAME_GROUP_APP.format(lib='xm_byname_off_lib'))
+
+    library = importlib.import_module('xm_byname_off_lib')
+    module = importlib.import_module('xm_byname_off_app')
+    library.setup()
+
+    state = _make_state(module.__pyne_slot_layout__['main'])
+    assert module.main(state, 3, 2) == (1, 1)
+

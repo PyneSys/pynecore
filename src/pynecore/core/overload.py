@@ -24,7 +24,9 @@ compatible matching) and calls it through a per-anchor bound cache:
   the same semantics the legacy module-global scope gave such calls.
 
 A call site whose argument TYPES the Pine type pass could decide reaches the
-binder with an overload pin -- one type character per positional argument. The
+binder with an overload pin -- one type character per positional argument, and
+where the witnesses would not select the implementation Pine does, the index of
+that implementation in the group's registration order after an ``=``. The
 anchor then turns those characters into witness values and runs the ORDINARY
 selector on them once, at bind time, instead of selecting per bar from the
 values. That is what makes the dispatch match TradingView's: Pine resolves an
@@ -340,6 +342,15 @@ _PIN_WITNESSES: dict[str, Any] = {
 #: exists for.
 _PIN_ANY = '*'
 
+#: Separator of a pin's implementation index. ``<characters>=<index>`` names the
+#: implementation by its position in the group's registration order: the type
+#: pass writes it where Pine's static selection runs another implementation
+#: than the values or the witnesses would (an empty container matches the first
+#: implementation of its kind), and the characters before it only count the
+#: positional arguments. The suffix is ``transformers/pine_type_rules.py``'s
+#: ``PIN_INDEX``.
+_PIN_INDEX = '='
+
 
 def _select_pinned(impls: list[Implementation], pin: str) -> Implementation | None:
     """Select the implementation a pin with wildcard positions names.
@@ -400,6 +411,33 @@ def _takes_pinned(impl: Implementation, argc: int, probes: list[tuple[int, Any]]
                                                               strict):
             return False
     return True
+
+
+def _indexed(impls: list[Implementation], position: str, argc: int) -> Implementation | None:
+    """The implementation an indexed pin names.
+
+    The index is the implementation's position in the group's registration
+    order. It names nothing where it is out of range, or where the
+    implementation cannot take the call's positional arguments at all.
+
+    :param impls: Registered implementations (registration order).
+    :param position: The pin's text after the index separator.
+    :param argc: The number of positional arguments the call site passes.
+    :return: The implementation, or None.
+    """
+    if not position.isdigit():
+        return None
+    index = int(position)
+    if index >= len(impls):
+        return None
+    impl = impls[index]
+    if argc > len(impl.param_types):
+        return None
+    try:
+        impl.sig.bind(*range(argc))
+    except TypeError:
+        return None
+    return impl
 
 
 def _no_overload_error(qualname: str, args: tuple, kwargs: dict) -> WrongOperandTypeError:
@@ -488,7 +526,10 @@ def _anchored(impls: list[Implementation], qualname: str,
         one); per-anchor entries create their own.
     :param pin: The call site's overload pin, when the type pass decided on
         one: the implementation is then selected here, once, from the static
-        types rather than per bar from the values.
+        types rather than per bar from the values. A pin with an index
+        (``_PIN_INDEX``) names the implementation outright; the first call
+        checks every argument against it, and a mismatch hands the site to the
+        value dispatch for good.
     :return: The dispatch callable.
 
     A fully pinned stateless implementation may supply ``__pyne_pinned_bind__``.
@@ -586,37 +627,46 @@ def _anchored(impls: list[Implementation], qualname: str,
     if not pin or os.environ.get('PYNE_NO_TYPE_PIN') == '1':
         return dispatch
 
-    if _PIN_ANY in pin:
-        pinned = _select_pinned(impls, pin) \
-            if all(c in _PIN_WITNESSES or c == _PIN_ANY for c in pin) else None
+    chars, separator, position = pin.partition(_PIN_INDEX)
+    argc = len(chars)
+    if separator:
+        pinned = _indexed(impls, position, argc)
+    elif _PIN_ANY in chars:
+        pinned = _select_pinned(impls, chars) \
+            if all(c in _PIN_WITNESSES or c == _PIN_ANY for c in chars) else None
     else:
-        witnesses = tuple(_PIN_WITNESSES[c] for c in pin if c in _PIN_WITNESSES)
-        pinned = _select(impls, witnesses, {}) if len(witnesses) == len(pin) else None
+        witnesses = tuple(_PIN_WITNESSES[c] for c in chars if c in _PIN_WITNESSES)
+        pinned = _select(impls, witnesses, {}) if len(witnesses) == argc else None
     if pinned is None:
-        # An unwitnessable character, or no implementation for the static
-        # shape: the values know more than the pin does, so let them decide,
-        # exactly as they did before there were pins
+        # An unwitnessable character, no implementation for the static shape,
+        # or an index the group does not have: the values know more than the
+        # pin does, so let them decide, exactly as they did before there were pins
         return dispatch
     # Narrowed alias: the closure below reads it on every call, and only the
     # non-None case ever gets there
     chosen: Implementation = pinned
-    argc = len(pin)
     group = len(impls)
-    # Positions the pin carries no type for. The selection ignored them, so the
-    # first call checks the values against what the chosen implementation
-    # declares there: a witnessed position can name an implementation the
-    # arguments as a whole do not fit, and the values must win that.
-    wildcards = tuple(index for index, char in enumerate(pin) if char == _PIN_ANY)
-    verified = [not wildcards]
+    # Positions the selection did not read. A wildcard one carries no type, and
+    # an index reads none at all, so the first call checks the values against
+    # what the chosen implementation declares there: a witnessed position can
+    # name an implementation the arguments as a whole do not fit, and so can a
+    # stale index, and the values must win that.
+    checked = tuple(range(argc)) if separator \
+        else tuple(index for index, char in enumerate(chars) if char == _PIN_ANY)
+    verified = [not checked]
+    # An index whose first call the values do not fit is given up for good: the
+    # call site dispatches from its values from then on
+    rejected = [False]
 
     def dispatch_pinned(*args: Any, **kwargs: Any) -> Any:
-        if kwargs or len(args) != argc or len(impls) != group:
+        if kwargs or len(args) != argc or len(impls) != group or rejected[0]:
             # Not the shape the pin was computed for — a keyword spelling, a
             # different arity, or an implementation registered after the bind
             return dispatch(*args, **kwargs)
         if not verified[0]:
             if not all(_check_type(args[index], chosen.param_types[index][1], False)
-                       for index in wildcards):
+                       for index in checked):
+                rejected[0] = bool(separator)
                 return dispatch(*args, **kwargs)
             verified[0] = True
         # The entry bookkeeping of ``dispatch``, repeated rather than shared:
@@ -639,8 +689,9 @@ def _anchored(impls: list[Implementation], qualname: str,
     dispatch_pinned.__pyne_impls__ = impls
     # Stateless implementations may fuse a result cache into the pinned entry.
     # The factory retains dispatch_pinned as the fallback for changed call shapes
-    # or implementations; wildcard positions still need ordinary verification.
-    if wildcards or hasattr(chosen.func, '__pyne_layout__'):
+    # or implementations; checked positions still need ordinary verification,
+    # and an indexed pin keeps the route whose guards its fallback relies on.
+    if separator or checked or hasattr(chosen.func, '__pyne_layout__'):
         return dispatch_pinned
     pinned_bind = chosen.pinned_bind
     if pinned_bind is None:

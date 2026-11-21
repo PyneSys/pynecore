@@ -28,7 +28,8 @@ from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
     FIT_OMISSIBLE, FIT_REQUIRED, INT, ImplSig, NONE_DEFAULT, OBJECT, TYPELESS,
     annotation_takes_none, class_id, default_fit, get_pin, get_ty, object_ty, overload_bind,
-    overload_binding, overload_candidates, overload_choice, overload_pick,
+    overload_binding, overload_candidates, overload_choice, overload_pick, pin_index,
+    pine_choice,
 )
 from pynecore.transformers.pine_type_transformer import PineTypeTransformer
 from pynecore.transformers.series import SeriesTransformer
@@ -948,9 +949,10 @@ def tag(x: list[Line], y: str) -> int:
 
 def __test_a_call_the_candidates_agree_on_is_typed__():
     """
-    ``count(lines)`` can run either implementation (an empty array of lines
-    passes for the ``list[Box]`` one, declared first), and both return an int;
-    ``first(lines)`` can too, and they disagree, so it has no type; ``tag``
+    ``count(lines)`` runs the ``list[Line]`` implementation, declared first;
+    ``first(lines)`` can run either by its values (an empty array of lines
+    passes for the ``list[Box]`` one, declared first), so its pin names the
+    ``list[Line]`` one Pine selects by index, and the call has its type; ``tag``
     takes an array by its kind, so a map runs the map implementation
     """
     table = infer_module(ast.parse(CANDIDATE_GROUPS + '''
@@ -964,7 +966,7 @@ def main():
     return n
 '''), 'test')
     types = {name: binding.ty for name, binding in table.bindings['main'].items()}
-    assert (types['n'], types['f'], types['t'], types['u']) == ('i', '?', 's', 'i')
+    assert (types['n'], types['f'], types['t'], types['u']) == ('i', 'o:lib#Line', 's', 'i')
 
 
 @pytest.mark.parametrize("bare,expected", [
@@ -994,3 +996,195 @@ def __test_an_unannotated_position_takes_every_keyword_argument__(bare: str,
                      names=('x', 'y'), bare=bare)]
     choice = overload_binding(impls, '*', ['a:i'], {'y': '*'}, {'y': 'o:m#A'})
     assert (None if choice is None else impls.index(choice)) == expected
+
+
+# --- the indexed pin: Pine's selection where the values would run another ---
+
+#: A group whose ``list[Line]`` implementation comes after another array one: an
+#: EMPTY array of lines passes for the first ``list[...]`` implementation by its
+#: values, while Pine selects by the static element type. The first implementation
+#: takes a required keyword-only parameter, which the static selection leaves out
+#: of its shapes: the index still counts it, it is the registration order.
+INDEXED_GROUP = '''
+from pynecore import Persistent
+from pynecore.core.overload import overload
+from pynecore.lib import array
+from pynecore.types import Box, Line
+
+@overload
+def tally(x: list[int], *, k: int) -> int:
+    return -1
+
+@overload
+def tally(x: list[Box]) -> str:
+    return 'boxes'
+
+@overload
+def tally(x: list[Line]) -> int:
+    seen: Persistent[int] = 0
+    seen += 1
+    return seen
+'''
+
+
+def __test_an_empty_container_is_pinned_by_index__():
+    """
+    The call is typed by the implementation Pine selects, and its pin names that
+    implementation by its registration index, the left-out keyword-only one counted
+    """
+    tree = ast.parse(INDEXED_GROUP + '''
+def main():
+    lines: list[Line] = array.new_line(0)
+    n = tally(lines)
+    return n
+''')
+    table = infer_module(tree, 'test')
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'tally')
+    assert get_pin(call) == '*=2'
+    assert pin_index(get_pin(call)) == 2
+    assert table.bindings['main']['n'].ty == INT
+    assert [sig.slot for sig in table.groups['tally']] == [1, 2]
+
+
+def __test_the_indexed_pin_runs_the_selected_implementation__():
+    """
+    The empty array of lines runs the ``list[Line]`` implementation, whose state
+    persists across bars like any pinned anchor's
+    """
+    ns, dump = _transform(INDEXED_GROUP + '''
+def main():
+    lines: list[Line] = array.new_line(0)
+    return tally(lines)
+''', 'pin_mod_indexed')
+    assert "'*=2'" in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert [ns['main'](state) for _ in range(3)] == [1, 2, 3]
+
+
+def __test_the_indexed_pin_can_be_switched_off__(monkeypatch):
+    """ ``PYNE_NO_TYPE_PIN=1`` ignores the index: the values run the first array implementation """
+    monkeypatch.setenv('PYNE_NO_TYPE_PIN', '1')
+    ns, _ = _transform(INDEXED_GROUP + '''
+def main():
+    lines: list[Line] = array.new_line(0)
+    return tally(lines)
+''', 'pin_mod_indexed_off')
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state) == 'boxes'
+
+
+def __test_a_decided_site_takes_no_index__():
+    """
+    Where the selection the values make already runs Pine's implementation, the pin
+    stays as it was: an array of boxes, and an int-typed argument
+    """
+    tree = ast.parse(INDEXED_GROUP + '''
+def main(r: int):
+    boxes: list[Box] = array.new_box(0)
+    s = tally(boxes)
+    return s
+''')
+    table = infer_module(tree, 'test')
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'tally')
+    assert get_pin(call) is None
+    assert table.bindings['main']['s'].ty == 's'
+
+
+def __test_a_float_argument_of_a_direct_call_takes_no_index__():
+    """
+    A float-typed value the runtime may hold as a Python int is no reason for an
+    index on a direct call: the site stays unpinned, as it was
+    """
+    tree = ast.parse(PIN_SRC + '''
+def main(r: float):
+    return f(r)
+''')
+    infer_module(tree, 'test')
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'f')
+    assert get_pin(call) is None
+
+
+@pytest.mark.parametrize("params,shapes,expected", [
+    # Exact first, in any declaration order
+    ([('f',), ('i',)], ['i'], 1),
+    # An int widens to a float only where nothing takes it exactly
+    ([('f',), ('s',)], ['i'], 0),
+    # The element type of a container decides
+    ([('a:o:lib#Box',), ('a:o:lib#Line',)], ['a:o:lib#Line'], 1),
+    # No implicit conversion between container element types
+    ([('a:f',)], ['a:i'], None),
+    # Two exact answers are no answer
+    ([('i',), ('i',)], ['i'], None),
+    # An argument type that is not settled decides nothing
+    ([('i',), ('f',)], ['?'], None),
+    ([('i',), ('f',)], ['*'], None),
+    # Nor does a declared type that is not
+    ([('?',), ('f',)], ['f'], None),
+])
+def __test_pines_own_static_selection__(params, shapes, expected):
+    """ ``pine_choice`` is Pine's rule over the static types alone """
+    impls = [ImplSig(params=p, required=len(p), open_ended=False, ret='v', fits='n' * len(p),
+                     names=('x',) * len(p)) for p in params]
+    assert pine_choice(impls, shapes) == expected
+
+
+def _indexed_group():
+    """Two array implementations, built without the decorator."""
+    def strings(x: list[str]) -> str:
+        return 'strings'
+
+    def ints(x: list[int]) -> str:
+        return 'ints'
+    return [Implementation(strings), Implementation(ints)]
+
+
+def __test_the_index_selects_without_witnesses__():
+    """ An empty array runs the implementation the index names, not the first of its kind """
+    impls = _indexed_group()
+    assert _anchored(impls, 'test.indexed')([]) == 'strings'
+    bound = _anchored(impls, 'test.indexed', pin='*=1')
+    assert bound([]) == 'ints'
+    assert bound([1]) == 'ints'
+
+
+def __test_a_first_call_the_index_does_not_fit_falls_back_for_good__():
+    """
+    The first call checks every argument against the indexed implementation: values
+    it does not take hand the site to the value dispatch, for every later call too
+    """
+    bound = _anchored(_indexed_group(), 'test.indexed_mismatch', pin='*=1')
+    assert bound(['a']) == 'strings'
+    # The index would run ``ints`` here; the site dispatches from its values now
+    assert bound([]) == 'strings'
+
+
+@pytest.mark.parametrize("pin", ['*=2', '*=', '*=x', '**=1'])
+def __test_an_index_the_group_cannot_run_falls_back__(pin: str):
+    """ An index out of range, a malformed one, or one of another arity: the values decide """
+    bound = _anchored(_indexed_group(), 'test.indexed_bad', pin=pin)
+    assert bound([]) == 'strings'
+
+
+def __test_the_index_is_ignored_when_pins_are_off__(monkeypatch):
+    """ ``PYNE_NO_TYPE_PIN=1`` dispatches from the values, an index included """
+    monkeypatch.setenv('PYNE_NO_TYPE_PIN', '1')
+    bound = _anchored(_indexed_group(), 'test.indexed_off', pin='*=1')
+    assert bound([]) == 'strings'
+
+
+def __test_the_indexed_route_keeps_the_shape_guards__():
+    """ A keyword spelling, another arity and a grown group all go to the values """
+    impls = _indexed_group()
+    bound = _anchored(impls, 'test.indexed_guards', pin='*=1')
+    assert bound(x=[]) == 'strings'
+    with pytest.raises(WrongOperandTypeError):
+        bound([], [])
+
+    def floats(x: list[float]) -> str:
+        return 'floats'
+    impls.insert(0, Implementation(floats))
+    assert bound([]) == 'floats'
+

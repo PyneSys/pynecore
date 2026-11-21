@@ -80,7 +80,7 @@ from .pine_type_rules import (
     join, binop_type, unaryop_type, compare_type, annotation_type, bare_wrapper,
     LIB_TYPE_OVERRIDES, OVERRIDE_PARAM_NAMES, BUILTIN_CALL_TYPES, BUILTIN_NAME_TYPES,
     TY_ATTR, get_ty, set_ty, inherit_ty,
-    constant_type, PIN_ANY, pin_for, get_pins, set_pin, set_pins, set_vector,
+    constant_type, PIN_ANY, pin_for, pin_chars, get_pins, set_pin, set_pins, set_vector,
     get_varying, set_varying,
     WIDEN_FLOAT, WIDEN_BOOL, WIDEN_ITEMS, WIDEN_MATRIX, WIDEN_STRING_NA, WIDEN_NUMBER_NA,
     WIDEN_BOOL_NA, WIDEN_NA_TEXT, WIDEN_ARRAY_NA, WIDEN_MAP_NA, WIDEN_MATRIX_NA, CONTAINER_NA_WIDENS,
@@ -88,7 +88,7 @@ from .pine_type_rules import (
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
     overload_result, ImplSig, overload_choice, overload_binding, overload_candidates,
-    value_chars, default_fit, FIT_REQUIRED,
+    indexed_pin, pin_index, pine_choice, value_rival, value_chars, default_fit, FIT_REQUIRED,
     impl_sig, _param_defaults, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, is_array,
@@ -3723,7 +3723,55 @@ class _Inference:
                 isinstance(a, ast.Starred) for a in node.args):
             shapes = [self._ty_of(a) for a in node.args]
             pin = pin_for(shapes)
+            if impls is not None:
+                indexed = self._pine_index(impls, shapes, pin)
+                if indexed is not None:
+                    return self._record_pin(node, indexed_pin(shapes, indexed.slot))
         return self._record_pin(node, pin, settled=self._settled(impls, pin, shapes))
+
+    @staticmethod
+    def _pine_index(impls: Sequence[ImplSig], shapes: Sequence[str], pin: str | None,
+                    by_name: bool = False) -> ImplSig | None:
+        """
+        The implementation a call site's pin has to name by its index.
+
+        A pin without an index makes the runtime select from its characters,
+        and an unpinned call from the values. Where that selection -- the exact
+        pass and the candidates it leaves (``_selected``) -- does not settle on
+        the one implementation Pine selects from the static types
+        (``pine_choice``), and does once the implementations the values alone
+        can make it run are out of the way (``value_rival``), the index is
+        what makes it run that one: an implementation that declares another
+        element type of an argument's container kind, and for a call by name
+        one that declares an int for a float argument or the other way round.
+        Everywhere else the site stays as it is.
+
+        :param impls: The group's implementations, in declaration order
+        :param shapes: The static type of each positional argument
+        :param pin: The pin the site justifies without an index, or None for
+                    a site the runtime selects from the values
+        :param by_name: Whether the call finds the group by its name, which no
+                        pin without an index reaches
+        :return: The implementation Pine selects, or None where the site needs
+                 no index or one would not settle it
+        """
+        position = pine_choice(impls, shapes)
+        if position is None or impls[position].slot < 0:
+            return None
+        chosen = impls[position]
+        chars = pin if pin is not None else value_chars(shapes)
+        if _selected(impls, chars, shapes) == [position]:
+            return None
+        kept = [impl for impl in impls
+                if impl is chosen or not value_rival(impl, shapes, by_name)]
+        if len(kept) == len(impls):
+            return None
+        # With its numeric rivals out of the way, a call by name reads its
+        # numbers by their types, as the index makes the runtime do
+        if _selected(kept, pin_chars(shapes) if by_name else chars, shapes) \
+                != [kept.index(chosen)]:
+            return None
+        return chosen
 
     @staticmethod
     def _settled(impls: Sequence[ImplSig] | None, pin: str | None,
@@ -4924,16 +4972,59 @@ class _Inference:
                     or not self._group_call_fits(key, name, node, args):
                 self._record_pin(node, None, settled=True)
                 return UNKNOWN
-            shapes = self._shapes(args)
-            pin = None if shapes is None or node.keywords else pin_for(shapes)
-            self._record_pin(node, pin,
-                             settled=self._settled(self._impl_sigs(key), pin, shapes or ()))
+            pin = self._method_pin(node, args, self._impl_sigs(key), False)
             ty = self._generic_call(key, frame, node, args)
             return self._group_type(key, pin, args, node.keywords) if ty is None else ty
         # The method handed over as a function is the one the call site's dispatch
         # entry binds, so the instance vector stamped here configures it
         # (``core/pine_method``)
         return self._call_context(key, node, frame, args)
+
+    def _method_pin(self, node: ast.Call, args: Sequence[ast.expr],
+                    impls: Sequence[ImplSig], by_name: bool) -> str | None:
+        """
+        Stamp the pin of a ``method_call`` site that reaches an overload group.
+
+        A method handed over as a function is pinned the way a direct call is
+        (``_pin``). One found by NAME is selected from the values, so it carries
+        a pin only where that selection does not run the implementation Pine
+        selects, and then the pin names it by its index (``_pine_index``):
+        the dispatch entry hands such a pin, and no other, to the export it
+        finds (``core/pine_method``).
+
+        :param node: The ``method_call`` node
+        :param args: The receiver and the arguments after it
+        :param impls: The group's implementations, in declaration order
+        :param by_name: Whether the call finds the group by its name
+        :return: The pin this context justified, or None
+        """
+        shapes = self._shapes(args)
+        if shapes is None or node.keywords:
+            return self._record_pin(node, None, settled=True)
+        pin = None if by_name else pin_for(shapes)
+        indexed = self._pine_index(impls, shapes, pin, by_name)
+        if indexed is not None:
+            return self._record_pin(node, indexed_pin(shapes, indexed.slot))
+        return self._record_pin(node, pin, settled=self._settled(impls, pin, shapes))
+
+    def _by_name_pin(self, node: ast.Call, args: Sequence[ast.expr],
+                     impls: Sequence[ImplSig]) -> str | None:
+        """
+        The pin of a ``method_call`` site that reaches another module's group or its own export.
+
+        Such a site carries no pin today: its dispatch entry selects from the
+        values. It is stamped with an indexed one where that selection does not
+        run the implementation Pine selects (``_method_pin``), and only on a
+        ``method_call`` node, the one whose anchor hands the pin over.
+
+        :param node: The call node
+        :param args: The receiver and the arguments after it
+        :param impls: The group's implementations, in declaration order
+        :return: The indexed pin this context justified, or None
+        """
+        if dotted_name(node.func) != 'method_call':
+            return None
+        return self._method_pin(node, args, impls, True)
 
     def _unknown_method(self, node: ast.Call) -> str:
         """
@@ -5214,7 +5305,8 @@ class _Inference:
             if not self._group_call_fits(key, name, node, args):
                 return UNKNOWN
             impls = self._impl_sigs(key)
-            settled = self._group_result(impls, None, args, node.keywords)
+            settled = self._group_result(impls, self._by_name_pin(node, args, impls),
+                                         args, node.keywords)
             if settled is not None:
                 return settled
             receiver = self._ty_of(args[0]) if args else UNKNOWN
@@ -5290,7 +5382,8 @@ class _Inference:
         if not self._export_call_fits(node, name, sig, args, by_name):
             return UNKNOWN
         if sig.kind == 'group':
-            settled = self._group_result(sig.impls, None, args, node.keywords)
+            settled = self._group_result(sig.impls, self._by_name_pin(node, args, sig.impls),
+                                         args, node.keywords)
             if settled is not None:
                 return settled
             receiver = self._ty_of(args[0]) if args else UNKNOWN
@@ -5668,6 +5761,9 @@ class _Inference:
             return None if choice is None \
                 else [index for index, sig in enumerate(sigs) if sig is choice]
         pin = None if by_name else pin_for(shapes)
+        indexed = self._pine_index(sigs, shapes, pin, by_name)
+        if indexed is not None:
+            return [index for index, sig in enumerate(sigs) if sig is indexed]
         return overload_candidates(sigs, pin if pin is not None else value_chars(shapes), shapes)
 
     def _group_type(self, key: str, pin: str | None, args: Sequence[ast.expr],
@@ -5722,7 +5818,7 @@ class _Inference:
         if choice is not None:
             self._widen_group_nas(choice, args, keywords)
             return choice.ret
-        if kw_shapes:
+        if kw_shapes or pin_index(pin) is not None:
             return None
         found = overload_candidates(list(impls), pin if pin is not None else value_chars(shapes),
                                     shapes)
@@ -5812,6 +5908,10 @@ class _Inference:
         """
         if shapes is None or kw_shapes is None:
             return None
+        index = pin_index(pin)
+        if index is not None:
+            # The runtime runs the implementation the index names
+            return next((impl for impl in impls if impl.slot == index), None)
         if kw_shapes:
             declared = {pname for impl in impls for pname in impl.names}
             kw_shapes = {_runtime_keyword(pname, declared): ty for pname, ty in kw_shapes.items()}
@@ -5853,7 +5953,8 @@ class _Inference:
                 continue
             slot = self._group_slot.get(node_id(impl) or -1)
             ret = returns[slot] if slot is not None and slot < len(returns) else UNKNOWN
-            out.append((impl, impl_sig(impl, ret, self._ty_of, self._classes, self._enums)))
+            out.append((impl, impl_sig(impl, ret, self._ty_of, self._classes, self._enums,
+                                       -1 if slot is None else slot)))
         return out
 
     def _call_context(self, key: str, node: ast.Call, frame: int,
@@ -6876,6 +6977,22 @@ def _element_at(ty: str, path: Sequence[int]) -> str:
             return UNKNOWN
         ty = elements[index]
     return ty
+
+
+def _selected(impls: Sequence[ImplSig], chars: str, shapes: Sequence[str]) -> list[int] | None:
+    """
+    The implementations a positional call can run, by index, as ``_group_result`` reads them.
+
+    :param impls: The group's implementations, in declaration order
+    :param chars: The call's pin, or its arguments read as values
+    :param shapes: The static type of each positional argument
+    :return: The one the exact pass settles on, else the candidates
+             (``overload_candidates``)
+    """
+    choice = overload_choice(list(impls), chars, shapes)
+    if choice is not None:
+        return [index for index, impl in enumerate(impls) if impl is choice]
+    return overload_candidates(list(impls), chars, shapes)
 
 
 def _reaches_library_methods(receiver: str, name: str) -> bool:

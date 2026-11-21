@@ -349,7 +349,8 @@ impl ExportSig {
             .and_then(serde_json::Value::as_array)
             .ok_or("no impls")?
             .iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(position, item)| {
                 Ok(ImplSig {
                     params: json_strs(item, "params")?,
                     required: usize::try_from(json_int(item, "required")?)
@@ -363,6 +364,10 @@ impl ExportSig {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
+                    slot: match item.get("slot").and_then(serde_json::Value::as_i64) {
+                        Some(slot) => slot,
+                        None => i64::try_from(position).map_err(|_| "slot")?,
+                    },
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

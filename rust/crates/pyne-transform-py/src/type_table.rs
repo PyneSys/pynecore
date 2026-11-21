@@ -200,6 +200,7 @@ impl<'py> Classes<'py> {
             fits: string(&get("fits")?)?,
             names: tuple(&get("names")?, string)?,
             bare: string(&get("bare")?)?,
+            slot: int(&get("slot")?)?,
         })
     }
 
@@ -402,6 +403,7 @@ impl<'py> Classes<'py> {
             kwargs.set_item("fits", &imp.fits)?;
             kwargs.set_item("names", PyTuple::new(py, &imp.names)?)?;
             kwargs.set_item("bare", &imp.bare)?;
+            kwargs.set_item("slot", imp.slot)?;
             items.push(self.impl_sig.call((), Some(&kwargs))?);
         }
         PyTuple::new(py, items)?.into_bound_py_any(py)

@@ -419,7 +419,8 @@ pub fn interface_digest(interface: &Interface) -> String {
 
 /// One published signature, in the payload's shape (`_export_json`).
 fn export_json(sig: &ExportSig) -> Value {
-    let impls: Vec<Value> = sig.impls.iter().map(impl_json).collect();
+    let impls: Vec<Value> =
+        sig.impls.iter().enumerate().map(|(position, imp)| impl_json(imp, position)).collect();
     json!({
         "kind": sig.kind,
         "params": sig.params,
@@ -433,15 +434,21 @@ fn export_json(sig: &ExportSig) -> Value {
     })
 }
 
-fn impl_json(imp: &ImplSig) -> Value {
-    json!({
+/// One implementation of a published group, in the payload's shape (`_impl_json`): the
+/// registration index is written only where it is not the position in the list.
+fn impl_json(imp: &ImplSig, position: usize) -> Value {
+    let mut data = json!({
         "params": imp.params,
         "required": imp.required,
         "open_ended": imp.open_ended,
         "ret": imp.ret,
         "fits": imp.fits,
         "names": imp.names,
-    })
+    });
+    if i64::try_from(position).ok() != Some(imp.slot) {
+        data["slot"] = json!(imp.slot);
+    }
+    data
 }
 
 /// One signature with its line number taken out (`_unlined`).

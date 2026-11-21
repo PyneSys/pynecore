@@ -1435,12 +1435,30 @@ def _export_json(sig: ExportSig) -> dict:
     return {
         'kind': sig.kind, 'params': list(sig.params), 'required': sig.required,
         'open_ended': sig.open_ended, 'ret': sig.ret, 'annotated': sig.annotated,
-        'impls': [{'params': list(impl.params), 'required': impl.required,
-                   'open_ended': impl.open_ended, 'ret': impl.ret, 'fits': impl.fits,
-                   'names': list(impl.names)}
-                  for impl in sig.impls],
+        'impls': [_impl_json(impl, position) for position, impl in enumerate(sig.impls)],
         'line': sig.line, 'names': list(sig.names),
     }
+
+
+def _impl_json(impl: ImplSig, position: int) -> dict:
+    """
+    One implementation of a published group, in the payload's shape.
+
+    The registration index (``ImplSig.slot``) is written only where it is not
+    the implementation's position in the published list -- where the static
+    selection leaves an earlier implementation of the group out -- and a
+    reader takes the position where it is absent.
+
+    :param impl: The implementation
+    :param position: Its position in the published list
+    :return: Its JSON form
+    """
+    data = {'params': list(impl.params), 'required': impl.required,
+            'open_ended': impl.open_ended, 'ret': impl.ret, 'fits': impl.fits,
+            'names': list(impl.names)}
+    if impl.slot != position:
+        data['slot'] = impl.slot
+    return data
 
 
 def _export_from_json(name: str, data: dict) -> ExportSig:
@@ -1460,8 +1478,9 @@ def _export_from_json(name: str, data: dict) -> ExportSig:
                             required=impl.get('required', 0),
                             open_ended=bool(impl.get('open_ended')),
                             ret=impl.get('ret', UNKNOWN), fits=impl.get('fits', ''),
-                            names=tuple(impl.get('names') or ()))
-                    for impl in (data.get('impls') or ())),
+                            names=tuple(impl.get('names') or ()),
+                            slot=impl.get('slot', position))
+                    for position, impl in enumerate(data.get('impls') or [])),
         line=data.get('line', 0), names=tuple(data.get('names') or ()))
 
 

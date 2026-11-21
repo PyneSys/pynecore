@@ -17,8 +17,8 @@ use crate::pine_qualifier::SERIES;
 use crate::pine_type_rules::ImplSig;
 use crate::pine_type_rules::{
     NUMERIC, OBJECT, PINE_LOOP, TYPELESS, UNKNOWN, array_of, builtin_call_type, class_of,
-    elements_of, impl_sig, is_map, join, namespace_of, object_ty, overload_candidates,
-    overload_result, param_defaults, pin_for, render_ty, tuple_of, value_chars,
+    elements_of, impl_sig, indexed_pin, is_map, join, namespace_of, object_ty, overload_candidates,
+    overload_result, param_defaults, pin_for, pin_index, render_ty, tuple_of, value_chars,
 };
 use crate::pine_type_table::{CallSite, ClassSig, ExportSig};
 
@@ -462,21 +462,59 @@ impl Engine<'_, '_> {
             }
             let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
             let keywords = keywords.to_vec();
-            let shapes = self.shapes(&args);
-            let pin = match &shapes {
-                Some(shapes) if keywords.is_empty() => pin_for(shapes),
-                _ => None,
-            };
             let impls = self.impl_sigs(&key)?;
-            let settled =
-                lib_calls::settled(Some(&impls), pin.as_deref(), shapes.as_deref().unwrap_or(&[]));
-            self.record_pin(node, pin.clone(), true, settled)?;
+            let pin = self.method_pin(node, &args, &impls, false)?;
             if let Some(ty) = self.generic_call(&key, frame, node, &args)? {
                 return Ok(Some(ty));
             }
             return self.group_type(&key, pin.as_deref(), &args, &keywords).map(Some);
         }
         self.call_context(&key, node, frame, Some(&args), true, None).map(Some)
+    }
+
+    /// Stamp the pin of a `method_call` site that reaches an overload group
+    /// (`_method_pin`): a method handed over as a function the way a direct call is, one
+    /// found by name only with an index, where the values would not run the
+    /// implementation Pine selects.
+    fn method_pin(
+        &mut self,
+        node: NodeId,
+        args: &[NodeId],
+        impls: &[ImplSig],
+        by_name: bool,
+    ) -> R<Option<String>> {
+        let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
+        let shapes = self.shapes(args);
+        let Some(shapes) = shapes.filter(|_| keywords.is_empty()) else {
+            return self.record_pin(node, None, true, true);
+        };
+        let pin = if by_name { None } else { pin_for(&shapes) };
+        if let Some(index) = lib_calls::pine_index(impls, &shapes, pin.as_deref(), by_name) {
+            return self.record_pin(
+                node,
+                Some(indexed_pin(&shapes, impls[index].slot)),
+                true,
+                false,
+            );
+        }
+        let settled = lib_calls::settled(Some(impls), pin.as_deref(), &shapes);
+        self.record_pin(node, pin, true, settled)
+    }
+
+    /// The pin of a `method_call` site that reaches another module's group or its own
+    /// export (`_by_name_pin`): an indexed one where the values would not run the
+    /// implementation Pine selects, and only on a `method_call` node.
+    fn by_name_pin(
+        &mut self,
+        node: NodeId,
+        args: &[NodeId],
+        impls: &[ImplSig],
+    ) -> R<Option<String>> {
+        let (func, _, _) = facts::call_parts(self.ast, node).expect("a call");
+        if self.dotted(func).as_deref() != Some("method_call") {
+            return Ok(None);
+        }
+        self.method_pin(node, args, impls, true)
     }
 
     /// Report a `method_call` that reaches no method, naming the method
@@ -712,7 +750,8 @@ impl Engine<'_, '_> {
             let impls = self.impl_sigs(key)?;
             let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
             let keywords = keywords.to_vec();
-            if let Some(settled) = self.group_result(&impls, None, args, &keywords)? {
+            let pin = self.by_name_pin(node, args, &impls)?;
+            if let Some(settled) = self.group_result(&impls, pin.as_deref(), args, &keywords)? {
                 return Ok(settled);
             }
             let receiver = args.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
@@ -787,7 +826,8 @@ impl Engine<'_, '_> {
         if sig.kind == "group" {
             let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
             let keywords = keywords.to_vec();
-            if let Some(settled) = self.group_result(&sig.impls, None, args, &keywords)? {
+            let pin = self.by_name_pin(node, args, &sig.impls)?;
+            if let Some(settled) = self.group_result(&sig.impls, pin.as_deref(), args, &keywords)? {
                 return Ok(settled);
             }
             let receiver = args.first().map_or(UNKNOWN.to_string(), |&arg| self.ty_of(arg));
@@ -1090,7 +1130,7 @@ impl Engine<'_, '_> {
             self.widen_group_nas(&choice, args, keywords)?;
             return Ok(Some(choice.ret));
         }
-        if !kw_shapes.is_empty() {
+        if !kw_shapes.is_empty() || pin_index(pin).is_some() {
             return Ok(None);
         }
         let chars = match pin {
@@ -1121,6 +1161,9 @@ impl Engine<'_, '_> {
             return self.choice_at(sigs, None, Some(&shapes), Some(&kw_shapes)).map(|at| vec![at]);
         }
         let pin = if by_name { None } else { pin_for(&shapes) };
+        if let Some(index) = lib_calls::pine_index(sigs, &shapes, pin.as_deref(), by_name) {
+            return Some(vec![index]);
+        }
         let chars = pin.unwrap_or_else(|| value_chars(&shapes));
         overload_candidates(sigs, &chars, &shapes)
     }
@@ -1178,17 +1221,16 @@ impl Engine<'_, '_> {
                 Some(slot) if slot < returns.len() => returns[slot].clone(),
                 _ => UNKNOWN.to_string(),
             };
-            out.push((
+            let mut sig = impl_sig(
+                self.ast,
                 imp,
-                impl_sig(
-                    self.ast,
-                    imp,
-                    &ret,
-                    &|value| self.ty_of(value),
-                    &self.classes_lookup,
-                    &self.enums,
-                )?,
-            ));
+                &ret,
+                &|value| self.ty_of(value),
+                &self.classes_lookup,
+                &self.enums,
+            )?;
+            sig.slot = slot.and_then(|slot| i64::try_from(slot).ok()).unwrap_or(-1);
+            out.push((imp, sig));
         }
         Ok(out)
     }

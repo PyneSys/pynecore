@@ -26,7 +26,9 @@ from pathlib import Path
 import pytest
 
 from ..pine_analysis import analyse_module
+from pynecore.core.import_hook import PyneLoader
 from pynecore.errorcodes import CALL_ARGUMENT_TWICE, CALL_UNKNOWN_PARAMETER
+from pynecore.transformers.import_normalizer import ImportNormalizerTransformer
 from pynecore.transformers.lib_registry import lib_types
 from pynecore.transformers.pine_type_infer import infer_module
 from pynecore.transformers.pine_type_rules import (
@@ -1360,3 +1362,52 @@ def __test_a_method_no_proxy_holds_is_not_reached_by_name_on_an_array__():
         .replace('shiftr: _ProtocolShiftr = Exported()\n', '')
     table = infer_module(ast.parse(source), 'test')
     assert [diag.code for diag in table.diags]
+
+
+# --- an overload group the value dispatch would select differently --------
+
+#: Two array implementations of one group: an EMPTY array of labels passes for the
+#: first ``list[...]`` one by its values, so only an indexed pin runs the one Pine
+#: selects -- and only with it can the call be typed at all.
+EMPTY_CONTAINER_EDGE = '''"""
+@pyne edge
+"""
+from pynecore.core.overload import overload
+from pynecore.lib import array, script
+from pynecore.types import Label, Line
+
+
+@overload
+def last_of(xs: list[Line]) -> Line:
+    return array.last(xs)
+
+
+@overload
+def last_of(xs: list[Label]) -> Label:
+    return array.last(xs)
+
+
+@script.indicator("x")
+def main():
+    labels: list[Label] = array.new_label(0)
+    item = last_of(labels)
+    if array.size(labels) > 0:
+        item = last_of(labels)
+'''
+
+
+def __test_an_empty_container_call_is_typed_by_the_implementation_pine_selects__():
+    """ The ``list[Label]`` implementation types the call, and nothing is left unknown """
+    tree = ImportNormalizerTransformer().visit(ast.parse(EMPTY_CONTAINER_EDGE))
+    table = infer_module(tree, 'test')
+    assert table.bindings['main']['item'].ty == object_ty(builtin_class_id('Label'))
+    assert table.diags == []
+
+
+def __test_an_empty_container_call_compiles_under_strict__(tmp_path, monkeypatch):
+    """ The strict edge compile no longer stops at the group call """
+    monkeypatch.setenv('PYNE_EDGE_STRICT', '1')
+    path = tmp_path / 'edge_empty_container.py'
+    path.write_text(EMPTY_CONTAINER_EDGE, encoding='utf-8')
+    PyneLoader(path.stem, str(path)).source_to_code(path.read_bytes(), str(path))
+
