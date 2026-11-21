@@ -55,6 +55,7 @@ from ..errorcodes import (
     CALL_MISSING_ARGUMENT, CALL_NO_OVERLOAD, CALL_POSITIONAL_COUNT, CALL_TOO_FEW_ARGUMENTS,
     CALL_UNKNOWN_PARAMETER, CONSTRUCTOR_FIELD_COUNT, CONSTRUCTOR_FIELD_TYPE,
     CONSTRUCTOR_MISSING_FIELD, LOOP_ENTER_ARITY, LOOP_STEP_ARITY, METHOD_CALL_SHAPE,
+    OVERLOAD_ARGUMENT_UNKNOWN, OVERLOAD_NOT_DECIDED,
     TYPE_CALLEE_NOT_NAME, TYPE_CONFLICT, TYPE_CONTEXT_LIMIT, TYPE_DECLARED_MISMATCH,
     TYPE_FIELD_ASSIGN_MISMATCH, TYPE_IMPORT_CYCLE, TYPE_IMPORTED_TWICE, TYPE_INDEX_NOT_PINE,
     TYPE_LIB_NAMESPACE_CALL, TYPE_LIB_VALUE_CALL, TYPE_LOOP_BOUNDS_UNKNOWN,
@@ -88,8 +89,9 @@ from .pine_type_rules import (
     NOT_PINE_STRINGS, set_widen, get_widen_site,
     set_widen_site, get_widens, set_widens, is_na_widen, set_na_class,
     overload_result, ImplSig, overload_choice, overload_binding, overload_candidates,
-    indexed_pin, pin_index, pine_choice, value_rival, value_chars, default_fit, FIT_REQUIRED,
-    resolve_pin, PIN_INDEX,
+    indexed_pin, pin_index, pine_choice, pine_keyword_choice, value_rival, value_chars,
+    default_fit, FIT_REQUIRED, resolve_pin, is_unsettled, annotation_qualifier, qualifier_choice,
+    has_twin,
     impl_sig, _param_defaults, _DYN_DEFAULT,  # noqa: internal API
     CLASS_SEP, LIB_MODULE, SCALARS, PINE_LOOP, array_of, builtin_class_id, class_id, class_of,
     element_of, elements_of, is_array,
@@ -572,6 +574,12 @@ class _Inference:
         #: Overload call node id -> context id -> whether the value dispatch of
         #: that context runs the implementation its pin selects
         self._pin_settled: dict[int, dict[int, bool]] = {}
+        #: Overload call node id -> the node and, per context id, how the static
+        #: types decide it: None where they name the implementation, the 1-based
+        #: position of the first positional argument of unknown type, else the
+        #: name of the first keyword argument of unknown type, or 0 where every
+        #: type is known and they still do not (``_report_undecided``)
+        self._undecided: dict[int, tuple[ast.Call, dict[int, int | str | None]]] = {}
         #: Node ids of the varying sites whose every instance is handed its
         #: vector entry (``_stamp_instance_vectors``)
         self._delivered: set[int] = set()
@@ -1181,6 +1189,7 @@ class _Inference:
         self._stamp_instance_vectors(tree)
         self._suppress_pins(tree)
         self._report_context_pins()
+        self._report_undecided()
         self._report_unhandled_widens()
         # Where the types ran out, once per cause: the coverage meter of a
         # hand-written script, the first error of an edge module
@@ -2006,7 +2015,8 @@ class _Inference:
 
         A script entry's parameter IS its default on every bar, an input; a
         function nothing calls (a library export among them) may be passed
-        anything, which is series.
+        anything, which is series, except where its qualifier marker says
+        what it takes (``annotation_qualifier``).
 
         :param node: The definition to read
         :return: One qualifier per parameter, positional first then keyword-only
@@ -2015,7 +2025,11 @@ class _Inference:
         out: list[int] = []
         for arg in _every_param(node):
             default = defaults.get(arg.arg)
-            out.append(SERIES if default is None else self._qual(default))
+            if default is not None:
+                out.append(self._qual(default))
+                continue
+            marked = annotation_qualifier(arg.annotation)
+            out.append(SERIES if marked is None else int(marked))
         return tuple(out)
 
     def _type_defaults(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -3710,9 +3724,12 @@ class _Inference:
         The overload pin this call site justifies in the running context.
 
         Only a proven overload group is worth pinning: everything else has a
-        single implementation and nothing to choose between. A keyword or an
-        unpacked argument is declined rather than guessed -- the pin is
-        positional, and the runtime declines the same shapes anyway.
+        single implementation and nothing to choose between. An unpacked
+        argument, positional or keyword, is declined rather than guessed. A
+        group whose implementations the static selection reads is decided by
+        its argument types, keyword ones included (``_decided_pin``); one whose
+        implementations it does not read is pinned by its positional
+        characters only, and a call with keyword arguments not at all.
 
         :param node: The call node
         :param is_group: Whether the callee is a proven overload group
@@ -3722,16 +3739,155 @@ class _Inference:
         """
         pin = None
         shapes: list[str] = []
-        if is_group and not node.keywords and not any(
+        kw_shapes = self._keyword_shapes(node.keywords)
+        if is_group and kw_shapes is not None and not any(
                 isinstance(a, ast.Starred) for a in node.args):
             shapes = [self._ty_of(a) for a in node.args]
-            pin = pin_for(shapes)
             if impls is not None:
-                indexed = self._pine_index(impls, shapes, pin)
-                if indexed is not None:
-                    return self._record_pin(node, indexed_pin(shapes, indexed.slot))
-        return self._record_pin(node, _resolved_pin(impls, pin),
+                return self._decided_pin(node, impls, shapes, False, kw_shapes,
+                                         [self._qual(a) for a in node.args],
+                                         self._keyword_quals(node.keywords))
+            if not kw_shapes:
+                pin = pin_for(shapes)
+        return self._record_pin(node, pin,
                                 settled=self._settled(impls, pin, shapes))
+
+    def _decided_pin(self, node: ast.Call, impls: Sequence[ImplSig], shapes: Sequence[str],
+                     by_name: bool, kw_shapes: Mapping[str, str] | None = None,
+                     quals: Sequence[int] | None = None,
+                     kw_quals: Mapping[str, int] | None = None) -> str | None:
+        """
+        Stamp the pin of a call to an overload group the static selection reads.
+
+        The call runs the implementation its static types decide
+        (``_group_choice``), named by its index; in a group whose
+        implementations differ by a qualifier marker, a positional call runs
+        the one its arguments' qualifiers select (``qualifier_choice``), which
+        the value dispatch cannot tell from its twins -- keyword arguments
+        included, each under the name the dispatcher hands it to
+        (``_runtime_keyword``). A choice another implementation cannot be told
+        apart from (``has_twin``) is no choice: the call is undecided. One neither
+        decides carries no pin, dispatches on its values and is reported
+        (``_report_undecided``). The pin's characters are those of the
+        positional arguments; the index covers the keyword ones too.
+
+        :param node: The call node
+        :param impls: The group's implementations, in declaration order
+        :param shapes: The static type of each positional argument
+        :param by_name: Whether the call finds the group by its name
+        :param kw_shapes: Keyword name -> the keyword argument's static type, as
+                          the call spells it
+        :param quals: The qualifier of each positional argument, where the
+                      caller knows them
+        :param kw_quals: Keyword name -> the keyword argument's qualifier, as the
+                         call spells it
+        :return: The indexed pin, or None
+        """
+        chosen, settled = self._group_choice(impls, shapes, by_name, kw_shapes)
+        if quals is not None and not any(is_unsettled(shape) for shape in shapes) \
+                and not any(is_unsettled(shape) for shape in (kw_shapes or {}).values()):
+            declared = {pname for impl in impls for pname in impl.names}
+            bound_shapes = {_runtime_keyword(pname, declared): ty
+                            for pname, ty in (kw_shapes or {}).items()}
+            bound_quals = {_runtime_keyword(pname, declared): qual
+                           for pname, qual in (kw_quals or {}).items()}
+            position = qualifier_choice(impls, shapes, quals, bound_shapes, bound_quals)
+            if position is not None and impls[position].slot >= 0 \
+                    and impls[position] is not chosen:
+                chosen, settled = impls[position], False
+        if chosen is not None and has_twin(impls, chosen):
+            chosen = None
+        nid = node_id(node)
+        if nid is not None:
+            verdict: int | str | None = None
+            if chosen is None:
+                verdict = next((position + 1 for position, shape in enumerate(shapes)
+                                if is_unsettled(shape)), None)
+                if verdict is None:
+                    verdict = next((name for name, shape in (kw_shapes or {}).items()
+                                    if is_unsettled(shape)), 0)
+            self._undecided.setdefault(nid, (node, {}))[1][self._context] = verdict
+        if chosen is None:
+            return self._record_pin(node, None, settled=True)
+        return self._record_pin(node, indexed_pin(shapes, chosen.slot), settled=settled)
+
+    @staticmethod
+    def _group_choice(impls: Sequence[ImplSig], shapes: Sequence[str], by_name: bool,
+                      kw_shapes: Mapping[str, str] | None = None
+                      ) -> tuple[ImplSig | None, bool]:
+        """
+        The one implementation a call to an overload group runs, from the static types.
+
+        An argument of unknown type (``is_unsettled``) decides nothing: the
+        values then select, and a call no implementation takes stops the run
+        there. Otherwise the implementation Pine selects where the selection
+        from the pin's characters or from the values runs another one
+        (``_pine_index``), else the one the selector runs for the argument
+        types (``resolve_pin``), else the one Pine selects (``pine_choice``),
+        which reads the positions the pin has no witness for by their types,
+        else the one the selection reads off those types (``_selected``): a
+        typeless na goes to the first implementation the other arguments let
+        through, as the value dispatch on the na it is converted to does.
+
+        A call with keyword arguments is decided by ``_keyword_choice``.
+
+        :param impls: The group's implementations, in declaration order
+        :param shapes: The static type of each positional argument
+        :param by_name: Whether the call finds the group by its name
+        :param kw_shapes: Keyword name -> the keyword argument's static type, as
+                          the call spells it
+        :return: The implementation, or None where the types do not decide it,
+                 and whether the call's value dispatch runs it too (``_settled``)
+        """
+        if any(is_unsettled(shape) for shape in shapes):
+            return None, True
+        if kw_shapes:
+            return _Inference._keyword_choice(impls, shapes, kw_shapes)
+        pin = None if by_name else pin_for(shapes)
+        indexed = _Inference._pine_index(impls, shapes, pin, by_name)
+        if indexed is not None:
+            return indexed, False
+        settled = _Inference._settled(impls, pin, shapes)
+        resolved = resolve_pin(impls, pin_chars(shapes))
+        if resolved is not None:
+            return resolved, settled
+        position = pine_choice(impls, shapes)
+        if position is None:
+            found = _selected(impls, pin_chars(shapes), shapes)
+            position = found[0] if found is not None and len(found) == 1 else None
+        if position is None or impls[position].slot < 0:
+            return None, True
+        return impls[position], settled
+
+    @staticmethod
+    def _keyword_choice(impls: Sequence[ImplSig], shapes: Sequence[str],
+                        kw_shapes: Mapping[str, str]) -> tuple[ImplSig | None, bool]:
+        """
+        The one implementation a call with keyword arguments runs, from the static types.
+
+        An argument of unknown type (``is_unsettled``) decides nothing. Otherwise
+        the implementation Pine selects (``pine_keyword_choice``), each keyword
+        bound under the name the dispatcher hands it to (``_runtime_keyword``),
+        else the one the selector's exact pass settles on for the types
+        (``_choice``), which is the one the value dispatch runs.
+
+        :param impls: The group's implementations, in declaration order
+        :param shapes: The static type of each positional argument
+        :param kw_shapes: Keyword name -> the keyword argument's static type, as
+                          the call spells it
+        :return: The implementation, or None where the types do not decide it,
+                 and whether the call's value dispatch runs it too
+        """
+        if any(is_unsettled(shape) for shape in kw_shapes.values()):
+            return None, True
+        declared = {pname for impl in impls for pname in impl.names}
+        bound = {_runtime_keyword(pname, declared): ty for pname, ty in kw_shapes.items()}
+        by_values = _Inference._choice(impls, None, shapes, kw_shapes)
+        position = pine_keyword_choice(impls, shapes, bound)
+        chosen = by_values if position is None else impls[position]
+        if chosen is None or chosen.slot < 0:
+            return None, True
+        return chosen, chosen is by_values
 
     @staticmethod
     def _pine_index(impls: Sequence[ImplSig], shapes: Sequence[str], pin: str | None,
@@ -3902,6 +4058,33 @@ class _Inference:
                 TYPE_PIN_PER_CONTEXT, (pins,), node,
                 self._unknown('context-dependent-pin', node, dotted_name(node.func) or ''),
                 fix='annotate the parameters so every call site agrees')
+
+    def _report_undecided(self) -> None:
+        """
+        Report the positional overload calls whose static types do not decide the implementation.
+
+        Such a call carries no pin (``_decided_pin``) and dispatches on its
+        values. A context's later walk overwrites its verdict, so only what a
+        context finally saw is reported, once per site: the first argument of
+        unknown type of any context, else that the known types do not decide.
+        A call no implementation takes is reported as that already.
+        """
+        for node, verdicts in self._undecided.values():
+            found = [verdict for verdict in verdicts.values() if verdict is not None]
+            if not found or id(node) in self._bad_calls:
+                continue
+            name = _overload_callee(node)
+            origin = self._unknown('undecided-overload', node, name)
+            positional = [verdict for verdict in found
+                          if isinstance(verdict, int) and verdict > 0]
+            keyword = sorted(verdict for verdict in found if isinstance(verdict, str))
+            if positional or keyword:
+                argument = str(min(positional)) if positional else f'`{keyword[0]}`'
+                self._diag(OVERLOAD_ARGUMENT_UNKNOWN, (argument, name), node, origin,
+                           fix='give the argument a known type')
+            else:
+                self._diag(OVERLOAD_NOT_DECIDED, (name,), node, origin,
+                           fix='pass arguments whose types name one overload')
 
     def _record_widen(self, node: ast.expr, kind: str | None) -> None:
         """
@@ -4989,12 +5172,11 @@ class _Inference:
         """
         Stamp the pin of a ``method_call`` site that reaches an overload group.
 
-        A method handed over as a function is pinned the way a direct call is
-        (``_pin``). One found by NAME is selected from the values, so it carries
-        a pin only where that selection does not run the implementation Pine
-        selects, and then the pin names it by its index (``_pine_index``):
-        the dispatch entry hands such a pin, and no other, to the export it
-        finds (``core/pine_method``).
+        It is pinned the way a direct call is, by the index of the
+        implementation its static types decide (``_decided_pin``), whether
+        the method is handed over as a function or found by NAME: the dispatch
+        entry hands an indexed pin, and no other, to the export it finds
+        (``core/pine_method``).
 
         :param node: The ``method_call`` node
         :param args: The receiver and the arguments after it
@@ -5003,24 +5185,22 @@ class _Inference:
         :return: The pin this context justified, or None
         """
         shapes = self._shapes(args)
-        if shapes is None or node.keywords:
+        kw_shapes = self._keyword_shapes(node.keywords)
+        if shapes is None or kw_shapes is None:
             return self._record_pin(node, None, settled=True)
-        pin = None if by_name else pin_for(shapes)
-        indexed = self._pine_index(impls, shapes, pin, by_name)
-        if indexed is not None:
-            return self._record_pin(node, indexed_pin(shapes, indexed.slot))
-        return self._record_pin(node, _resolved_pin(impls, pin),
-                                settled=self._settled(impls, pin, shapes))
+        return self._decided_pin(node, impls, shapes, by_name, kw_shapes,
+                                 [self._qual(a) for a in args],
+                                 self._keyword_quals(node.keywords))
 
     def _by_name_pin(self, node: ast.Call, args: Sequence[ast.expr],
                      impls: Sequence[ImplSig]) -> str | None:
         """
         The pin of a ``method_call`` site that reaches another module's group or its own export.
 
-        Such a site carries no pin today: its dispatch entry selects from the
-        values. It is stamped with an indexed one where that selection does not
-        run the implementation Pine selects (``_method_pin``), and only on a
-        ``method_call`` node, the one whose anchor hands the pin over.
+        Its dispatch entry selects from the values unless the site carries an
+        indexed pin: it is stamped with the one its static types decide
+        (``_method_pin``), and only on a ``method_call`` node, the one whose
+        anchor hands the pin over.
 
         :param node: The call node
         :param args: The receiver and the arguments after it
@@ -5761,17 +5941,14 @@ class _Inference:
         if shapes is None or kw_shapes is None:
             return None
         sigs = [sig for _, sig in group]
-        if kw_shapes:
-            choice = self._choice(sigs, None, shapes, kw_shapes)
-            return None if choice is None \
-                else [index for index, sig in enumerate(sigs) if sig is choice]
-        pin = None if by_name else pin_for(shapes)
-        indexed = self._pine_index(sigs, shapes, pin, by_name)
-        if indexed is None and pin is not None:
-            indexed = resolve_pin(sigs, pin)
-        if indexed is not None:
-            return [index for index, sig in enumerate(sigs) if sig is indexed]
-        return overload_candidates(sigs, pin if pin is not None else value_chars(shapes), shapes)
+        chosen, _ = self._group_choice(sigs, shapes, by_name, kw_shapes)
+        if kw_shapes and chosen is None:
+            chosen = self._choice(sigs, None, shapes, kw_shapes)
+            return None if chosen is None \
+                else [index for index, sig in enumerate(sigs) if sig is chosen]
+        if chosen is not None:
+            return [index for index, sig in enumerate(sigs) if sig is chosen]
+        return overload_candidates(sigs, value_chars(shapes), shapes)
 
     def _group_type(self, key: str, pin: str | None, args: Sequence[ast.expr],
                     keywords: Sequence[ast.keyword]) -> str:
@@ -5875,6 +6052,16 @@ class _Inference:
         if any(isinstance(arg, ast.Starred) for arg in args):
             return None
         return [self._ty_of(arg) for arg in args]
+
+    def _keyword_quals(self, keywords: Sequence[ast.keyword]) -> dict[str, int]:
+        """
+        The qualifier of each named keyword argument of a call, by parameter name.
+
+        :param keywords: The keyword arguments, visited already
+        :return: Parameter name -> qualifier
+        """
+        return {keyword.arg: self._qual(keyword.value)
+                for keyword in keywords if keyword.arg is not None}
 
     def _keyword_shapes(self, keywords: Sequence[ast.keyword]) -> dict[str, str] | None:
         """
@@ -6987,24 +7174,20 @@ def _element_at(ty: str, path: Sequence[int]) -> str:
     return ty
 
 
-def _resolved_pin(impls: Sequence[ImplSig] | None, pin: str | None) -> str | None:
+def _overload_callee(node: ast.Call) -> str:
     """
-    A pin with the implementation it resolves to named by its index.
+    The overload group a call reaches, as the call spells it.
 
-    The runtime resolves a pin without an index from its witness values; where
-    that resolution is decided here already (``resolve_pin``), the pin names
-    its answer instead, the registration index after ``PIN_INDEX``, and the
-    runtime runs that implementation without selecting.
-
-    :param impls: The group's implementations, in registration order, where the
-                  static selection reads them
-    :param pin: The pin the call site justified, or None
-    :return: The pin, indexed where it resolves
+    :param node: The call node; a ``method_call`` names its method first
+    :return: The method of a ``method_call``, the callee of any other call
     """
-    if pin is None or impls is None:
-        return pin
-    resolved = resolve_pin(impls, pin)
-    return pin if resolved is None else f'{pin}{PIN_INDEX}{resolved.slot}'
+    callee = node.func
+    if dotted_name(callee) == 'method_call' and node.args:
+        selector = node.args[0]
+        if isinstance(selector, ast.Constant) and isinstance(selector.value, str):
+            return selector.value
+        callee = selector
+    return dotted_name(callee) or ast.unparse(callee)
 
 
 def _selected(impls: Sequence[ImplSig], chars: str, shapes: Sequence[str]) -> list[int] | None:

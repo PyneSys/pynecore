@@ -66,7 +66,7 @@ impl<'py> Args<'_, 'py> {
     }
 
     /// `ImplSig` tuples: `(params, required, open_ended, ret, fits, names, bare, slot,
-    /// accepts, wide_fits, kwarg, size)`.
+    /// accepts, wide_fits, kwarg, size, quals)`.
     fn impls(&self, index: usize) -> PyResult<Vec<rules::ImplSig>> {
         let mut out = Vec::new();
         for item in self.get(index)?.try_iter()? {
@@ -85,6 +85,7 @@ impl<'py> Args<'_, 'py> {
                 wide_fits: at(9)?.extract()?,
                 kwarg: at(10)?.extract()?,
                 size: at(11)?.extract()?,
+                quals: at(12)?.extract()?,
             });
         }
         Ok(out)
@@ -501,6 +502,7 @@ fn tree_call<'py>(py: Python<'py>, name: &str, a: &Args<'_, 'py>) -> PyResult<Bo
                 sig.wide_fits.into_bound_py_any(py)?,
                 sig.kwarg.into_bound_py_any(py)?,
                 sig.size.into_bound_py_any(py)?,
+                sig.quals.into_bound_py_any(py)?,
             ];
             PyTuple::new(py, items)?.into_bound_py_any(py)
         }

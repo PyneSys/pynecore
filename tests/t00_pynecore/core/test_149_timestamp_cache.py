@@ -24,7 +24,7 @@ def clear_cache(monkeypatch):
 def __test_loaded_map_namespace_does_not_shadow_builtin__():
     namespace = importlib.import_module('pynecore.lib.map')
     assert lib.map is namespace
-    bound = lib.timestamp.__pyne_bind__('iii=3')
+    bound = lib.timestamp.__pyne_bind__('iii=2')
     result = bound(2025, 1, 1)
     before = lib._timestamp_components_cached.cache_info()
     assert result == 1735689600000
@@ -33,15 +33,15 @@ def __test_loaded_map_namespace_does_not_shadow_builtin__():
 
 
 @pytest.mark.parametrize('pin,args', [
-    ('iii=3', (2025, 1, 1)),
-    ('iiii=3', (2025, 1, 1, 2)),
-    ('iiiii=3', (2025, 1, 1, 2, 30)),
-    ('iiiiii=3', (2025, 1, 1, 2, 30, 40)),
-    ('siii=2', ('UTC', 2025, 1, 1)),
-    ('siiii=2', ('UTC', 2025, 1, 1, 2)),
-    ('siiiii=2', ('UTC', 2025, 1, 1, 2, 30)),
-    ('siiiiii=2', ('UTC', 2025, 1, 1, 2, 30, 40)),
-    ('fff=3', (2025.9, 1.9, 1.9)),
+    ('iii=2', (2025, 1, 1)),
+    ('iiii=2', (2025, 1, 1, 2)),
+    ('iiiii=2', (2025, 1, 1, 2, 30)),
+    ('iiiiii=2', (2025, 1, 1, 2, 30, 40)),
+    ('siii=1', ('UTC', 2025, 1, 1)),
+    ('siiii=1', ('UTC', 2025, 1, 1, 2)),
+    ('siiiii=1', ('UTC', 2025, 1, 1, 2, 30)),
+    ('siiiiii=1', ('UTC', 2025, 1, 1, 2, 30, 40)),
+    ('fff=2', (2025.9, 1.9, 1.9)),
 ])
 def __test_each_component_shape_keeps_its_last_result__(pin, args):
     bound = lib.timestamp.__pyne_bind__(pin)
@@ -56,7 +56,7 @@ def __test_each_component_shape_keeps_its_last_result__(pin, args):
 
 
 def __test_input_edits_and_restoration_use_the_shared_lru__():
-    bound = lib.timestamp.__pyne_bind__('iii=3')
+    bound = lib.timestamp.__pyne_bind__('iii=2')
     original = bound(2025, 1, 1)
     assert bound(2025, 1, 2) == original + 86400000
     assert bound(2025, 1, 1) == original
@@ -65,8 +65,8 @@ def __test_input_edits_and_restoration_use_the_shared_lru__():
 
 
 @pytest.mark.parametrize('pin,args', [
-    ('iii=3', (2025, 7, 1)),
-    ('siii=2', ('', 2025, 7, 1)),
+    ('iii=2', (2025, 7, 1)),
+    ('siii=1', ('', 2025, 7, 1)),
 ])
 def __test_exchange_timezone_is_read_on_every_call__(monkeypatch, pin, args):
     bound = lib.timestamp.__pyne_bind__(pin)
@@ -79,7 +79,7 @@ def __test_exchange_timezone_is_read_on_every_call__(monkeypatch, pin, args):
 
 
 def __test_timezone_resolution_invalidation_is_observed__(monkeypatch):
-    bound = lib.timestamp.__pyne_bind__('iii=3')
+    bound = lib.timestamp.__pyne_bind__('iii=2')
     utc = bound(2025, 7, 1)
     core_datetime._parse_timezone_cached.cache_clear()
     monkeypatch.setattr(core_datetime, 'ZoneInfo', lambda name: timezone(timedelta(hours=3)))
@@ -90,7 +90,7 @@ def __test_timezone_resolution_invalidation_is_observed__(monkeypatch):
 
 
 def __test_unknown_timezone_does_not_reuse_a_previous_result__(monkeypatch):
-    bound = lib.timestamp.__pyne_bind__('iii=3')
+    bound = lib.timestamp.__pyne_bind__('iii=2')
     bound(2025, 1, 1)
     monkeypatch.setattr(lib.syminfo, 'timezone', 'Not/AZone')
     with pytest.raises(UnknownTimezoneError, match='`Not/AZone`'):
@@ -105,7 +105,7 @@ def __test_equivalent_components_have_one_shared_entry__():
 
 
 def __test_keyword_and_arity_changes_keep_dispatch_semantics__():
-    bound = lib.timestamp.__pyne_bind__('iii=3')
+    bound = lib.timestamp.__pyne_bind__('iii=2')
     result = bound(2025, 1, 1)
     assert bound(year=2025, month=1, day=1) == result
     assert bound('UTC', 2025, 1, 1) == result
@@ -117,7 +117,7 @@ def __test_keyword_and_arity_changes_keep_dispatch_semantics__():
 def __test_replaced_implementation_invalidates_the_front_cache__(monkeypatch):
     implementation = next(impl for impl in lib.timestamp.__pyne_impls__
                           if tuple(impl.sig.parameters)[0] == 'year')
-    bound = lib.timestamp.__pyne_bind__('iii=3')
+    bound = lib.timestamp.__pyne_bind__('iii=2')
     bound(2025, 1, 1)
     monkeypatch.setattr(implementation, 'func', lambda *args: 42.0)
     assert bound(2025, 1, 1) == 42.0
@@ -144,14 +144,14 @@ def __test_changed_overload_group_uses_the_fallback__():
 
 def __test_disabling_pins_keeps_value_driven_dispatch__(monkeypatch):
     monkeypatch.setenv('PYNE_NO_TYPE_PIN', '1')
-    bound = lib.timestamp.__pyne_bind__('iii=3')
+    bound = lib.timestamp.__pyne_bind__('iii=2')
     assert bound.__name__ == 'dispatch'
     assert bound(2025, 1, 1) == 1735689600000
 
 
-def __test_wildcard_pins_keep_ordinary_verification__():
-    bound = lib.timestamp.__pyne_bind__('ii*=3')
-    assert bound.__name__ != 'cached'
+def __test_wildcard_pins_take_the_call_site_cache__():
+    bound = lib.timestamp.__pyne_bind__('ii*=2')
+    assert bound.__name__ == 'cached'
     assert bound(2025, 1, 1) == 1735689600000
 
 
@@ -164,7 +164,7 @@ def __test_mutable_numeric_subclasses_are_converted_on_every_call__():
 
     value = ChangingNumber(1)
     value.current = 1
-    bound = lib.timestamp.__pyne_bind__('iii=3')
+    bound = lib.timestamp.__pyne_bind__('iii=2')
     first = bound(2025, 1, 1)
     assert bound(2025, 1, value) == first
     value.current = 2

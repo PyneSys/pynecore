@@ -379,6 +379,11 @@ impl ExportSig {
                         .to_string(),
                     kwarg: item.get("kwarg").and_then(serde_json::Value::as_bool).unwrap_or(false),
                     size: item.get("size").and_then(serde_json::Value::as_i64).unwrap_or(-1),
+                    quals: item
+                        .get("quals")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

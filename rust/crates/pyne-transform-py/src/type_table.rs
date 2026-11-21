@@ -205,6 +205,7 @@ impl<'py> Classes<'py> {
             wide_fits: string(&get("wide_fits")?)?,
             kwarg: boolean(&get("kwarg")?)?,
             size: int(&get("size")?)?,
+            quals: string(&get("quals")?)?,
         })
     }
 
@@ -412,6 +413,7 @@ impl<'py> Classes<'py> {
             kwargs.set_item("wide_fits", &imp.wide_fits)?;
             kwargs.set_item("kwarg", imp.kwarg)?;
             kwargs.set_item("size", imp.size)?;
+            kwargs.set_item("quals", &imp.quals)?;
             items.push(self.impl_sig.call((), Some(&kwargs))?);
         }
         PyTuple::new(py, items)?.into_bound_py_any(py)

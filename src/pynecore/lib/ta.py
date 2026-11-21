@@ -2363,7 +2363,9 @@ def pivothigh(leftbars: int, rightbars: int) -> PyneFloat:
     :return: Price of the pivot high point, or NaN if no pivot
     """
     try:
-        return pivothigh(safe_convert.safe_float(high), leftbars, rightbars)  # type: ignore
+        # Declared, so the type pass reads the source as a float and pins the call
+        source: float = safe_convert.safe_float(high)
+        return pivothigh(source, leftbars, rightbars)  # type: ignore
     except TypeError:
         if not (high == high):
             return na_float
@@ -2419,7 +2421,9 @@ def pivotlow(leftbars: int, rightbars: int) -> PyneFloat:
     :return: Price of the pivot low point, or NaN if no pivot
     """
     try:
-        return pivotlow(safe_convert.safe_float(low), leftbars, rightbars)  # type: ignore
+        # Declared, so the type pass reads the source as a float and pins the call
+        source: float = safe_convert.safe_float(low)
+        return pivotlow(source, leftbars, rightbars)  # type: ignore
     except TypeError:
         if not (low == low):
             return na_float
@@ -2484,8 +2488,11 @@ def range(source: Series[TFI], length: int) -> TFI:
         return cast(TFI, na_float)
     length = int(length)
 
+    # Declared, so the type pass reads the window as a float one and pins both calls:
+    # each group takes a source only as a float series, an int one included
+    values: float = source
     # noinspection PyUnnecessaryCast
-    return cast(TFI, highest(source, length) - lowest(source, length))
+    return cast(TFI, highest(values, length) - lowest(values, length))
 
 
 def rci(source: Series[float], length: int) -> PyneFloat:

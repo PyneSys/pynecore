@@ -441,8 +441,8 @@ fn export_json(sig: &ExportSig) -> Value {
 /// One implementation of a published group, in the payload's shape (`_impl_json`): the
 /// registration index is written only where it is not the position in the list, the
 /// group's size only where it is not the list's length, the widening pass's fits only
-/// where they are not the exact pass's, and the acceptance specs and the `**kwargs`
-/// flag only where they say something.
+/// where they are not the exact pass's, and the acceptance specs, the `**kwargs` flag
+/// and the qualifier markers only where they say something.
 fn impl_json(imp: &ImplSig, position: usize, published: usize) -> Value {
     let mut data = json!({
         "params": imp.params,
@@ -466,6 +466,9 @@ fn impl_json(imp: &ImplSig, position: usize, published: usize) -> Value {
     }
     if imp.kwarg {
         data["kwarg"] = json!(true);
+    }
+    if !imp.quals.is_empty() {
+        data["quals"] = json!(imp.quals);
     }
     data
 }

@@ -2489,14 +2489,14 @@ def main():
 ''')
     types = {name: binding.ty for name, binding in table.bindings['main'].items()}
     assert types['x'] == STR and types['y'] == INT
-    assert types['z'] == UNKNOWN and types['w'] == UNKNOWN
-    assert sorted(_reasons(table)) == ['bad-call', 'unknown-return']
+    assert types['z'] == FLOAT and types['w'] == UNKNOWN
+    assert sorted(_reasons(table)) == ['bad-call']
     found = sorted((diag.code, diag.args) for diag in table.diags)
-    assert found == [('E0016', ('scale',)), ('E0065', ('scale',))]
+    assert found == [('E0065', ('scale',))]
     pins = {node.targets[0].id: get_pin(node.value) for node in ast.walk(tree)
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Name) and node.value.func.id == 'method_call'}
-    assert pins == {'x': None, 'y': 'ii=0', 'z': None, 'w': None}
+    assert pins == {'x': 'f=1', 'y': 'ii=0', 'z': 'ff=1', 'w': None}
 
 
 def __test_a_builtin_winning_a_closure_method_call_takes_no_captures__(tmp_path):
@@ -2892,9 +2892,10 @@ def __test_a_group_call_is_typed_by_the_class_of_its_argument__():
     """
     ``init(Tm(), 1, 2)`` runs the ``Tm`` implementation: the selector checks the
     object against the class each one declares, so the static pass reads the
-    position by its class where the pin has no witness for it -- on a pinned
-    site (``*ii``) and on an unpinned one (``parse(Tm(), "x")``) alike, and
-    through a composed call whose inner group is settled the same way
+    position by its class where the pin has no witness for it, and the pin
+    names the implementation by its index -- with an int position (``*ii``)
+    and without one (``parse(Tm(), "x")``) alike, and through a composed call
+    whose inner group is settled the same way
     """
     tree, table = _infer(CLASSED_GROUP + '''
 def main():
@@ -2910,18 +2911,17 @@ def main():
     assert types['v'] == TM
     calls = {ast.unparse(node): node for node in ast.walk(tree)
              if isinstance(node, ast.Call) and ast.unparse(node.func) in ('init', 'parse')}
-    assert get_pin(calls['init(Tm(), 1, 2)']) == '*ii'
-    assert get_pin(calls["parse(Tm(), '0930')"]) is None
+    assert get_pin(calls['init(Tm(), 1, 2)']) == '*ii=1'
+    assert get_pin(calls["parse(Tm(), '0930')"]) == '*s=0'
     assert get_ty(calls["parse(Win(), '0930')"]) == WIN
     assert table.diags == []
 
 
-def __test_a_float_position_of_an_unpinned_site_says_nothing__():
+def __test_a_float_position_is_read_by_its_type__():
     """
-    An unpinned site dispatches on its values, and a float-typed value may be a
-    Python int there, so the class settles the receiver and the float position
-    is left to the values: the two ``Tm`` implementations disagree, so the call
-    has no type
+    A float-typed value may be a Python int at run time, but the call is decided
+    by the static types: the class settles the receiver, the float position the
+    float implementation, and the pin names it, so the call has its type
     """
     _, table = _infer(CLASSED_GROUP + '''
 @overload
@@ -2941,7 +2941,7 @@ def main(f: float):
     return s
 ''')
     types = {name: binding.ty for name, binding in table.bindings['main'].items()}
-    assert types['s'] == UNKNOWN
+    assert types['s'] == TM
 
 
 def __test_a_method_called_by_name_answers_for_its_receivers_class__(tmp_path, monkeypatch):
@@ -3020,11 +3020,10 @@ def main():
 
 def __test_a_keyword_call_to_a_classed_group_is_bound_by_name__():
     """
-    ``init(Tm(), h=1, m=2)`` is never pinned (a keyword call dispatches on its
-    values), but the selector binds the keywords to each implementation's
-    parameters, and the receiver's class plus the bound types settle the ``Tm``
-    implementation statically the same way; a ``na`` arm next to it is the na
-    of ``Tm``
+    ``init(Tm(), h=1, m=2)``: the selector binds the keywords to each
+    implementation's parameters, and the receiver's class plus the bound types
+    settle the ``Tm`` implementation statically, which the pin names by its
+    index; a ``na`` arm next to it is the na of ``Tm``
     """
     tree, table = _infer(CLASSED_GROUP + '''
 def main():
@@ -3038,7 +3037,7 @@ def main():
     assert (types['t'], types['u'], types['p'], types['w']) == (TM, TM, TM, WIN)
     calls = {ast.unparse(node): node for node in ast.walk(tree)
              if isinstance(node, ast.Call) and ast.unparse(node.func) == 'init'}
-    assert get_pin(calls['init(Tm(), h=1, m=2)']) is None
+    assert get_pin(calls['init(Tm(), h=1, m=2)']) == '*=1'
     assert table.diags == []
 
 

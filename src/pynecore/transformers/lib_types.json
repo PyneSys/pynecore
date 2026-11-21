@@ -9282,21 +9282,6 @@
      "defaults": 0,
      "fits": "n",
      "names": [
-      "date_string"
-     ],
-     "params": [
-      "?"
-     ],
-     "ret": "i",
-     "wide_fits": "n"
-    },
-    {
-     "accepts": [
-      "s/s"
-     ],
-     "defaults": 0,
-     "fits": "n",
-     "names": [
       "dateString"
      ],
      "params": [

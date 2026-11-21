@@ -514,6 +514,21 @@ CONSTRUCTOR_FIELD_TYPE = Code(
     '`{field}` holds `{declared}`, `{passed}` passed.',
     ('field', 'declared', 'passed'),
 )
+OVERLOAD_ARGUMENT_UNKNOWN = Code(
+    'E0071',
+    'error',
+    'Overload not decidable',
+    'Argument {argument} of `{function}` has no known type, so the overload this call runs is not '
+    'decided.',
+    ('argument', 'function'),
+)
+OVERLOAD_NOT_DECIDED = Code(
+    'E0072',
+    'error',
+    'Overload not decidable',
+    'The argument types of `{function}` do not decide one overload for this call.',
+    ('function',),
+)
 INTERNAL_ERROR = Code(
     'I0004',
     'error',
@@ -1661,6 +1676,23 @@ class ConstructorFieldTypeError(PyneSyntaxError):
         super().__init__(field=field, declared=declared, passed=passed, location=location)
 
 
+class OverloadArgumentUnknownError(PyneSyntaxError):
+    """E0071: Overload not decidable"""
+    code = OVERLOAD_ARGUMENT_UNKNOWN
+
+    def __init__(self, *, argument: object, function: object,
+                 location: SyntaxLocation | None = None) -> None:
+        super().__init__(argument=argument, function=function, location=location)
+
+
+class OverloadNotDecidedError(PyneSyntaxError):
+    """E0072: Overload not decidable"""
+    code = OVERLOAD_NOT_DECIDED
+
+    def __init__(self, *, function: object, location: SyntaxLocation | None = None) -> None:
+        super().__init__(function=function, location=location)
+
+
 class InternalError(PyneError):
     """I0004: Internal error"""
     code = INTERNAL_ERROR
@@ -2305,12 +2337,13 @@ ALL: dict[str, Code] = {c.code: c for c in (
     METHOD_CALL_SHAPE, CALL_ARGUMENT_COUNT, CALL_TOO_FEW_ARGUMENTS, CALL_POSITIONAL_COUNT,
     CALL_UNKNOWN_PARAMETER, CALL_ARGUMENT_TYPE, CALL_NO_OVERLOAD, CALL_ARGUMENT_TWICE,
     CALL_MISSING_ARGUMENT, CONSTRUCTOR_FIELD_COUNT, CONSTRUCTOR_MISSING_FIELD,
-    CONSTRUCTOR_FIELD_TYPE, INTERNAL_ERROR, RESERVED_NAME_CHAR, PIPELINE_NAME,
-    SCRIPT_DECORATOR_NOT_ON_MAIN, DUPLICATE_SCRIPT_DECORATOR, NA_BOOL_NOT_LITERAL,
-    SERIES_OUTSIDE_FUNCTION, PERSISTENT_OUTSIDE_FUNCTION, STATEFUL_CALL_AT_MODULE_LEVEL,
-    INPUT_NOT_MAIN_DEFAULT, LIB_IMPORT_ALIAS, WILDCARD_IMPORT_WITHOUT_ALL, UNKNOWN_LIB_ATTRIBUTE,
-    MODULE_STATE_MODIFIED, PLOT_CALL_CONDITIONAL, PLOT_AS_VALUE, STATEFUL_METHOD_KIND,
-    UNPACKED_RECEIVER, EXPORT_CAPTURES_GLOBAL, STRATEGY_STATE_IN_SECURITY, DRAWING_IN_SECURITY,
+    CONSTRUCTOR_FIELD_TYPE, OVERLOAD_ARGUMENT_UNKNOWN, OVERLOAD_NOT_DECIDED, INTERNAL_ERROR,
+    RESERVED_NAME_CHAR, PIPELINE_NAME, SCRIPT_DECORATOR_NOT_ON_MAIN, DUPLICATE_SCRIPT_DECORATOR,
+    NA_BOOL_NOT_LITERAL, SERIES_OUTSIDE_FUNCTION, PERSISTENT_OUTSIDE_FUNCTION,
+    STATEFUL_CALL_AT_MODULE_LEVEL, INPUT_NOT_MAIN_DEFAULT, LIB_IMPORT_ALIAS,
+    WILDCARD_IMPORT_WITHOUT_ALL, UNKNOWN_LIB_ATTRIBUTE, MODULE_STATE_MODIFIED,
+    PLOT_CALL_CONDITIONAL, PLOT_AS_VALUE, STATEFUL_METHOD_KIND, UNPACKED_RECEIVER,
+    EXPORT_CAPTURES_GLOBAL, STRATEGY_STATE_IN_SECURITY, DRAWING_IN_SECURITY,
     TOO_MANY_FUNCTION_REQUESTS, DIVISION_BY_ZERO, NA_TO_INTEGER, INFINITY_TO_INTEGER,
     ASSERTION_FAILED, RUNTIME_ERROR, ARGUMENT_NOT_POSITIVE, ARGUMENT_NEGATIVE, ARGUMENT_ZERO,
     PERCENTAGE_OUT_OF_RANGE, INDEX_OUT_OF_RANGE, EMPTY_COLLECTION, SIZE_MISMATCH,
@@ -2349,19 +2382,20 @@ EXCEPTIONS: dict[str, type[PyneError]] = {c.code.code: c for c in (
     CallTooFewArgumentsError, CallPositionalCountError, CallUnknownParameterError,
     CallArgumentTypeError, CallNoOverloadError, CallArgumentTwiceError, CallMissingArgumentError,
     ConstructorFieldCountError, ConstructorMissingFieldError, ConstructorFieldTypeError,
-    InternalError, ReservedNameCharError, PipelineNameError, ScriptDecoratorNotOnMainError,
-    DuplicateScriptDecoratorError, NaBoolNotLiteralError, SeriesOutsideFunctionError,
-    PersistentOutsideFunctionError, StatefulCallAtModuleLevelError, InputNotMainDefaultError,
-    LibImportAliasError, WildcardImportWithoutAllError, UnknownLibAttributeError,
-    ModuleStateModifiedError, PlotCallConditionalError, PlotAsValueError, StatefulMethodKindError,
-    UnpackedReceiverError, ExportCapturesGlobalError, StrategyStateInSecurityError,
-    DrawingInSecurityError, TooManyFunctionRequestsError, DivisionByZeroError, NaToIntegerError,
-    InfinityToIntegerError, AssertionFailedError, ScriptRuntimeError, ArgumentNotPositiveError,
-    ArgumentNegativeError, ArgumentZeroError, PercentageOutOfRangeError, IndexOutOfRangeError,
-    EmptyCollectionError, SizeMismatchError, MatrixNotSquareError, MatrixSingularError,
-    NoConvergenceError, NaObjectError, UnboundVariableError, ResourceLimitError,
-    InvalidTimeframeError, TickTimeframeError, InvalidSessionError, InvalidDateError,
-    InvalidFormatError, InvalidRegexError, UnknownTimezoneError, SecurityDataMissingError,
+    OverloadArgumentUnknownError, OverloadNotDecidedError, InternalError, ReservedNameCharError,
+    PipelineNameError, ScriptDecoratorNotOnMainError, DuplicateScriptDecoratorError,
+    NaBoolNotLiteralError, SeriesOutsideFunctionError, PersistentOutsideFunctionError,
+    StatefulCallAtModuleLevelError, InputNotMainDefaultError, LibImportAliasError,
+    WildcardImportWithoutAllError, UnknownLibAttributeError, ModuleStateModifiedError,
+    PlotCallConditionalError, PlotAsValueError, StatefulMethodKindError, UnpackedReceiverError,
+    ExportCapturesGlobalError, StrategyStateInSecurityError, DrawingInSecurityError,
+    TooManyFunctionRequestsError, DivisionByZeroError, NaToIntegerError, InfinityToIntegerError,
+    AssertionFailedError, ScriptRuntimeError, ArgumentNotPositiveError, ArgumentNegativeError,
+    ArgumentZeroError, PercentageOutOfRangeError, IndexOutOfRangeError, EmptyCollectionError,
+    SizeMismatchError, MatrixNotSquareError, MatrixSingularError, NoConvergenceError,
+    NaObjectError, UnboundVariableError, ResourceLimitError, InvalidTimeframeError,
+    TickTimeframeError, InvalidSessionError, InvalidDateError, InvalidFormatError,
+    InvalidRegexError, UnknownTimezoneError, SecurityDataMissingError,
     SecurityTimeframeHigherError, SecurityVariesInLoopError, StrategyValueNotFiniteError,
     StrategyInSecurityError, LinePriceXlocError, WrongOperandTypeError, FloatRangeError,
     DecimalInvalidError, NotAvailableError, ScriptTimeframeError, InvalidDataError,

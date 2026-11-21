@@ -700,6 +700,26 @@ pub static CONSTRUCTOR_FIELD_TYPE: super::Code = super::Code {
     fix: None,
 };
 
+/// E0071: Overload not decidable
+pub static OVERLOAD_ARGUMENT_UNKNOWN: super::Code = super::Code {
+    code: "E0071",
+    severity: super::Severity::Error,
+    title: "Overload not decidable",
+    message: "Argument {argument} of `{function}` has no known type, so the overload this call runs is not decided.",
+    params: &["argument", "function"],
+    fix: None,
+};
+
+/// E0072: Overload not decidable
+pub static OVERLOAD_NOT_DECIDED: super::Code = super::Code {
+    code: "E0072",
+    severity: super::Severity::Error,
+    title: "Overload not decidable",
+    message: "The argument types of `{function}` do not decide one overload for this call.",
+    params: &["function"],
+    fix: None,
+};
+
 /// I0004: Internal error
 pub static INTERNAL_ERROR: super::Code = super::Code {
     code: "I0004",
@@ -1542,6 +1562,8 @@ pub static ALL: &[&super::Code] = &[
     &CONSTRUCTOR_FIELD_COUNT,
     &CONSTRUCTOR_MISSING_FIELD,
     &CONSTRUCTOR_FIELD_TYPE,
+    &OVERLOAD_ARGUMENT_UNKNOWN,
+    &OVERLOAD_NOT_DECIDED,
     &INTERNAL_ERROR,
     &RESERVED_NAME_CHAR,
     &PIPELINE_NAME,

@@ -5,7 +5,7 @@ title: "Differences from Pine Script"
 description: "Compare Pyne code with Pine Script, including the module marker, Python syntax and explicit state annotations. Learn how ordinary Pyne and the edge profile differ."
 icon: "compare"
 date: "2025-03-31"
-lastmod: "2026-10-18"
+lastmod: "2026-11-21"
 draft: false
 toc: true
 categories: ["Overview"]
@@ -370,3 +370,54 @@ Pine Script uses dedicated series objects. Which is created on declaration. In P
 to use the "primitive" type everywhere. If you mark a variable as a series, it will create a series
 object, but every usage of them will be that basic type. This way the implementation could be much simpler.
 We don't need to handle everything differently because it is a series or not.
+
+### Qualifiers: `Simple` and `Const`
+
+Pine gives every value a qualifier besides its type: `const`, `simple` or `series`. Pyne code does
+not spell it: the type inference works it out where it matters, and hand-written Pyne code never
+needs to declare one.
+
+The one place a qualifier has to be written down is an overload group whose implementations differ
+only by it. Pine allows
+
+```
+export method replace(simple string this, map<string, string> m) => ...
+export method replace(string this, map<string, string> m) => ...
+```
+
+and selects the first one for a `simple` argument and the second one for a `series` argument. In
+Python both would be `def replace(this: str, m: dict[str, str])`, so PyneComp marks the qualified
+parameter:
+
+```python
+from pynecore.types import Simple
+
+
+@overload
+def replace(this: Simple[str], m: dict[str, str]):
+    ...
+
+
+@overload
+def replace(this: str, m: dict[str, str]):
+    ...
+```
+
+`Simple[T]` and `Const[T]` (from `pynecore.types`) exist only so that such implementations stay
+distinct. The type inference reads them to pin each call to the implementation Pine selects: a
+`const` argument goes to the `Const` implementation before the `Simple` one before the unmarked
+one, a `simple` argument to the `Simple` one before the unmarked one, and a `series` argument to
+the unmarked one.
+
+At run time a marker has no effect at all: `Simple[str]` is `str` itself, so nothing wraps the
+value and nothing is checked. The compiler emits a marker only in an overload group where two
+implementations would otherwise get the same Python signature, and only on the parameters whose
+qualifier differs; every other parameter keeps its plain annotation.
+
+Overload selection reads only the positional parameters' types and their markers, not their
+names.
+Keyword-only parameters (the ones after a bare `*`) take no part in it: their types are ignored.
+The edge profile does not allow them at all. If the arguments' types and qualifiers leave two
+implementations that cannot be told apart (identical signatures, ones that differ only in
+parameter names, or only in keyword-only parameters), the type pass does not pick one. The call is reported as
+`overload_not_decided` (E0072) and dispatches on its values at run time.

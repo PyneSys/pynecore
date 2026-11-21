@@ -402,7 +402,7 @@ b = wrapper(2.0)
     assert get_pin(calls[0]) is None
     pins = get_pins(calls[0])
     assert pins is not None
-    assert sorted(pins.values(), key=str) == [None, 'i=0']
+    assert sorted(pins.values(), key=str) == ['f=1', 'i=0']
 
     table = infer_module(ast.parse(source), 'test')
     reasons = {diag.origin.reason for diag in table.diags if diag.origin is not None}
@@ -430,7 +430,7 @@ def main():
     b = wrapper(2.0)
 '''
     _, calls = _calls(source, 'g')
-    assert sorted(get_pins(calls[0]).values(), key=str) == [None, 'i=0']
+    assert sorted(get_pins(calls[0]).values(), key=str) == ['f=1', 'i=0']
     assert not __test_helper_context_pin_reported(source)
 
 
@@ -493,7 +493,7 @@ a = wrapper(1, A())
 b = wrapper(2.0, B())
 '''
     _, calls = _calls(source, 'g')
-    assert sorted(get_pins(calls[0]).values(), key=str) == [None, 'i*=0']
+    assert sorted(get_pins(calls[0]).values(), key=str) == ['f*=1', 'i*=0']
     assert not __test_helper_context_pin_reported(source)
 
 
@@ -664,7 +664,7 @@ def main(n: int):
     return out
 '''
     tree, calls = _calls(source, 'g')
-    assert get_pin(calls[0]) is None
+    assert get_pin(calls[0]) == 'f=1'
     assert get_pins(calls[0]) is None
 
     table = infer_module(ast.parse(source), 'test')
@@ -673,7 +673,8 @@ def main(n: int):
 
     ns = _run(source, 'ctx_mod_closure')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state, 3) == ['int-impl', 'float-impl', 'float-impl']
+    # ``total`` is float-typed, the Python int 0 of the first bar included
+    assert ns['main'](state, 3) == ['float-impl', 'float-impl', 'float-impl']
 
 
 def __test_a_nested_parameter_does_not_hide_the_wrappers_own_read__():
@@ -700,12 +701,13 @@ def main(n: int):
     return out
 '''
     tree, calls = _calls(source, 'g')
-    assert get_pin(calls[0]) is None
+    assert get_pin(calls[0]) == 'f=1'
     assert get_pins(calls[0]) is None
 
     ns = _run(source, 'ctx_mod_nested_param')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state, 3) == ['int-impl', 'float-impl', 'float-impl']
+    # ``total`` is float-typed, the Python int 0 of the first bar included
+    assert ns['main'](state, 3) == ['float-impl', 'float-impl', 'float-impl']
 
 
 def __test_a_nonlocal_declaration_is_still_a_read_of_the_enclosing_scope__():
@@ -732,12 +734,13 @@ def main(n: int):
     return out
 '''
     _, calls = _calls(source, 'g')
-    assert get_pin(calls[0]) is None
+    assert get_pin(calls[0]) == 'f=1'
     assert get_pins(calls[0]) is None
 
     ns = _run(source, 'ctx_mod_nonlocal')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state, 3) == ['int-impl', 'float-impl', 'float-impl']
+    # ``total`` is float-typed, the Python int 0 of the first bar included
+    assert ns['main'](state, 3) == ['float-impl', 'float-impl', 'float-impl']
 
 
 def __test_a_global_declaration_is_still_a_read_of_the_module_scope__():
@@ -764,12 +767,13 @@ def main(n: int):
     return out
 '''
     _, calls = _calls(source, 'g')
-    assert get_pin(calls[0]) is None
+    assert get_pin(calls[0]) == 'f=1'
     assert get_pins(calls[0]) is None
 
     ns = _run(source, 'ctx_mod_global')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state, 3) == ['int-impl', 'float-impl', 'float-impl']
+    # ``total`` is float-typed, the Python int 0 of the first bar included
+    assert ns['main'](state, 3) == ['float-impl', 'float-impl', 'float-impl']
 
 
 def __test_a_global_name_reads_the_module_binding_not_an_intermediate_one__():
@@ -824,7 +828,7 @@ def main(n: int):
 '''
     tree, calls = _calls(source, 'g')
     assert get_pin(calls[0]) is None
-    assert sorted(str(pin) for pin in (get_pins(calls[0]) or {}).values()) == ['None', 'i=0']
+    assert sorted(str(pin) for pin in (get_pins(calls[0]) or {}).values()) == ['f=1', 'i=0']
 
     table = infer_module(ast.parse(source), 'test')
     assert [result.params for result in table.contexts.values()

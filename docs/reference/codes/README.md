@@ -179,3 +179,5 @@ check each name their errors by code, so the code in a message leads here.
 | [E0068](edge-profile.md#E0068) | error    | Wrong number of constructor arguments       |
 | [E0069](edge-profile.md#E0069) | error    | Missing field value                         |
 | [E0070](edge-profile.md#E0070) | error    | Field value of another type                 |
+| [E0071](edge-profile.md#E0071) | error    | Overload not decidable                      |
+| [E0072](edge-profile.md#E0072) | error    | Overload not decidable                      |

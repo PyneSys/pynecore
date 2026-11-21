@@ -112,6 +112,16 @@ struct Shadowed {
 /// One call site's analysis identity (`_anchors`' key).
 type Anchor = (String, Vec<String>, i64, Option<i64>, Option<i64>);
 
+/// Why the static types do not decide an overload call (`_undecided`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Undecided {
+    /// The 1-based position of the first positional argument of unknown type, or 0
+    /// where every type is known and they still do not decide
+    Position(i64),
+    /// The first keyword argument of unknown type, as the call spells it
+    Keyword(String),
+}
+
 /// The walker (`_Inference`).
 struct Engine<'a, 'h> {
     ast: &'a mut Ast,
@@ -187,6 +197,9 @@ struct Engine<'a, 'h> {
     /// Overload call node id -> context id -> whether that context's value dispatch
     /// runs the implementation its pin selects (`_pin_settled`)
     pin_settled: HashMap<i64, HashMap<i64, bool>>,
+    /// Overload call node id -> the node and, per context id, how the static types
+    /// decide it: None where they name the implementation, else why not (`_undecided`)
+    undecided: IndexMap<i64, (NodeId, IndexMap<i64, Option<Undecided>>)>,
     /// Node ids of the varying sites whose every instance is handed its vector entry
     /// (`_delivered`)
     delivered: HashSet<i64>,
@@ -297,6 +310,7 @@ impl<'a, 'h> Engine<'a, 'h> {
             signed: HashSet::new(),
             pin_reports: IndexMap::new(),
             pin_settled: HashMap::new(),
+            undecided: IndexMap::new(),
             delivered: HashSet::new(),
             unvectored: HashSet::new(),
             call_ctx: HashMap::new(),
@@ -858,6 +872,7 @@ impl<'a, 'h> Engine<'a, 'h> {
         self.stamp_instance_vectors(tree);
         self.suppress_pins(tree);
         self.report_context_pins();
+        self.report_undecided()?;
         self.report_unhandled_widens()?;
         self.sync_module_bindings();
         let reported = report::unknown_diags(self, tree)?;

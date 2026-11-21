@@ -9,19 +9,19 @@ use pyne_ast::{Kind, NodeId, Unsupported};
 use super::facts::{
     self, HLINE, WIDEN_HARMLESS, bound_arg, call_arity, fits, holds_na, keyword_parts, unchecked,
 };
-use super::{Engine, R};
+use super::{Engine, R, Undecided};
 use crate::data::{self, LibEntry};
 use crate::pine_qualifier::{SERIES, SERIES_LENGTH_KEYWORD, WINDOW_CALLS, window_length};
 use crate::pine_type_rules::{
     BOOL, CONTAINER_NA_WIDENS, CallRule, FIT_REQUIRED, FLOAT, INT, ImplSig, NUMERIC, OBJECT,
-    PIN_ANY, PIN_INDEX, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_BOOL,
-    WIDEN_BOOL_NA, WIDEN_FLOAT, WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA,
-    array_of, class_of, default_fit, element_of, get_ty, indexed_pin, is_array, is_map, is_matrix,
-    is_na_text_param, is_na_widen, is_not_pine_string, join, key_of, lib_type_override, matrix_of,
-    object_ty, overload_binding, overload_candidates, overload_choice, overload_result,
-    override_param_names, pin_chars, pin_for, pin_index, pine_choice, render_ty, resolve_pin,
-    set_na_class, set_pin, set_pins, set_widen, shape_conflict, tuple_of, value_chars, value_of,
-    value_rival,
+    PIN_ANY, SCALARS, STR, TYPELESS, UNKNOWN, VOID, WIDEN_ARRAY_NA, WIDEN_BOOL, WIDEN_BOOL_NA,
+    WIDEN_FLOAT, WIDEN_MAP_NA, WIDEN_NA_TEXT, WIDEN_NUMBER_NA, WIDEN_STRING_NA, array_of, class_of,
+    default_fit, element_of, get_ty, has_twin, indexed_pin, is_array, is_map, is_matrix,
+    is_na_text_param, is_na_widen, is_not_pine_string, is_unsettled, join, key_of,
+    lib_type_override, matrix_of, object_ty, overload_binding, overload_candidates,
+    overload_choice, overload_result, override_param_names, pin_chars, pin_for, pin_index,
+    pine_choice, pine_keyword_choice, qualifier_choice, render_ty, resolve_pin, set_na_class,
+    set_pin, set_pins, set_widen, shape_conflict, tuple_of, value_chars, value_of, value_rival,
 };
 use crate::pine_type_table::{CallSite, Diag, Unknown};
 
@@ -177,6 +177,7 @@ pub(super) fn lib_impl_sig(entry: &LibEntry, slot: i64, size: i64) -> ImplSig {
         wide_fits: entry.wide_fits.clone().unwrap_or_default(),
         kwarg: entry.kwarg,
         size,
+        quals: String::new(),
     }
 }
 
@@ -190,15 +191,6 @@ pub(super) fn lib_impl_sigs(entry: &LibEntry) -> Vec<ImplSig> {
         .enumerate()
         .map(|(slot, imp)| lib_impl_sig(imp, i64::try_from(slot).unwrap_or(-1), size))
         .collect()
-}
-
-/// A pin with the implementation it resolves to named by its index (`_resolved_pin`).
-pub(super) fn resolved_pin(impls: Option<&[ImplSig]>, pin: Option<String>) -> Option<String> {
-    let (Some(impls), Some(pin)) = (impls, pin.as_deref()) else { return pin };
-    match resolve_pin(impls, pin) {
-        Some(index) => Some(format!("{pin}{PIN_INDEX}{}", impls[index].slot)),
-        None => Some(pin.to_string()),
-    }
 }
 
 /// Whether a call site's value dispatch runs the implementation its pin selects
@@ -245,6 +237,94 @@ pub(super) fn pine_index(
     let kept_chars = if by_name { pin_chars(shapes) } else { chars };
     let at = kept.iter().position(|&index| index == position)?;
     (selected(&kept_impls, &kept_chars, shapes) == Some(vec![at])).then_some(position)
+}
+
+/// The one implementation a positional call to an overload group runs, from the static
+/// types, by its index in `impls` (`_group_choice`), and whether the call's value
+/// dispatch runs it too (`settled`): none where an argument's type is unknown
+/// (`is_unsettled`); else Pine's where the pin's characters or the values run another
+/// (`pine_index`), the selector's for the types (`resolve_pin`), Pine's
+/// (`pine_choice`), and the one the selection reads off the types (`selected`).
+pub(super) fn group_choice(
+    impls: &[ImplSig],
+    shapes: &[String],
+    by_name: bool,
+    kw_shapes: Option<&IndexMap<String, String>>,
+) -> (Option<usize>, bool) {
+    if shapes.iter().any(|shape| is_unsettled(shape)) {
+        return (None, true);
+    }
+    if let Some(kw_shapes) = kw_shapes.filter(|kw_shapes| !kw_shapes.is_empty()) {
+        return keyword_choice(impls, shapes, kw_shapes);
+    }
+    let pin = if by_name { None } else { pin_for(shapes) };
+    if let Some(index) = pine_index(impls, shapes, pin.as_deref(), by_name) {
+        return (Some(index), false);
+    }
+    let settled = settled(Some(impls), pin.as_deref(), shapes);
+    let chars = pin_chars(shapes);
+    if let Some(index) = resolve_pin(impls, &chars) {
+        return (Some(index), settled);
+    }
+    let position = pine_choice(impls, shapes).or_else(|| match selected(impls, &chars, shapes) {
+        Some(found) if found.len() == 1 => Some(found[0]),
+        _ => None,
+    });
+    match position {
+        Some(index) if impls[index].slot >= 0 => (Some(index), settled),
+        _ => (None, true),
+    }
+}
+
+/// The one implementation a call with keyword arguments runs, from the static types
+/// (`_keyword_choice`), and whether the value dispatch runs it too: none where an
+/// argument's type is unknown; else Pine's (`pine_keyword_choice`), each keyword under
+/// the name the dispatcher hands it to, else the exact pass's (`keyword_value_choice`).
+fn keyword_choice(
+    impls: &[ImplSig],
+    shapes: &[String],
+    kw_shapes: &IndexMap<String, String>,
+) -> (Option<usize>, bool) {
+    if kw_shapes.values().any(|shape| is_unsettled(shape)) {
+        return (None, true);
+    }
+    let by_values = keyword_value_choice(impls, shapes, kw_shapes);
+    let bound = runtime_keywords(impls, kw_shapes);
+    let chosen = pine_keyword_choice(impls, shapes, &bound).or(by_values);
+    match chosen {
+        Some(index) if impls[index].slot >= 0 => (Some(index), chosen == by_values),
+        _ => (None, true),
+    }
+}
+
+/// Each keyword argument's type under the name the dispatcher hands it to
+/// (`runtime_keyword`), in call order.
+fn runtime_keywords<T: Clone>(
+    impls: &[ImplSig],
+    kw_shapes: &IndexMap<String, T>,
+) -> Vec<(String, T)> {
+    let declares =
+        |known: &str| impls.iter().any(|imp| imp.names.iter().any(|named| named == known));
+    kw_shapes
+        .iter()
+        .map(|(name, ty)| (facts::runtime_keyword(name, declares), ty.clone()))
+        .collect()
+}
+
+/// The implementation the selector's exact pass settles on for a call with keyword
+/// arguments read as values (`_choice`, its keyword branch).
+fn keyword_value_choice(
+    impls: &[ImplSig],
+    shapes: &[String],
+    kw_shapes: &IndexMap<String, String>,
+) -> Option<usize> {
+    let kw_types = runtime_keywords(impls, kw_shapes);
+    let chars = value_chars(shapes);
+    let kw_chars: Vec<(String, String)> = kw_types
+        .iter()
+        .map(|(name, ty)| (name.clone(), value_chars(std::slice::from_ref(ty))))
+        .collect();
+    overload_binding(impls, &chars, shapes, &kw_chars, &kw_types)
 }
 
 /// The implementations a positional call can run, by index (`_selected`): the one the
@@ -634,20 +714,159 @@ impl Engine<'_, '_> {
         let mut shapes: Vec<String> = Vec::new();
         if let Some((_, args, keywords)) = facts::call_parts(self.ast, node)
             && is_group
-            && keywords.is_empty()
+            && let Some(kw_shapes) = self.keyword_shapes(keywords)
             && !args.iter().any(|&arg| facts::is_starred(self.ast, arg))
         {
             shapes = args.iter().map(|&arg| self.ty_of(arg)).collect();
-            pin = pin_for(&shapes);
-            if let Some(impls) = impls
-                && let Some(index) = pine_index(impls, &shapes, pin.as_deref(), false)
-            {
-                let indexed = indexed_pin(&shapes, impls[index].slot);
-                return self.record_pin(node, Some(indexed), true, false);
+            if let Some(impls) = impls {
+                let quals: Vec<u8> = args.iter().map(|&arg| self.qual(arg)).collect();
+                let kw_quals = self.keyword_quals(keywords);
+                return self.decided_pin(
+                    node,
+                    impls,
+                    &shapes,
+                    false,
+                    Some(&kw_shapes),
+                    Some((&quals, &kw_quals)),
+                );
+            }
+            if kw_shapes.is_empty() {
+                pin = pin_for(&shapes);
             }
         }
         let settled = settled(impls, pin.as_deref(), &shapes);
-        self.record_pin(node, resolved_pin(impls, pin), true, settled)
+        self.record_pin(node, pin, true, settled)
+    }
+
+    /// Stamp the pin of a call to an overload group the static selection reads
+    /// (`_decided_pin`): the index of the implementation its static types decide
+    /// (`group_choice`), keyword arguments included; in a group whose implementations
+    /// differ by a qualifier marker, a call's the one its arguments'
+    /// qualifiers (`quals`) select (`qualifier_choice`); a choice with an
+    /// indistinguishable twin (`has_twin`) is none; or no pin and a report
+    /// (`report_undecided`).
+    pub(super) fn decided_pin(
+        &mut self,
+        node: NodeId,
+        impls: &[ImplSig],
+        shapes: &[String],
+        by_name: bool,
+        kw_shapes: Option<&IndexMap<String, String>>,
+        quals: Option<(&[u8], &IndexMap<String, u8>)>,
+    ) -> R<Option<String>> {
+        let (mut chosen, mut settled) = group_choice(impls, shapes, by_name, kw_shapes);
+        let empty = IndexMap::new();
+        let kw_shapes_or = kw_shapes.unwrap_or(&empty);
+        if let Some((quals, kw_quals)) = quals
+            && !shapes.iter().any(|shape| is_unsettled(shape))
+            && !kw_shapes_or.values().any(|shape| is_unsettled(shape))
+            && let Some(position) = qualifier_choice(
+                impls,
+                shapes,
+                quals,
+                &runtime_keywords(impls, kw_shapes_or),
+                &runtime_keywords(impls, kw_quals),
+            )
+            && impls[position].slot >= 0
+            && chosen != Some(position)
+        {
+            (chosen, settled) = (Some(position), false);
+        }
+        if let Some(index) = chosen
+            && has_twin(impls, index)
+        {
+            chosen = None;
+        }
+        if let Some(nid) = self.nid(node) {
+            let verdict = match chosen {
+                Some(_) => None,
+                None => Some(match shapes.iter().position(|shape| is_unsettled(shape)) {
+                    Some(position) => Undecided::Position(position as i64 + 1),
+                    None => kw_shapes
+                        .and_then(|kw_shapes| {
+                            kw_shapes.iter().find(|(_, shape)| is_unsettled(shape))
+                        })
+                        .map_or(Undecided::Position(0), |(name, _)| {
+                            Undecided::Keyword(name.clone())
+                        }),
+                }),
+            };
+            let context = self.context();
+            self.undecided
+                .entry(nid)
+                .or_insert_with(|| (node, IndexMap::new()))
+                .1
+                .insert(context, verdict);
+        }
+        match chosen {
+            Some(index) => {
+                let indexed = indexed_pin(shapes, impls[index].slot);
+                self.record_pin(node, Some(indexed), true, settled)
+            }
+            None => self.record_pin(node, None, true, true),
+        }
+    }
+
+    /// Report the positional overload calls whose static types do not decide the
+    /// implementation (`_report_undecided`): the first argument of unknown type of any
+    /// context, else that the known types do not decide; a bad call is reported already.
+    pub(super) fn report_undecided(&mut self) -> R<()> {
+        for (node, verdicts) in self.undecided.clone().into_values() {
+            let found: Vec<Undecided> = verdicts.values().flatten().cloned().collect();
+            if found.is_empty() || self.bad_calls.contains(&node) {
+                continue;
+            }
+            let name = self.overload_callee(node)?;
+            let origin = self.unknown("undecided-overload", node, &name);
+            let positional = found
+                .iter()
+                .filter_map(|verdict| match verdict {
+                    Undecided::Position(position) if *position > 0 => Some(*position),
+                    _ => None,
+                })
+                .min();
+            let keyword = found
+                .iter()
+                .filter_map(|verdict| match verdict {
+                    Undecided::Keyword(name) => Some(name.as_str()),
+                    Undecided::Position(_) => None,
+                })
+                .min();
+            let argument = positional
+                .map(|position| position.to_string())
+                .or_else(|| keyword.map(|keyword| format!("`{keyword}`")));
+            match argument {
+                Some(argument) => self.diag(
+                    &pynecore_codes::OVERLOAD_ARGUMENT_UNKNOWN,
+                    &[&argument, &name],
+                    node,
+                    Some(origin),
+                    "give the argument a known type",
+                ),
+                None => self.diag(
+                    &pynecore_codes::OVERLOAD_NOT_DECIDED,
+                    &[&name],
+                    node,
+                    Some(origin),
+                    "pass arguments whose types name one overload",
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// The overload group a call reaches, as the call spells it (`_overload_callee`):
+    /// the method of a `method_call`, the callee of any other call.
+    fn overload_callee(&self, node: NodeId) -> R<String> {
+        let (func, args, _) = facts::call_parts(self.ast, node).expect("a call");
+        let mut callee = func;
+        if self.dotted(func).as_deref() == Some("method_call") && !args.is_empty() {
+            if let Some(text) = facts::str_constant(self.ast, args[0]) {
+                return Ok(text.to_string());
+            }
+            callee = args[0];
+        }
+        self.spelled(callee)
     }
 
     /// The pin of an `inline_series` call site in the running context
@@ -1279,6 +1498,18 @@ impl Engine<'_, '_> {
     }
 
     /// The static type of each keyword argument, by parameter name (`_keyword_shapes`).
+    /// The qualifier of each named keyword argument of a call, by parameter name
+    /// (`_keyword_quals`).
+    pub(super) fn keyword_quals(&self, keywords: &[NodeId]) -> IndexMap<String, u8> {
+        let mut out = IndexMap::new();
+        for &keyword in keywords {
+            if let (Some(name), value) = keyword_parts(self.ast, keyword) {
+                out.insert(name.to_string(), self.qual(value));
+            }
+        }
+        out
+    }
+
     pub(super) fn keyword_shapes(&self, keywords: &[NodeId]) -> Option<IndexMap<String, String>> {
         let mut out = IndexMap::new();
         for &keyword in keywords {
@@ -1315,20 +1546,7 @@ impl Engine<'_, '_> {
             return impls.iter().position(|imp| imp.slot == index);
         }
         if !kw_shapes.is_empty() {
-            let declares =
-                |known: &str| impls.iter().any(|imp| imp.names.iter().any(|named| named == known));
-            let kw_shapes: IndexMap<String, String> = kw_shapes
-                .iter()
-                .map(|(name, ty)| (facts::runtime_keyword(name, declares), ty.clone()))
-                .collect();
-            let chars = value_chars(shapes);
-            let kw_chars: Vec<(String, String)> = kw_shapes
-                .iter()
-                .map(|(name, ty)| (name.clone(), value_chars(std::slice::from_ref(ty))))
-                .collect();
-            let kw_types: Vec<(String, String)> =
-                kw_shapes.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect();
-            return overload_binding(impls, &chars, shapes, &kw_chars, &kw_types);
+            return keyword_value_choice(impls, shapes, kw_shapes);
         }
         let chars = match pin {
             Some(pin) => pin.to_string(),

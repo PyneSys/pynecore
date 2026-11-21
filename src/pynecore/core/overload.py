@@ -26,7 +26,8 @@ compatible matching) and calls it through a per-anchor bound cache:
 A call site whose argument TYPES the Pine type pass could decide reaches the
 binder with an overload pin -- one type character per positional argument, and
 after an ``=`` the index of the implementation to run in the group's
-registration order. The type pass selects that implementation from the static
+registration order; a keyword argument has no character, the index covers
+it too. The type pass selects that implementation from the static
 types (``pine_type_rules.resolve_pin``), and the anchor binds the call site to
 it once, instead of selecting per bar from the values. A pin without an index
 is one the type pass could not resolve to a single implementation, and its
@@ -339,13 +340,6 @@ _PIN_WITNESSES: dict[str, Any] = {
     '1': Matrix(1, 1, 0), '2': Matrix(1, 1, 0.0), '3': Matrix(1, 1, True), '4': Matrix(1, 1, ''),
 }
 
-#: Pin character for a position with no witness — a container, a drawing, a
-#: user type, or a type the pass could not settle. The position carries no
-#: information, so it is left out of the selection instead of blocking it:
-#: an int argument next to a user-typed one is exactly the shape the pin
-#: exists for.
-_PIN_ANY = '*'
-
 #: Separator of a pin's implementation index. ``<characters>=<index>`` names the
 #: implementation by its position in the group's registration order: the type
 #: pass writes it wherever it resolves the pin to one implementation, and
@@ -381,7 +375,9 @@ def _indexed(impls: list[Implementation], position: str, chars: str) -> Implemen
     if argc > len(impl.param_types):
         return None
     try:
-        impl.sig.bind(*range(argc))
+        # Partial: a keyword argument may fill a parameter the positions leave
+        # open, which the entry checks against the call's keyword names
+        impl.sig.bind_partial(*range(argc))
     except TypeError:
         return None
     if not all(_check_type(_PIN_WITNESSES[char], impl.param_types[index][1], False)
@@ -477,9 +473,12 @@ def _anchored(impls: list[Implementation], qualname: str,
     :param pin: The call site's overload pin, when the type pass decided on
         one. A pin with an index (``_PIN_INDEX``) names the implementation
         (``_indexed``), which is bound here once rather than selected per bar
-        from the values; the first call checks every wildcard argument against
-        it, and a mismatch hands the site to the value dispatch for good. A
-        pin without an index leaves the site to the value dispatch.
+        from the values: the type pass decided it from every argument's static
+        type, a wildcard position's included, so no value is checked against
+        it. A call with keyword arguments binds them to it under the names the
+        value dispatch would hand them to (``_canonical_kwarg_renames``), as long
+        as the implementation takes those names. A pin without an index leaves
+        the site to the value dispatch.
     :return: The dispatch callable.
 
     A fully pinned stateless implementation may supply ``__pyne_pinned_bind__``.
@@ -590,29 +589,47 @@ def _anchored(impls: list[Implementation], qualname: str,
     # non-None case ever gets there
     chosen: Implementation = pinned
     group = len(impls)
-    # Positions the static selection did not read: a wildcard one carries no
-    # type, so the first call checks the value against what the chosen
-    # implementation declares there -- the witnessed positions can name an
-    # implementation the arguments as a whole do not fit, and the values must
-    # win that. A witnessed position needs no such check: its value is of the
-    # type its character names, which the implementation takes (``_indexed``).
-    checked = tuple(index for index, char in enumerate(chars) if char not in _PIN_WITNESSES)
-    verified = [not checked]
-    # An index whose first call the values do not fit is given up for good: the
-    # call site dispatches from its values from then on
-    rejected = [False]
+    # The keyword renames the pinned implementation binds a call's keyword names
+    # with (``_canonical_kwarg_renames``), or None where it cannot bind them,
+    # keyed by the names as the call spells them. One anchor is one call site,
+    # whose keyword names the type pass decided the index for, so this holds
+    # one entry; a call the pin was not computed for (an implementation that
+    # does not take those names) goes to the value dispatch
+    _kw_pinned: dict[tuple[str, ...], tuple[tuple[str, str], ...] | None] = {}
+    # Whether the positions alone bind it: an index computed for a call that
+    # fills a required parameter by keyword names nothing for one that does not
+    try:
+        chosen.sig.bind(*range(argc))
+        positional = True
+    except TypeError:
+        positional = False
+
+    def _pinned_renames(names: tuple[str, ...]) -> tuple[tuple[str, str], ...] | None:
+        renames = _canonical_kwarg_renames(impls, names)
+        renamed = dict(renames)
+        try:
+            chosen.sig.bind(*range(argc), **{renamed.get(name, name): None for name in names})
+        except TypeError:
+            return None
+        return renames
 
     def dispatch_pinned(*args: Any, **kwargs: Any) -> Any:
-        if kwargs or len(args) != argc or len(impls) != group or rejected[0]:
-            # Not the shape the pin was computed for — a keyword spelling, a
-            # different arity, or an implementation registered after the bind
+        if len(args) != argc or len(impls) != group:
+            # Not the shape the pin was computed for — a different arity, or an
+            # implementation registered after the bind
             return dispatch(*args, **kwargs)
-        if not verified[0]:
-            if not all(_check_type(args[index], chosen.param_types[index][1], False)
-                       for index in checked):
-                rejected[0] = True
+        if kwargs:
+            names = tuple(kwargs)
+            if names in _kw_pinned:
+                renames = _kw_pinned[names]
+            else:
+                renames = _kw_pinned[names] = _pinned_renames(names)
+            if renames is None:
                 return dispatch(*args, **kwargs)
-            verified[0] = True
+            for raw, canonical in renames:
+                kwargs[canonical] = kwargs.pop(raw)
+        elif not positional:
+            return dispatch(*args)
         # The entry bookkeeping of ``dispatch``, repeated rather than shared:
         # this is per-bar code, and the point of the pinned route is that it
         # costs one dict lookup and nothing else — no type tuple, no token,
@@ -627,14 +644,14 @@ def _anchored(impls: list[Implementation], qualname: str,
                 entry = _cache[chosen] = (func, state, partial(func, state))
             else:
                 entry = _cache[chosen] = (func, None, _bind_target(func))
-        return entry[2](*args)
+        return entry[2](*args, **kwargs)
 
     dispatch_pinned.__pyne_cache__ = _cache
     dispatch_pinned.__pyne_impls__ = impls
     # Stateless implementations may fuse a result cache into the pinned entry.
     # The factory retains dispatch_pinned as the fallback for changed call shapes
-    # or implementations; checked positions still need ordinary verification.
-    if checked or hasattr(chosen.func, '__pyne_layout__'):
+    # or implementations.
+    if hasattr(chosen.func, '__pyne_layout__'):
         return dispatch_pinned
     pinned_bind = chosen.pinned_bind
     if pinned_bind is None:

@@ -243,8 +243,8 @@ timestamp(timezone, year, month, day, hour=0, minute=0, second=0) -> int
 |--------------|-------|-------------------|
 | `dateString` | `str` | The date to parse |
 
-`date_string` is accepted as the keyword too. A string without a timezone is read as UTC (GMT+0),
-whatever the exchange timezone is. A missing time is 00:00. Accepted spellings include:
+A string without a timezone is read as UTC (GMT+0), whatever the exchange timezone is. A missing
+time is 00:00. Accepted spellings include:
 
 | Form                    | Example                                       |
 |-------------------------|-----------------------------------------------|
@@ -708,7 +708,6 @@ alertcondition(condition, title=None, message=None) -> None
 - A malformed session specification returns `na` instead of stopping the script.
 - `timenow` is pinned to the last bar during a `pyne run` backtest, which makes backtests that
   read it reproducible.
-- `timestamp()` also accepts the keyword `date_string` in addition to `dateString`.
 - `max_bars_back()` resizes a `Series` buffer when called as a statement on a series variable;
   elsewhere it is a no-op. The history limit is 5000 bars.
 - `alertcondition()` is a no-op: PyneCore has no alert dialog to register conditions with.

@@ -340,7 +340,7 @@ def __test_an_exported_overload_group_is_pinned__(tmp_path, monkeypatch):
 
     pins = [call.pin for call in table.calls if call.callee == 'pick']
     # ``r / 8`` is int-TYPED while its value is fractional -- the whole point
-    assert pins == ['i=0', None, 'i=0']
+    assert pins == ['i=0', 'f=1', 'i=0']
     assert [call.ty for call in table.calls if call.callee == 'pick'] == [FLOAT] * 3
     assert get_pin(_call(tree, 'pick')) == 'i=0'
 
@@ -356,7 +356,7 @@ def __test_the_pin_reaches_the_binder_across_modules__(tmp_path, monkeypatch, ca
 
     dump = capsys.readouterr().out
     assert "__bind_any·__(__state__, 0, pick, 'i=0')" in dump
-    assert '__bind_any·__(__state__, 1, pick)' in dump
+    assert "__bind_any·__(__state__, 1, pick, 'f=1')" in dump
     assert "__bind_any·__(__state__, 2, pick, 'i=0')" in dump
 
 
@@ -420,11 +420,10 @@ def main(r: int):
     tree, table = _analysed(app)
 
     pinned = [call for call in table.calls if call.callee == 'pick']
-    assert [call.pin for call in pinned] == ['i=0', None]
-    # The implementations disagree on their return, so only the pinned site
-    # can say which one runs
-    assert [call.ty for call in pinned] == [INT, UNKNOWN]
-    assert get_pin(_call(tree, 'pick')) is None
+    assert [call.pin for call in pinned] == ['i=0', 'f=1']
+    # The implementations disagree on their return, and each pin says which one runs
+    assert [call.ty for call in pinned] == [INT, FLOAT]
+    assert get_pin(_call(tree, 'pick')) == 'f=1'
 
 
 # --- what cannot be resolved -----------------------------------------------
@@ -903,7 +902,7 @@ def __test_a_group_found_by_name_is_pinned_by_index__(tmp_path, monkeypatch):
     """
     A float argument may be a Python int at run time, which the value dispatch hands to
     the int implementation: the by-name site names the float one Pine selects by index,
-    and is typed by it; the int argument already runs the int one and stays unpinned
+    and is typed by it; the int argument names the int one
     """
     monkeypatch.syspath_prepend(tmp_path)
     _write(tmp_path, 'xm_byname_lib', BY_NAME_GROUP_LIB)
@@ -913,7 +912,7 @@ def __test_a_group_found_by_name_is_pinned_by_index__(tmp_path, monkeypatch):
 
     calls = [node for node in ast.walk(tree)
              if isinstance(node, ast.Call) and ast.unparse(node.func) == 'method_call']
-    assert [get_pin(call) for call in calls] == ['*f=1', None]
+    assert [get_pin(call) for call in calls] == ['*f=1', '*i=0']
     types = {name: binding.ty for name, binding in table.bindings['main'].items()}
     assert (types['a'], types['b']) == ('s', INT)
 

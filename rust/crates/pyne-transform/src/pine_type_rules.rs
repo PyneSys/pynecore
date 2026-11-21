@@ -19,6 +19,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use indexmap::IndexMap;
+
 use pyne_ast::walk::{children, walk, walk_statements};
 use pyne_ast::{
     Ast, Category, Constant, ExprContext, Int, Kind, NodeId, Operator, UnaryOperator, Unsupported,
@@ -1155,7 +1157,8 @@ pub const ANNOTATION_TYPES: &[(&str, &str)] = &[
     ("None", VOID),
 ];
 
-/// Annotation heads whose payload is the type itself.
+/// Annotation heads whose payload is the type itself, the qualifier markers
+/// (`QUALIFIER_MARKERS`) included.
 const TRANSPARENT_SUBSCRIPTS: &[&str] = &[
     "Series",
     "PersistentSeries",
@@ -1164,7 +1167,28 @@ const TRANSPARENT_SUBSCRIPTS: &[&str] = &[
     "IBPersistent",
     "IBPersistentSeries",
     "Optional",
+    "Simple",
+    "Const",
 ];
+/// A parameter's qualifier marker, one `ImplSig::quals` character per positional
+/// parameter: the `pine_qualifier` lattice's values, lowest first.
+pub const QUAL_CONST: char = '0';
+/// The `ImplSig::quals` character of a `Simple[T]` parameter.
+pub const QUAL_SIMPLE: char = '1';
+/// The `ImplSig::quals` character of a parameter without a marker.
+pub const QUAL_PLAIN: char = '2';
+/// Qualifier marker annotation head -> its `ImplSig::quals` character.
+const QUALIFIER_MARKERS: &[(&str, char)] = &[("Const", QUAL_CONST), ("Simple", QUAL_SIMPLE)];
+
+/// The qualifier a parameter annotation's marker declares (`annotation_qualifier`):
+/// `QUAL_SIMPLE` for `Simple[T]`, `QUAL_CONST` for `Const[T]`, `None` for no marker.
+pub fn annotation_qualifier(ast: &Ast, node: Option<NodeId>) -> Option<char> {
+    let Kind::Subscript { value, .. } = ast.kind(node?) else {
+        return None;
+    };
+    let name = leaf_name(ast, *value);
+    QUALIFIER_MARKERS.iter().find(|(head, _)| *head == name).map(|&(_, qual)| qual)
+}
 /// Annotation heads whose payload is the array element type.
 const ARRAY_SUBSCRIPTS: &[&str] = &["list", "Array", "SequenceView"];
 /// Annotation heads whose payload is the matrix element type.
@@ -1670,6 +1694,10 @@ pub struct ImplSig {
     pub kwarg: bool,
     /// How many implementations the group registers; -1 where it is not known
     pub size: i64,
+    /// One `QUAL_*` character per positional parameter, the qualifier its marker
+    /// declares (`annotation_qualifier`), `QUAL_PLAIN` where it has none; empty where
+    /// no parameter has one (`qualifier_choice`)
+    pub quals: String,
 }
 
 /// Whether an implementation's positional parameter has no annotation (`_is_bare`).
@@ -1734,23 +1762,51 @@ pub fn resolve_pin(impls: &[ImplSig], pin: &str) -> Option<usize> {
     let wanted = pin_items(chars);
     let no_shapes: &[&str] = &[];
     if chars.contains(PIN_ANY) {
-        for strict in [true, false] {
-            let verdicts: Vec<Verdict> = impls
-                .iter()
-                .map(|imp| takes(imp, &wanted, false, no_shapes, strict, true))
-                .collect();
+        let verdicts_for = |strict: bool| -> Vec<Verdict> {
+            impls.iter().map(|imp| takes(imp, &wanted, false, no_shapes, strict, true)).collect()
+        };
+        let exact = verdicts_for(true);
+        let widening = verdicts_for(false);
+        if exact.contains(&Verdict::Maybe) || widening.contains(&Verdict::Maybe) {
+            return None;
+        }
+        for (strict, verdicts) in [(true, &exact), (false, &widening)] {
             let found: Vec<usize> = verdicts
                 .iter()
                 .enumerate()
                 .filter(|(_, verdict)| **verdict == Verdict::Yes)
                 .map(|(index, _)| index)
                 .collect();
-            if verdicts.contains(&Verdict::Maybe) || found.len() > 1 {
+            if found.len() > 1 {
                 return None;
             }
-            if let Some(&index) = found.first() {
-                return Some(index);
+            let Some(&index) = found.first() else {
+                continue;
+            };
+            if strict {
+                // The values may fail the chosen one at a wildcard position and
+                // fall through to the widening pass: only an implementation that
+                // declares the same types there cannot be the one they then take
+                let chosen = &impls[index].params;
+                let wild: Vec<usize> = chars
+                    .chars()
+                    .enumerate()
+                    .filter(|(_, char)| *char == PIN_ANY)
+                    .map(|(k, _)| k)
+                    .collect();
+                let differs = widening.iter().enumerate().any(|(other, verdict)| {
+                    let params = &impls[other].params;
+                    *verdict == Verdict::Yes
+                        && other != index
+                        && wild.iter().any(|&k| {
+                            k >= params.len() || k >= chosen.len() || params[k] != chosen[k]
+                        })
+                });
+                if differs {
+                    return None;
+                }
             }
+            return Some(index);
         }
         return None;
     }
@@ -1887,6 +1943,17 @@ fn strictly_held(ty: &str) -> bool {
 /// implementation the arity reaches declares the positions the call fills, and exactly
 /// one implementation answers the first pass any answers.
 pub fn pine_choice<S: AsRef<str>>(impls: &[ImplSig], shapes: &[S]) -> Option<usize> {
+    match pine_matches(impls, shapes) {
+        Some(found) if found.len() == 1 => Some(found[0]),
+        _ => None,
+    }
+}
+
+/// The implementations that answer the first of Pine's two passes any answers, by
+/// their index in `impls` (`_pine_matches`): the candidates [`pine_choice`] decides
+/// among; empty where no pass answers, `None` where the types are not ones the passes
+/// read.
+fn pine_matches<S: AsRef<str>>(impls: &[ImplSig], shapes: &[S]) -> Option<Vec<usize>> {
     let argc = shapes.len();
     if !shapes.iter().all(|given| pine_settled(given.as_ref())) {
         return None;
@@ -1916,10 +1983,204 @@ pub fn pine_choice<S: AsRef<str>>(impls: &[ImplSig], shapes: &[S]) -> Option<usi
             })
             .collect();
         if !found.is_empty() {
-            return if found.len() == 1 { Some(found[0]) } else { None };
+            return Some(found);
         }
     }
-    None
+    Some(Vec::new())
+}
+
+/// The implementation Pine selects among ones that differ only by a parameter's
+/// qualifier, by its index in `impls` (`qualifier_choice`): of the candidates the
+/// types leave ([`pine_matches`]), the ones whose markers admit every argument's
+/// qualifier, and of those the one whose every parameter is at least as narrow as
+/// every other's. A call with keyword arguments is read the same way, each keyword at
+/// the parameter of its name ([`pine_keyword_matches`]); one bound to a keyword-only
+/// parameter carries no marker. Undecided where no implementation carries a marker and
+/// where no one implementation is the narrowest.
+///
+/// :param quals: The `pine_qualifier` qualifier of each positional argument
+/// :param kw_shapes: Parameter name -> the keyword argument's static type, each keyword
+///                   spelled as the parameter it binds
+/// :param kw_quals: Parameter name -> the keyword argument's qualifier, spelled as
+///                  `kw_shapes`
+pub fn qualifier_choice<S: AsRef<str>>(
+    impls: &[ImplSig],
+    shapes: &[S],
+    quals: &[u8],
+    kw_shapes: &[(String, String)],
+    kw_quals: &[(String, u8)],
+) -> Option<usize> {
+    if quals.len() != shapes.len() || impls.iter().all(|imp| imp.quals.is_empty()) {
+        return None;
+    }
+    let shaped: HashSet<&str> = kw_shapes.iter().map(|(name, _)| name.as_str()).collect();
+    let qualified: HashSet<&str> = kw_quals.iter().map(|(name, _)| name.as_str()).collect();
+    if shaped != qualified {
+        return None;
+    }
+    let found = if kw_shapes.is_empty() {
+        pine_matches(impls, shapes)?
+    } else {
+        pine_keyword_matches(impls, shapes, kw_shapes)?
+    };
+    let bound = |index: usize| -> IndexMap<usize, u8> {
+        let names = &impls[index].names;
+        let mut out: IndexMap<usize, u8> = quals.iter().copied().enumerate().collect();
+        for (name, qual) in kw_quals {
+            if let Some(position) = names.iter().position(|known| known == name) {
+                out.insert(position, *qual);
+            }
+        }
+        out
+    };
+    let rank = |index: usize, position: usize| -> u8 {
+        impls[index].quals.as_bytes().get(position).copied().unwrap_or(QUAL_PLAIN as u8) - b'0'
+    };
+    let admitted: Vec<usize> = found
+        .into_iter()
+        .filter(|&index| {
+            bound(index).iter().all(|(&position, &qual)| qual <= rank(index, position))
+        })
+        .collect();
+    let narrowest: Vec<usize> = admitted
+        .iter()
+        .copied()
+        .filter(|&index| {
+            let positions = bound(index);
+            admitted.iter().all(|&other| {
+                positions.keys().all(|&position| rank(index, position) <= rank(other, position))
+            })
+        })
+        .collect();
+    if narrowest.len() == 1 { Some(narrowest[0]) } else { None }
+}
+
+/// The implementation Pine itself selects for a call with keyword arguments, by its
+/// index in `impls` (`pine_keyword_choice`): every implementation that binds the call
+/// (`keyword_bound`) is reached, and the two passes of [`pine_choice`] compare each
+/// bound argument; a keyword the shape does not name binds a keyword-only parameter
+/// untyped. Undecided where a type is not settled, an implementation takes `*args` or
+/// `**kwargs`, or several answer the first pass any answers.
+///
+/// :param kw_shapes: Parameter name -> the keyword argument's static type, each keyword
+///     spelled as the parameter it binds
+pub fn pine_keyword_choice<S: AsRef<str>>(
+    impls: &[ImplSig],
+    shapes: &[S],
+    kw_shapes: &[(String, String)],
+) -> Option<usize> {
+    match pine_keyword_matches(impls, shapes, kw_shapes) {
+        Some(found) if found.len() == 1 => Some(found[0]),
+        _ => None,
+    }
+}
+
+/// Whether another implementation of the group is indistinguishable from the chosen one
+/// (`has_twin`): equal positional types, witness specs, required count and qualifier
+/// markers; keyword-only parameters and parameter names take no part in it.
+pub fn has_twin(impls: &[ImplSig], chosen: usize) -> bool {
+    let key = |imp: &ImplSig| {
+        let count = imp.params.len();
+        let prefix = |text: &str| text.chars().take(count).collect::<String>();
+        (
+            imp.params.clone(),
+            imp.required,
+            imp.open_ended,
+            imp.bare.clone(),
+            imp.accepts.clone(),
+            imp.quals.clone(),
+            prefix(&imp.fits),
+            prefix(&imp.wide_fits),
+        )
+    };
+    let own = key(&impls[chosen]);
+    impls.iter().enumerate().any(|(index, imp)| index != chosen && imp.slot >= 0 && key(imp) == own)
+}
+
+/// The implementations that answer the first of Pine's two passes any answers, keywords
+/// bound, by their index in `impls` (`_pine_keyword_matches`): the candidates
+/// [`pine_keyword_choice`] decides among; empty where no pass answers, `None` where the
+/// types are not ones the passes read.
+fn pine_keyword_matches<S: AsRef<str>>(
+    impls: &[ImplSig],
+    shapes: &[S],
+    kw_shapes: &[(String, String)],
+) -> Option<Vec<usize>> {
+    if !shapes.iter().all(|given| pine_settled(given.as_ref()))
+        || !kw_shapes.iter().all(|(_, given)| pine_settled(given))
+    {
+        return None;
+    }
+    let mut reachable: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    for (index, imp) in impls.iter().enumerate() {
+        if imp.open_ended || imp.kwarg {
+            return None;
+        }
+        let Some(bound) = keyword_bound(imp, shapes, kw_shapes) else { continue };
+        if bound.iter().any(|(declared, _)| !pine_settled(declared)) {
+            return None;
+        }
+        reachable.push((index, bound));
+    }
+    for widening in [false, true] {
+        let found: Vec<usize> = reachable
+            .iter()
+            .filter(|(_, bound)| {
+                bound.iter().all(|(declared, given)| pine_takes(declared, given, widening))
+            })
+            .map(|(index, _)| *index)
+            .collect();
+        if !found.is_empty() {
+            return Some(found);
+        }
+    }
+    Some(Vec::new())
+}
+
+/// The (declared, given) type pairs a call with keyword arguments binds in one
+/// implementation (`_keyword_bound`): UNKNOWN declared for a parameter without an
+/// annotation, nothing for a keyword-only one; None where it does not bind the call.
+fn keyword_bound<S: AsRef<str>>(
+    imp: &ImplSig,
+    shapes: &[S],
+    kw_shapes: &[(String, String)],
+) -> Option<Vec<(String, String)>> {
+    if shapes.len() > imp.params.len() {
+        return None;
+    }
+    let declared_at = |position: usize| {
+        if is_bare(imp, position) { UNKNOWN.to_string() } else { imp.params[position].clone() }
+    };
+    let mut filled: Vec<usize> = (0..shapes.len()).collect();
+    let mut bound: Vec<(String, String)> = shapes
+        .iter()
+        .enumerate()
+        .map(|(position, given)| (declared_at(position), given.as_ref().to_string()))
+        .collect();
+    let keyword_only = imp.fits.chars().count() > imp.params.len();
+    for (name, given) in kw_shapes {
+        let Some(position) = imp.names.iter().position(|known| known == name) else {
+            if !keyword_only {
+                return None;
+            }
+            continue;
+        };
+        if filled.contains(&position) {
+            return None;
+        }
+        filled.push(position);
+        bound.push((declared_at(position), given.clone()));
+    }
+    if imp
+        .fits
+        .chars()
+        .take(imp.params.len())
+        .enumerate()
+        .any(|(position, fit)| fit == FIT_REQUIRED && !filled.contains(&position))
+    {
+        return None;
+    }
+    Some(bound)
 }
 
 /// Whether the value dispatch may run an implementation for a reason only an indexed pin
@@ -1938,6 +2199,21 @@ pub fn value_rival<S: AsRef<str>>(imp: &ImplSig, shapes: &[S], numbers: bool) ->
         } else if numbers && NUMERIC.contains(&given) && NUMERIC.contains(&declared.as_str()) {
             return true;
         }
+    }
+    false
+}
+
+/// Whether an argument type leaves the overload a call runs to its value
+/// (`is_unsettled`): UNKNOWN, an object whose class was lost, a container of either.
+pub fn is_unsettled(ty: &str) -> bool {
+    if ty == UNKNOWN || ty == OBJECT {
+        return true;
+    }
+    if is_array(ty) || is_matrix(ty) {
+        return is_unsettled(element_of(ty));
+    }
+    if is_map(ty) {
+        return is_unsettled(key_of(ty)) || is_unsettled(value_of(ty));
     }
     false
 }
@@ -2318,12 +2594,17 @@ pub fn impl_sig(
     let mut types = Vec::with_capacity(found.positional.len());
     let mut bare = String::with_capacity(found.positional.len());
     let mut accepts = Vec::with_capacity(found.positional.len());
+    let mut quals = String::with_capacity(found.positional.len());
     for &arg in &found.positional {
         let annotation = arg_parts(ast, arg).1;
         let declared = annotation_type(ast, annotation, classes, enums)?;
         accepts.push(own_accepts(ast, annotation, &declared, classes)?);
         types.push(declared);
         bare.push(if annotation.is_none() { '1' } else { '0' });
+        quals.push(annotation_qualifier(ast, annotation).unwrap_or(QUAL_PLAIN));
+    }
+    if quals.chars().all(|qual| qual == QUAL_PLAIN) {
+        quals.clear();
     }
     let mut fits = String::new();
     let mut wide_fits = String::new();
@@ -2348,6 +2629,7 @@ pub fn impl_sig(
         wide_fits,
         kwarg: found.kwarg,
         size: -1,
+        quals,
     })
 }
 
@@ -2467,7 +2749,8 @@ const NAME_ACCEPTS: &[(&str, &str)] = &[
 
 /// Annotation heads whose payload is checked as the annotation itself
 /// (`_SAME_ACCEPTS_SUBSCRIPTS`).
-const SAME_ACCEPTS_SUBSCRIPTS: &[&str] = &["Persistent", "IBPersistent", "Optional", "Series"];
+const SAME_ACCEPTS_SUBSCRIPTS: &[&str] =
+    &["Persistent", "IBPersistent", "Optional", "Series", "Simple", "Const"];
 
 /// Annotation heads that take no witness whatever their payload (`_NO_WITNESS_SUBSCRIPTS`).
 const NO_WITNESS_SUBSCRIPTS: &[&str] = &["NA", "dict", "tuple", "Tuple", "set"];

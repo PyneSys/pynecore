@@ -52,7 +52,9 @@ __all__ = [
     'get_widens', 'set_widens',
     'pin_chars', 'pin_for', 'value_chars', 'overload_result', 'ImplSig', 'overload_pick',
     'overload_bind', 'overload_choice', 'overload_candidates', 'overload_binding',
-    'PIN_INDEX', 'indexed_pin', 'pin_index', 'pine_choice', 'value_rival',
+    'PIN_INDEX', 'indexed_pin', 'pin_index', 'pine_choice', 'pine_keyword_choice', 'value_rival', 'is_unsettled',
+    'QUAL_CONST', 'QUAL_SIMPLE', 'QUAL_PLAIN', 'annotation_qualifier', 'qualifier_choice',
+    'has_twin',
     'resolve_pin', 'PIN_WITNESSED', 'ACCEPTS_SEP', 'ACCEPTS_UNKNOWN', 'annotation_accepts',
     'is_str_literal',
     'TYPELESS', 'NONE_DEFAULT', 'FIT_OMISSIBLE', 'FIT_REQUIRED', 'FIT_UNSURE',
@@ -1336,11 +1338,23 @@ ANNOTATION_TYPES: Final[dict[str, str]] = {
 }
 
 #: Annotation heads whose payload is the element type: ``Series[int]``,
-#: ``NA[float]``, ``Persistent[int]``, ``Optional[int]``.
+#: ``NA[float]``, ``Persistent[int]``, ``Optional[int]``, and the qualifier
+#: markers ``Simple[str]`` and ``Const[str]`` (``_QUALIFIER_MARKERS``).
 _TRANSPARENT_SUBSCRIPTS: Final = frozenset({
     'Series', 'PersistentSeries', 'NA', 'Persistent', 'IBPersistent',
-    'IBPersistentSeries', 'Optional',
+    'IBPersistentSeries', 'Optional', 'Simple', 'Const',
 })
+
+#: A parameter's qualifier marker, one ``ImplSig.quals`` character per
+#: positional parameter: the marker PyneComp writes where an overload group's
+#: implementations differ only by a Pine qualifier (``types/qualifier.py``).
+#: The characters are the ``pine_qualifier`` lattice's values, lowest first.
+QUAL_CONST: Final = '0'
+QUAL_SIMPLE: Final = '1'
+QUAL_PLAIN: Final = '2'
+
+#: Qualifier marker annotation head -> its ``ImplSig.quals`` character
+_QUALIFIER_MARKERS: Final[dict[str, str]] = {'Const': QUAL_CONST, 'Simple': QUAL_SIMPLE}
 
 #: Annotation heads whose payload is the ARRAY element type. PyneComp emits
 #: ``T[]`` as ``list[T]``; ``SequenceView`` is what ``array.slice`` hands back,
@@ -1920,6 +1934,10 @@ class ImplSig(NamedTuple):
     #: How many implementations the group registers, the ones the static
     #: selection leaves out included; -1 where it is not known
     size: int = -1
+    #: One ``QUAL_*`` character per positional parameter, the qualifier its
+    #: marker declares (``annotation_qualifier``), ``QUAL_PLAIN`` where it has
+    #: none; empty where no parameter has one (``qualifier_choice``)
+    quals: str = ''
 
 
 def _is_bare(impl: ImplSig, index: int) -> bool:
@@ -2026,7 +2044,10 @@ def resolve_pin(impls: Sequence[ImplSig], pin: str) -> ImplSig | None:
     an answer only where exactly one implementation takes the rest, in the
     first pass any implementation does: where more than one survives, the
     position the pin knows nothing about is the one that decides, and the
-    values know it and the pin does not.
+    values know it and the pin does not. An exact-pass answer also needs every
+    implementation the widening pass takes to declare the same types at the
+    wildcard positions: values the answer refuses there fall through to the
+    widening pass, which would run another implementation.
 
     There is no answer where the runtime has no witness for a character, where
     a declared type or a default does not say how the selector checks a value
@@ -2047,13 +2068,28 @@ def resolve_pin(impls: Sequence[ImplSig], pin: str) -> ImplSig | None:
         return None
     wanted = tuple(chars)
     if PIN_ANY in wanted:
+        verdicts = {strict: [_takes(impl, wanted, False, (), strict, True) for impl in impls]
+                    for strict in (True, False)}
+        if any(_MAYBE in passed for passed in verdicts.values()):
+            return None
         for strict in (True, False):
-            verdicts = [_takes(impl, wanted, False, (), strict, True) for impl in impls]
-            found = [impl for impl, verdict in zip(impls, verdicts) if verdict == _YES]
-            if _MAYBE in verdicts or len(found) > 1:
+            found = [impl for impl, verdict in zip(impls, verdicts[strict]) if verdict == _YES]
+            if len(found) > 1:
                 return None
-            if found:
-                return found[0]
+            if not found:
+                continue
+            chosen = found[0]
+            if strict:
+                # The values may fail the chosen one at a wildcard position and
+                # fall through to the widening pass: only an implementation that
+                # declares the same types there cannot be the one they then take
+                wild = [k for k, char in enumerate(wanted) if char == PIN_ANY]
+                for impl, verdict in zip(impls, verdicts[False]):
+                    if verdict == _YES and impl is not chosen and any(
+                            k >= len(impl.params) or k >= len(chosen.params)
+                            or impl.params[k] != chosen.params[k] for k in wild):
+                        return None
+            return chosen
         return None
     for strict in (True, False):
         verdict, chosen = _pass_choice(impls, wanted, (), strict)
@@ -2452,6 +2488,22 @@ def pine_choice(impls: Sequence[ImplSig], shapes: Sequence[str]) -> int | None:
     :param shapes: The static type of each positional argument
     :return: The index of the selected implementation in ``impls``, or None
     """
+    found = _pine_matches(impls, shapes)
+    return found[0] if found is not None and len(found) == 1 else None
+
+
+def _pine_matches(impls: Sequence[ImplSig], shapes: Sequence[str]) -> list[int] | None:
+    """
+    The implementations that answer the first of Pine's two passes any answers.
+
+    The candidates ``pine_choice`` decides among, by their index in ``impls``.
+
+    :param impls: Every implementation of the group the static selection reads,
+                  in declaration order
+    :param shapes: The static type of each positional argument
+    :return: Their indices, empty where no pass answers, or None where the
+             types are not ones the passes read
+    """
     argc = len(shapes)
     if not all(_pine_settled(given) for given in shapes):
         return None
@@ -2470,8 +2522,195 @@ def pine_choice(impls: Sequence[ImplSig], shapes: Sequence[str]) -> int | None:
                  if all(_pine_takes(impls[index].params[position], given, widening)
                         for position, given in enumerate(shapes))]
         if found:
-            return found[0] if len(found) == 1 else None
-    return None
+            return found
+    return []
+
+
+def qualifier_choice(impls: Sequence[ImplSig], shapes: Sequence[str],
+                     quals: Sequence[int], kw_shapes: Mapping[str, str] | None = None,
+                     kw_quals: Mapping[str, int] | None = None) -> int | None:
+    """
+    The implementation Pine selects among ones that differ only by a parameter's qualifier.
+
+    Where the types leave several implementations (``_pine_matches``), Pine
+    reads the qualifier of each argument: a marked parameter takes only an
+    argument its qualifier admits -- a ``Const`` one a const argument, a
+    ``Simple`` one a const or simple one, an unmarked one any -- and of the
+    ones that take the call, the implementation whose every parameter is at
+    least as narrow as every other's is the one that runs: a const argument
+    goes to ``Const`` before ``Simple`` before the unmarked one, a simple one
+    to ``Simple`` before the unmarked one, a series one to the unmarked one.
+    A call with keyword arguments is read the same way, each keyword at the
+    parameter of its name (``_pine_keyword_matches``); a keyword bound to a
+    keyword-only parameter carries no marker. Undecided where no
+    implementation of the group carries a marker (``ImplSig.quals``), and
+    where no one implementation is the narrowest.
+
+    :param impls: Every implementation of the group the static selection reads,
+                  in declaration order
+    :param shapes: The static type of each positional argument
+    :param quals: The ``pine_qualifier`` qualifier of each positional argument
+    :param kw_shapes: Parameter name -> the keyword argument's static type, each
+                      keyword spelled as the parameter it binds
+    :param kw_quals: Parameter name -> the keyword argument's qualifier, spelled
+                     as ``kw_shapes``
+    :return: The index of the selected implementation in ``impls``, or None
+    """
+    if len(quals) != len(shapes) or not any(impl.quals for impl in impls):
+        return None
+    kw_shapes = kw_shapes or {}
+    kw_quals = kw_quals or {}
+    if set(kw_quals) != set(kw_shapes):
+        return None
+    found = _pine_keyword_matches(impls, shapes, kw_shapes) if kw_shapes \
+        else _pine_matches(impls, shapes)
+    if not found:
+        return None
+
+    def bound(index: int) -> dict[int, int]:
+        names = impls[index].names
+        out = dict(enumerate(quals))
+        for name, qual in kw_quals.items():
+            if name in names:
+                out[names.index(name)] = qual
+        return out
+
+    def rank(index: int, position: int) -> int:
+        marked = impls[index].quals
+        return int(marked[position]) if position < len(marked) else int(QUAL_PLAIN)
+
+    admitted = [index for index in found
+                if all(qual <= rank(index, position)
+                       for position, qual in bound(index).items())]
+    narrowest = [index for index in admitted
+                 if all(all(rank(index, position) <= rank(other, position)
+                            for position in bound(index))
+                        for other in admitted)]
+    return narrowest[0] if len(narrowest) == 1 else None
+
+
+def pine_keyword_choice(impls: Sequence[ImplSig], shapes: Sequence[str],
+                        kw_shapes: Mapping[str, str]) -> int | None:
+    """
+    The implementation Pine itself selects for a call with keyword arguments, by its index.
+
+    ``pine_choice`` for a call that names some of its arguments: every
+    implementation that binds the call -- its positional arguments in order,
+    each keyword to the parameter of its name, every required parameter filled
+    -- is reached, and the two passes compare each bound argument's type with
+    what its parameter declares. A keyword the shape does not name binds a
+    keyword-only parameter where the implementation has one; the shape does not
+    type such a parameter, so it takes the keyword in both passes (the runtime
+    falls back to the value dispatch where the implementation cannot bind it
+    after all). Undecided where an argument or a parameter it binds is not
+    settled, where an implementation takes ``*args`` or ``**kwargs``, and where
+    the first pass that any implementation answers is answered by several.
+
+    :param impls: Every implementation of the group the static selection reads,
+                  in declaration order
+    :param shapes: The static type of each positional argument
+    :param kw_shapes: Parameter name -> the keyword argument's static type, each
+                      keyword spelled as the parameter it binds
+    :return: The index of the selected implementation in ``impls``, or None
+    """
+    found = _pine_keyword_matches(impls, shapes, kw_shapes)
+    return found[0] if found is not None and len(found) == 1 else None
+
+
+def has_twin(impls: Sequence[ImplSig], chosen: ImplSig) -> bool:
+    """
+    Whether another implementation of the group is indistinguishable from the chosen one.
+
+    The selection reads the positional parameters only -- their types, how
+    they take a witness, which ones a call must pass and their qualifier
+    markers; a keyword-only parameter takes no part in it, and neither does a
+    parameter's name. Two implementations equal in all of that are twins:
+    the static types cannot tell which one runs, and picking the first would
+    be a guess.
+
+    :param impls: Every implementation of the group the static selection reads
+    :param chosen: The implementation the selection settled on
+    :return: True where a twin of ``chosen`` is among ``impls``
+    """
+    def key(impl: ImplSig) -> tuple:
+        count = len(impl.params)
+        return (impl.params, impl.required, impl.open_ended, impl.bare, impl.accepts,
+                impl.quals, impl.fits[:count], impl.wide_fits[:count])
+
+    own = key(chosen)
+    return any(impl is not chosen and impl.slot >= 0 and key(impl) == own for impl in impls)
+
+
+def _pine_keyword_matches(impls: Sequence[ImplSig], shapes: Sequence[str],
+                          kw_shapes: Mapping[str, str]) -> list[int] | None:
+    """
+    The implementations that answer the first of Pine's two passes any answers, keywords bound.
+
+    The candidates ``pine_keyword_choice`` decides among, by their index in ``impls``.
+
+    :param impls: Every implementation of the group the static selection reads,
+                  in declaration order
+    :param shapes: The static type of each positional argument
+    :param kw_shapes: Parameter name -> the keyword argument's static type, each
+                      keyword spelled as the parameter it binds
+    :return: Their indices, empty where no pass answers, or None where the
+             types are not ones the passes read
+    """
+    if not all(_pine_settled(given) for given in shapes) \
+            or not all(_pine_settled(given) for given in kw_shapes.values()):
+        return None
+    reachable: list[tuple[int, list[tuple[str, str]]]] = []
+    for index, impl in enumerate(impls):
+        if impl.open_ended or impl.kwarg:
+            return None
+        bound = _keyword_bound(impl, shapes, kw_shapes)
+        if bound is None:
+            continue
+        if any(not _pine_settled(declared) for declared, _ in bound):
+            return None
+        reachable.append((index, bound))
+    for widening in (False, True):
+        found = [index for index, bound in reachable
+                 if all(_pine_takes(declared, given, widening) for declared, given in bound)]
+        if found:
+            return found
+    return []
+
+
+def _keyword_bound(impl: ImplSig, shapes: Sequence[str],
+                   kw_shapes: Mapping[str, str]) -> list[tuple[str, str]] | None:
+    """
+    The (declared, given) type pairs a call with keyword arguments binds in one implementation.
+
+    A parameter without an annotation is paired with UNKNOWN, which no pass
+    compares (``pine_keyword_choice``); a keyword bound to a keyword-only
+    parameter is not paired at all.
+
+    :param impl: The implementation's shape
+    :param shapes: The static type of each positional argument
+    :param kw_shapes: Parameter name -> the keyword argument's static type
+    :return: The pairs, or None where the implementation does not bind the call
+    """
+    if len(shapes) > len(impl.params):
+        return None
+    filled = set(range(len(shapes)))
+    bound = [(UNKNOWN if _is_bare(impl, position) else impl.params[position], given)
+             for position, given in enumerate(shapes)]
+    keyword_only = len(impl.fits) > len(impl.params)
+    for name, given in kw_shapes.items():
+        if name not in impl.names:
+            if not keyword_only:
+                return None
+            continue
+        position = impl.names.index(name)
+        if position in filled:
+            return None
+        filled.add(position)
+        bound.append((UNKNOWN if _is_bare(impl, position) else impl.params[position], given))
+    if any(fit == FIT_REQUIRED and position not in filled
+           for position, fit in enumerate(impl.fits[:len(impl.params)])):
+        return None
+    return bound
 
 
 def value_rival(impl: ImplSig, shapes: Sequence[str], numbers: bool) -> bool:
@@ -2499,6 +2738,27 @@ def value_rival(impl: ImplSig, shapes: Sequence[str], numbers: bool) -> bool:
                 return True
         elif numbers and given in (INT, FLOAT) and declared in (INT, FLOAT):
             return True
+    return False
+
+
+def is_unsettled(ty: str) -> bool:
+    """
+    Whether an argument type leaves the overload a call runs to its value.
+
+    The type pass decides a call to an overload group from the static types of
+    its arguments; one it does not know -- UNKNOWN, an object whose class was
+    lost, a container of either -- says nothing about which implementation
+    takes the value, nor whether any does.
+
+    :param ty: An argument's static type
+    :return: True when the type is not known
+    """
+    if ty in (UNKNOWN, OBJECT):
+        return True
+    if is_array(ty) or is_matrix(ty):
+        return is_unsettled(element_of(ty))
+    if is_map(ty):
+        return is_unsettled(key_of(ty)) or is_unsettled(value_of(ty))
     return False
 
 
@@ -2672,6 +2932,7 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
     params = tuple(annotation_type(a.annotation, classes, enums) for a in positional)
     accepts = tuple(_own_accepts(arg, declared, classes)
                     for arg, declared in zip(positional, params))
+    quals = ''.join(annotation_qualifier(a.annotation) or QUAL_PLAIN for a in positional)
     return ImplSig(
         params=params,
         required=len(positional) - len(args.defaults),
@@ -2683,7 +2944,28 @@ def impl_sig(node: ast.FunctionDef | ast.AsyncFunctionDef, ret: str,
         accepts=accepts if any(accepts) else (),
         wide_fits=''.join(param_fit(arg, defaults.get(arg.arg), ty_of, classes, enums, False)
                           for arg in every),
-        kwarg=args.kwarg is not None)
+        kwarg=args.kwarg is not None,
+        quals=quals if quals.strip(QUAL_PLAIN) else '')
+
+
+def annotation_qualifier(node: ast.expr | None) -> str | None:
+    """
+    The qualifier a parameter annotation's marker declares.
+
+    ``Simple[T]`` and ``Const[T]`` are what PyneComp writes for a ``simple``
+    and a ``const`` parameter, and only in an overload group whose
+    implementations would otherwise have the same signature
+    (``types/qualifier.py``); everything else declares none.
+
+    :param node: The annotation expression, or None when there is none
+    :return: ``QUAL_SIMPLE`` or ``QUAL_CONST``, or None for no marker
+    """
+    if not isinstance(node, ast.Subscript):
+        return None
+    value = node.value
+    name = value.id if isinstance(value, ast.Name) else \
+        (value.attr if isinstance(value, ast.Attribute) else '')
+    return _QUALIFIER_MARKERS.get(name)
 
 
 def param_fit(arg: ast.arg, default: ast.expr | None,
@@ -2791,8 +3073,11 @@ _NAME_ACCEPTS: Final[dict[str, str]] = {
 #: Annotation heads whose payload is checked as the annotation itself: the
 #: ``Persistent`` wrappers are ``T | NA[T] | Series[T]``, and only ``T`` takes a
 #: witness; a parameter's ``Series[T]`` is ``T`` at run time, the series
-#: transform leaves the payload in its place (``SeriesTransformer``)
-_SAME_ACCEPTS_SUBSCRIPTS: Final = frozenset({'Persistent', 'IBPersistent', 'Optional', 'Series'})
+#: transform leaves the payload in its place (``SeriesTransformer``); a
+#: qualifier marker IS its payload at run time
+_SAME_ACCEPTS_SUBSCRIPTS: Final = frozenset({
+    'Persistent', 'IBPersistent', 'Optional', 'Series', 'Simple', 'Const',
+})
 
 #: Annotation heads that take no witness whatever their payload
 _NO_WITNESS_SUBSCRIPTS: Final = frozenset({'NA', 'dict', 'tuple', 'Tuple', 'set'})

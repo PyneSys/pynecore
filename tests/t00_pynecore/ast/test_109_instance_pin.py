@@ -101,7 +101,7 @@ def main(r: int):
 
 
 def __test_each_call_site_carries_its_own_instance_vector__():
-    """The int caller configures ``'i'``; the float caller configures nothing"""
+    """The int caller configures the int implementation, the float caller the float one"""
     tree = ast.parse(GROUP + SHARED_BODY + '''
 def main(r: int):
     return f(r), f(r * 1.5)
@@ -109,9 +109,7 @@ def main(r: int):
     infer_module(tree, 'test')
     vectors = [get_vector(node) for node in ast.walk(tree)
                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'f']
-    # The all-None vector IS the layout default, so it is never stamped: an
-    # unconfigured instance already dispatches from the values
-    assert vectors == [('i=0',), None]
+    assert vectors == [('i=0',), ('f=1',)]
 
 
 def __test_two_sites_of_one_closure_get_a_vector_each__():
@@ -141,7 +139,7 @@ def main(r: int):
     infer_module(tree, 'test')
     vectors = [get_vector(node) for node in ast.walk(tree)
                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'f']
-    assert vectors == [('i=0',), None]
+    assert vectors == [('i=0',), ('f=1',)]
 
     ns, _ = _transform(source, 'pin_mod_two_sites')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
@@ -160,7 +158,7 @@ def main(r: int):
     assert "'pin': 0" in dump
     assert '__bind_any·__(__state__, 1, g, __state__[0][0])' in dump
     assert "__resolve_slot·__(__state__, 0, f, ('i=0',))" in dump
-    assert '__resolve_slot·__(__state__, 1, f)' in dump
+    assert "__resolve_slot·__(__state__, 1, f, ('f=1',))" in dump
 
 
 def __test_a_body_that_agrees_gets_no_slot_and_no_extra_argument__():
@@ -250,9 +248,9 @@ def main(r: int):
     return f(r), f(r * 1.5)
 ''', 'ipin_mod_uniform')
     # The pin position is filled in with None: the binder takes them
-    # positionally, and this site has a vector but nothing to pin
+    # positionally, and these sites have a vector but nothing to pin
     assert "__bind_any·__(__state__, 0, f, None, ('i=0',))" in dump
-    assert '__bind_any·__(__state__, 1, f)' in dump
+    assert "__bind_any·__(__state__, 1, f, None, ('f=1',))" in dump
     state = _make_state(ns['__pyne_slot_layout__']['main'])
     assert ns['main'](state, 1) == (1.0, 2.0)
 

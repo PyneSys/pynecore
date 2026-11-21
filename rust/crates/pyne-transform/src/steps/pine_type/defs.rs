@@ -11,7 +11,9 @@ use super::facts::{self, arg_parts, every_param, spells_series};
 use super::segments::Segments;
 use super::{Anchor, Engine, Frame, R};
 use crate::pine_qualifier::{CONST, NOT_READ, SERIES};
-use crate::pine_type_rules::{TYPELESS, UNKNOWN, VOID, join, overload_result, param_defaults};
+use crate::pine_type_rules::{
+    TYPELESS, UNKNOWN, VOID, annotation_qualifier, join, overload_result, param_defaults,
+};
 use crate::pine_type_table::{Binding, ContextKey, ContextResult};
 use crate::steps::dynamic_default::is_script_entry;
 
@@ -137,16 +139,21 @@ impl Engine<'_, '_> {
         Ok(out)
     }
 
-    /// The parameter qualifiers a definition states on its own (`_declared_quals`).
+    /// The parameter qualifiers a definition states on its own (`_declared_quals`): a
+    /// parameter without a caller is series, except where its qualifier marker says
+    /// what it takes (`annotation_qualifier`).
     fn declared_quals(&self, node: NodeId) -> R<Vec<u8>> {
         let defaults =
             if is_script_entry(self.ast, node) { param_defaults(self.ast, node)? } else { vec![] };
         Ok(every_param(self.ast, node)
             .into_iter()
             .map(|arg| {
-                let name = arg_parts(self.ast, arg).0;
+                let (name, annotation) = arg_parts(self.ast, arg);
                 match defaults.iter().find(|(known, _)| known == name) {
-                    None => SERIES,
+                    None => match annotation_qualifier(self.ast, annotation) {
+                        Some(marked) => marked as u8 - b'0',
+                        None => SERIES,
+                    },
                     Some((_, default)) => self.qual(*default),
                 }
             })

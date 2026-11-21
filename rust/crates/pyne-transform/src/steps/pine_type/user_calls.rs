@@ -17,9 +17,8 @@ use crate::pine_qualifier::SERIES;
 use crate::pine_type_rules::ImplSig;
 use crate::pine_type_rules::{
     NUMERIC, OBJECT, PINE_LOOP, TYPELESS, UNKNOWN, array_of, builtin_call_type, class_of,
-    elements_of, impl_sig, indexed_pin, is_map, join, namespace_of, object_ty, overload_candidates,
-    overload_result, param_defaults, pin_for, pin_index, render_ty, resolve_pin, tuple_of,
-    value_chars,
+    elements_of, impl_sig, is_map, join, namespace_of, object_ty, overload_candidates,
+    overload_result, param_defaults, pin_index, render_ty, tuple_of, value_chars,
 };
 use crate::pine_type_table::{CallSite, ClassSig, ExportSig};
 
@@ -485,21 +484,13 @@ impl Engine<'_, '_> {
         by_name: bool,
     ) -> R<Option<String>> {
         let (_, _, keywords) = facts::call_parts(self.ast, node).expect("a call");
-        let shapes = self.shapes(args);
-        let Some(shapes) = shapes.filter(|_| keywords.is_empty()) else {
+        let (Some(shapes), Some(kw_shapes)) = (self.shapes(args), self.keyword_shapes(keywords))
+        else {
             return self.record_pin(node, None, true, true);
         };
-        let pin = if by_name { None } else { pin_for(&shapes) };
-        if let Some(index) = lib_calls::pine_index(impls, &shapes, pin.as_deref(), by_name) {
-            return self.record_pin(
-                node,
-                Some(indexed_pin(&shapes, impls[index].slot)),
-                true,
-                false,
-            );
-        }
-        let settled = lib_calls::settled(Some(impls), pin.as_deref(), &shapes);
-        self.record_pin(node, lib_calls::resolved_pin(Some(impls), pin), true, settled)
+        let quals: Vec<u8> = args.iter().map(|&arg| self.qual(arg)).collect();
+        let kw_quals = self.keyword_quals(keywords);
+        self.decided_pin(node, impls, &shapes, by_name, Some(&kw_shapes), Some((&quals, &kw_quals)))
     }
 
     /// The pin of a `method_call` site that reaches another module's group or its own
@@ -1158,18 +1149,14 @@ impl Engine<'_, '_> {
     ) -> Option<Vec<usize>> {
         let shapes = self.shapes(args)?;
         let kw_shapes = self.keyword_shapes(keywords)?;
+        if let (Some(index), _) = lib_calls::group_choice(sigs, &shapes, by_name, Some(&kw_shapes))
+        {
+            return Some(vec![index]);
+        }
         if !kw_shapes.is_empty() {
             return self.choice_at(sigs, None, Some(&shapes), Some(&kw_shapes)).map(|at| vec![at]);
         }
-        let pin = if by_name { None } else { pin_for(&shapes) };
-        if let Some(index) = lib_calls::pine_index(sigs, &shapes, pin.as_deref(), by_name) {
-            return Some(vec![index]);
-        }
-        if let Some(index) = pin.as_deref().and_then(|pin| resolve_pin(sigs, pin)) {
-            return Some(vec![index]);
-        }
-        let chars = pin.unwrap_or_else(|| value_chars(&shapes));
-        overload_candidates(sigs, &chars, &shapes)
+        overload_candidates(sigs, &value_chars(&shapes), &shapes)
     }
 
     /// Convert the typeless `na` arguments of a call the exact pass settled

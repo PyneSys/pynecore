@@ -1166,3 +1166,42 @@ Message:
 ```
 
 Pass a value of the field's type.
+
+<a id="E0071"></a>
+
+## E0071: Overload not decidable
+
+| Severity | PyneCore raises |
+|----------|-----------------|
+| error    | `SyntaxError`   |
+
+Message:
+
+```text
+Argument {argument} of `{function}` has no known type, so the overload this call runs is not decided.
+```
+
+An overloaded function is called with an argument whose type the analysis does
+not know: an instance of a plain class instead of a `@udt` one, or the value of
+a helper without a return annotation. Which overload runs is then decided from
+the values at run time, and an argument no overload takes stops the run there.
+Give the argument a known type: annotate it, or make its class a `@udt`.
+
+<a id="E0072"></a>
+
+## E0072: Overload not decidable
+
+| Severity | PyneCore raises |
+|----------|-----------------|
+| error    | `SyntaxError`   |
+
+Message:
+
+```text
+The argument types of `{function}` do not decide one overload for this call.
+```
+
+The static types of the arguments leave more than one overload of the function,
+or none the analysis can read, for this call. Which overload runs is then
+decided from the values at run time. Annotate the overloads' parameters, or pass
+arguments whose types name one overload.

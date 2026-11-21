@@ -442,24 +442,6 @@ def _timestamp_component_overload(func: _FunctionType) -> _FunctionType:
     return func
 
 
-@overload
-def timestamp(date_string: DateStr) -> PyneInt:  # It is more pythonic, but not supported by Pine Script
-    """
-    Parse date string and return UNIX timestamp in milliseconds
-
-    Multiple calling formats supported:
-    - timestamp("2020-02-20T15:30:00+02:00")  # ISO 8601
-    - timestamp("20 Feb 2020 15:30:00 GMT+0200")  # RFC 2822
-    - timestamp("Feb 01 2020 22:10:05")       # Pine format
-    - timestamp("2011-10-10T14:48:00")        # Pine format without timezone
-
-    :param date_string: Date string in Pine Script format
-    :return: UNIX timestamp in milliseconds
-    """
-    dt = _parse_datestring(date_string)
-    return pine_int(int(dt.timestamp() * 1000))
-
-
 # noinspection PyPep8Naming
 @overload
 def timestamp(dateString: DateStr) -> PyneInt:
@@ -476,7 +458,8 @@ def timestamp(dateString: DateStr) -> PyneInt:
     :param dateString: Date string in Pine Script format
     :return: UNIX timestamp in milliseconds
     """
-    return timestamp(date_string=dateString)
+    dt = _parse_datestring(dateString)
+    return pine_int(int(dt.timestamp() * 1000))
 
 
 # noinspection PyShadowingNames

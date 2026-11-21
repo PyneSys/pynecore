@@ -1451,8 +1451,8 @@ def _impl_json(impl: ImplSig, position: int, published: int) -> dict:
     reader takes the position where it is absent. The group's size
     (``ImplSig.size``) is written only where it is not the published list's
     length, the widening pass's fits only where they are not the exact pass's,
-    and the acceptance specs and the ``**kwargs`` flag only where they say
-    something.
+    and the acceptance specs, the ``**kwargs`` flag and the qualifier markers
+    only where they say something.
 
     :param impl: The implementation
     :param position: Its position in the published list
@@ -1472,6 +1472,8 @@ def _impl_json(impl: ImplSig, position: int, published: int) -> dict:
         data['accepts'] = list(impl.accepts)
     if impl.kwarg:
         data['kwarg'] = True
+    if impl.quals:
+        data['quals'] = impl.quals
     return data
 
 
@@ -1497,7 +1499,8 @@ def _export_from_json(name: str, data: dict) -> ExportSig:
                             accepts=tuple(impl.get('accepts') or ()),
                             wide_fits=impl.get('wide_fits', impl.get('fits', '')),
                             kwarg=bool(impl.get('kwarg')),
-                            size=impl.get('size', len(impls)))
+                            size=impl.get('size', len(impls)),
+                            quals=impl.get('quals', ''))
                     for impls in [data.get('impls') or []]
                     for position, impl in enumerate(impls)),
         line=data.get('line', 0), names=tuple(data.get('names') or ()))

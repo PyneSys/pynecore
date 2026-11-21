@@ -121,12 +121,12 @@ def _call_site(source: str, callee: str = 'f') -> tuple[ast.Call, list]:
     ('math.abs(R + z)', 'i'),
 ])
 def __test_the_measured_overload_table__(expression: str, expected: str):
-    """ The argument carries TradingView's type, and an int one is pinned """
+    """ The argument carries TradingView's type, and the pin names its implementation """
     node, calls = _call_site(MEASURED_SETUP.format(expression=expression))
     assert get_ty(node.args[0]) == expected, expression
     pin = [call.pin for call in calls if call.callee == 'f'][-1]
-    # The pin names the int implementation by its registration index as well
-    assert pin == ('i=0' if expected == 'i' else None), expression
+    # The pin names the implementation of that type by its registration index
+    assert pin == ('i=0' if expected == 'i' else 'f=1'), expression
     assert get_pin(node) == pin
 
 
@@ -156,22 +156,22 @@ result = lib.ta.highest(R / 8)
     assert get_pin(node) == 'i=1'
 
 
-@pytest.mark.parametrize("call", [
-    'f(R * 1.0)',            # nothing int-typed: the values already agree
-    'f(x=R / 8)',            # a keyword spelling is not a position
-    'f(*args)',              # an unpacking hides which position is which
-    'f(array.new_float(1))',  # an object: no single value witnesses it
-    'f(unknown)',            # untypable, so there is nothing to pin on
+@pytest.mark.parametrize("call,pin", [
+    ('f(R * 1.0)', 'f=1'),     # a float: its implementation, by its index
+    ('f(x=R / 8)', '=0'),       # a keyword is decided by its type too
+    ('f(*args)', None),         # an unpacking hides which position is which
+    ('f(array.new_float(1))', None),  # no implementation takes an array
+    ('f(first)', 'f=1'),        # the first element of a float array is a float
 ])
-def __test_the_unpinnable_shapes__(call: str):
-    """ A shape the pin cannot describe is declined, never guessed """
+def __test_the_unpinnable_shapes__(call: str, pin: str | None):
+    """ A shape the static types do not decide is declined, never guessed """
     node, _ = _call_site(MEASURED_SETUP.replace(
         'import bar_index', 'import array, bar_index').format(expression='R').replace(
         'result = f(R)',
         'args = [1]\n'
-        '    unknown = array.first(array.new_float(1))\n'
+        '    first = array.first(array.new_float(1))\n'
         f'    result = {call}'))
-    assert get_pin(node) is None
+    assert get_pin(node) == pin
 
 
 # --- emission ------------------------------------------------------------
@@ -214,13 +214,13 @@ def f(x: float) -> float:
 
 
 def __test_the_pin_reaches_the_binder__():
-    """ The pinned site carries the type characters, the others are unchanged """
+    """ Each site carries the type characters and the index of its implementation """
     _, dump = _transform(PIN_SRC + '''
 def main(r: int):
     return f(r / 8), f(r * 1.0)
 ''', 'pin_mod_a')
     assert "__bind_any·__(__state__, 0, f, 'i=0')" in dump
-    assert '__bind_any·__(__state__, 1, f)' in dump
+    assert "__bind_any·__(__state__, 1, f, 'f=1')" in dump
 
 
 def __test_the_loop_and_comprehension_forms_carry_it_too__():
@@ -361,9 +361,9 @@ def __test_a_later_pass_erases_the_pin_it_no_longer_stands_behind__():
     The loop fixpoint walks a body twice; the second walk decides.
 
     ``total`` starts int and widens to float over the loop, so the first walk
-    pins the call and the second must not: a stamp left over from the first
-    would emit a pin the inference itself rejected, and the site would keep
-    calling the int implementation for the rest of the run.
+    pins the int implementation and the second the float one: a stamp left
+    over from the first would emit a pin the inference itself rejected, and the
+    site would keep calling the int implementation for the rest of the run.
     """
     source = '''
 from pynecore.core.overload import overload
@@ -387,14 +387,16 @@ def main(n: int):
     tree = ast.parse(source)
     table = infer_module(tree, 'test')
     # The last walk is the verdict, and the node has to carry that one
-    assert [call.pin for call in table.calls if call.callee == 'g'][-1] is None
+    assert [call.pin for call in table.calls if call.callee == 'g'][-1] == 'f=1'
     call = [node for node in ast.walk(tree)
             if isinstance(node, ast.Call) and getattr(node.func, 'id', None) == 'g'][0]
-    assert get_pin(call) is None
+    assert get_pin(call) == 'f=1'
 
     ns, _ = _transform(source, 'pin_mod_loop')
     state = _make_state(ns['__pyne_slot_layout__']['main'])
-    assert ns['main'](state, 3) == ['int-impl', 'float-impl', 'float-impl']
+    # The float-typed ``total`` runs the float implementation from the first bar,
+    # while it still holds the Python int 0
+    assert ns['main'](state, 3) == ['float-impl', 'float-impl', 'float-impl']
 
 
 def _witness_group():
@@ -617,7 +619,7 @@ def __test_a_none_default_the_annotation_rejects_answers_nothing__():
 
     The widening pass is the one that answers, as it does at run time: it takes
     the int witness for ``h(x: float, ...)``, so ``h(1)`` is a float, and the
-    float-typed argument of ``g`` takes no pin.
+    float-typed argument of ``g`` takes the float implementation.
     """
     table = infer_module(ast.parse(NONE_DEFAULT_GROUPS + '''
 def main(r: int):
@@ -625,7 +627,7 @@ def main(r: int):
 '''), 'test')
     assert [call.pin for call in table.calls if call.callee == 'h'] == ['i=1']
     assert [call.ty for call in table.calls if call.callee == 'h'] == ['f']
-    assert [call.pin for call in table.calls if call.callee == 'g'] == [None]
+    assert [call.pin for call in table.calls if call.callee == 'g'] == ['f=1']
 
 
 def __test_a_none_default_dispatches_the_way_the_static_pass_says__():
@@ -734,7 +736,7 @@ def __test_a_module_level_pin_binds_in_place__():
 
     ``R / 8`` is int-TYPED with a fractional value: left alone, the top-level
     call resolves from the VALUE and runs the float implementation. Only the
-    pinned site is rewritten -- the float one keeps the plain call.
+    int-typed site names the int implementation, the float one the float one.
     """
     ns, dump = _transform(PIN_SRC + '''
 R = 14
@@ -742,7 +744,7 @@ pinned = f(R / 8)
 plain = f(R * 1.0)
 ''', 'pin_mod_module')
     assert "pinned = __bind_pinned·__(f, 'i=0')(R / 8)" in dump
-    assert 'plain = f(R * 1.0)' in dump
+    assert "plain = __bind_pinned·__(f, 'f=1')(R * 1.0)" in dump
     assert ns['pinned'] == 1.0
     assert ns['plain'] == 2.0
 
@@ -1094,10 +1096,10 @@ def main():
     assert ns['main'](state) == 'boxes'
 
 
-def __test_a_decided_site_takes_no_index__():
+def __test_a_decided_site_names_its_implementation__():
     """
     Where the selection the values make already runs Pine's implementation, the pin
-    stays as it was: an array of boxes, and an int-typed argument
+    still names it by its index: an array of boxes takes the boxes implementation
     """
     tree = ast.parse(INDEXED_GROUP + '''
 def main(r: int):
@@ -1108,14 +1110,14 @@ def main(r: int):
     table = infer_module(tree, 'test')
     call = next(node for node in ast.walk(tree)
                 if isinstance(node, ast.Call) and ast.unparse(node.func) == 'tally')
-    assert get_pin(call) is None
+    assert get_pin(call) == '*=1'
     assert table.bindings['main']['s'].ty == 's'
 
 
-def __test_a_float_argument_of_a_direct_call_takes_no_index__():
+def __test_a_float_argument_of_a_direct_call_names_the_float_implementation__():
     """
-    A float-typed value the runtime may hold as a Python int is no reason for an
-    index on a direct call: the site stays unpinned, as it was
+    A float-typed value the runtime may hold as a Python int runs the float
+    implementation: the pin names it by its index
     """
     tree = ast.parse(PIN_SRC + '''
 def main(r: float):
@@ -1124,7 +1126,7 @@ def main(r: float):
     infer_module(tree, 'test')
     call = next(node for node in ast.walk(tree)
                 if isinstance(node, ast.Call) and ast.unparse(node.func) == 'f')
-    assert get_pin(call) is None
+    assert get_pin(call) == 'f=1'
 
 
 @pytest.mark.parametrize("params,shapes,expected", [
@@ -1170,15 +1172,15 @@ def __test_the_index_selects_without_witnesses__():
     assert bound([1]) == 'ints'
 
 
-def __test_a_first_call_the_index_does_not_fit_falls_back_for_good__():
+def __test_a_wildcard_position_does_not_overrule_the_index__():
     """
-    The first call checks every argument against the indexed implementation: values
-    it does not take hand the site to the value dispatch, for every later call too
+    The type pass decided the index from every argument's static type, a wildcard
+    position's included: no value is checked against it, on the first call or later
     """
-    bound = _anchored(_indexed_group(), 'test.indexed_mismatch', pin='*=1')
-    assert bound(['a']) == 'strings'
-    # The index would run ``ints`` here; the site dispatches from its values now
-    assert bound([]) == 'strings'
+    bound = _anchored(_indexed_group(), 'test.indexed_wildcard', pin='*=1')
+    assert bound.__qualname__.endswith('dispatch_pinned')
+    assert bound(['a']) == 'ints'
+    assert bound([]) == 'ints'
 
 
 @pytest.mark.parametrize("pin", ['*=2', '*=', '*=x', '**=1'])
@@ -1284,10 +1286,10 @@ def __test_only_a_whole_group_resolves_a_pin__():
     ('ta.pivothigh', '*ii', 0),
     # ``timestamp``: the strings are ``str`` aliases, the components ``int | float``
     ('timestamp', 's', 0),
-    ('timestamp', 'iii', 3),
-    ('timestamp', 'fff', 3),
-    ('timestamp', 'siii', 2),
-    ('timestamp', 'siiiiii', 2),
+    ('timestamp', 'iii', 2),
+    ('timestamp', 'fff', 2),
+    ('timestamp', 'siii', 1),
+    ('timestamp', 'siiiiii', 1),
     ('timestamp', 'ii', None),
 ])
 def __test_a_lib_pin_resolves_from_the_measured_table__(key: str, pin: str,
@@ -1357,22 +1359,22 @@ stamp = lib.timestamp(2020, 1, R)
 top = lib.ta.highest(lib.bar_index, R)
 ''', 'lib.timestamp')
     pins = {call.callee: call.pin for call in calls}
-    assert pins['timestamp'] == 'iii=3'
+    assert pins['timestamp'] == 'iii=2'
     assert pins['ta.highest'] == 'ii=0'
     assert {call.callee: call.ty for call in calls}['ta.highest'] == 'f'
 
 
-@pytest.mark.parametrize("pin", ['iii=3', 'siii=2', 'fff=3'])
+@pytest.mark.parametrize("pin", ['iii=2', 'siii=1', 'fff=2'])
 def __test_an_indexed_pin_keeps_the_stateless_fast_path__(pin: str):
     """ A fully witnessed indexed pin binds through ``__pyne_pinned_bind__`` """
     bound = lib.timestamp.__pyne_bind__(pin)
     assert bound.__qualname__.endswith('_bind_timestamp_components.<locals>.cached')
 
 
-def __test_an_indexed_wildcard_pin_keeps_its_check__():
-    """ A wildcard position is still checked on the first call, so no fast path """
-    bound = lib.timestamp.__pyne_bind__('*iii=2')
-    assert bound.__qualname__.endswith('dispatch_pinned')
+def __test_an_indexed_wildcard_pin_takes_the_fast_path__():
+    """ A wildcard position is checked by nothing, so it takes the fast path too """
+    bound = lib.timestamp.__pyne_bind__('*iii=1')
+    assert bound.__qualname__.endswith('_bind_timestamp_components.<locals>.cached')
 
 
 def _numbers_group() -> list[Implementation]:
@@ -1405,3 +1407,258 @@ def __test_a_pin_without_an_index_dispatches_from_the_values__(pin: str):
     bound = _anchored(_numbers_group(), 'test.unindexed', pin=pin)
     assert bound.__qualname__.endswith('.dispatch')
     assert bound(1) == 'int' and bound(1.5) == 'float'
+
+
+# --- the static decision ---------------------------------------------------
+
+#: A group whose second position is a class the pin has no witness for:
+#: ``(int, A)`` and ``(str, B)``
+CLASS_POSITION_GROUP = '''
+from pynecore.core.overload import overload
+from pynecore.core.pine_udt import udt
+
+@udt
+class A:
+    v: int = 0
+
+@udt
+class B:
+    v: int = 0
+
+def make(which: int):
+    return B() if which else A()
+
+@overload
+def kind(n: int, a: A) -> str:
+    return 'int-a'
+
+@overload
+def kind(s: str, b: B) -> str:
+    return 'str-b'
+'''
+
+
+def __test_a_call_without_an_int_argument_names_its_implementation__():
+    """ A string argument decides the group as an int one does: the pin names it """
+    node, _ = _call_site('''
+from pynecore import lib
+result = lib.timestamp("2024-01-01 00:00")
+''', 'lib.timestamp')
+    assert get_pin(node) == 's=0'
+
+
+def __test_an_argument_of_unknown_type_decides_nothing__():
+    """
+    A value that is an ``A`` or a ``B`` has no known type: the call carries no
+    pin, even where its int argument alone would name one implementation, and is
+    reported
+    """
+    tree = ast.parse(CLASS_POSITION_GROUP + '''
+def main(which: int):
+    return kind(1, make(which))
+''')
+    table = infer_module(tree, 'test')
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'kind')
+    assert get_pin(call) is None
+    found = [(diag.code, diag.args) for diag in table.diags if diag.code in ('E0071', 'E0072')]
+    assert found == [('E0071', ('2', 'kind'))]
+
+
+def __test_a_known_class_at_a_wildcard_position_is_read_by_its_type__():
+    """ A udt argument is known: the pin's wildcard is read by its class and indexed """
+    tree = ast.parse(CLASS_POSITION_GROUP + '''
+def main():
+    return kind(1, A()), kind("s", B())
+''')
+    table = infer_module(tree, 'test')
+    pins = [get_pin(node) for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'kind']
+    assert pins == ['i*=0', 's*=1']
+    assert not [diag for diag in table.diags if diag.code in ('E0071', 'E0072')]
+
+
+def __test_an_undecided_call_no_implementation_takes_stops_the_run__():
+    """
+    ``kind(1, B())`` through an argument of unknown type: no implementation takes
+    an int with a ``B``, and the call, carrying no index, is rejected by the values
+    instead of running the int implementation
+    """
+    ns, dump = _transform(CLASS_POSITION_GROUP + '''
+def main(which: int):
+    return kind(1, make(which))
+''', 'pin_mod_undecided')
+    assert "'i*=0'" not in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    with pytest.raises(WrongOperandTypeError):
+        ns['main'](state, 1)
+
+
+# --- keyword calls -------------------------------------------------------
+
+
+def __test_a_keyword_call_is_pinned_by_its_types__():
+    """
+    ``x=r / 8`` is int-typed with a fractional value: the index names the int
+    implementation, which the values alone would never run
+    """
+    ns, dump = _transform(PIN_SRC + '''
+def main(r: int):
+    return f(x=r / 8), f(x=r * 1.0)
+''', 'pin_mod_keyword')
+    assert "__bind_any·__(__state__, 0, f, '=0')" in dump
+    assert "__bind_any·__(__state__, 1, f, '=1')" in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state, 14) == (1.0, 2.0)
+
+
+def __test_a_keyword_after_positions_is_pinned_with_them__():
+    """ The pin's characters are the positional ones; the index covers the keyword """
+    ns, dump = _transform('''
+from pynecore.core.overload import overload
+
+@overload
+def g(a: int, b: int = 0) -> str:
+    return 'int'
+
+@overload
+def g(a: float, b: float = 0.0) -> str:
+    return 'float'
+
+def main(r: int):
+    return g(r / 8, b=r / 8), g(r / 8, b=r * 1.0)
+''', 'pin_mod_keyword_mixed')
+    assert "__bind_any·__(__state__, 0, g, 'i=0')" in dump
+    # An int position with a float keyword: Pine widens the int to the float one
+    assert "__bind_any·__(__state__, 1, g, 'i=1')" in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state, 14) == ('int', 'float')
+
+
+def __test_a_pine_spelled_keyword_binds_its_renamed_parameter__():
+    """ ``len=`` reaches ``len__ren__`` under the pin, as it does under the values """
+    ns, dump = _transform('''
+from pynecore.core.overload import overload
+
+@overload
+def h(len__ren__: int) -> str:
+    return 'int'
+
+@overload
+def h(len__ren__: float) -> str:
+    return 'float'
+
+def main(r: int):
+    return h(len=r / 8)
+''', 'pin_mod_keyword_renamed')
+    assert "__bind_any·__(__state__, 0, h, '=0')" in dump
+    state = _make_state(ns['__pyne_slot_layout__']['main'])
+    assert ns['main'](state, 14) == 'int'
+
+
+def __test_a_keyword_of_unknown_type_is_reported_and_not_pinned__():
+    """ A keyword argument of unknown type decides nothing, and is named in the report """
+    tree = ast.parse(CLASS_POSITION_GROUP + '''
+def main(which: int):
+    return kind(1, a=make(which))
+''')
+    table = infer_module(tree, 'test')
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == 'kind')
+    assert get_pin(call) is None
+    found = [(diag.code, diag.args) for diag in table.diags if diag.code in ('E0071', 'E0072')]
+    assert found == [('E0071', ('`a`', 'kind'))]
+
+
+def __test_a_lib_keyword_call_is_pinned__():
+    """ A registry group called by keyword names its implementation by its index """
+    node, _ = _call_site('''
+from pynecore import lib
+R = lib.input.int(14)
+result = lib.ta.lowest(source=lib.low, length=R)
+''', 'lib.ta.lowest')
+    assert get_pin(node) == '=0'
+
+
+def __test_the_pinned_route_binds_keywords_and_falls_back_on_another_shape__():
+    """
+    A keyword call runs the indexed implementation with no value check; a
+    keyword the implementation does not take, and another positional count, are
+    not the shape the pin was computed for and go to the values
+    """
+    def narrow(x: int, y: int = 0) -> str:
+        return f'int:{x}:{y}'
+
+    def wide(x: float, z: float = 0.0) -> str:
+        return f'float:{x}:{z}'
+    impls = [Implementation(narrow), Implementation(wide)]
+    bound = _anchored(impls, 'test.keyword', pin='=0')
+    assert bound(x=1.75) == 'int:1.75:0'
+    assert bound(x=1.75, y=2) == 'int:1.75:2'
+    assert bound(x=1.75, z=2.0) == 'float:1.75:2.0'
+    assert bound(1.75) == 'float:1.75:0.0'
+    with pytest.raises(WrongOperandTypeError):
+        bound(x='s', z='s')
+
+
+__test_helper_TWIN_SETUP = '''
+from pynecore.core.overload import overload
+from pynecore.lib import close, script
+from pynecore.types import Simple
+
+
+@script.indicator("twins")
+def main():
+    @overload
+    def kw_only(x: float, *, scale: float = 1.0):
+        return 1.0
+
+    @overload
+    def kw_only(x: float, *, scale: int = 1):
+        return 2.0
+
+    @overload
+    def twin(x: float):
+        return 1.0
+
+    @overload
+    def twin(x: float):
+        return 2.0
+
+    @overload
+    def renamed(x: float):
+        return 1.0
+
+    @overload
+    def renamed(y: float):
+        return 2.0
+
+    @overload
+    def marked(x: Simple[float]):
+        return 1.0
+
+    @overload
+    def marked(x: float):
+        return 2.0
+
+    a = kw_only(close)
+    b = twin(close)
+    c = marked(close)
+    d = renamed(close)
+'''
+
+
+def __test_an_indistinguishable_choice_is_undecided__():
+    """Twins the static types cannot tell apart -- identical, renamed or keyword-only only --
+    get no index and E0072; marked ones are indexed"""
+    tree = ImportNormalizerTransformer().visit(ast.parse(__test_helper_TWIN_SETUP))
+    table = infer_module(tree, 'test')
+    pins = {ast.unparse(node.func): get_pin(node) for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) in ('kw_only', 'twin', 'renamed', 'marked')}
+    assert pins['kw_only'] is None
+    assert pins['twin'] is None
+    assert pins['renamed'] is None
+    assert pins['marked'] == 'f=1'
+    undecided = sorted(diag.args[0] for diag in table.diags if diag.code == 'E0072')
+    assert undecided == ['kw_only', 'renamed', 'twin'], [(d.code, d.args) for d in table.diags]
