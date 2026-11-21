@@ -18079,6 +18079,12 @@ class OrderSyncEngine:
         timestamp) or when the row is already closed — the position the entry
         opened is gone, so a same-side re-emission is a fresh entry rather
         than the pyramiding-cap re-declaration of a still-open fill.
+
+        The row is looked up across every instance of the logical run: the
+        anchor outlives a restart, but a row an earlier instance closed stays
+        with that instance (measured live: capitalcom cycle 450 re-sent the
+        ``S3`` anchor cycle 442 had closed defensively, and the startup replay
+        had marked that id neutralised, so the new fill was dropped).
         """
         if not isinstance(intent, EntryIntent) or self._store_ctx is None:
             return False
@@ -18090,7 +18096,7 @@ class OrderSyncEngine:
                 retry_seq=anchor.retry_seq,
                 coid_max_len=self._coid_max_len,
             ).client_order_id(kind)
-            row = self._store_ctx.get_order(prior)
+            row = self._store_ctx.get_order_for_run_id(prior)
             if row is None or row.filled_qty < row.qty - 1e-9:
                 continue
             if row.side != intent.side or row.closed_ts_ms is not None:

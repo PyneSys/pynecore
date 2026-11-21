@@ -3043,6 +3043,62 @@ def __test_re_entry_over_a_consumed_same_side_anchor_mints_a_fresh_coid__(tmp_pa
         assert (replayed["L"].run_tag, replayed["L"].bar_ts_ms) == (RUN_TAG, later_bar)
 
 
+def __test_re_entry_over_an_anchor_consumed_by_an_earlier_instance_mints_a_fresh_coid__(
+        tmp_path):
+    """An entry anchor spent by an EARLIER process instance is spent too.
+
+    The journal's envelope anchors are scoped to the logical run, so they
+    outlive a restart, while a restart re-homes only the LIVE order rows: a
+    parent row filled and closed by an earlier instance stays with that
+    instance. A re-entry under the same Pine id in a later instance must still
+    see that row and mint a fresh current-bar COID. Measured live:
+    capitalcom cycle 450, where the ``S3`` anchor of cycle 442 (its parent
+    closed defensively) went out again two days later; the startup replay had
+    seeded that COID into the late-parent-ENTRY cache, so the new ``S3`` fill
+    was dropped and every later opposite entry deferred on it.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    spent_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    later_bar = BAR_TS + 2 * 86_400_000
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        earlier = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        earlier.record_envelope(key="L", bar_ts_ms=BAR_TS, retry_seq=0, run_tag=RUN_TAG)
+        earlier.upsert_order(
+            spent_coid, symbol=SYMBOL, side="buy", qty=1.0, filled_qty=1.0,
+            state="confirmed", intent_key="L", pine_entry_id="L",
+            exchange_order_id="xchg-prev",
+        )
+        earlier.close_order(spent_coid)
+        earlier.close()
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        assert ctx.run_instance_id != earlier.run_instance_id
+        assert ctx.get_order(spent_coid) is None
+        b = MockBroker()
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        pos.entry_orders["L"] = _entry_order("L", 1.0)
+
+        engine.sync(later_bar)
+
+        assert len(b.entry_calls) == 1
+        envelope = b.entry_calls[0]
+        assert envelope.client_order_id(KIND_ENTRY) != spent_coid
+        assert (envelope.run_tag, envelope.bar_ts_ms, envelope.retry_seq) == (
+            RUN_TAG, later_bar, 0)
+        replayed, _ = ctx.replay()
+        assert (replayed["L"].run_tag, replayed["L"].bar_ts_ms) == (RUN_TAG, later_bar)
+        ctx.close()
+
+
 def __test_same_bar_re_entry_over_a_consumed_anchor_bumps_the_retry__(tmp_path):
     """On the anchor's own bar the consumed same-side anchor bumps instead.
 

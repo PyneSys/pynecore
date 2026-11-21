@@ -2256,6 +2256,29 @@ class RunContext:
             ).fetchone()
         return _row_to_order(row) if row is not None else None
 
+    def get_order_for_run_id(self, client_order_id: str) -> OrderRow | None:
+        """Look up ``client_order_id`` across every process instance of this logical run.
+
+        Scoped to ``runs.run_id`` like :meth:`iter_closed_orders_for_run_id`:
+        a restart re-homes only the live rows into the new instance, so a row
+        closed before it stays with the instance that closed it, while the
+        journal's envelope anchors outlive the restart. This instance's own row
+        wins; otherwise the most recently updated row of an earlier instance.
+        Read-only.
+
+        :param client_order_id: The client order id to look up.
+        """
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT o.* FROM orders AS o "
+                "JOIN runs AS r ON o.run_instance_id = r.run_instance_id "
+                "WHERE r.run_id = ? AND o.client_order_id = ? "
+                "ORDER BY o.run_instance_id = ? DESC, o.updated_ts_ms DESC "
+                "LIMIT 1",
+                (self.run_id, client_order_id, self.run_instance_id),
+            ).fetchone()
+        return _row_to_order(row) if row is not None else None
+
     def iter_live_orders(
             self, *,
             from_entry: str | None = None,
