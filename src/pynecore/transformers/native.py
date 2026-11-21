@@ -214,6 +214,22 @@ def current_phases(phases: Iterable[Any]) -> frozenset[str]:
         and all(rule.name in current for rule in phase.rules))
 
 
+def _by_field(value: Any) -> Any:
+    """``value`` as ``json.dumps`` should write it for the native reader, which takes a
+    record by its field names: every named tuple in it becomes a dict of its fields.
+    ``dataclasses.asdict`` keeps a named tuple (an ``ImplSig``) a tuple, which JSON
+    writes as an array.
+    """
+    fields = getattr(value, '_fields', None) if isinstance(value, tuple) else None
+    if fields is not None:
+        return {name: _by_field(item) for name, item in zip(fields, value)}
+    if isinstance(value, dict):
+        return {key: _by_field(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_by_field(item) for item in value]
+    return value
+
+
 class _Host:
     """What a native step asks the interpreter, answered by the very functions the
     Python step uses, at the moment the Python step would use them."""
@@ -264,12 +280,14 @@ class _Host:
 
     def interface(self, path: str, settled: bool = False) -> str | None:
         """The interface a module publishes and the record a dependency on it keeps, as JSON
-        in the dataclasses' own field order; with ``settled``, only one whose routes are."""
+        in the dataclasses' own field order, every record (a group's ``ImplSig`` too) an
+        object keyed by its field names; with ``settled``, only one whose routes are."""
         found = module_interface.lookup(path, self._analyse, self._pipeline_hash, settled)
         if found is None:
             return None
-        return json.dumps({'interface': dataclasses.asdict(found),
-                           'record': dataclasses.asdict(module_interface.dep_record(found))})
+        return json.dumps(_by_field(
+            {'interface': dataclasses.asdict(found),
+             'record': dataclasses.asdict(module_interface.dep_record(found))}))
 
     @staticmethod
     def closes_cycle(path: str) -> bool:

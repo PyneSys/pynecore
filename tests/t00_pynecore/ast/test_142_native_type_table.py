@@ -239,6 +239,46 @@ def __test_every_table_field_crosses_the_bridge__(tmp_path, monkeypatch):
                       'DepRecord', 'ExportSig', 'ClassSig', 'ImplSig'}
 
 
+def __test_an_imported_interface_crosses_the_bridge__(tmp_path, monkeypatch):
+    """A script importing a library that publishes a class with a method, a method on
+    that class and an overload group runs every native step natively: the host hands
+    the library's interface over in the shape the native reader takes, each group
+    implementation as an object keyed by its fields, rather than declining the module
+    to Python."""
+    __test_helper_require_native()
+    from pynecore.transformers import native
+
+    monkeypatch.setenv('PYNE_SAVE_SCRIPT_TOML', '0')
+    monkeypatch.setenv('PYNE_AST_BACKEND', 'verify')
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / 'ttab_shapes.py').write_text(__test_helper_SHAPES, encoding='utf-8')
+    app = tmp_path / 'ttab_app.py'
+    app.write_text(__test_helper_APP, encoding='utf-8')
+    answers: list[tuple[str, object]] = []
+    run = native.run
+
+    def recording(names, tree, ctx, layout=None, table=False):
+        answer = run(names, tree, ctx, layout, table)
+        answers.append((f'{ctx.path.name}: {"+".join(names)}', answer))
+        return answer
+
+    monkeypatch.setattr(native, 'run', recording)
+    module_interface._registry.clear()
+    module_interface._analysing.clear()
+    try:
+        module = ast.parse(__test_helper_APP)
+        mode = import_hook._module_mode(module)[1]
+        import_hook._analyse_tree(module, __test_helper_APP, app.resolve(), mode)
+    finally:
+        module_interface._registry.clear()
+        module_interface._analysing.clear()
+        for name in [name for name in sys.modules if name.startswith('ttab_')]:
+            del sys.modules[name]
+    assert any(where.startswith('ttab_app.py: ') and 'PineType' in where.split(' ')[1].split('+')
+               for where, _ in answers)
+    assert [where for where, answer in answers if not isinstance(answer, ast.Module)] == []
+
+
 @pytest.mark.parametrize('table', [
     PineTypeTable(funcs={'f': FuncSig('f', params=('i',))}),
     PineTypeTable(bindings={'': {'x': Binding('x', line=True)}}),
