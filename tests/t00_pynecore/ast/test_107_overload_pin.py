@@ -17,12 +17,9 @@ import ast
 
 import pytest
 
-import json
 from typing import Any, Optional
 
 from pynecore import lib
-from pynecore.lib import ta as lib_ta
-from pynecore.core import overload as overload_module
 from pynecore.core.instance_state import _make_state
 from pynecore.core.overload import (  # noqa: internal API
     Implementation, _anchored, _check_type, _select, _PIN_WITNESSES,
@@ -410,7 +407,7 @@ def _witness_group():
 def __test_the_pinned_route_falls_back_to_the_values__():
     """ A shape the pin was not computed for decides the old way """
     impls = _witness_group()
-    bound = _anchored(impls, 'test.guard', pin='i')
+    bound = _anchored(impls, 'test.guard', pin='i=0')
     # The only implementation takes the int witness by widening
     assert bound(1) == 'float'
     # A keyword spelling and a different arity are not that shape
@@ -1295,14 +1292,9 @@ def __test_only_a_whole_group_resolves_a_pin__():
 ])
 def __test_a_lib_pin_resolves_from_the_measured_table__(key: str, pin: str,
                                                        expected: int | None):
-    """ The registry's measurements answer exactly what the runtime witnesses do """
+    """ The registry's measurements resolve a lib group's pin """
     resolved = resolve_pin(_lib_impl_sigs(lib_types()[key]), pin)
     assert (None if resolved is None else resolved.slot) == expected
-    group = lib_ta.highest if key == 'ta.highest' else \
-        lib_ta.pivothigh if key == 'ta.pivothigh' else lib.timestamp
-    impls = group.__pyne_impls__
-    witnessed = overload_module._witnessed(impls, pin)
-    assert (None if witnessed is None else impls.index(witnessed)) == expected
 
 
 #: Annotation spellings, and the names they need to be evaluated
@@ -1370,9 +1362,9 @@ top = lib.ta.highest(lib.bar_index, R)
     assert {call.callee: call.ty for call in calls}['ta.highest'] == 'f'
 
 
-@pytest.mark.parametrize("pin", ['iii', 'iii=3', 'siii=2', 'fff=3'])
+@pytest.mark.parametrize("pin", ['iii=3', 'siii=2', 'fff=3'])
 def __test_an_indexed_pin_keeps_the_stateless_fast_path__(pin: str):
-    """ A fully witnessed indexed pin binds through ``__pyne_pinned_bind__`` as before """
+    """ A fully witnessed indexed pin binds through ``__pyne_pinned_bind__`` """
     bound = lib.timestamp.__pyne_bind__(pin)
     assert bound.__qualname__.endswith('_bind_timestamp_components.<locals>.cached')
 
@@ -1393,51 +1385,23 @@ def _numbers_group() -> list[Implementation]:
     return [Implementation(ints), Implementation(floats)]
 
 
-def __test_an_index_the_witnesses_contradict_is_bound_by_its_index__(monkeypatch):
-    """
-    Without the verify mode the index is what runs: it is the type pass's own
-    resolution of the pin, and the runtime does not select again
-    """
-    monkeypatch.setattr(overload_module, '_PIN_VERIFY', False)
+def __test_the_index_is_what_runs__():
+    """ The index is the type pass's selection, and the runtime does not select again """
     bound = _anchored(_numbers_group(), 'test.contradicted', pin='i=1')
     assert bound(1) == 'float'
 
 
-def __test_an_index_whose_witness_the_implementation_rejects_falls_back__(monkeypatch):
+def __test_an_index_whose_witness_the_implementation_rejects_falls_back__():
     """ A string implementation takes no int witness: the index is not this group's """
-    monkeypatch.setattr(overload_module, '_PIN_VERIFY', False)
     def strings(x: str) -> str:
         return 'str'
     impls = _numbers_group() + [Implementation(strings)]
     assert _anchored(impls, 'test.foreign_index', pin='i=2')(1) == 'int'
 
 
-def __test_the_verify_mode_raises_on_a_forged_index__(monkeypatch):
-    """ ``PYNE_PIN_VERIFY``: an index the witnesses name another implementation for is an error """
-    monkeypatch.setattr(overload_module, '_PIN_VERIFY', True)
-    with pytest.raises(RuntimeError, match=r"'i=1' of test.forged.*\[1\] .*floats.*\[0\] .*ints"):
-        _anchored(_numbers_group(), 'test.forged', pin='i=1')
-
-
-@pytest.mark.parametrize("pin", ['i=0', 'f=1', '*=1', 's=0'])
-def __test_the_verify_mode_accepts_an_index_the_witnesses_agree_with__(monkeypatch, pin: str):
-    """ An agreeing index, and one where the witnesses decide nothing, are silent """
-    monkeypatch.setattr(overload_module, '_PIN_VERIFY', True)
-    _anchored(_numbers_group(), 'test.agreeing', pin=pin)
-
-
-def __test_the_verify_log_records_every_pinned_bind__(monkeypatch, tmp_path):
-    """ ``PYNE_PIN_VERIFY_LOG``: one line per bound pinned site, index and witness decision """
-    log = tmp_path / 'pins.jsonl'
-    monkeypatch.setattr(overload_module, '_PIN_VERIFY', True)
-    monkeypatch.setattr(overload_module, '_PIN_VERIFY_LOG', str(log))
-    impls = _numbers_group()
-    _anchored(impls, 'test.logged', pin='i=0')
-    _anchored(impls, 'test.logged', pin='f')
-    _anchored(impls, 'test.logged', pin='*')
-    records = [json.loads(line) for line in log.read_text().splitlines()]
-    assert records == [
-        {'group': 'test.logged', 'pin': 'i=0', 'index': 0, 'witness': 0},
-        {'group': 'test.logged', 'pin': 'f', 'index': None, 'witness': 1},
-        {'group': 'test.logged', 'pin': '*', 'index': None, 'witness': None},
-    ]
+@pytest.mark.parametrize("pin", ['i', 'f', '*'])
+def __test_a_pin_without_an_index_dispatches_from_the_values__(pin: str):
+    """ No index: the type pass named no implementation, so the values select """
+    bound = _anchored(_numbers_group(), 'test.unindexed', pin=pin)
+    assert bound.__qualname__.endswith('.dispatch')
+    assert bound(1) == 'int' and bound(1.5) == 'float'

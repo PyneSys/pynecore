@@ -321,15 +321,15 @@ def main(r: int):
     layout = ns['__pyne_slot_layout__']['f']
     parent = _make_state(ns['__pyne_slot_layout__']['main'])
     # The anchor's first bind creates the instance and configures it
-    bound = __bind_any__(parent, 0, ns['f'], None, ('i',))
+    bound = __bind_any__(parent, 0, ns['f'], None, ('i=0',))
     assert bound(1) == 1.0
     vector = bound.args[0][layout['pin']]
     # A redefinition of the same logical callee misses the identity check and
     # rebinds; the state vector is carried over, and so is what configured it
-    __bind_any__(parent, 0, ns['f'], None, ('i',))
+    __bind_any__(parent, 0, ns['f'], None, ('i=0',))
     carried = parent[0][1].args[0]
     assert carried is bound.args[0]
-    assert carried[layout['pin']] == vector == ('i',)
+    assert carried[layout['pin']] == vector == ('i=0',)
     assert parent[0][1](1) == 2.0  # the int implementation kept counting
 
 

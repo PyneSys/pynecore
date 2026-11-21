@@ -72,42 +72,42 @@ def __test_a_wildcard_position_does_not_block_the_pin__(csv_reader, runner):
                 break
 
 
+def __test_helper_group(*impls):
+    """The shapes as one whole group, each with its registration index"""
+    return [impl._replace(slot=slot, size=len(impls)) for slot, impl in enumerate(impls)]
+
+
 def __test_the_selection_ignores_only_the_wildcard_positions__():
     """A pin whose witnessed positions leave two candidates picks neither"""
-    from pynecore.core.overload import _PIN_ANY, _select_pinned, Implementation
+    from pynecore.transformers.pine_type_rules import PIN_ANY, ImplSig, object_ty, resolve_pin
 
-    def one(a: int, b: str):
-        return 1
-
-    def two(a: int, b: Marker):
-        return 2
-
-    impls = [Implementation(one), Implementation(two)]
+    marker = object_ty('script#Marker')
+    # ``one(a: int, b: str)`` and ``two(a: int, b: Marker)``
+    impls = __test_helper_group(ImplSig(('i', 's'), 2, False, 'i', 'nn'),
+                                ImplSig(('i', marker), 2, False, 'f', 'nn'))
     # 'i*': the int witness matches both, the wildcard is the position that
     # would decide -- so the values keep the decision
-    assert _select_pinned(impls, 'i' + _PIN_ANY) is None
+    assert resolve_pin(impls, 'i' + PIN_ANY) is None
     # 'is': fully witnessed, one candidate
-    assert _select_pinned(impls, 'is') is impls[0]
+    assert resolve_pin(impls, 'is') is impls[0]
 
 
 def __test_the_wildcard_selection_binds_omitted_defaults__():
     """An implementation whose optional parameter the call omits is a candidate, its default checked"""
-    from pynecore.core.overload import _PIN_ANY, _select_pinned, Implementation
+    from pynecore.transformers.pine_type_rules import PIN_ANY, ImplSig, object_ty, resolve_pin
 
-    def as_int(x: int, marker: Marker, n: int = 0):
-        return 'INT'
-
-    def as_float(x: float, marker: Marker, n: int = 0):
-        return 'FLOAT'
-
-    # A bool is no float to the selector, widened or not
-    def bad_default(x: int, marker: Marker, n: float = True):
-        return 'BAD'
-
-    impls = [Implementation(as_int), Implementation(as_float)]
+    marker = object_ty('script#Marker')
+    # ``as_int(x: int, marker: Marker, n: int = 0)`` and its float twin
+    impls = __test_helper_group(
+        ImplSig(('i', marker, 'i'), 2, False, 'i', 'nny', wide_fits='nny'),
+        ImplSig(('f', marker, 'i'), 2, False, 'f', 'nny', wide_fits='nny'))
+    # ``bad_default(x: int, marker: Marker, n: float = True)``: a bool is no
+    # float to the selector, widened or not
+    bad_default = __test_helper_group(
+        ImplSig(('i', marker, 'f'), 2, False, 'i', 'nnn', wide_fits='nnn'))
     # 'i*' on a two-argument call: the int-typed position names the int implementation
-    assert _select_pinned(impls, 'i' + _PIN_ANY) is impls[0]
+    assert resolve_pin(impls, 'i' + PIN_ANY) is impls[0]
     # A default that does not fit its declared type rules the implementation out
-    assert _select_pinned([Implementation(bad_default)], 'i' + _PIN_ANY) is None
+    assert resolve_pin(bad_default, 'i' + PIN_ANY) is None
     # More arguments than positional parameters: no candidate
-    assert _select_pinned(impls, 'i' + _PIN_ANY * 3) is None
+    assert resolve_pin(impls, 'i' + PIN_ANY * 3) is None

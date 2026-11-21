@@ -86,7 +86,6 @@ core/ohlcv_legacy.py OHLCVReader.get_size assert 1
 core/ohlcv_legacy.py OHLCVReader.read IndexError 1
 core/ohlcv_legacy.py OHLCVReader.read assert 1
 core/ohlcv_legacy.py OHLCVReader.start_datetime assert 1
-core/overload.py _verify_index RuntimeError 1
 core/pine_export.py export.decorator assert 1
 core/profiler.py RunProfiler.to_dict assert 1
 core/profiler.py _check_available ProfilerUnavailable 3

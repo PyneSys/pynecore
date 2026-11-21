@@ -26,14 +26,12 @@ compatible matching) and calls it through a per-anchor bound cache:
 A call site whose argument TYPES the Pine type pass could decide reaches the
 binder with an overload pin -- one type character per positional argument, and
 after an ``=`` the index of the implementation to run in the group's
-registration order: the one the witnesses select, where the type pass resolved
-them already (``pine_type_rules.resolve_pin``), or the one Pine selects where
-the values would run another. A pin without an index makes the anchor turn
-its characters into witness values and run the ORDINARY selector on them once,
-at bind time, instead of selecting per bar from the values; an indexed one is
-bound to its implementation outright. ``PYNE_PIN_VERIFY=1`` checks every index
-against the witnesses' selection (``_verify_index``). That is what makes the
-dispatch match TradingView's: Pine resolves an
+registration order. The type pass selects that implementation from the static
+types (``pine_type_rules.resolve_pin``), and the anchor binds the call site to
+it once, instead of selecting per bar from the values. A pin without an index
+is one the type pass could not resolve to a single implementation, and its
+call site dispatches from the values. That is what makes the dispatch match
+TradingView's: Pine resolves an
 overload from the static type, and the two answers differ exactly where an
 int-TYPED expression carries a fractional value (``14 / 8`` is int-typed and
 1.75 there), which the value-driven selector would widen to the float
@@ -46,12 +44,11 @@ signatures and parameter types are computed from the VISIBLE parameters
 only, and the state argument is prepended by the bound partial, never by
 the caller.
 """
-import json
 import os
 from typing import (TypeVar, Callable, get_type_hints, overload as typing_overload,
                     Any, Type, Union, get_args, get_origin, cast)
 from functools import wraps, partial
-from inspect import Parameter, signature
+from inspect import signature
 from collections import defaultdict
 from types import FunctionType, UnionType
 
@@ -327,12 +324,14 @@ def _select(impls: list[Implementation], args: tuple, kwargs: dict) -> Implement
 
 
 #: Value each pin character stands for. A pin records the STATIC types the
-#: type pass decided on; the witnesses turn them back into values the ordinary
-#: :func:`_select` understands, so the static and the dynamic decision run the
-#: SAME code and cannot drift apart. Only types with one unambiguous witness
-#: are pinnable: the four scalars, and an array or a matrix of one of them,
-#: whose witness holds one element of that scalar (the selector samples the
-#: head element). A container of drawings or user types, and a map, have none.
+#: type pass decided on; a witness is one value of such a type, checked the way
+#: :func:`_select` checks an argument. The lib registry measures with them
+#: which declared types take which character, and an indexed pin is checked
+#: with them against the implementation it names (``_indexed``). Only types
+#: with one unambiguous witness are pinnable: the four scalars, and an array
+#: or a matrix of one of them, whose witness holds one element of that scalar
+#: (the selector samples the head element). A container of drawings or user
+#: types, and a map, have none.
 #: The characters are ``transformers/pine_type_rules.py``'s ``PIN_CONTAINERS``.
 _PIN_WITNESSES: dict[str, Any] = {
     'i': 0, 'f': 0.0, 'b': True, 's': '',
@@ -349,90 +348,12 @@ _PIN_ANY = '*'
 
 #: Separator of a pin's implementation index. ``<characters>=<index>`` names the
 #: implementation by its position in the group's registration order: the type
-#: pass writes it wherever it resolves the witnesses itself, and where Pine's
-#: static selection runs another implementation than the values would (an
-#: empty container matches the first implementation of its kind). The
-#: characters before it keep their meaning, one per positional argument. The
+#: pass writes it wherever it resolves the pin to one implementation, and
+#: where Pine's static selection runs another implementation than the values
+#: would (an empty container matches the first implementation of its kind).
+#: The characters before it keep their meaning, one per positional argument. The
 #: suffix is ``transformers/pine_type_rules.py``'s ``PIN_INDEX``.
 _PIN_INDEX = '='
-
-
-def _select_pinned(impls: list[Implementation], pin: str) -> Implementation | None:
-    """Select the implementation a pin with wildcard positions names.
-
-    The witnessed positions are matched the way :func:`_select` matches them,
-    the wildcard ones are not looked at. That is only an answer while it is the
-    ONLY answer: where more than one implementation survives, the position the
-    pin knows nothing about is the one that decides, and the values know it and
-    the pin does not.
-
-    :param impls: Registered implementations (registration order).
-    :param pin: The call site's pin, one character per positional argument.
-    :return: The single matching implementation, or None.
-    """
-    argc = len(pin)
-    probes = [(index, _PIN_WITNESSES[char])
-              for index, char in enumerate(pin) if char != _PIN_ANY]
-    for strict in (True, False):
-        matches = [impl for impl in impls if _takes_pinned(impl, argc, probes, strict)]
-        if matches:
-            return matches[0] if len(matches) == 1 else None
-    return None
-
-
-def _takes_pinned(impl: Implementation, argc: int, probes: list[tuple[int, Any]],
-                  strict: bool) -> bool:
-    """Whether an implementation takes a pin's witnessed positions.
-
-    The call fills the first ``argc`` positional parameters; a parameter it
-    omits takes its default, which has to fit its declared type the way
-    :func:`_select` checks it. The wildcard positions are not looked at.
-
-    :param impl: One registered implementation.
-    :param argc: The number of positional arguments the call site passes.
-    :param probes: The witnessed positions and their witness values.
-    :param strict: Match without the int-where-float-is-wanted widening.
-    :return: True when the implementation takes the call.
-    """
-    params = list(impl.sig.parameters.values())
-    positional = [p for p in params
-                  if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)]
-    if argc > len(positional):
-        return False
-    try:
-        bound = impl.sig.bind(*range(argc))
-    except TypeError:
-        return False
-    if not all(_check_type(value, impl.param_types[index][1], strict) for index, value in probes):
-        return False
-    bound.apply_defaults()
-    supplied = {p.name for p in positional[:argc]}
-    for p in params:
-        if p.name in supplied or p.name not in impl.type_hints \
-                or p.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
-            continue
-        default = bound.arguments[p.name]
-        if default is not __dyn_default__ and not _check_type(default, impl.type_hints[p.name],
-                                                              strict):
-            return False
-    return True
-
-
-def _witnessed(impls: list[Implementation], chars: str) -> Implementation | None:
-    """The implementation a pin without an index names, selected on its witnesses.
-
-    :param impls: Registered implementations (registration order).
-    :param chars: The pin's characters, one per positional argument.
-    :return: The implementation, or None where a character has no witness or
-        the witnesses name none.
-    """
-    if _PIN_ANY in chars:
-        if not all(c in _PIN_WITNESSES or c == _PIN_ANY for c in chars):
-            return None
-        return _select_pinned(impls, chars)
-    if not all(c in _PIN_WITNESSES for c in chars):
-        return None
-    return _select(impls, tuple(_PIN_WITNESSES[c] for c in chars), {})
 
 
 def _indexed(impls: list[Implementation], position: str, chars: str) -> Implementation | None:
@@ -467,62 +388,6 @@ def _indexed(impls: list[Implementation], position: str, chars: str) -> Implemen
                for index, char in enumerate(chars) if char in _PIN_WITNESSES):
         return None
     return impl
-
-
-#: ``PYNE_PIN_VERIFY=1``: every indexed pin bound is checked against what its
-#: witnesses select (``_verify_index``). Read once, at import.
-_PIN_VERIFY = os.environ.get('PYNE_PIN_VERIFY') == '1'
-
-#: ``PYNE_PIN_VERIFY_LOG=<path>``: every pinned call site bound appends one JSON
-#: line to that file (``_log_pin``). Read once, at import, and only under
-#: ``PYNE_PIN_VERIFY``.
-_PIN_VERIFY_LOG = os.environ.get('PYNE_PIN_VERIFY_LOG') if _PIN_VERIFY else None
-
-
-def _verify_index(impls: list[Implementation], qualname: str, pin: str, chars: str,
-                  position: str) -> None:
-    """Check an indexed pin against the implementation its witnesses select.
-
-    The index is the type pass's static resolution of the pin, and wherever the
-    witnesses decide (``_witnessed``) it has to name the implementation they do.
-
-    :param impls: Registered implementations (registration order).
-    :param qualname: Qualified name of the group.
-    :param pin: The call site's pin.
-    :param chars: The pin's characters.
-    :param position: The pin's text after the index separator.
-    :raises RuntimeError: Where the witnesses select another implementation.
-    """
-    witnessed = _witnessed(impls, chars)
-    if _PIN_VERIFY_LOG:
-        _log_pin(qualname, pin, impls, witnessed)
-    named = impls[int(position)] if position.isdigit() and int(position) < len(impls) else None
-    if witnessed is not None and witnessed is not named:
-        raise RuntimeError(
-            f"overload pin {pin!r} of {qualname}: the index names "
-            f"{'no implementation' if named is None else _impl_label(impls, named)}, "
-            f"the witnesses select {_impl_label(impls, witnessed)}")
-
-
-def _impl_label(impls: list[Implementation], impl: Implementation) -> str:
-    """An implementation as an error names it: its index and its signature."""
-    return f"[{impls.index(impl)}] {impl.func.__qualname__}{impl.sig}"
-
-
-def _log_pin(qualname: str, pin: str, impls: list[Implementation],
-             witnessed: Implementation | None) -> None:
-    """Append one bound pinned call site to the ``PYNE_PIN_VERIFY_LOG`` file.
-
-    :param qualname: Qualified name of the group.
-    :param pin: The call site's pin.
-    :param impls: Registered implementations (registration order).
-    :param witnessed: The implementation the witnesses select, or None.
-    """
-    index = pin.partition(_PIN_INDEX)[2]
-    record = {'group': qualname, 'pin': pin, 'index': int(index) if index.isdigit() else None,
-              'witness': None if witnessed is None else impls.index(witnessed)}
-    with open(cast(str, _PIN_VERIFY_LOG), 'a') as stream:
-        stream.write(json.dumps(record) + '\n')
 
 
 def _no_overload_error(qualname: str, args: tuple, kwargs: dict) -> WrongOperandTypeError:
@@ -610,11 +475,11 @@ def _anchored(impls: list[Implementation], qualname: str,
     :param cache: Externally held cache dict (the dispatcher's registered
         one); per-anchor entries create their own.
     :param pin: The call site's overload pin, when the type pass decided on
-        one: the implementation is then selected here, once, from the static
-        types rather than per bar from the values. A pin with an index
-        (``_PIN_INDEX``) names the implementation outright (``_indexed``); the
-        first call checks every wildcard argument against it, and a mismatch
-        hands the site to the value dispatch for good.
+        one. A pin with an index (``_PIN_INDEX``) names the implementation
+        (``_indexed``), which is bound here once rather than selected per bar
+        from the values; the first call checks every wildcard argument against
+        it, and a mismatch hands the site to the value dispatch for good. A
+        pin without an index leaves the site to the value dispatch.
     :return: The dispatch callable.
 
     A fully pinned stateless implementation may supply ``__pyne_pinned_bind__``.
@@ -714,30 +579,23 @@ def _anchored(impls: list[Implementation], qualname: str,
 
     chars, separator, position = pin.partition(_PIN_INDEX)
     argc = len(chars)
-    if separator:
-        pinned = _indexed(impls, position, chars)
-        if _PIN_VERIFY:
-            _verify_index(impls, qualname, pin, chars, position)
-    else:
-        pinned = _witnessed(impls, chars)
-        if _PIN_VERIFY_LOG:
-            _log_pin(qualname, pin, impls, pinned)
+    pinned = _indexed(impls, position, chars) if separator else None
     if pinned is None:
-        # An unwitnessable character, no implementation for the static shape,
-        # or an index the group does not have: the values know more than the
-        # pin does, so let them decide, exactly as they did before there were pins
+        # No index -- the type pass could not name one implementation for the
+        # static shape -- or one the group does not have: the values know more
+        # than the pin does, so let them decide, exactly as they did before
+        # there were pins
         return dispatch
     # Narrowed alias: the closure below reads it on every call, and only the
     # non-None case ever gets there
     chosen: Implementation = pinned
     group = len(impls)
-    # Positions the selection did not read: a wildcard one carries no type, so
-    # the first call checks the value against what the chosen implementation
-    # declares there -- a witnessed position can name an implementation the
-    # arguments as a whole do not fit, and the values must win that. A
-    # witnessed position needs no such check: its value is of the type its
-    # character names, which the implementation takes (``_indexed`` checks the
-    # witness of an index's, the selection itself everyone else's).
+    # Positions the static selection did not read: a wildcard one carries no
+    # type, so the first call checks the value against what the chosen
+    # implementation declares there -- the witnessed positions can name an
+    # implementation the arguments as a whole do not fit, and the values must
+    # win that. A witnessed position needs no such check: its value is of the
+    # type its character names, which the implementation takes (``_indexed``).
     checked = tuple(index for index, char in enumerate(chars) if char not in _PIN_WITNESSES)
     verified = [not checked]
     # An index whose first call the values do not fit is given up for good: the
@@ -752,7 +610,7 @@ def _anchored(impls: list[Implementation], qualname: str,
         if not verified[0]:
             if not all(_check_type(args[index], chosen.param_types[index][1], False)
                        for index in checked):
-                rejected[0] = bool(separator)
+                rejected[0] = True
                 return dispatch(*args, **kwargs)
             verified[0] = True
         # The entry bookkeeping of ``dispatch``, repeated rather than shared:

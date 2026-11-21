@@ -1989,22 +1989,26 @@ def _pass_choice(impls: Sequence[ImplSig], wanted: tuple[str, ...], shapes: Sequ
 
 def resolve_pin(impls: Sequence[ImplSig], pin: str) -> ImplSig | None:
     """
-    The implementation the runtime runs for a pin, decided statically.
+    The implementation a pinned call site runs, selected from the static types.
 
-    This is ``core/overload.py``'s ``_anchored`` resolving a pin without an
-    index from its witness values, rule for rule. A pin without a wildcard runs
-    the ordinary selector on the witnesses: its exact pass (``overload_choice``),
-    and where no implementation takes them there, its widening pass, which
-    takes an int where a float is declared and a float where an int is, the
-    defaults checked the same way. A pin with wildcards ignores those positions
-    and is an answer only where exactly one implementation takes the rest, in
-    the first pass any implementation does (``_select_pinned``).
+    The selection follows ``core/overload.py``'s value selector (``_select``)
+    on one value of each pinned type, rule for rule, and its answer is the
+    index the runtime binds the call site to. A pin without a wildcard takes
+    the selector's exact pass (``overload_choice``), and where no
+    implementation takes the types there, its widening pass, which takes an
+    int where a float is declared and a float where an int is, the defaults
+    checked the same way. A pin with wildcards ignores those positions and is
+    an answer only where exactly one implementation takes the rest, in the
+    first pass any implementation does: where more than one survives, the
+    position the pin knows nothing about is the one that decides, and the
+    values know it and the pin does not.
 
     There is no answer where the runtime has no witness for a character, where
     a declared type or a default does not say how the selector checks a value
     (``_MAYBE``), and where the implementations are not the whole group in its
     registration order (``ImplSig.slot``, ``ImplSig.size``): the one the static
-    selection leaves out may still be the one the runtime runs.
+    selection leaves out may still be the one the values select. A call site
+    without an answer dispatches from its values.
 
     :param impls: Every implementation of the group, in registration order
     :param pin: The call site's pin; an index after it is not read
@@ -2165,9 +2169,8 @@ def _takes(impl: ImplSig, wanted: tuple[str, ...], exact_arity: bool,
                         implementation whose every parameter the call fills
     :param shapes: The static type of each positional argument, or nothing
     :param strict: The exact pass; the widening pass otherwise
-    :param wild: Whether a wildcard position is left out of the match, the way
-                 the runtime resolves a pin with wildcards (``_select_pinned``),
-                 instead of being read from its static type
+    :param wild: Whether a wildcard position is left out of the match
+                 (``resolve_pin``) instead of being read from its static type
     :return: ``_YES``, ``_MAYBE`` or ``_NO``
     """
     if impl.open_ended or impl.kwarg:

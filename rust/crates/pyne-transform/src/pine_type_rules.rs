@@ -1959,7 +1959,7 @@ fn shape_at<S: AsRef<str>>(shapes: &[S], index: usize) -> &str {
 /// (`_takes`).
 ///
 /// :param strict: The exact pass; the widening pass otherwise
-/// :param wild: Whether a wildcard position is left out of the match (`_select_pinned`)
+/// :param wild: Whether a wildcard position is left out of the match (`resolve_pin`)
 fn takes<S: AsRef<str>>(
     imp: &ImplSig,
     wanted: &[&str],
