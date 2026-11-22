@@ -285,13 +285,25 @@ impl Series<'_> {
         self.series_declarations.entry(scope.clone()).or_default();
 
         let Kind::FunctionDef { args, .. } = ast.kind(id) else { unreachable!() };
-        let Kind::Arguments { args: params, .. } = ast.kind(*args) else { unreachable!() };
+        let Kind::Arguments { posonlyargs, args: positional, vararg, kwonlyargs, kwarg, .. } =
+            ast.kind(*args)
+        else {
+            unreachable!()
+        };
+        let params: Vec<NodeId> =
+            posonlyargs.iter().chain(positional).chain(kwonlyargs).copied().collect();
+        let starred: Vec<NodeId> = vararg.iter().chain(kwarg.iter()).copied().collect();
         let mut param_inits = Vec::new();
         // A parameter that is an array, a matrix or a map in some contexts only is
         // one of the definition's instance-varying sites; its entry selects the kind
         let varying = get_varying(ast, id).unwrap_or_default();
         self.varying.push(varying.clone());
-        for param in params.clone() {
+        for param in starred {
+            let Kind::Arg { arg, .. } = ast.kind(param) else { unreachable!() };
+            let arg = arg.clone();
+            self.local_vars.get_mut(&scope).expect("entered above").insert(arg);
+        }
+        for param in params {
             let Kind::Arg { arg, annotation, .. } = ast.kind(param) else { unreachable!() };
             let (arg, annotation) = (arg.clone(), *annotation);
             self.local_vars.get_mut(&scope).expect("entered above").insert(arg.clone());

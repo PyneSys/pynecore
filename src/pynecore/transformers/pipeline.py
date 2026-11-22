@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from pynecore.transformers.builtin_shadow import BuiltinShadowTransformer
 from pynecore.transformers.call_inline import CallInlineTransformer
@@ -61,6 +61,7 @@ from pynecore.transformers.security_drawings import SecurityDrawingsTransformer
 from pynecore.transformers.security_instantiation import SecurityInstantiationTransformer
 from pynecore.transformers.security_slice import SecuritySliceTransformer, finalize_clone_defaults
 from pynecore.transformers.series import SeriesTransformer
+from pynecore.transformers.series_qualifier import normalize_series_qualifiers
 from pynecore.transformers.slot_layout import ModuleLayout
 from pynecore.transformers.ta_variable_hoist import TaVariableHoistTransformer
 from pynecore.transformers.type_checking_stripper import TypeCheckingStripperTransformer
@@ -147,7 +148,7 @@ def _lower_layout(transformer: type) -> Callable[[ast.Module, PipelineContext], 
 
 
 def _in_place(fn: Callable[[ast.Module], object]) -> Callable[[ast.Module, PipelineContext], ast.Module]:
-    def run(tree: ast.Module, ctx: PipelineContext) -> ast.Module:
+    def run(tree: ast.Module, _ctx: PipelineContext) -> ast.Module:
         fn(tree)
         return tree
     return run
@@ -180,6 +181,10 @@ ANALYSIS: Sequence[Step] = (
     # lib.<ns>.<name> chains it emits get their imports added there
     Step('BuiltinShadow', _visit(BuiltinShadowTransformer)),
     Step('ImportNormalizer', _visit(ImportNormalizerTransformer)),
+    # ``Simple[Series[float]]`` -> ``Series[Simple[float]]``: ahead of every step that
+    # looks for a ``Series`` parameter annotation (security, closure arguments, the
+    # series lowering), so they see the head they look for
+    Step('SeriesQualifier', _in_place(normalize_series_qualifiers)),
     Step('PlotScope', lambda tree, ctx: PlotScopeTransformer(ctx.source).visit(tree),
          user_code_only=True),
     # The language rule that an object created outside a function may not be
@@ -299,6 +304,9 @@ LOWERING: Sequence[Step | Phase] = (
     Step('FixLocations', lambda tree, ctx: locations.fix_locations(tree)),
 )
 
+#: What one pass answers: the module, or what a native batch answers instead
+_R = TypeVar('_R')
+
 #: One pass as the dispatch runs it: its name and the pass
 _Unit = tuple[str, Callable[[ast.Module, PipelineContext], ast.Module]]
 
@@ -379,14 +387,14 @@ def _run_native(batch: list[_Unit], tree: ast.Module, ctx: PipelineContext) -> a
     # as the Python steps would have filled them
     result = _run('+'.join(names) + ' (native)', ctx, native.run, names, tree, ctx,
                   ctx.slot_layout, True)
-    if isinstance(result, ast.Module):
+    if result is not None and not isinstance(result, native.Rejection):
         return result
     for name, run in units:
         tree = _run(name, ctx, run, tree, ctx)
     return tree
 
 
-def _run(name: str, ctx: PipelineContext, run: Callable[..., Any], *args: Any) -> ast.Module:
+def _run(name: str, ctx: PipelineContext, run: Callable[..., _R], *args: Any) -> _R:
     """Run one pass over the module, timed when ``PYNE_AST_TIMING`` asks for it."""
     if not _TIMING:
         return run(*args)

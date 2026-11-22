@@ -88,12 +88,18 @@ def __test_every_qualifier_site_is_pinned_by_index__():
     analysed = analyse_module(Path(__file__))
     assert analysed is not None
     tree, table, _ = analysed
-    pins = sorted((ast.unparse(node.args[0]), ast.unparse(node.func), str(get_pin(node)))
-                  for node in ast.walk(tree)
-                  if isinstance(node, ast.Call) and ast.unparse(node.func) in ('tag', 'rank'))
+    pins = []
+    labels = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if ast.unparse(node.func) in ('tag', 'rank'):
+            pins.append((ast.unparse(node.args[0]), ast.unparse(node.func), str(get_pin(node))))
+        elif ast.unparse(node.func) == 'label':
+            labels.append((ast.unparse(node), str(get_pin(node))))
+    pins.sort()
+    labels.sort()
     assert all(PIN_INDEX in pin for _, _, pin in pins), pins
-    labels = sorted((ast.unparse(node), str(get_pin(node))) for node in ast.walk(tree)
-                    if isinstance(node, ast.Call) and ast.unparse(node.func) == 'label')
     assert all(PIN_INDEX in pin for _, pin in labels), labels
     assert pins == [("'lit'", 'rank', 's=0'), ("'lit'", 'tag', 's=0'),
                     ('name', 'rank', 's=1'), ('name', 'tag', 's=0'),

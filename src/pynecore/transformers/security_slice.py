@@ -67,7 +67,7 @@ from .security_dependencies import (
 from .security_contexts import ctx_get as _ctx_get, iter_contexts as _iter_contexts
 from .varip_types import VARIP_TYPES
 
-__all__ = ['SecuritySliceTransformer', 'CLONE_PREFIX', 'CLONE_SUFFIX']
+__all__ = ['SecuritySliceTransformer', 'CLONE_PREFIX', 'CLONE_SUFFIX', 'finalize_clone_defaults']
 
 #: Name shape of an emitted clone. The security protocol's own injected names
 #: (``__sec_write__``, ``__sec_read__``, ...) share this namespace; a script

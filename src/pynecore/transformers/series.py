@@ -193,7 +193,11 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         # one of the definition's instance-varying sites; its entry selects the kind
         varying = get_varying(node) or ()
         self._varying.append(varying)
-        for arg in node.args.args:
+        arguments = node.args
+        for arg in (arguments.vararg, arguments.kwarg):
+            if arg is not None:
+                self.local_vars[self.current_scope].add(arg.arg)
+        for arg in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs):
             self.local_vars[self.current_scope].add(arg.arg)
             if arg.annotation is not None and self._is_series_type(arg.annotation):
                 pin = next((j for j, site in enumerate(varying) if site is arg), None)
@@ -237,7 +241,7 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                 # same-named parent series, like a plain assignment does.
                 self.local_vars.setdefault(self.current_scope, set()).add(node.target.id)
             if node.value:
-                node.value = cast(ast.expr, self.visit(node.value))
+                node.value = self.visit(node.value)
             return node
 
         if not self.current_scope:
@@ -253,7 +257,7 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         return ast.copy_location(ast.Assign(
             targets=[ast.Name(id=node.target.id, ctx=ast.Store())],
             value=self._buffer_call(self.current_scope, slot, 'add',
-                                    [cast(ast.expr, self.visit(node.value))])), node)
+                                    [self.visit(node.value)])), node)
 
     def visit_If(self, node: ast.If) -> ast.AST:
         """Leave a parameter-default guard's own assignment alone.
@@ -268,11 +272,11 @@ class SeriesTransformer(ast_walk.NodeTransformer):
         if is_dynamic_default_guard(node):
             outer, self._in_default_guard = self._in_default_guard, True
             try:
-                node.body = [cast(ast.stmt, self.visit(stmt)) for stmt in node.body]
+                node.body = [self.visit(stmt) for stmt in node.body]
             finally:
                 self._in_default_guard = outer
             return node
-        return cast(ast.AST, self.generic_visit(node))
+        return self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> ast.AST | list[ast.stmt]:
         """Convert assignments to same-scope series variables into buffer writes."""
@@ -281,13 +285,13 @@ class SeriesTransformer(ast_walk.NodeTransformer):
             slots = self.series_slots.get(self.current_scope)
             if self._in_default_guard and slots is not None and var_name in slots:
                 # The guard resolves the parameter; the buffer write follows it
-                node.value = cast(ast.expr, self.visit(node.value))
+                node.value = self.visit(node.value)
                 return node
             if slots is not None and var_name in slots:
                 return ast.copy_location(ast.Assign(
                     targets=[ast.Name(id=var_name, ctx=ast.Store())],
                     value=self._buffer_call(self.current_scope, slots[var_name], 'set',
-                                            [cast(ast.expr, self.visit(node.value))])), node)
+                                            [self.visit(node.value)])), node)
             if self.current_scope:
                 self.local_vars.setdefault(self.current_scope, set()).add(var_name)
 
@@ -300,7 +304,7 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                 and self.current_scope
                 and all(isinstance(e, ast.Name) for e in target.elts)):
             slots = self.series_slots.get(self.current_scope, {})
-            node.value = cast(ast.expr, self.visit(node.value))
+            node.value = self.visit(node.value)
             stmts: list[ast.stmt] = [node]
             for elt in target.elts:
                 name = cast(ast.Name, elt).id
@@ -313,7 +317,7 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                     self.local_vars.setdefault(self.current_scope, set()).add(name)
             return stmts if len(stmts) > 1 else node
 
-        return cast(ast.AST, self.generic_visit(node))
+        return self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
         """Convert augmented assignments to same-scope series into ``set()``."""
@@ -327,12 +331,12 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                     ast.BinOp(left=set_ty(ast.Name(id=node.target.id, ctx=ast.Load()),
                                           augmented),
                               op=node.op,
-                              right=cast(ast.expr, self.visit(node.value))), augmented)
+                              right=self.visit(node.value)), augmented)
                 return ast.copy_location(ast.Assign(
                     targets=[ast.Name(id=node.target.id, ctx=ast.Store())],
                     value=self._buffer_call(self.current_scope, slots[node.target.id],
                                             'set', [value])), node)
-        return cast(ast.AST, self.generic_visit(node))
+        return self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
         """Rewrite series indexing to address the buffer in its slot."""
@@ -341,9 +345,9 @@ class SeriesTransformer(ast_walk.NodeTransformer):
             if found:
                 scope, slot = found
                 node.value = self._state_ref(scope, slot)
-                node.slice = cast(ast.expr, self.visit(node.slice))
+                node.slice = self.visit(node.slice)
                 return node
-        return cast(ast.AST, self.generic_visit(node))
+        return self.generic_visit(node)
 
     def visit_Expr(self, node: ast.Expr) -> ast.AST:
         """Convert a statement-position buffer setter call into an attribute
@@ -353,12 +357,12 @@ class SeriesTransformer(ast_walk.NodeTransformer):
                 and call.func.attr in _BUFFER_SETTERS
                 and isinstance(call.func.value, ast.Name)
                 and call.func.value.id == 'lib'
-                and len(call.args) >= 2 and isinstance(call.args[0], ast.Name)):
-            found = self._lookup(call.args[0].id)
+                and len(call.args) >= 2 and isinstance(target := call.args[0], ast.Name)):
+            found = self._lookup(target.id)
             if found:
                 scope, slot = found
                 return ast.copy_location(ast.Assign(
                     targets=[ast.Attribute(value=self._state_ref(scope, slot),
                                            attr=_BUFFER_SETTERS[call.func.attr], ctx=ast.Store())],
-                    value=cast(ast.expr, self.visit(call.args[1]))), node)
-        return cast(ast.AST, self.generic_visit(node))
+                    value=self.visit(call.args[1])), node)
+        return self.generic_visit(node)

@@ -155,6 +155,7 @@ The tables list the steps in exactly the order `pipeline.py` runs them. "User co
 | `TypeErasure`           | Replace `typing.cast(T, x)` with `x`                                  | no             | Before ImportNormalizer: it trusts `cast` by the `typing` imports as written     |
 | `BuiltinShadow`         | Send accesses a shadowing library alias cannot serve to the built-ins | no             | Before ImportNormalizer: it adds the imports of the `lib.<ns>.<name>` chains     |
 | `ImportNormalizer`      | Rewrite pynecore imports to `from pynecore import lib` and `lib.*`    | no             | Later steps read the normalized `lib.*` chains                                   |
+| `SeriesQualifier`       | Put `Series` outside a parameter's qualifier marker                   | no             | Before every step that looks for a `Series` parameter annotation                 |
 | `PlotScope`             | Require plot declarations to run directly in the script entry         | yes            | Before lowering creates control flow of its own                                  |
 | `OuterWrite`            | Reject writes into objects created outside a function                 | yes            | Well before FunctionIsolation (its per-call-site copies would repeat the report) |
 | `ExportCapture`         | Reject library exports that capture non-constant library globals      | yes            | Before closure and state lowering                                                |
@@ -389,6 +390,17 @@ a = lib.close
 Because the module level variable changed, and we access through the lib module object.
 
 Most later steps match the normalized `lib.*` chains this step produces, which is why it stands this early.
+
+### SeriesQualifier
+
+Puts `Series` outside a parameter's qualifier marker. Pine lets two overloads of a function differ only by a parameter's qualifier, and the compiler marks the qualified parameter `Simple[T]` or `Const[T]` (see `pynecore.types.qualifier`). When the body reads that parameter's history, its annotation is `Series[T]` and the marker goes around it: the compiler writes `Simple[Series[float]]`, while Pyne code may also write `Series[Simple[float]]`. This step rewrites the first form into the second by swapping the two subscript heads in place:
+
+```python
+def g(x: Simple[Series[float]]):   # before
+def g(x: Series[Simple[float]]):   # after
+```
+
+Every step that looks for a `Series` parameter annotation (security, closure arguments, the series lowering) checks only the outermost head, so after this step it sees one. The type pass reads the marker under `Series` (`pine_type_rules.annotation_qualifier`). At run time a marker is its payload, so `Series[Simple[float]]` behaves as `Series[float]`.
 
 ### PlotScope
 

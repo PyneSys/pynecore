@@ -1181,12 +1181,16 @@ pub const QUAL_PLAIN: char = '2';
 const QUALIFIER_MARKERS: &[(&str, char)] = &[("Const", QUAL_CONST), ("Simple", QUAL_SIMPLE)];
 
 /// The qualifier a parameter annotation's marker declares (`annotation_qualifier`):
-/// `QUAL_SIMPLE` for `Simple[T]`, `QUAL_CONST` for `Const[T]`, `None` for no marker.
+/// `QUAL_SIMPLE` for `Simple[T]`, `QUAL_CONST` for `Const[T]`, `None` for no marker. A
+/// parameter whose history is read carries the marker under `Series`: `Series[Simple[T]]`.
 pub fn annotation_qualifier(ast: &Ast, node: Option<NodeId>) -> Option<char> {
-    let Kind::Subscript { value, .. } = ast.kind(node?) else {
+    let Kind::Subscript { value, slice, .. } = ast.kind(node?) else {
         return None;
     };
     let name = leaf_name(ast, *value);
+    if name == "Series" {
+        return annotation_qualifier(ast, Some(*slice));
+    }
     QUALIFIER_MARKERS.iter().find(|(head, _)| *head == name).map(|&(_, qual)| qual)
 }
 /// Annotation heads whose payload is the array element type.

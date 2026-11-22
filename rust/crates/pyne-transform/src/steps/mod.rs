@@ -34,6 +34,7 @@ pub mod security_drawings;
 pub mod security_instantiation;
 pub mod security_slice;
 pub mod series;
+pub mod series_qualifier;
 pub mod ta_variable_hoist;
 pub mod type_checking_stripper;
 pub mod type_erasure;

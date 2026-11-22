@@ -2559,8 +2559,8 @@ def qualifier_choice(impls: Sequence[ImplSig], shapes: Sequence[str],
     if len(quals) != len(shapes) or not any(impl.quals for impl in impls):
         return None
     kw_shapes = kw_shapes or {}
-    kw_quals = kw_quals or {}
-    if set(kw_quals) != set(kw_shapes):
+    keyword_quals: Mapping[str, int] = kw_quals or {}
+    if set(keyword_quals) != set(kw_shapes):
         return None
     found = _pine_keyword_matches(impls, shapes, kw_shapes) if kw_shapes \
         else _pine_matches(impls, shapes)
@@ -2570,7 +2570,7 @@ def qualifier_choice(impls: Sequence[ImplSig], shapes: Sequence[str],
     def bound(index: int) -> dict[int, int]:
         names = impls[index].names
         out = dict(enumerate(quals))
-        for name, qual in kw_quals.items():
+        for name, qual in keyword_quals.items():
             if name in names:
                 out[names.index(name)] = qual
         return out
@@ -2955,7 +2955,9 @@ def annotation_qualifier(node: ast.expr | None) -> str | None:
     ``Simple[T]`` and ``Const[T]`` are what PyneComp writes for a ``simple``
     and a ``const`` parameter, and only in an overload group whose
     implementations would otherwise have the same signature
-    (``types/qualifier.py``); everything else declares none.
+    (``types/qualifier.py``); everything else declares none. A parameter whose
+    history is read carries the marker under ``Series``: ``Series[Simple[T]]``,
+    the form the ``SeriesQualifier`` step writes ``Simple[Series[T]]`` in.
 
     :param node: The annotation expression, or None when there is none
     :return: ``QUAL_SIMPLE`` or ``QUAL_CONST``, or None for no marker
@@ -2965,6 +2967,8 @@ def annotation_qualifier(node: ast.expr | None) -> str | None:
     value = node.value
     name = value.id if isinstance(value, ast.Name) else \
         (value.attr if isinstance(value, ast.Attribute) else '')
+    if name == 'Series':
+        return annotation_qualifier(node.slice)
     return _QUALIFIER_MARKERS.get(name)
 
 
