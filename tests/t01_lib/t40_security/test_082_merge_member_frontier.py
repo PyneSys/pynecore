@@ -197,7 +197,7 @@ def __test_the_outside_consumer_resolves__(runner, log):
     log.info("the outside consumer resolved on %d bars", len(rows))
 
 
-@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
+@pytest.mark.python_only("counts or groups security child processes")
 def __test_a_groups_non_primary_member_publishes_its_frontier__(runner, log):
     """A consumer of a merged group's NON-primary member never parks.
 

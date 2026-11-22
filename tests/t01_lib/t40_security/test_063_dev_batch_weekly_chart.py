@@ -172,8 +172,7 @@ def __test_the_weekly_reads_start_na_and_resolve__(runner, log):
     log.info("first week na, last week resolved on %d daily bars", len(rows))
 
 
-@pytest.mark.aot_unsupported("inspects the developing-batch plan; "
-                             "a compiled run has no batch planner")
+@pytest.mark.python_only("inspects the developing-batch plan")
 def __test_weekly_batch_matches_per_bar_path__(runner, log):
     """A weekly batch on a daily chart answers exactly like the per-bar path.
 

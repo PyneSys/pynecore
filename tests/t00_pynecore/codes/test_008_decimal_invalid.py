@@ -1,7 +1,7 @@
 """
 The decimal arithmetic of the strategy, the number formatter and the candle
-aggregation stops with R0034 under the AOT's ``function`` and ``why``: the kernel's
-own name, replaced by the outermost strategy entry point on the stack, and the
+aggregation stops with R0034 under its ``function`` and ``why``: the kernel's own
+name, replaced by the outermost strategy entry point on the stack, and the
 strategy's ``strategy()`` options of no known value are R0042.
 """
 import math
@@ -26,7 +26,7 @@ def __test_helper_raised(call, *args) -> errorcodes.DecimalInvalidError:
 
 
 def __test_the_kernels_name_themselves__(monkeypatch):
-    """Each kernel raises under its own name with the AOT's reason"""
+    """Each kernel raises under its own name with its reason"""
     monkeypatch.setattr(syminfo, '_size_round_factor', 1e4, raising=False)
     error = __test_helper_raised(strategy._book_commission,  # noqa
                                  [Decimal(0), 0.0, [], 0.0], 1.0, math.inf, 0.0, True)
@@ -60,8 +60,8 @@ def __test_the_outermost_entry_point_names_the_error__(monkeypatch):
     assert __test_helper_raised(outer).params['function'] == 'strategy.entry'
 
 
-def __test_the_entry_points_are_the_aot_names__():
-    """The table names the AOT's ``.at()`` targets"""
+def __test_the_entry_points_are_named__():
+    """The table names the strategy entry points a decimal error is reported under"""
     strategy._decimal_error('', '')  # noqa
     assert set(strategy._DEC_ENTRY_POINTS.values()) == {  # noqa
         'strategy.entry', 'strategy.exit', 'strategy.order', 'strategy.close',

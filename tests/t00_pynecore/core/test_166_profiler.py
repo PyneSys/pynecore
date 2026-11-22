@@ -63,7 +63,7 @@ def __test_helper_profile(csv_reader, runner, path: Path) -> dict:
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-@pytest.mark.aot_unsupported("the profiler measures CPython code objects")
+@pytest.mark.python_only("the profiler measures CPython code objects")
 def __test_profile_counts_every_execution__(csv_reader, runner, tmp_path):
     """ Each line counts the times it ran, loops and branches included """
     __test_helper_require_profiler()
@@ -100,7 +100,7 @@ def __test_profile_counts_every_execution__(csv_reader, runner, tmp_path):
     assert ran("    plot(") == bars
 
 
-@pytest.mark.aot_unsupported("the profiler measures CPython code objects")
+@pytest.mark.python_only("the profiler measures CPython code objects")
 def __test_profile_times_add_up__(csv_reader, runner, tmp_path):
     """ The categories cover the run, the blocks sum their lines """
     __test_helper_require_profiler()
@@ -132,7 +132,7 @@ def __test_profile_times_add_up__(csv_reader, runner, tmp_path):
     assert sys.monitoring.get_tool(sys.monitoring.PROFILER_ID) is None
 
 
-@pytest.mark.aot_unsupported("the profiler measures CPython code objects")
+@pytest.mark.python_only("the profiler measures CPython code objects")
 def __test_profile_leaves_results_unchanged__(csv_reader, runner, tmp_path):
     """ A profiled run computes the same values as a plain one """
     __test_helper_require_profiler()
@@ -145,7 +145,7 @@ def __test_profile_leaves_results_unchanged__(csv_reader, runner, tmp_path):
     assert (tmp_path / 'profile.json').exists()
 
 
-@pytest.mark.aot_unsupported("the profiler measures CPython code objects")
+@pytest.mark.python_only("the profiler measures CPython code objects")
 def __test_failed_run_writes_no_profile__(csv_reader, runner, tmp_path):
     """ A run that fails stops the profiler and leaves no profile behind """
     __test_helper_require_profiler()
@@ -164,7 +164,7 @@ def __test_failed_run_writes_no_profile__(csv_reader, runner, tmp_path):
     assert sys.monitoring.get_tool(sys.monitoring.PROFILER_ID) is None
 
 
-@pytest.mark.aot_unsupported("the profiler measures CPython code objects")
+@pytest.mark.python_only("the profiler measures CPython code objects")
 def __test_profiler_refuses_where_it_cannot_run__(csv_reader, runner, tmp_path, monkeypatch):
     """ No profiling next to another profiler, without the extension, or in a live run """
     __test_helper_require_profiler()

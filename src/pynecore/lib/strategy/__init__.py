@@ -6257,13 +6257,13 @@ _CASH_CTX = Context(prec=10, rounding=ROUND_HALF_UP)
 _SPLIT_CTX = Context(prec=40)
 _DEC_CENT = Decimal('0.01')
 
-# The ``why`` of a decimal error, in the AOT's words (``pyneaot-strategy`` ``decimal.rs``)
+# The ``why`` of a decimal error
 _WHY_SPECIAL = "an infinite or NaN operand"
 _WHY_DIVISION_BY_ZERO = "division by zero"
 _WHY_INFINITY_TIMES_ZERO = "infinity times zero"
 
 #: The entry points a decimal error of the strategy is reported under, by code object,
-#: as the AOT's ``DecError::at`` names them; filled on the first error
+#: filled on the first error
 _DEC_ENTRY_POINTS: dict[object, str] = {}
 
 
@@ -6271,12 +6271,12 @@ def _decimal_error(function: str, why: str) -> _DecimalInvalidError:
     """
     The ``R0034`` error of a trapped decimal signal in a strategy kernel.
 
-    The AOT renames the error at every entry point it passes on the way out, so the
-    outermost one names it. Here the kernel cannot see its callers, so the stack is
-    walked once, on the error path: the outermost entry point on it gives the name.
+    The error is reported under the outermost entry point it passes on the way out.
+    The kernel cannot see its callers, so the stack is walked once, on the error path:
+    the outermost entry point on it gives the name.
 
     :param function: The kernel's own name, used when no entry point is on the stack
-    :param why: The reason, as the AOT words it
+    :param why: The reason
     :return: The error to raise
     """
     if not _DEC_ENTRY_POINTS:

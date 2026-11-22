@@ -106,8 +106,7 @@ def _run(script_path, module_key, rate_path: str) -> list[dict]:
     return rows
 
 
-@pytest.mark.aot_unsupported("counts the rate provider's Python calls; "
-                             "the compiled run reads the rates from its feed")
+@pytest.mark.python_only("counts the rate provider's Python calls")
 # noinspection PyShadowingNames
 def __test_the_rate_is_sampled_once_per_bar__(script_path, module_key):
     """One provider lookup per bar, however many money expressions read the rate."""

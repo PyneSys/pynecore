@@ -1,8 +1,8 @@
 # PyneCore native transform
 
 A Rust port of PyneCore's AST transform pipeline (`src/pynecore/transformers`), so
-the pipeline can run where there is no Python interpreter (the browser, the AOT
-compiler) and, step by step, faster under CPython.
+the pipeline can run where there is no Python interpreter and, step by step,
+faster under CPython.
 
 **The Python pipeline is the reference.** Every native step is a port of the
 Python step of the same name and must produce the same tree for the same input.

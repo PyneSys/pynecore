@@ -4,8 +4,8 @@ The plain double-underscore names the transform emits into user code.
 Most names the transformers inject carry the reserved middle dot (see
 ``PYNE_RESERVED_NAME_CHAR`` in ``transformers/emission_settings.py``). The ones below
 do not: runtime helpers, module-level protocol records and generated temporaries that
-other tools (the runtime, the security children, the ahead-of-time compiler)
-address by these exact spellings. User code that binds or reads one of them
+other parts of PyneCore (the runtime, the security children) address by these
+exact spellings. User code that binds or reads one of them
 would silently collide with the emission -- a truthiness temporary rebinding a
 module variable of the same name, a user ``__state__`` shadowing the state
 vector -- so the loader rejects Pyne code that spells one (see

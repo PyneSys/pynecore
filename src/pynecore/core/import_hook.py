@@ -506,8 +506,8 @@ def _in_package(source_path: str) -> bool:
 
 #: The pipeline every transformed module in this process was produced by, taken
 #: once at import. It is the public face of ``_get_transform_pipeline_hash``:
-#: PyneAOT writes it into its bundle so a bundle built by one pipeline can be
-#: told apart from a checkout running another. The function stays the live
+#: a tool that stores transformed code writes it beside that code, so output
+#: built by one pipeline can be told apart from a checkout running another. The function stays the live
 #: value the loader itself reads, which is what lets a test simulate a
 #: different pipeline without rewriting this constant.
 PIPELINE_DIGEST: str = _get_transform_pipeline_hash()

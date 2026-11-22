@@ -54,8 +54,7 @@ def __test_helper_run(runner):
     return rows, r
 
 
-@pytest.mark.aot_unsupported("reads the script module's security contexts; "
-                             "a compiled run has no script module")
+@pytest.mark.python_only("reads the script module's security contexts")
 def __test_time_takes_the_passthrough__(runner, log):
     """``time`` is a passthrough field.
 

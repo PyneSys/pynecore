@@ -3,8 +3,7 @@ exception class :mod:`~pynecore.errorcodes` generates from ``scripts/errorcodes/
 
 An error carries its code, the values of the code's parameters, and, once the
 run has located it, the bar it stopped on and the line of the script that
-raised it. :meth:`PyneError.report` writes the one line a run prints for it,
-in the form ``pyneaot run`` writes it too::
+raised it. :meth:`PyneError.report` writes the one line a run prints for it::
 
     bar 12 (2024-01-02 03:04 UTC): R0010 at /scripts/my_script.py:7:5: <message>
 """

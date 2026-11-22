@@ -161,7 +161,7 @@ def __test_helper_run(runner, no_merge=False):
     return rows, spawned
 
 
-@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
+@pytest.mark.python_only("counts or groups security child processes")
 def __test_unread_branch_gets_no_process__(runner, log):
     """A READ starts a context — and the whole group it belongs to with it.
 

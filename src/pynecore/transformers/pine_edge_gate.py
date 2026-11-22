@@ -2,9 +2,8 @@
 The ``@pyne edge`` gate: what a module may contain to be Pine.
 
 An edge module is a promise: everything in it is Pine, so it runs on the fast
-path, compiles ahead of time and runs on the web. The promise has two halves
-and this module keeps the structural one -- the SYNTAX a Pine program can be
-written with. The other half, that every value has a known Pine type, is what
+path. The promise has two halves and this module keeps the structural one --
+the SYNTAX a Pine program can be written with. The other half, that every value has a known Pine type, is what
 the type inference reports through its own diagnostics; the gate in the
 import hook raises the first one of either kind.
 

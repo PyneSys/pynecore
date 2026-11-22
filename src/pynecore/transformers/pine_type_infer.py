@@ -3,7 +3,7 @@ The Pine type inference engine.
 
 Walks a module and gives every expression a Pine type, which it stamps on the
 node itself (``node._pine_ty``). Later passes reuse the node objects, so the
-stamp travels with the tree into the lowered form the AOT compiler consumes;
+stamp travels with the tree into the lowered form;
 the passes that BUILD a wrapper node have to carry it over explicitly, which
 is what ``inherit_ty`` is for.
 

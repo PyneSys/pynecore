@@ -1802,7 +1802,7 @@ def run(
                     print_profile_report(json.loads(profile_path.read_text(encoding='utf-8')),
                                          profile_path, profile_top, console)
         except PyneError as e:
-            # The script's own error: one line, as `pyneaot run` writes it
+            # The script's own error: one line
             if show_traceback:
                 console.print_exception(show_locals=False)
             secho(f"Error: {e.report(pine=from_pine)}", err=True, fg=colors.RED)

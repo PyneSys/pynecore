@@ -134,7 +134,7 @@ def __test_a_reimported_library_leaves_its_old_main_out__(tmp_path):
     assert main.__globals__ is vars(sys.modules['t169_reloaded_lib'])
 
 
-@pytest.mark.aot_unsupported("the profiler measures CPython code objects")
+@pytest.mark.python_only("the profiler measures CPython code objects")
 def __test_profile_skips_a_foreign_library__(tmp_path, syminfo):
     """ A later script's profile lists no library of an earlier one, even when its file is gone """
     if sys.version_info < (3, 13):

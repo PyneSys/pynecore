@@ -212,8 +212,7 @@ def __test_lookahead_on_closed_bars_on_non_nested_chart__(runner, log):
     __test_helper_check(rows)
 
 
-@pytest.mark.aot_unsupported("inspects the developing-batch plan; "
-                             "a compiled run has no batch planner")
+@pytest.mark.python_only("inspects the developing-batch plan")
 def __test_lookahead_on_closed_bars_on_non_nested_chart_batched__(runner, log):
     """The developing batch replays the same closed bars as the per-bar path.
 

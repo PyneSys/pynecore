@@ -279,7 +279,7 @@ def main():
 
 
 def __test_a_test_prefixed_function_is_exempt__(log):
-    """Harness code is not script code — the AOT exporter skips it as well"""
+    """Harness code is not script code"""
     __test_helper_analyse("""
 STORE = lib.array.new_float(0)
 

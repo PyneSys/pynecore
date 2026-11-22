@@ -40,8 +40,7 @@ def main():
     return {"caught": caught}
 
 
-@pytest.mark.aot_unsupported("try/except: a compiled script has no exceptions, a failed "
-                             "assert is a trap that ends the run")
+@pytest.mark.python_only("catches the script's errors with try/except")
 def __test_zero_truncated_length__(runner):
     """Every function of the na-length family rejects a length that truncates to 0"""
     from datetime import datetime, UTC

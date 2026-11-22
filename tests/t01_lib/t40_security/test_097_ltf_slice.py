@@ -47,8 +47,7 @@ def __test_helper_run(runner, no_slice):
     return rows
 
 
-@pytest.mark.aot_unsupported("switches the security slice off; "
-                             "a compiled run has no unsliced child")
+@pytest.mark.python_only("switches the security slice off")
 def __test_the_unsliced_child_reaches_the_chart_side_statement__(runner, log):
     """Unsliced, the LTF child evaluates the chart's statements that raise there.
 

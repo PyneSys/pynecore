@@ -371,21 +371,18 @@ def runner(request, script_path, module_key, syminfo) -> RunnerProtocol:
         # ScriptRunner -- everything else about the test (its data file, its
         # reference columns, its assertions) is untouched, so the existing
         # expectations validate that backend with nothing duplicated. The
-        # value names the module to import; "aot" is shorthand for PyneAOT's
-        # own, which must be importable (PYTHONPATH=<pyneaot>/conformance).
+        # value names the module to import, which must be importable.
         backend = os.environ.get('PYNE_BACKEND')
         if backend and backend != 'python':
-            # A test marked `aot_unsupported` exercises a construct the
-            # compiled surface has no answer for (an `except` clause, say).
-            # Under the alternative backend it is SKIPPED with that reason,
-            # so a compile refusal there is not counted as a failure; under
+            # A test marked `python_only` relies on the CPython runtime itself
+            # (its child processes, its profiler, an `except` clause). Under
+            # the alternative backend it is SKIPPED with that reason; under
             # CPython the marker changes nothing.
-            marker = request.node.get_closest_marker('aot_unsupported')
+            marker = request.node.get_closest_marker('python_only')
             if marker is not None:
                 pytest.skip(f"{backend} backend: {marker.args[0]}")
             from importlib import import_module
-            module = 'pyneaot_backend' if backend == 'aot' else backend
-            return import_module(module).ScriptRunner(
+            return import_module(backend).ScriptRunner(
                 script_path, ohlcv_iter, syminfo, security_data=security_data,
                 **runner_kwargs)
 
@@ -410,12 +407,11 @@ def _backend_script_runner(request, monkeypatch):
     backend = os.environ.get('PYNE_BACKEND')
     if not backend or backend == 'python':
         return
-    marker = request.node.get_closest_marker('aot_unsupported')
+    marker = request.node.get_closest_marker('python_only')
     if marker is not None:
         pytest.skip(f"{backend} backend: {marker.args[0]}")
     from importlib import import_module
-    module = 'pyneaot_backend' if backend == 'aot' else backend
-    cls = import_module(module).ScriptRunner
+    cls = import_module(backend).ScriptRunner
     import pynecore.core.script_runner as sr_module
     monkeypatch.setattr(sr_module, 'ScriptRunner', cls)
 

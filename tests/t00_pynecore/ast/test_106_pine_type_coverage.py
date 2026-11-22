@@ -4,8 +4,8 @@ The Pine type stamp survives the whole lowering chain.
 The type travels ON the node (``node._pine_ty``), which the later passes get
 for free wherever they reuse the node object — and lose wherever they build a
 replacement. That loss is silent: the tree still compiles, the script still
-runs, and only the overload pin and the AOT front end notice that the value
-they were about to type is untyped.
+runs, and only the overload pin notices that the value it was about to type is
+untyped.
 
 The invariant that catches it is upward closure: **no unstamped expression may
 contain a stamped one**. A pass that wraps typed operands in fresh plumbing

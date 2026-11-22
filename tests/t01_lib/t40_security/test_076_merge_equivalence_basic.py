@@ -192,7 +192,7 @@ def __test_helper_run_with_timeout(fn, seconds=180):
     return box.get('result')
 
 
-@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
+@pytest.mark.python_only("counts or groups security child processes")
 def __test_merged_group_equals_one_child_per_context__(runner, log):
     """Three calls on one context answer identically merged and unmerged.
 

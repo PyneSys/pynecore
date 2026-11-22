@@ -3,8 +3,8 @@ The native (Rust) backend of the transform pipeline.
 
 The Python steps are the reference. A native step is a port of the Python step of
 the same name and must hand back the same tree for the same input; it exists so
-the pipeline can also run where there is no Python (the browser, the AOT
-compiler) and, step by step, run faster here.
+the pipeline can also run where there is no Python interpreter and, step by step,
+run faster here.
 
 Which backend a step runs on:
 

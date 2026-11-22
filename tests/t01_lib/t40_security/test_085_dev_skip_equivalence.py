@@ -336,8 +336,7 @@ def __test_dev_skip_answers_exactly_like_a_round_per_bar__(runner, log):
              len(skip_rows), len(skip_rows[0]))
 
 
-@pytest.mark.aot_unsupported("inspects the developing-skip decision table; "
-                             "a compiled run has no batch planner")
+@pytest.mark.python_only("inspects the developing-skip decision table")
 def __test_only_the_provable_shapes_skip__(runner, log):
     """The decision per context, and the rounds it actually removed
 

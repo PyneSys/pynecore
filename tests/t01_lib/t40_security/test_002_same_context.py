@@ -54,8 +54,7 @@ def __test_same_context__(csv_reader, runner, log):
     log.info("Same context test passed — values match chart data")
 
 
-@pytest.mark.aot_unsupported("counts shared-memory cleanups of security child processes; "
-                             "a compiled run has none")
+@pytest.mark.python_only("counts shared-memory cleanups of security child processes")
 def __test_same_context_cleans_up_once__(csv_reader, runner, log, monkeypatch):
     """Same symbol + same TF uses chart data directly without spawning a process."""
     from pynecore.core import security

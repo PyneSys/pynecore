@@ -1262,7 +1262,7 @@ def stamp_lowering(root: _E, result: str) -> _E:
 
     The Pine types are upward-closed over expressions: an unstamped node may
     never CONTAIN a stamped one, or the type of a value is lost exactly where
-    its consumers -- the overload pin, the AOT front end -- look for it. A pass
+    its consumers -- the overload pin among them -- look for it. A pass
     that wraps typed operands in fresh plumbing therefore has to type the
     plumbing too, and the plumbing's types are mechanical: the tests it emits
     are bools, the references it emits are objects, and the arithmetic it emits

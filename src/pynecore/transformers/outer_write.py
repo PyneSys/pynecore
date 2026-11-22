@@ -26,7 +26,7 @@ Placement in the pipeline: right after import normalization, so the ``lib.*``
 chains are in their canonical shape, and well before function isolation, whose
 per-call-site copies would otherwise report the same write several times.
 Functions whose name starts with ``__test_`` are exempt: they are harness code,
-not script code, and the AOT exporter skips them as well.
+not script code.
 """
 import ast
 
@@ -61,7 +61,7 @@ _MUTATING_LIB_CALLS: dict[str, frozenset[str]] = {
 }
 
 #: Prefix of the harness functions of a ``@pyne`` test script. They are not
-#: script code — the AOT exporter drops them — so the rule does not apply to them.
+#: script code, so the rule does not apply to them.
 _TEST_PREFIX = '__test_'
 
 

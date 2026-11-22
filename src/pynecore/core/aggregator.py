@@ -77,7 +77,7 @@ def validate_aggregation(source_tf: str, target_tf: str) -> None:
 
 
 #: The ``function`` and ``why`` of the error of a volume sum that holds both
-#: infinities, per caller, in the AOT's words
+#: infinities, per caller
 VOLUME_ERROR_AGGREGATE = ('pyne data aggregate', 'the summed volumes hold both +inf and -inf')
 VOLUME_ERROR_SECURITY = ('request.security', 'the summed volumes hold both +inf and -inf')
 VOLUME_ERROR_MAGNIFIER = ('strategy', 'the sub-bar volumes add up to infinity minus infinity')
@@ -93,7 +93,7 @@ def _merge_candles(candles: list[OHLCV], bar_time: int, restore_volume: bool = F
     :param restore_volume: Whether the source volumes carry float32 storage
                error that has to be undone before summing
     :param volume_error: The ``function`` and ``why`` of the error raised when the
-               volumes hold both +inf and -inf: the caller's, as the AOT reports it
+               volumes hold both +inf and -inf: the caller's
     :return: Aggregated OHLCV candle
     """
     # The target file stores volume as an absolute f64, so its values are read

@@ -4,8 +4,8 @@ Generate ``pynecore/transformers/edge_rules.json`` from the Pyne Edge profile.
 
 The ``@pyne edge`` gate rejects every construct the Edge profile does not
 allow, and the profile is defined ONCE, in the PyneIDE's
-``pyneide_edge_rules.py``: the IDE lints against it, this gate compiles
-against it, and the AOT validator will consume the same data. A hand-copied
+``pyneide_edge_rules.py``: the IDE lints against it and this gate compiles
+against it. A hand-copied
 rule set would drift, and the drift would show as a script the IDE accepts
 and the compiler rejects -- or the other way round -- which is exactly the
 guarantee the gate exists to give. So the rules are EXTRACTED: this script

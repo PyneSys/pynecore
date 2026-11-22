@@ -997,5 +997,5 @@ Message:
 Internal error: {what}.
 ```
 
-An error of the runtime (PyneCore or PyneAOT), not of the script. Please
+An error of the runtime (PyneCore), not of the script. Please
 report it with the script, the data and the traceback attached.

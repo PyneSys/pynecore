@@ -90,7 +90,7 @@ def __test_helper_run_with_timeout(fn, seconds=120):
     return box.get('result')
 
 
-@pytest.mark.aot_unsupported("a security child process dies; a compiled run has no child process")
+@pytest.mark.python_only("a security child process dies")
 def __test_a_dying_consumer_child_stops_the_chart_with_an_error__(runner, log):
     """A security child dying mid-run stops the chart with its error instead of freezing it.
 

@@ -200,7 +200,7 @@ def __test_every_read_context_resolves__(runner, log):
     log.info("all five read contexts resolved on %d bars", len(rows))
 
 
-@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
+@pytest.mark.python_only("counts or groups security child processes")
 def __test_inline_signalled_contexts_share_one_child__(runner, log):
     """Every call on one stable feed shares a child, however its signal stands.
 

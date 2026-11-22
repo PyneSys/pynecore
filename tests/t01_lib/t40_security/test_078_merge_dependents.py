@@ -84,7 +84,7 @@ def __test_helper_run(runner, no_merge):
     return rows, spawned
 
 
-@pytest.mark.aot_unsupported("counts or groups security child processes; a compiled run has none")
+@pytest.mark.python_only("counts or groups security child processes")
 def __test_dependent_siblings_survive_sharing_one_child__(runner, log):
     """Dependent, accumulating, history-reading and looped members stay exact.
 

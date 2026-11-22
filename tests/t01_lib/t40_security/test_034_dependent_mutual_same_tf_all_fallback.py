@@ -82,7 +82,7 @@ def __test_helper_run_with_timeout(fn, seconds=120):
     return box.get('result')
 
 
-@pytest.mark.aot_unsupported("try/except: a compiled script has no exceptions")
+@pytest.mark.python_only("catches the script's errors with try/except")
 def __test_mutual_all_sids_fallback_terminates__(runner, log):
     """Two mutually dependent same-timeframe contexts terminate with correct values.
 

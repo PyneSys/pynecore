@@ -55,7 +55,7 @@ from pynecore.transformers.pine_type_rules import (  # noqa: E402
 )
 
 #: Registry format version. Bump whenever the shape below changes; the
-#: consumers (the inference engine, and the PyneAOT front end) pin it.
+#: consumers (the inference engine and its native port) pin it.
 SCHEMA_VERSION = 12
 
 #: The route ``classify_callee`` gives a callee it proves nothing about. The

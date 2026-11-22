@@ -1048,7 +1048,7 @@ def __test_the_published_shape_is_the_modules_own__(tmp_path):
 
 
 def __test_the_pipeline_digest_is_the_public_face_of_the_hash__():
-    """PyneAOT bakes this into its bundle to notice a pipeline it was not built by"""
+    """Stored transformed code carries it to notice a pipeline it was not built by"""
     assert PIPELINE_DIGEST == _get_transform_pipeline_hash()
     assert len(PIPELINE_DIGEST) == 16
     int(PIPELINE_DIGEST, 16)  # raises if it is not hex

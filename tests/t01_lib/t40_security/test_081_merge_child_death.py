@@ -95,7 +95,7 @@ def __test_a_zero_division_in_a_context_stops_the_run__(runner, log):
     log.info("the zero division surfaced as %s: %s", type(raised).__name__, raised)
 
 
-@pytest.mark.aot_unsupported("a security child process dies; a compiled run has no child process")
+@pytest.mark.python_only("a security child process dies")
 def __test_a_dead_merged_child_unblocks_every_context_it_served__(runner, log):
     """A merged child dying stops the chart with its error instead of freezing it.
 
@@ -120,7 +120,7 @@ def __test_a_dead_merged_child_unblocks_every_context_it_served__(runner, log):
     log.info("a dead merged security child surfaced as: %s", raised)
 
 
-@pytest.mark.aot_unsupported("a security child process dies; a compiled run has no child process")
+@pytest.mark.python_only("a security child process dies")
 def __test_the_unmerged_run_fails_the_same_way__(runner, log):
     """With merging off the same script fails identically, one child per context.
 
