@@ -9,6 +9,7 @@ fixture-fed ``replay`` provider.
 import itertools
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -45,10 +46,11 @@ def __test_helper_write_fixture(tmp_path: Path, last_ts: int) -> tuple[Path, Pat
 def __test_download_then_live_stream_runs_the_script__(script_path, module_key, tmp_path):
     """The downloaded bars run, then the bars the stream brought in run on
 
-    The replay provider streams its whole recording as soon as it connects, so the
-    live rows land while the history runs: the closed bar is caught up after the
-    history, and the update of the bar it closed is dropped, as for any feed whose
-    bars arrive during the warmup.
+    The replay provider streams its whole recording as soon as it connects, and the
+    history runs only once the stream has taken all of it, so the live rows land
+    during the warmup: the closed bar is caught up after the history, and the update
+    of the bar it closed is dropped, as for any feed whose bars arrive during the
+    warmup.
     """
     from pynecore.core.ohlcv import OHLCVReader
     from pynecore.core.provider_download import download_provider_history, open_live_stream
@@ -64,10 +66,29 @@ def __test_download_then_live_stream_runs_the_script__(script_path, module_key, 
                                         config_dir=config_dir)
 
     assert history.time_from_ts == last_ts - 4 * 60_000
+
+    # The stream asks for the next update only once it has queued the last one, so a
+    # call after the whole recording means every live row is in the queue. Without
+    # this wait a busy machine can run the history before the stream thread queued
+    # them: the warmup then ends on an empty queue, and the update goes on live.
+    provider = history.provider_instance
+    live_rows = len(json.loads((tmp_path / "fixture.json").read_text(encoding="utf-8"))["live"])
+    replay_watch = provider.watch_ohlcv
+    watch_calls = itertools.count(1)
+    recording_queued = threading.Event()
+
+    async def watch_ohlcv(symbol: str, timeframe: str):
+        if next(watch_calls) > live_rows:
+            recording_queued.set()
+        return await replay_watch(symbol, timeframe)
+
+    provider.watch_ohlcv = watch_ohlcv  # type: ignore[method-assign]
+
     with OHLCVReader(history.ohlcv_path) as reader:
         bars = list(reader.read_from(history.time_from_ts, last_ts))
         assert len(bars) == 5
         live = open_live_stream(history, last_historical_timestamp=last_ts, shutdown_timeout=5.0)
+        assert recording_queued.wait(10.0)
         runner = ScriptRunner(script_path, itertools.chain(bars, live), history.syminfo,
                               live=True)
         results = []

@@ -2630,14 +2630,21 @@ def __test_late_ticks_of_a_history_settled_slot_are_dropped__():
     stream = live_ohlcv_generator(provider, "BTC/USDT", "1", backfill=backfill)
     fill = backfill.request(s0)
     assert fill is not None and fill.result(timeout=5.0) == 1
-    provider.push(_make_ohlcv(s1, close=950.0, is_closed=False))
-    provider.push(_make_ohlcv(s2, close=102.0, is_closed=False))
-    provider.push(_make_ohlcv(s2, close=102.0))
 
+    # The fill queues its bar before its count resolves, so the consumer drains it as
+    # catch-up and reaches the transition before any tick is pushed. A forming update
+    # still queued at the transition is dropped by that catch-up drain: it would hide
+    # the forming tick of s2, and drop the late tick of s1 in place of the stream.
     seen: list[tuple[int, bool]] = []
     for item in stream:
         if item is LIVE_TRANSITION:
-            continue
+            break
+        seen.append((item.timestamp, item.is_closed))
+
+    provider.push(_make_ohlcv(s1, close=950.0, is_closed=False))
+    provider.push(_make_ohlcv(s2, close=102.0, is_closed=False))
+    provider.push(_make_ohlcv(s2, close=102.0))
+    for item in stream:
         seen.append((item.timestamp, item.is_closed))
         if item.timestamp == s2 and item.is_closed:
             break
