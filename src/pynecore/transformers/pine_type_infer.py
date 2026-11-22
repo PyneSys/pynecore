@@ -3827,7 +3827,9 @@ class _Inference:
         which reads the positions the pin has no witness for by their types,
         else the one the selection reads off those types (``_selected``): a
         typeless na goes to the first implementation the other arguments let
-        through, as the value dispatch on the na it is converted to does.
+        through, as the value dispatch on the na it is converted to does. An
+        implementation that declares another class where the pin has a wildcard
+        for an object argument is no answer (``_takes_wild_classes``).
 
         A call with keyword arguments is decided by ``_keyword_choice``.
 
@@ -3849,13 +3851,14 @@ class _Inference:
             return indexed, False
         settled = _Inference._settled(impls, pin, shapes)
         resolved = resolve_pin(impls, pin_chars(shapes))
-        if resolved is not None:
+        if resolved is not None and _takes_wild_classes(resolved, shapes):
             return resolved, settled
         position = pine_choice(impls, shapes)
         if position is None:
             found = _selected(impls, pin_chars(shapes), shapes)
             position = found[0] if found is not None and len(found) == 1 else None
-        if position is None or impls[position].slot < 0:
+        if position is None or impls[position].slot < 0 \
+                or not _takes_wild_classes(impls[position], shapes):
             return None, True
         return impls[position], settled
 
@@ -7188,6 +7191,30 @@ def _overload_callee(node: ast.Call) -> str:
             return selector.value
         callee = selector
     return dotted_name(callee) or ast.unparse(callee)
+
+
+def _takes_wild_classes(impl: ImplSig, shapes: Sequence[str]) -> bool:
+    """
+    Whether an implementation declares the class of every object argument its pin cannot witness.
+
+    A pin character witnesses a scalar; a UDT or enum argument (``o:<class id>``)
+    is a wildcard to the pin, so a selection read from the characters never sees
+    its class. The runtime binds an indexed pin without checking the arguments,
+    so an implementation declaring another class there would run on an object it
+    was not written for, where the value dispatch refuses the call. A parameter
+    without an annotation takes every value.
+
+    :param impl: The implementation a selection settled on
+    :param shapes: The static type of each positional argument
+    :return: True when every such argument is of the class its parameter declares
+    """
+    for position, (char, shape) in enumerate(zip(pin_chars(shapes), shapes)):
+        if char != PIN_ANY or class_of(shape) is None or position >= len(impl.params):
+            continue
+        if impl.params[position] != shape and not (position < len(impl.bare)
+                                                   and impl.bare[position] == '1'):
+            return False
+    return True
 
 
 def _selected(impls: Sequence[ImplSig], chars: str, shapes: Sequence[str]) -> list[int] | None:

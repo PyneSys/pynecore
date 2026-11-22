@@ -945,3 +945,71 @@ def __test_the_by_name_index_can_be_switched_off__(tmp_path, monkeypatch):
     state = _make_state(module.__pyne_slot_layout__['main'])
     assert module.main(state, 3, 2) == (1, 1)
 
+
+
+TWO_CLASS_METHOD_LIB = '''"""
+@pyne
+"""
+from pynecore.core.overload import overload
+from pynecore.core.pine_export import Exported, export
+from pynecore.core.pine_method import method
+from pynecore.core.pine_udt import udt
+
+__all__ = ['Holder', 'Other', 'tag']
+tag = Exported()
+
+
+@udt
+class Other:
+    v: int = 0
+
+
+@udt
+class Holder:
+    v: int = 0
+
+
+@export
+@overload
+@method
+def tag(this: Other, s: str) -> str:
+    return 'other-str'
+
+
+@export
+@overload
+@method
+def tag(this: Holder, n: int) -> str:
+    return 'holder-int'
+'''
+
+TWO_CLASS_METHOD_APP = '''"""
+@pyne
+"""
+from pynecore.core.pine_method import method_call
+import xm_two_class_lib as tl
+
+
+def main():
+    fits = method_call('tag', tl.Holder.new(), 1)
+    wrong = method_call('tag', tl.Holder.new(), "x")
+    return fits, wrong
+'''
+
+
+def __test_a_receiver_class_no_implementation_declares_names_none__(tmp_path, monkeypatch):
+    """
+    ``method_call('tag', Holder, "x")``: the string alone names ``tag(Other, str)``,
+    but the receiver is a ``Holder``. An indexed pin binds without checking the
+    arguments, so naming it would run that method on a ``Holder``; the call keeps
+    no index and the value dispatch refuses it, as Pine does
+    """
+    monkeypatch.syspath_prepend(tmp_path)
+    _write(tmp_path, 'xm_two_class_lib', TWO_CLASS_METHOD_LIB)
+    app = _write(tmp_path, 'xm_two_class_app', TWO_CLASS_METHOD_APP)
+
+    tree, _ = _analysed(app)
+
+    pins = [get_pin(node) for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == 'method_call']
+    assert pins == ['*i=1', None]

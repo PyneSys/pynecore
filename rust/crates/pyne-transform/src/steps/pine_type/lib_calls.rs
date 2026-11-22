@@ -244,7 +244,9 @@ pub(super) fn pine_index(
 /// dispatch runs it too (`settled`): none where an argument's type is unknown
 /// (`is_unsettled`); else Pine's where the pin's characters or the values run another
 /// (`pine_index`), the selector's for the types (`resolve_pin`), Pine's
-/// (`pine_choice`), and the one the selection reads off the types (`selected`).
+/// (`pine_choice`), and the one the selection reads off the types (`selected`); an
+/// implementation declaring another class at an object argument the pin has a wildcard
+/// for is no answer (`takes_wild_classes`).
 pub(super) fn group_choice(
     impls: &[ImplSig],
     shapes: &[String],
@@ -263,7 +265,9 @@ pub(super) fn group_choice(
     }
     let settled = settled(Some(impls), pin.as_deref(), shapes);
     let chars = pin_chars(shapes);
-    if let Some(index) = resolve_pin(impls, &chars) {
+    if let Some(index) = resolve_pin(impls, &chars)
+        && takes_wild_classes(&impls[index], shapes)
+    {
         return (Some(index), settled);
     }
     let position = pine_choice(impls, shapes).or_else(|| match selected(impls, &chars, shapes) {
@@ -271,9 +275,26 @@ pub(super) fn group_choice(
         _ => None,
     });
     match position {
-        Some(index) if impls[index].slot >= 0 => (Some(index), settled),
+        Some(index) if impls[index].slot >= 0 && takes_wild_classes(&impls[index], shapes) => {
+            (Some(index), settled)
+        }
         _ => (None, true),
     }
+}
+
+/// Whether an implementation declares the class of every object argument its pin cannot
+/// witness (`_takes_wild_classes`): a UDT or enum argument is a wildcard to the pin, so a
+/// selection read from the characters never sees its class, and the runtime binds an
+/// indexed pin without checking the arguments. A parameter without an annotation takes
+/// every value.
+fn takes_wild_classes(imp: &ImplSig, shapes: &[String]) -> bool {
+    pin_chars(shapes).chars().zip(shapes).enumerate().all(|(position, (char, shape))| {
+        char != PIN_ANY
+            || class_of(shape).is_none()
+            || position >= imp.params.len()
+            || imp.params[position] == *shape
+            || imp.bare.as_bytes().get(position) == Some(&b'1')
+    })
 }
 
 /// The one implementation a call with keyword arguments runs, from the static types
