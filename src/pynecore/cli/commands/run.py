@@ -1256,8 +1256,6 @@ def run(
             ohlcv_iter = iter([])
         else:
             ohlcv_iter = chart_bar_window.bars()
-        lossless_volume = reader.lossless_volume
-        lossless_prices = reader.lossless_prices
 
         # --broker implies --live.
         if broker:
@@ -1507,8 +1505,6 @@ def run(
                                           chart_provider_instance=chart_provider_instance,
                                           time_from=time_from_dt,
                                           chart_data_path=data_path,
-                                          lossless_volume=lossless_volume,
-                                          lossless_prices=lossless_prices,
                                           config_dir=app_state.config_dir,
                                           profile_path=profile_path)
                 except ProfilerUnavailable as e:

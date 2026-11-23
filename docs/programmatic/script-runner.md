@@ -115,7 +115,7 @@ bar is calculated.
 
 The remaining keyword parameters (`broker_plugin`, `broker_event_loop`, `broker_store_ctx`,
 `chart_provider_name`, `chart_provider_instance`, `chart_data_path`, `time_from`, `log_ohlcv`,
-`lossless_volume`, `lossless_prices`, `chart_bar_window`) wire up live data providers and broker
+`chart_bar_window`) wire up live data providers and broker
 trading for `pyne run`. A plain backtest from Python needs none of them; see
 [Live Mode](../advanced/live-mode.md) for how live runs work.
 

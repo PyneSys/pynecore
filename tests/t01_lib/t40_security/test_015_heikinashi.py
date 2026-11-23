@@ -99,7 +99,7 @@ def __test_heikinashi_same_symbol__(runner, syminfo, tmp_path, log):
 def __test_heikinashi_subtick_precision__(runner, syminfo, tmp_path, log):
     """A Heikin Ashi bar keeps full precision — it is never snapped to the mintick grid.
 
-    ``_round_price`` cleans float32 ``.ohlcv`` storage artifacts off values that
+    ``restore_f32_price`` cleans float32 ``.ohlcv`` storage artifacts off values that
     genuinely sit on the mintick grid. A Heikin Ashi candle is an average of
     four such values, so it lands BETWEEN grid points and TradingView reports it
     unrounded (measured on BINANCE:BTCUSDT 30m). The feed below is on the grid

@@ -18,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, TYPE_CHECKING
 
+# noinspection PyProtectedMember
+from ..lib.strategy import _price_round
+
 if TYPE_CHECKING:
     from ..core.syminfo import SymInfo
     from ..lib.strategy import Order, SimPosition, Trade
@@ -397,10 +400,14 @@ class TradeRecorder:
             options: list[float] = []
             if stop is not None and stop == stop:
                 options.append(float(stop))
+            # The levels a fill resolves are snapped to the tick grid exactly as the
+            # engine snaps them (``SimPosition`` ticks resolution), so the recorded
+            # stop is the one that fills
             if mirrored is not None:
-                options.append(2.0 * entry - float(mirrored))
+                options.append(_price_round(2.0 * entry - float(mirrored), -direction))
             if loss_ticks is not None and self._mintick > 0.0:
-                options.append(entry - direction * self._mintick * float(loss_ticks))
+                options.append(_price_round(
+                    entry - direction * self._mintick * float(loss_ticks), -direction))
             if options:
                 # Both levels of one exit are live: the nearer one fills first
                 stops.append(max(options, key=lambda s: direction * s))

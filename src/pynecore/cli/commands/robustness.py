@@ -141,8 +141,6 @@ class _RunnerFactory:
                                 chart_bar_window=chart_bar_window,
                                 time_from=self.time_from,
                                 chart_data_path=self.data_path,
-                                lossless_volume=reader.lossless_volume,
-                                lossless_prices=reader.lossless_prices,
                                 config_dir=self.config_dir)
 
 

@@ -14,7 +14,6 @@ import time
 import tomllib
 from dataclasses import dataclass, field as dataclasses_field
 from functools import partial
-from math import floor
 from pathlib import Path
 from datetime import datetime, UTC
 
@@ -24,7 +23,7 @@ from datetime import datetime, UTC
 # CLI launched from the monorepo root, whose top-level ``pynecore/`` directory
 # shadows the editable ``src/pynecore``), and then only a cached transformed
 # ``.pyc`` would hide it. Importing the module installs the hook.
-from pynecore.core import import_hook, pine_math
+from pynecore.core import import_hook
 from pynecore import lib
 from pynecore.core import script as script_mod
 from pynecore.lib import timeframe as timeframe_lib
@@ -47,7 +46,7 @@ from pynecore.core.error_location import located
 from pynecore.core.errors import MAIN_MODULE, MODULE_ID, PyneError
 from pynecore.core.live_timing import is_catch_up, is_stale_update
 from pynecore.core.lookahead import ALLOW_LOOKAHEAD
-from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, copy_ohlcv_tail, restore_f32_volume
+from pynecore.core.ohlcv import ChartBarWindow, OHLCVReader, copy_ohlcv_tail
 from pynecore.core.script_timeframe import ScriptTimeframe
 from pynecore.core.series import close_collection_bar
 from pynecore.core.strategy_stats import calculate_strategy_statistics, write_strategy_statistics_csv
@@ -280,37 +279,6 @@ def import_script(script_path: Path, *, inputs: dict[str, Any] | None = None,
     return module
 
 
-def _round_price(price: float, tick_decimals: int | None):
-    """
-    Clean float32 ``.ohlcv`` storage artifacts from an OHLC price, keeping the
-    finer of the mintick grid and a 6-significant-digit clean-up.
-
-    The float32 OHLCV format stores prices with sub-tick error (mintick=0.01
-    turns 93761.9 into 93761.8984; 109547.84 into 109547.836). Two clean-up
-    grids matter, and the right one depends on price magnitude:
-
-    - **6 significant digits** (``5 - floor(log10|price|)`` decimals) is the
-      historical heuristic. It is correct for small prices, where TradingView
-      itself carries sub-mintick precision (e.g. close=4.38075 on a coarser
-      tick), so it must NOT be snapped to the tick.
-    - **mintick decimals** is needed for large prices: at BTC ~94000, 6 sig
-      digits only reaches 1 decimal (93898.05 -> 93898.1) and discards the real
-      mintick-aligned precision, which flips threshold/hysteresis indicators.
-
-    Taking ``max`` of the two decimal counts keeps the finer grid in both
-    regimes — never coarser than the old 6-sig behaviour, only finer when the
-    mintick demands it. ``tick_decimals`` is ``None`` when the symbol has no
-    real mintick, falling back to the 6-sig clean-up alone.
-    """
-    if price == 0.0:
-        return 0.0
-    # The portable log10 kernel, not the platform's, whose answers differ per system
-    precision = 5 - floor(pine_math.log10(abs(price)))  # 6 significant digits
-    if tick_decimals is not None and tick_decimals > precision:
-        precision = tick_decimals
-    return round(price, precision)
-
-
 # noinspection PyShadowingNames
 def _set_path_bar(lib: ModuleType, node: int, bar: tuple[float, float, float, float, float],
                   near_is_high: bool) -> None:
@@ -379,62 +347,16 @@ def _set_partial_bar(lib: ModuleType, o: float, h: float, lo: float, c: float,
     props['hlcc4'] = (h + lo + 2 * c) / 4.0
 
 
-# noinspection PyShadowingNames,PyUnusedLocal
-def _clean_bar(ohlcv: OHLCV, round_decimals: int | None,
-               lossless_volume: bool, lossless_prices: bool,
-               derived_prices: bool = False
-               ) -> tuple[float, float, float, float, float]:
-    """
-    The bar's OHLCV exactly as the script sees it.
-
-    The ONE place the feed's float32 storage artifacts are cleaned off a chart
-    bar: :func:`_set_lib_properties` publishes what this returns, and anything
-    else that has to reproduce the chart's own bar values — a security child
-    replaying a developing batch, see
-    :func:`pynecore.core.security.iter_dev_batch_records` — asks the same
-    function rather than re-deriving them.
-
-    :param ohlcv: The raw bar as the feed read it.
-    :param round_decimals: Mintick decimals for :func:`_round_price`.
-    :param lossless_volume: The feed reads its volume back exactly.
-    :param lossless_prices: The feed reads its OHLC back exactly (see
-        :attr:`OHLCVReader.lossless_prices`); there is no artifact to clean.
-    :param derived_prices: The prices are computed from already cleaned values
-        (a synthetic Heikin Ashi candle), so they carry no artifact and do not
-        sit on the mintick grid.
-    :return: ``(open, high, low, close, volume)``.
-    """
-    if derived_prices or lossless_prices:
-        o, h, lo, c = ohlcv.open, ohlcv.high, ohlcv.low, ohlcv.close
-    else:
-        o = _round_price(ohlcv.open, round_decimals)
-        h = _round_price(ohlcv.high, round_decimals)
-        lo = _round_price(ohlcv.low, round_decimals)
-        c = _round_price(ohlcv.close, round_decimals)
-    return o, h, lo, c, (ohlcv.volume if lossless_volume
-                         else restore_f32_volume(ohlcv.volume))
-
-
 # noinspection PyProtectedMember
 def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo',
-                        round_decimals: int | None, last_bar_index: int | None = None,
-                        last_bar_time: int | None = None,
-                        lossless_volume: bool = False,
-                        lossless_prices: bool = False,
-                        derived_prices: bool = False):
+                        last_bar_index: int | None = None,
+                        last_bar_time: int | None = None):
     """
     Set lib properties from OHLCV
 
-    :param lossless_prices: The feed reads its OHLC back exactly (see
-        :attr:`OHLCVReader.lossless_prices`). There is no float32 storage artifact
-        to clean, and a legitimately off-grid price -- split-adjusted history, for
-        one -- only loses precision to the 6-significant-digit heuristic, so
-        ``_round_price`` is skipped.
-    :param derived_prices: The bar's prices are computed from already cleaned
-        feed values (a synthetic Heikin Ashi candle), not read from float32
-        storage. Such a price carries no storage artifact and does not sit on
-        the mintick grid, so ``_round_price`` must not touch it — TradingView
-        keeps the full-precision value (measured).
+    The bar is published as it arrives. A bar read from a file is already clean
+    (:class:`~pynecore.core.ohlcv.OHLCVReader` removes the float32 storage
+    artifacts), and a provider's bar never went through storage.
     """
     # The 18 properties below are written straight into the module namespace:
     # a module attribute store costs twice a dict store (measured 20.4 vs
@@ -463,12 +385,12 @@ def _set_lib_properties(ohlcv: OHLCV, bar_index: int, tz: 'ZoneInfo',
     props['bar_index'] = float(bar_index)
     props['last_bar_index'] = float(bar_index if last_bar_index is None else last_bar_index)
 
-    o, h, lo, c, props['volume'] = _clean_bar(
-        ohlcv, round_decimals, lossless_volume, lossless_prices, derived_prices)
+    o, h, lo, c = ohlcv.open, ohlcv.high, ohlcv.low, ohlcv.close
     props['open'] = o
     props['high'] = h
     props['low'] = lo
     props['close'] = c
+    props['volume'] = ohlcv.volume
     props['extra_fields'] = ohlcv.extra_fields if ohlcv.extra_fields else {}
 
     # TradingView fills ``bid``/``ask`` only on the ``"1T"`` (tick) feed and reports ``na``
@@ -1350,7 +1272,6 @@ class ScriptRunner:
                  '_engine_event_stream_future', '_quarantine_resume_watch_future',
                  '_broker_stop_settle_s', 'broker_stop_settled', '_broker_stop_settle_ran',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
-                 '_round_decimals', '_lossless_volume', '_lossless_prices',
                  '_config_dir', '_symbol_map', '_script_timeframe',
                  '_chart_bar_window',
                  'broker_balance', '_sim_logged_open_ids', '_inputs', '_settings', '_live',
@@ -1381,8 +1302,6 @@ class ScriptRunner:
                  chart_provider_instance: Any = None,
                  time_from: datetime | None = None,
                  chart_data_path: Path | None = None,
-                 lossless_volume: bool = False,
-                 lossless_prices: bool = False,
                  chart_bar_window: 'ChartBarWindow | None' = None,
                  config_dir: Path | None = None,
                  profile_path: Path | None = None):
@@ -1492,16 +1411,6 @@ class ScriptRunner:
                                      teardown stops the broker event stream. ``0`` skips
                                      the wait. The outcome is
                                      :attr:`~ScriptRunner.broker_stop_settled`.
-        :param lossless_volume: Whether ``ohlcv_iter`` yields the feed's own volume,
-                                needing no float32 storage clean-up. Read from the
-                                chart feed's :attr:`OHLCVReader.lossless_volume`;
-                                leave false when the source is unknown, which keeps
-                                the clean-up on (see :func:`restore_f32_volume`)
-        :param lossless_prices: Whether ``ohlcv_iter`` yields the feed's own OHLC,
-                                needing no float32 storage clean-up. Read from the
-                                chart feed's :attr:`OHLCVReader.lossless_prices`;
-                                leave false when the source is unknown, which keeps
-                                the clean-up on (see :func:`_round_price`)
         :param profile_path: Profile the run and write the per-line profile here (see
                              :mod:`pynecore.core.profiler`). Backtests only.
         :raises MissingFileError: If the script file does not exist
@@ -1812,12 +1721,6 @@ class ScriptRunner:
         # path uses a synthetic ``0.01`` tick for the same case).
         _mintick = getattr(syminfo, 'mintick', 0.0) or 0.0
         self._price_decimals = mintick_decimals(_mintick) if _mintick > 0 else 2
-        # Decimals used to snap OHLC to the mintick grid (see ``_round_price``).
-        # ``None`` when the symbol carries no real mintick, so rounding falls
-        # back to the magnitude-relative significant-digit heuristic.
-        self._round_decimals = mintick_decimals(_mintick) if _mintick > 0 else None
-        self._lossless_volume = lossless_volume
-        self._lossless_prices = lossless_prices
 
         self.tz = lib._parse_timezone(syminfo.timezone)
 
@@ -2254,10 +2157,8 @@ class ScriptRunner:
     def _dev_batch_spec(self, sec_state) -> 'DevBatchSpec':
         """What a context's child needs to reproduce its developing-batch rounds.
 
-        The chart's half is its bar window and the cleaning parameters the bar
-        loop publishes its bars with, so the child walks exactly the bars the
-        loop runs on: the same window object ``ohlcv_iter`` was produced from,
-        the same :func:`_clean_bar` arguments :func:`_set_lib_properties` uses.
+        The chart's half is its bar window, so the child walks exactly the bars
+        the loop runs on: the same window object ``ohlcv_iter`` was produced from.
         The context's half is what the per-bar path derived each push from — the
         aggregator's own configuration and the chart's schedule.
 
@@ -2268,9 +2169,6 @@ class ScriptRunner:
         assert self._chart_bar_window is not None
         return DevBatchSpec(
             window=self._chart_bar_window,
-            round_decimals=self._round_decimals,
-            lossless_volume=self._lossless_volume,
-            lossless_prices=self._lossless_prices,
             timeframe=sec_state.timeframe,
             tz=sec_state.tz,
             session_starts=sec_state.session_starts,
@@ -3576,47 +3474,23 @@ class ScriptRunner:
                     lib._plot_data.update(r)
 
             # noinspection PyProtectedMember
-            def _write_plot_row(row_candle, values, echo_lib: bool):
+            def _write_plot_row(row_candle, values):
                 """Write one output row of the plot CSV.
 
                 :param row_candle: The bar the row is keyed by — a CHART bar in
                     script-timeframe mode, the executed bar otherwise.
                 :param values: Plot values for this row.
-                :param echo_lib: Take the OHLCV from ``lib.*`` (the bar the body
-                    saw) instead of snapping ``row_candle``'s own values.
                 """
                 if not self.plot_writer or not values:
                     return
                 ef = {} if row_candle.extra_fields is None else dict(row_candle.extra_fields)
                 ef.update(values)
-                if echo_lib:
-                    # Echo the bar the script actually saw: ``lib.open``… and
-                    # ``lib.volume`` are snapped off the float32 storage grid by
-                    # ``_round_price`` / ``restore_f32_volume``, so writing the raw candle
-                    # would show an input no bar was ever computed from.
-                    row_candle = row_candle._replace(
-                        open=lib.open, high=lib.high, low=lib.low, close=lib.close,
-                        volume=lib.volume)
-                else:
-                    # Script-timeframe row: ``lib.*`` holds the higher-timeframe bar
-                    # while the row is a chart bar, so the chart candle is snapped off
-                    # the storage grid here instead.
-                    if not self._lossless_prices:
-                        rd = self._round_decimals
-                        row_candle = row_candle._replace(
-                            open=_round_price(row_candle.open, rd),
-                            high=_round_price(row_candle.high, rd),
-                            low=_round_price(row_candle.low, rd),
-                            close=_round_price(row_candle.close, rd))
-                    if not self._lossless_volume:
-                        row_candle = row_candle._replace(
-                            volume=restore_f32_volume(row_candle.volume))
                 self.plot_writer.write_ohlcv(row_candle._replace(extra_fields=ef))
 
             # noinspection PyProtectedMember
-            def _write_bar_output(bar_candle, echo_lib: bool = True):
+            def _write_bar_output(bar_candle):
                 nonlocal broker_trades_closed_written
-                _write_plot_row(bar_candle, lib._plot_data, echo_lib)
+                _write_plot_row(bar_candle, lib._plot_data)
 
                 self._write_viz_bar()
 
@@ -3899,7 +3773,7 @@ class ScriptRunner:
                     if htf_candle is None:
                         gap_values = stf.gap_values
                         if gap_values is not None:
-                            _write_plot_row(candle, gap_values, False)
+                            _write_plot_row(candle, gap_values)
                             yield candle, gap_values
                         if on_progress:
                             on_progress(datetime.fromtimestamp(
@@ -3955,10 +3829,8 @@ class ScriptRunner:
                 if last_index is not None and calc_start > 0:
                     last_index -= calc_start
                 _set_lib_properties(
-                    exec_candle, self.bar_index, self.tz, self._round_decimals,
-                    last_index,
+                    exec_candle, self.bar_index, self.tz, last_index,
                     (self.last_bar_time if stf is None else stf.last_bar_time),
-                    self._lossless_volume, self._lossless_prices,
                 )
                 # The peek the last-bar detection above already holds: HTF
                 # security confirmation reads it to recognize a session that
@@ -4061,10 +3933,8 @@ class ScriptRunner:
                 # Write output — in script-timeframe mode the row stays keyed by
                 # the CHART bar that closed this HTF bar, so the output grid is the
                 # chart's and gap bars can be filled around it.
-                if stf is None:
-                    _write_bar_output(candle)
-                else:
-                    _write_bar_output(candle, echo_lib=False)
+                _write_bar_output(candle)
+                if stf is not None:
                     stf.remember(lib._plot_data)
 
                 # Yield
@@ -4301,9 +4171,7 @@ class ScriptRunner:
                     barstate.isconfirmed = bar_update.is_closed
                     barstate.isnew = is_new_bar
 
-                    _set_lib_properties(candle, self.bar_index, self.tz, self._round_decimals,
-                                        lossless_volume=self._lossless_volume,
-                                        lossless_prices=self._lossless_prices)
+                    _set_lib_properties(candle, self.bar_index, self.tz)
                     # Live: no next bar exists, so HTF confirmation keeps the
                     # session schedule instead of the chart-grid peek.
                     lib._next_time = 0
@@ -4929,9 +4797,7 @@ class ScriptRunner:
             barstate.isnew = True
 
             # Set lib OHLCV to the aggregated chart-bar values (what the script sees)
-            _set_lib_properties(window.aggregated, self.bar_index, self.tz, self._round_decimals,
-                                lossless_volume=self._lossless_volume,
-                                lossless_prices=self._lossless_prices)
+            _set_lib_properties(window.aggregated, self.bar_index, self.tz)
             lib._next_time = window.next_time
 
             # Store first price for buy & hold calculation
@@ -4961,16 +4827,10 @@ class ScriptRunner:
                 hi, lo, vol = float('-inf'), float('inf'), 0.0
                 for idx in range(len(window.sub_bars) - 1):
                     sub_bar = window.sub_bars[idx]
-                    sub_high = (sub_bar.high if self._lossless_prices
-                                else _round_price(sub_bar.high, self._round_decimals))
-                    sub_low = (sub_bar.low if self._lossless_prices
-                               else _round_price(sub_bar.low, self._round_decimals))
-                    hi = max(hi, sub_high)
-                    lo = min(lo, sub_low)
-                    vol += (sub_bar.volume if self._lossless_volume
-                            else restore_f32_volume(sub_bar.volume))
-                    sub_close = (sub_bar.close if self._lossless_prices
-                                 else _round_price(sub_bar.close, self._round_decimals))
+                    hi = max(hi, sub_bar.high)
+                    lo = min(lo, sub_bar.low)
+                    vol += sub_bar.volume
+                    sub_close = sub_bar.close
                     if var_snapshot.has_vars:
                         var_snapshot.restore()
                     _drop_discarded_run(drawing_snapshot)

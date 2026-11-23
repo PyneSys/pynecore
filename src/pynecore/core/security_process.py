@@ -1150,8 +1150,7 @@ def security_process_main(
                 real_index_map = rim
 
     # Import the script module (triggers AST transformation)
-    from .script_runner import (import_script, _round_price, _set_lib_properties,
-                                _set_lib_syminfo_properties)
+    from .script_runner import import_script, _set_lib_properties, _set_lib_syminfo_properties
     from pynecore import lib
     from pynecore.lib import barstate
     from pynecore.core import instance_state, script as script_mod
@@ -1221,20 +1220,6 @@ def security_process_main(
         chart_ring_capacity=chart_ring_capacity,
         chart_ring_arena=chart_ring_arena,
     )
-
-    # Mintick decimals for OHLC grid-snapping in ``_set_lib_properties``
-    # (``None`` when the symbol has no real mintick -> falls back to the
-    # significant-digit clean-up). Mirrors ``ScriptRunner._round_decimals``.
-    from .syminfo import mintick_decimals
-    _sec_mintick = getattr(syminfo, 'mintick', 0.0) or 0.0
-    round_decimals = mintick_decimals(_sec_mintick) if _sec_mintick > 0 else None
-    # This context's own feed decides whether its bars need the float32 storage
-    # clean-up — a child can run on a different file, and format, than the chart.
-    # Without a reader this is the live provider path: warmup and streamed bars
-    # carry the provider's own values and never touched storage, so the clean-up
-    # there could only truncate what the feed served.
-    lossless_volume = reader.lossless_volume if reader is not None else True
-    lossless_prices = reader.lossless_prices if reader is not None else True
 
     # A security child is a read-only replica of the user's script, not a place
     # to persist config. ``script.indicator``/``strategy`` re-saves the script's
@@ -1377,14 +1362,12 @@ def security_process_main(
     # otherwise var-less plain-OHLCV context, activating the snapshot exactly
     # where the recurrence needs it.
     #
-    # The float32 storage clean-up belongs to the feed values the recurrence
-    # READS, so ``_ha_apply`` runs it itself and the emitted HA bar is then
-    # handed to ``_set_lib_properties`` as ``derived_prices``: an HA candle is an
-    # average, it does not sit on the mintick grid, and TradingView keeps its
-    # full precision (measured on BINANCE:BTCUSDT 30m — snapping it to mintick
-    # moved ``ta.ema(haClose, 34)`` by up to 2.2e-3, the raw average reproduces
-    # TV's own plot to 1.5e-11).
-    _derived_prices = chart_type == 'heikinashi'
+    # The recurrence reads the feed values as they arrive (a file's bars come
+    # clean from its reader), and the HA bar it emits is published unrounded: an
+    # HA candle is an average, it does not sit on the mintick grid, and
+    # TradingView keeps its full precision (measured on BINANCE:BTCUSDT 30m —
+    # snapping it to mintick moved ``ta.ema(haClose, 34)`` by up to 2.2e-3, the
+    # raw average reproduces TV's own plot to 1.5e-11).
     if chart_type == 'heikinashi':
         _ha_key = f'__heikinashi__{sec_id}'
         _ha_root = instance_state.create_root(_ha_key, {
@@ -1414,11 +1397,7 @@ def security_process_main(
                         if _wb.timestamp >= _first_ts_ms:
                             break
                         _wo, _, _, _wc = _heikinashi_step(
-                            _po, _pc,
-                            _round_price(_wb.open, round_decimals),
-                            _round_price(_wb.high, round_decimals),
-                            _round_price(_wb.low, round_decimals),
-                            _round_price(_wb.close, round_decimals))
+                            _po, _pc, _wb.open, _wb.high, _wb.low, _wb.close)
                         _po, _pc = _wo, _wc
             except (OSError, ValueError):
                 # A missing or unreadable warmup feed is not worth failing the
@@ -1435,14 +1414,11 @@ def security_process_main(
                 # Legacy gap-fill bar: forward-fill the last HA close flat and do
                 # NOT advance the recurrence (mirrors the removed feed transform's
                 # ``volume < 0`` skip).
-                _fill = _ha_root[1] if _ha_root[1] is not None else _round_price(
-                    _b.close, round_decimals)
+                _fill = _ha_root[1] if _ha_root[1] is not None else _b.close
                 _ha_pending[0], _ha_pending[1] = _ha_root[0], _ha_root[1]
                 return _b._replace(open=_fill, high=_fill, low=_fill, close=_fill)
             _ho, _hh, _hl, _hc = _heikinashi_step(
-                _ha_root[0], _ha_root[1],
-                _round_price(_b.open, round_decimals), _round_price(_b.high, round_decimals),
-                _round_price(_b.low, round_decimals), _round_price(_b.close, round_decimals))
+                _ha_root[0], _ha_root[1], _b.open, _b.high, _b.low, _b.close)
             _ha_pending[0], _ha_pending[1] = _ho, _hc
             return _b._replace(open=_ho, high=_hh, low=_hl, close=_hc)
 
@@ -1668,9 +1644,7 @@ def security_process_main(
         last_warmup_ts = bar_buffer[-1].timestamp if bar_buffer else None
 
         def _run_ltf_intrabar(intrabar, bar_index, confirmed, is_new, islast):
-            _set_lib_properties(intrabar, bar_index, tz, round_decimals,
-                                lossless_volume=lossless_volume,
-                                lossless_prices=lossless_prices)
+            _set_lib_properties(intrabar, bar_index, tz)
             lib.last_bar_index = float(bar_index)
             barstate.isfirst = (bar_index == 0)
             barstate.islast = islast
@@ -2187,10 +2161,7 @@ def security_process_main(
                             snap.restore()
                         _ensure_child_snapshot().restore()
 
-                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, round_decimals,
-                                        lossless_volume=lossless_volume,
-                                        lossless_prices=lossless_prices,
-                                        derived_prices=_derived_prices)
+                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz)
                     _set_series_end(current_bar, dev_is_history)
 
                     barstate.isfirst = (current_bar == 0)
@@ -2281,10 +2252,7 @@ def security_process_main(
 
                     last_dev_period_start = None
 
-                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz, round_decimals,
-                                        lossless_volume=lossless_volume,
-                                        lossless_prices=lossless_prices,
-                                        derived_prices=_derived_prices)
+                    _set_lib_properties(_ha_apply(ohlcv), current_bar, tz)
                     _set_series_end(current_bar, dev_is_history)
                     barstate.isfirst = (current_bar == 0)
                     barstate.islast = False
@@ -2373,10 +2341,7 @@ def security_process_main(
                     sec_ctx.is_round_last = not next_open or next_open > target_time
 
                     total_bars = _current_total()
-                    _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz, round_decimals,
-                                        lossless_volume=lossless_volume,
-                                        lossless_prices=lossless_prices,
-                                        derived_prices=_derived_prices)
+                    _set_lib_properties(_ha_apply(ohlcv_file_bar), current_bar, tz)
                     lib.last_bar_index = float(total_bars - 1)
                     if reader is not None:
                         lib.last_bar_time = file_last_bar_time_ms

@@ -955,16 +955,12 @@ class DevBatchSpec:
     Travels to the child in the spawn arguments (a few hundred bytes) in place
     of the round sequence itself. Two halves:
 
-    * the chart's bar production — the window over the chart's own OHLCV file
-      and the cleaning parameters the bar loop publishes its bars with, so the
-      child walks the very bars the loop runs on;
+    * the chart's bar production — the window over the chart's own OHLCV file,
+      so the child walks the very bars the loop runs on;
     * the chart-side context state the per-bar path derived each push from — the
       aggregator's configuration and the chart's own schedule.
 
     :param window: The run's chart bar window (see :class:`ChartBarWindow`).
-    :param round_decimals: Mintick decimals of the chart's price rounding.
-    :param lossless_volume: The chart feed reads its volume back exactly.
-    :param lossless_prices: The chart feed reads its OHLC back exactly.
     :param timeframe: The context's timeframe.
     :param tz: The context's session timezone.
     :param session_starts: Its intraday session anchoring, or ``None``.
@@ -979,9 +975,6 @@ class DevBatchSpec:
     """
 
     window: 'ChartBarWindow'
-    round_decimals: int | None
-    lossless_volume: bool
-    lossless_prices: bool
     timeframe: str
     tz: ZoneInfo
     session_starts: 'list[SymInfoSession] | None'
@@ -1092,10 +1085,9 @@ def iter_dev_batch_records(spec: DevBatchSpec,
     """Produce the whole historical developing-transport sequence of a context.
 
     Walks the CHART's bars — from ``spec.window``, the same production the bar
-    loop takes its bars from, cleaned by the same
-    :func:`~pynecore.core.script_runner._clean_bar` the loop publishes through — with a
-    private :class:`HTFAggregator` configured exactly like the runtime one, and yields
-    per bar what ``__sec_signal__``'s ``Lookahead.ON`` branch would have pushed: the
+    loop takes its bars from — with a private :class:`HTFAggregator` configured
+    exactly like the runtime one, and yields per bar what ``__sec_signal__``'s
+    ``Lookahead.ON`` branch would have pushed: the
     one-time prefill target, then the closed step of a period that just completed
     and the developing step of the period in progress.
 
@@ -1121,11 +1113,9 @@ def iter_dev_batch_records(spec: DevBatchSpec,
     :return: Iterator of ``(kind, period_start, open, high, low, close, volume,
         tick, sched_next_open)`` records, in push order.
     """
-    # Neither can be imported at module level: ``htf_aggregator`` pulls in
-    # ``resampler``, which imports ``lib``, which imports THIS module, and
-    # ``script_runner`` imports ``lib`` too.
+    # Cannot be imported at module level: ``htf_aggregator`` pulls in
+    # ``resampler``, which imports ``lib``, which imports THIS module.
     from .htf_aggregator import HTFAggregator
-    from .script_runner import _clean_bar
 
     cal = spec.chart_calendar
     # A private aggregator, same construction as ``setup_security_states``': the
@@ -1136,9 +1126,6 @@ def iter_dev_batch_records(spec: DevBatchSpec,
         chart_span_ms=spec.chart_span_ms, grid_mode=spec.grid_mode)
     chart_off = spec.chart_off
     chart_timeframe = spec.chart_timeframe
-    round_decimals = spec.round_decimals
-    lossless_volume = spec.lossless_volume
-    lossless_prices = spec.lossless_prices
     last_confirmed = 0
     prefilled = False
     dev_period_start = 0
@@ -1152,7 +1139,7 @@ def iter_dev_batch_records(spec: DevBatchSpec,
     def _bar_records(bar: tuple, next_time: int) -> list[tuple]:
         """Every record ONE chart bar produces.
 
-        :param bar: The cleaned chart bar ``(open_ms, o, h, l, c, v)``.
+        :param bar: The chart bar ``(open_ms, o, h, l, c, v)``.
         :param next_time: Open time of the NEXT chart bar, 0 for the last one.
         :return: The bar's records, in push order.
         """
@@ -1210,13 +1197,12 @@ def iter_dev_batch_records(spec: DevBatchSpec,
     # trading schedule resolves from the NEXT bar's open time.
     pending: tuple | None = None
     for candle in spec.window.bars():
-        o, h, lo, c, v = _clean_bar(candle, round_decimals,
-                                    lossless_volume, lossless_prices)
-        cleaned = (candle.timestamp, o, h, lo, c, v)
+        chart_bar = (candle.timestamp, candle.open, candle.high, candle.low, candle.close,
+                     candle.volume)
         if pending is not None:
-            for record in _bar_records(pending, cleaned[0]):
+            for record in _bar_records(pending, chart_bar[0]):
                 yield record
-        pending = cleaned
+        pending = chart_bar
     if pending is not None:
         for record in _bar_records(pending, 0):
             yield record

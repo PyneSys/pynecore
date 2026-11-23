@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 from ..errorcodes import DecimalInvalidError
 from .ohlcv import OHLCVWriter
 from .ohlcv import OHLCVReader
-from .ohlcv import restore_f32_volume
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
 )
@@ -83,25 +82,17 @@ VOLUME_ERROR_SECURITY = ('request.security', 'the summed volumes hold both +inf 
 VOLUME_ERROR_MAGNIFIER = ('strategy', 'the sub-bar volumes add up to infinity minus infinity')
 
 
-def _merge_candles(candles: list[OHLCV], bar_time: int, restore_volume: bool = False,
+def _merge_candles(candles: list[OHLCV], bar_time: int,
                    volume_error: tuple[str, str] = VOLUME_ERROR_AGGREGATE) -> OHLCV:
     """
     Merge a window of candles into a single aggregated candle.
 
     :param candles: Non-empty list of OHLCV candles belonging to the same bar
     :param bar_time: Aligned bar opening timestamp in milliseconds
-    :param restore_volume: Whether the source volumes carry float32 storage
-               error that has to be undone before summing
     :param volume_error: The ``function`` and ``why`` of the error raised when the
                volumes hold both +inf and -inf: the caller's
     :return: Aggregated OHLCV candle
     """
-    # The target file stores volume as an absolute f64, so its values are read
-    # back as written — a consumer has no clean-up left to do. A legacy source
-    # therefore has to be restored HERE, per source bar (exactly what the chart
-    # does before summing), or the sum carries the float32 dust forever.
-    volumes = (restore_f32_volume(c.volume) for c in candles) if restore_volume \
-        else (c.volume for c in candles)
     # TradingView aggregates volume server-side as the exact DECIMAL sum of the feed's
     # volumes. A binary float sum drifts from it by an ulp on many bars, and the drift
     # carries into every volume-weighted series computed on the aggregated context.
@@ -122,7 +113,7 @@ def _merge_candles(candles: list[OHLCV], bar_time: int, restore_volume: bool = F
             close=asks[-1].close,
         )
     try:
-        volume = float(sum(Decimal(repr(v)) for v in volumes))
+        volume = float(sum(Decimal(repr(c.volume)) for c in candles))
     except InvalidOperation:
         raise DecimalInvalidError(function=volume_error[0], why=volume_error[1]) from None
     return OHLCV(
@@ -274,7 +265,6 @@ def aggregate_ohlcv(
                          pricescale=reader.pricescale) as writer, writer.batched():
             window: list[OHLCV] = []
             current_bar_time: int | None = None
-            restore_volume = not reader.lossless_volume
 
             start_ts = reader.start_timestamp
             if start_ts is None:
@@ -292,7 +282,7 @@ def aggregate_ohlcv(
 
                 if current_bar_time is not None and bar_time != current_bar_time:
                     # New bar boundary — flush the window
-                    writer.write(_merge_candles(window, current_bar_time, restore_volume, volume_error))
+                    writer.write(_merge_candles(window, current_bar_time, volume_error=volume_error))
                     target_count += 1
                     window = []
 
@@ -301,7 +291,7 @@ def aggregate_ohlcv(
 
             # Flush last window
             if window and current_bar_time is not None:
-                writer.write(_merge_candles(window, current_bar_time, restore_volume, volume_error))
+                writer.write(_merge_candles(window, current_bar_time, volume_error=volume_error))
                 target_count += 1
 
     return source_count, target_count
@@ -364,7 +354,6 @@ def _aggregate_observed(
             group_key: tuple | None = None
             counter = ObservedDayCounter(tz, opening_hours, fold=bar_end is not None,
                                          step=day_step)
-            restore_volume = not reader.lossless_volume
 
             start_ts = reader.start_timestamp
             if start_ts is None:
@@ -385,7 +374,7 @@ def _aggregate_observed(
                 if group_key is not None and key != group_key:
                     # A non-None group key means at least one bar was windowed.
                     assert window_start is not None
-                    writer.write(_merge_candles(window, window_start, restore_volume, volume_error))
+                    writer.write(_merge_candles(window, window_start, volume_error=volume_error))
                     target_count += 1
                     window = []
                     window_start = None
@@ -396,7 +385,7 @@ def _aggregate_observed(
                 window.append(candle)
 
             if window and window_start is not None:
-                writer.write(_merge_candles(window, window_start, restore_volume, volume_error))
+                writer.write(_merge_candles(window, window_start, volume_error=volume_error))
                 target_count += 1
 
     return source_count, target_count

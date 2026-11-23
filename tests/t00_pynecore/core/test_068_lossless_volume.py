@@ -11,7 +11,7 @@ the day (measured on the wild corpus: 249 divergent bars, all of them on the 9
 days that carried a truncated volume, none anywhere else).
 
 ``OHLCVReader.lossless_volume`` reports whether the feed needs the clean-up, and
-the runner skips it when it does not.
+the reader runs it only when it does.
 """
 import struct
 from pathlib import Path

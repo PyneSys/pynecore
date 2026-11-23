@@ -20,11 +20,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pynecore.errorcodes import DataFileUnreadableError, InvalidDataError, InvalidTimeframeError
 from pynecore.core._file_io import open_shared_binary, replace_file
 from pynecore.core.ohlcv_legacy import OHLCVReader as _LegacyOHLCVReader
-from pynecore.core.syminfo import SymInfoInterval, tick_grid
+from pynecore.core import pine_math
+from pynecore.core.errors import PyneError
+from pynecore.core.syminfo import SymInfo, SymInfoInterval, mintick_decimals, tick_grid
 from pynecore.types.ohlcv import OHLCV, AskOHLC
 
 __all__ = ["OHLCVWriter", "OHLCVReader", "ChartBarWindow", "parse_timezone_name",
-           "record_count", "copy_ohlcv_tail", "restore_f32_volume", "validate_candle"]
+           "record_count", "copy_ohlcv_tail", "restore_f32_price", "restore_f32_volume",
+           "validate_candle"]
 
 _MAGIC = b"\x89PYN\r\n\x1a\n"
 _VERSION_MAJOR = 2
@@ -95,6 +98,15 @@ _F64_SNAP_REL = 2.0 ** -52
 # division (a few ulps); anything farther is genuinely off-grid and must be stored
 # as absolute f64 so read-time snapping can never move it.
 _F64_GRID_REL = 2.0 ** -48
+
+# How a price is stored, which bounds the clean-up the reader may apply: an exact
+# one only moves by f64 dust, an f32 delta on its standard base (the open for the
+# bid side, the same bid field for an ask) by its own f32 noise plus the base's,
+# and any other lossy one (legacy float32, foreign layouts) is cleaned
+# unconditionally.
+_PRICE_EXACT = 0
+_PRICE_DELTA = 1
+_PRICE_LOSSY = 2
 
 _QTY_STEP_MIN_SAMPLES = 100
 _QTY_STEP_MAX_DECIMALS = 8
@@ -635,6 +647,82 @@ def _f32_resolution(value: float) -> float | None:
     if not (math.isfinite(lower) and math.isfinite(upper)):
         return None
     return max(rounded - lower, upper - rounded)
+
+
+def restore_f32_price(price: float, tick_decimals: int | None) -> float:
+    """Clean float32 storage artifacts from an OHLC price, keeping the finer of the
+    mintick grid and a 6-significant-digit clean-up.
+
+    Float32 storage carries sub-tick error (mintick=0.01 turns 93761.9 into 93761.8984;
+    109547.84 into 109547.836). Two clean-up grids matter, and the right one depends on
+    price magnitude:
+
+    - **6 significant digits** (``5 - floor(log10|price|)`` decimals) is the historical
+      heuristic. It is correct for small prices, where TradingView itself carries
+      sub-mintick precision (e.g. close=4.38075 on a coarser tick), so it must NOT be
+      snapped to the tick.
+    - **mintick decimals** is needed for large prices: at BTC ~94000, 6 sig digits only
+      reaches 1 decimal (93898.05 -> 93898.1) and discards the real mintick-aligned
+      precision, which flips threshold/hysteresis indicators.
+
+    Taking ``max`` of the two decimal counts keeps the finer grid in both regimes.
+
+    Only call this on a price that really went through float32 storage: on a value that
+    kept full precision it does not clean anything, it truncates (a split-adjusted
+    ``70.90875`` comes back as ``70.9087``).
+
+    :param price: Price as read back from storage.
+    :param tick_decimals: Decimals of the symbol's mintick, or ``None`` when the symbol
+        has no real mintick, which leaves the 6-significant-digit clean-up alone.
+    :return: The cleaned price; NaN and infinities pass through.
+    """
+    if price == 0.0:
+        return 0.0
+    if not math.isfinite(price):
+        return price
+    # The portable log10 kernel, not the platform's, whose answers differ per system
+    precision = 5 - math.floor(pine_math.log10(abs(price)))  # 6 significant digits
+    if tick_decimals is not None and tick_decimals > precision:
+        precision = tick_decimals
+    return round(price, precision)
+
+
+def _stored_price_noise(price: float, base_price: float, base_noise: float,
+                        storage: int) -> float:
+    """Return how far a decoded price can be off the feed's value through its storage.
+
+    :param price: Price as the concrete reader decoded it.
+    :param base_price: The decoded base of a delta-stored price.
+    :param base_noise: The base's own storage noise, which a delta inherits.
+    :param storage: The price's storage mode (``_PRICE_EXACT``, ``_PRICE_DELTA`` or
+        ``_PRICE_LOSSY``).
+    :return: The error bound: f64 dust for an exact price, plus the f32 noise of the
+        delta and of its base for a delta, unbounded for any other lossy price.
+    """
+    if storage == _PRICE_LOSSY:
+        return math.inf
+    noise = abs(price) * _F64_SNAP_REL
+    if storage == _PRICE_DELTA:
+        noise += base_noise + abs(price - base_price) * _F32_SNAP_REL
+    return noise
+
+
+def _restore_stored_price(price: float, noise: float, tick_decimals: int | None) -> float:
+    """Clean one price, moving it no farther than its storage can be off.
+
+    :func:`restore_f32_price` truncates a value that kept its precision, so it is
+    accepted only within the error the price's storage really adds (see
+    :func:`_stored_price_noise`): a feed open one ulp above its own high snaps to the
+    high, while a real digit beyond the noise, like a split-adjusted ``70.90875`` low
+    stored as a zero delta on its open, is kept.
+
+    :param price: Price as the concrete reader decoded it.
+    :param noise: The price's storage error bound.
+    :param tick_decimals: Decimals of the symbol's mintick.
+    :return: The cleaned price, or ``price`` when the clean-up would cut real digits.
+    """
+    restored = restore_f32_price(price, tick_decimals)
+    return restored if abs(restored - price) <= noise else price
 
 
 def restore_f32_volume(volume: float) -> float:
@@ -2561,11 +2649,71 @@ class _V2OHLCVReader:
         for column in self._columns:
             if column.role != _ROLE_OPEN and column.role not in _PROMOTABLE_ROLES:
                 continue
-            if column.dtype == 6 and column.base == _ABSOLUTE_BASE:
-                continue
-            if not (self._standard_ohlcv and self._pricescale):
+            if not self._price_column_exact(column):
                 return False
         return True
+
+    @property
+    def price_storage(self) -> tuple[int, int, int, int]:
+        """Return how each main OHLC price is stored, for the storage clean-up.
+
+        The per-field split of :attr:`~_V2OHLCVReader.lossless_prices`: without a
+        declared grid only the f32 delta columns carry storage noise, bounded by the
+        delta, while an absolute f64 column (the open always is one) reads back
+        exactly and must not lose a digit to the clean-up.
+
+        :return: ``(open, high, low, close)`` storage modes: ``_PRICE_EXACT``,
+            ``_PRICE_DELTA`` (a delta on the open) or ``_PRICE_LOSSY``.
+        """
+        by_role = {column.role: column for column in self._columns}
+        mode = self._price_storage_mode
+        return (mode(by_role[_ROLE_OPEN], _ROLE_OPEN), mode(by_role[_ROLE_HIGH], _ROLE_OPEN),
+                mode(by_role[_ROLE_LOW], _ROLE_OPEN), mode(by_role[_ROLE_CLOSE], _ROLE_OPEN))
+
+    @property
+    def ask_price_storage(self) -> tuple[int, int, int, int] | None:
+        """Return how each ask price is stored, for the storage clean-up.
+
+        An ask is a delta on the same bid field, so its clean-up has to follow the
+        bid's: a zero-spread ask left as decoded would otherwise read back below its
+        cleaned bid.
+
+        :return: ``(ask_open, ask_high, ask_low, ask_close)`` storage modes like
+            :attr:`~_V2OHLCVReader.price_storage`, ``_PRICE_DELTA`` meaning a delta on
+            the bid field; ``None`` when the file stores no ask side.
+        """
+        if not self._has_ask:
+            return None
+        by_role = {column.role: column for column in self._columns}
+        mode = self._price_storage_mode
+        return (mode(by_role[_ROLE_ASK_OPEN], _ROLE_OPEN),
+                mode(by_role[_ROLE_ASK_HIGH], _ROLE_HIGH),
+                mode(by_role[_ROLE_ASK_LOW], _ROLE_LOW),
+                mode(by_role[_ROLE_ASK_CLOSE], _ROLE_CLOSE))
+
+    def _price_storage_mode(self, column: _Column, base_role: int) -> int:
+        """Return the storage mode of one price column.
+
+        :param column: A price column of this file's layout.
+        :param base_role: The role a standard delta of this column is based on.
+        :return: ``_PRICE_EXACT``, ``_PRICE_DELTA`` or ``_PRICE_LOSSY``.
+        """
+        if self._price_column_exact(column):
+            return _PRICE_EXACT
+        if column.base == base_role:
+            return _PRICE_DELTA
+        return _PRICE_LOSSY
+
+    def _price_column_exact(self, column: _Column) -> bool:
+        """Return whether one price column reads back the feed value exactly.
+
+        :param column: A price column of this file's layout.
+        :return: Whether the column is an absolute f64, or an f32 delta restored by
+            the grid-snapping read path.
+        """
+        if column.dtype == 6 and column.base == _ABSOLUTE_BASE:
+            return True
+        return bool(self._standard_ohlcv and self._pricescale)
 
     @property
     def has_ask(self) -> bool:
@@ -3118,6 +3266,25 @@ class _V2OHLCVReader:
         return low
 
 
+def _sibling_price_decimals(path: str) -> int | None:
+    """Return the mintick decimals the data file's own symbol description declares.
+
+    The ``.toml`` next to a data file is where the user corrects what the provider
+    left out or got wrong, a symbol's tick grid among them. It is applied in memory
+    only, so the data file itself stays as the provider served it.
+
+    :param path: The OHLCV file path.
+    :return: The decimals of the TOML's ``mintick``, or ``None`` when there is no
+        readable TOML or it declares no real mintick.
+    """
+    try:
+        syminfo = SymInfo.load_toml(Path(path).with_suffix(".toml"))
+    except (OSError, PyneError):
+        return None
+    mintick = getattr(syminfo, "mintick", 0.0) or 0.0
+    return mintick_decimals(mintick) if mintick > 0 else None
+
+
 class OHLCVReader:
     """Read v2 and legacy v1 OHLCV files through one public interface.
 
@@ -3126,6 +3293,14 @@ class OHLCVReader:
     all data-path methods delegate directly to the selected concrete reader and do
     not test the file version.
 
+    The bars come back as the feed served them: whatever float32 storage could not
+    keep exactly (every field of a legacy v1 file, the f32 price deltas of a v2 file
+    without a declared tick grid) is cleaned here, once, with
+    :func:`restore_f32_price` and :func:`restore_f32_volume`. The price clean-up
+    takes its mintick from the data file's sibling ``.toml``, and without one it
+    leaves the prices as stored. A consumer never cleans a bar it read from this
+    reader again.
+
     Legacy v1 files do not declare a period and do not carry a writer-verified DENSE
     flag. Consequently, :attr:`period` and :attr:`dense` return ``None`` for v1
     files rather than inferring or fabricating metadata.
@@ -3133,7 +3308,8 @@ class OHLCVReader:
     :param path: Source OHLCV file path.
     """
 
-    __slots__ = ("path", "_reader", "_opened", "_period", "_dense")
+    __slots__ = ("path", "_reader", "_opened", "_period", "_dense", "_clean_prices",
+                 "_price_storage", "_ask_storage", "_clean_volume", "_price_decimals")
 
     def __init__(self, path: str | Path):
         """Create a closed format-transparent reader.
@@ -3145,6 +3321,11 @@ class OHLCVReader:
         self._opened = False
         self._period: str | None = None
         self._dense: bool | None = None
+        self._clean_prices = False
+        self._price_storage = (_PRICE_EXACT, _PRICE_EXACT, _PRICE_EXACT, _PRICE_EXACT)
+        self._ask_storage: tuple[int, int, int, int] | None = None
+        self._clean_volume = False
+        self._price_decimals: int | None = None
 
     def __enter__(self) -> "OHLCVReader":
         """Open the reader and return it.
@@ -3216,9 +3397,10 @@ class OHLCVReader:
         A v2 file with a declared tick grid either stores a price as an absolute f64 or
         as an f32 delta the writer verified to be a grid multiple, and the reader snaps
         the latter back onto the grid. Legacy v1 files pack every price into f32, where
-        the value read back carries sub-tick error a consumer has to clean up.
+        the value read back carries sub-tick error; this reader cleans it off with
+        :func:`restore_f32_price` before handing the bar out.
 
-        :return: Whether the OHLC prices need no storage clean-up.
+        :return: Whether the OHLC prices are stored exactly.
         """
         reader = self._reader
         return reader.lossless_prices if isinstance(reader, _V2OHLCVReader) else False
@@ -3238,9 +3420,10 @@ class OHLCVReader:
 
         A v2 file keeps volume as an absolute f64, so the value read back is the one
         the feed served. Legacy v1 files pack every field into f32, where the stored
-        value carries sub-lot error a consumer has to clean up.
+        value carries sub-lot error; this reader cleans it off with
+        :func:`restore_f32_volume` before handing the bar out.
 
-        :return: Whether volume needs no storage clean-up.
+        :return: Whether volume is stored exactly.
         """
         reader = self._reader
         return reader.lossless_volume if isinstance(reader, _V2OHLCVReader) else False
@@ -3312,6 +3495,22 @@ class OHLCVReader:
         self._reader = reader
         self._period = period
         self._dense = dense
+        # A price is cleaned only as far as float32 storage really moved it: on an exact
+        # digit the clean-up does not repair anything, it truncates
+        if isinstance(reader, _V2OHLCVReader):
+            self._price_storage = reader.price_storage
+            self._ask_storage = reader.ask_price_storage
+        else:
+            self._price_storage = (_PRICE_LOSSY, _PRICE_LOSSY, _PRICE_LOSSY, _PRICE_LOSSY)
+            self._ask_storage = None
+        # Without a mintick the 6-significant-digit clean-up is a guess that cuts real
+        # digits off a large price (100123.45 -> 100123.0), so the price is left as
+        # stored: the float32 noise is the smaller error
+        lossy = any(storage != _PRICE_EXACT
+                    for storage in self._price_storage + (self._ask_storage or ()))
+        self._price_decimals = _sibling_price_decimals(self.path) if lossy else None
+        self._clean_prices = self._price_decimals is not None
+        self._clean_volume = not self.lossless_volume
         self._opened = True
         return self
 
@@ -3320,11 +3519,52 @@ class OHLCVReader:
         self._reader.close()
         self._opened = False
 
+    def _restore(self, candle: OHLCV) -> OHLCV:
+        """Clean the float32 storage artifacts off one bar.
+
+        :param candle: The bar as the concrete reader decoded it.
+        :return: The bar with the values the feed served.
+        """
+        if self._clean_prices:
+            decimals = self._price_decimals
+            open_storage, high_storage, low_storage, close_storage = self._price_storage
+            open_price, high, low, close = candle.open, candle.high, candle.low, candle.close
+            open_noise = _stored_price_noise(open_price, open_price, 0.0, open_storage)
+            high_noise = _stored_price_noise(high, open_price, open_noise, high_storage)
+            low_noise = _stored_price_noise(low, open_price, open_noise, low_storage)
+            close_noise = _stored_price_noise(close, open_price, open_noise, close_storage)
+            ask = candle.ask
+            if ask is not None and self._ask_storage is not None:
+                # Each ask is decoded on the raw bid of its field, and cleaned within
+                # its own noise plus that bid's, so a zero spread stays zero
+                ask_open_storage, ask_high_storage, ask_low_storage, ask_close_storage = (
+                    self._ask_storage)
+                ask = AskOHLC(
+                    _restore_stored_price(ask.open, _stored_price_noise(
+                        ask.open, open_price, open_noise, ask_open_storage), decimals),
+                    _restore_stored_price(ask.high, _stored_price_noise(
+                        ask.high, high, high_noise, ask_high_storage), decimals),
+                    _restore_stored_price(ask.low, _stored_price_noise(
+                        ask.low, low, low_noise, ask_low_storage), decimals),
+                    _restore_stored_price(ask.close, _stored_price_noise(
+                        ask.close, close, close_noise, ask_close_storage), decimals))
+            candle = candle._replace(
+                open=_restore_stored_price(open_price, open_noise, decimals),
+                high=_restore_stored_price(high, high_noise, decimals),
+                low=_restore_stored_price(low, low_noise, decimals),
+                close=_restore_stored_price(close, close_noise, decimals),
+                ask=ask)
+        if self._clean_volume:
+            candle = candle._replace(volume=restore_f32_volume(candle.volume))
+        return candle
+
     def __iter__(self) -> Iterator[OHLCV]:
         """Iterate over all records without testing the file version.
 
         :return: Iterator of OHLCV values with millisecond timestamps.
         """
+        if self._clean_prices or self._clean_volume:
+            return map(self._restore, self._reader)
         return iter(self._reader)
 
     def read(self, position: int) -> OHLCV:
@@ -3333,6 +3573,8 @@ class OHLCVReader:
         :param position: Zero-based record index.
         :return: OHLCV value with a millisecond timestamp.
         """
+        if self._clean_prices or self._clean_volume:
+            return self._restore(self._reader.read(position))
         return self._reader.read(position)
 
     def read_from(
@@ -3344,6 +3586,8 @@ class OHLCVReader:
         :param end_timestamp: Inclusive upper bound, or ``None`` for the file end.
         :return: Iterator over matching OHLCV values.
         """
+        if self._clean_prices or self._clean_volume:
+            return map(self._restore, self._reader.read_from(start_timestamp, end_timestamp))
         return self._reader.read_from(start_timestamp, end_timestamp)
 
     def iter_timestamps(

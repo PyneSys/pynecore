@@ -84,7 +84,7 @@ def __test_volumes_of_both_infinities__():
     candles = [OHLCV(timestamp=0, open=1.0, high=1.0, low=1.0, close=1.0, volume=v)
                for v in (math.inf, -math.inf)]
     for volume_error in (VOLUME_ERROR_MAGNIFIER, VOLUME_ERROR_SECURITY):
-        error = __test_helper_raised(_merge_candles, candles, 0, False, volume_error)
+        error = __test_helper_raised(_merge_candles, candles, 0, volume_error)
         assert (error.params['function'], error.params['why']) == volume_error
     assert VOLUME_ERROR_MAGNIFIER == (
         'strategy', 'the sub-bar volumes add up to infinity minus infinity')
