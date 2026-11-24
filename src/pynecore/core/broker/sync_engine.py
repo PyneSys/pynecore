@@ -70,8 +70,8 @@ from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
-    KIND_ENTRY_STOP,
-    KIND_ENTRY_STOP_WATCH,
+    KIND_ENTRY_TRIGGERED,
+    KIND_STOP_LIMIT_WATCH,
     KIND_EXIT_SL,
     KIND_EXIT_SL_PARTIAL,
     KIND_EXIT_TP,
@@ -123,6 +123,7 @@ from pynecore.core.broker.models import (
     OrderEvent,
     OrderStatus,
     OrderType,
+    Quote,
     PartialBracketCancelTentativeDegradedEvent,
     PartialBracketCancelTentativeResolvedEvent,
     PartialBracketCancelTentativeStartedEvent,
@@ -149,9 +150,9 @@ from pynecore.core.broker.software_partial_bracket_engine import (
     SoftwarePartialBracketEngine,
     TickOffsetResolver,
 )
-from pynecore.core.broker.software_entry_stop_engine import (
-    EntryStopWatch,
-    SoftwareEntryStopEngine,
+from pynecore.core.broker.software_stop_limit_engine import (
+    SoftwareStopLimitEngine,
+    StopLimitWatch,
 )
 from pynecore.core.broker.one_way_emulator import (
     BracketFanResult,
@@ -188,13 +189,13 @@ from pynecore.core.broker.store_helpers import (
     LEG_STATE_ARMED,
     LEG_STATE_CANCEL_TENTATIVE,
     LEG_STATE_PENDING_ENTRY,
-    ENTRY_STOP_STATE_ARMED,
-    ENTRY_STOP_STATE_CANCEL_PENDING,
-    ENTRY_STOP_STATE_MARKET_PENDING,
+    LEGACY_OCO_STATE_MARKET_PENDING,
+    STOP_LIMIT_STATE_ARMED,
+    STOP_LIMIT_STATE_LIMIT_PENDING,
+    STOP_LIMIT_STATE_TRIGGERED,
     STATE_REJECTED,
     STATE_SUBMITTED,
     create_engine_trigger_partial_leg_row,
-    create_entry_stop_watch_row,
     iter_active_bracket_ownerships,
 )
 from pynecore.types.na import na_float
@@ -380,7 +381,7 @@ def _coid_is_close(coid: str) -> bool:
 
 def _coid_is_entry(coid: str) -> bool:
     """Return ``True`` when ``coid`` was minted for an entry dispatch
-    (:data:`KIND_ENTRY` or :data:`KIND_ENTRY_STOP`).
+    (:data:`KIND_ENTRY` or :data:`KIND_ENTRY_TRIGGERED`).
 
     Same canonical-format kind probe as :func:`_coid_is_close`; used on the
     cross-restart pending-anchor recovery path to seed the entry fill ledger
@@ -392,7 +393,7 @@ def _coid_is_entry(coid: str) -> bool:
     tail = coid.rsplit('-', 1)
     if len(tail) != 2 or not tail[1]:
         return False
-    return tail[1][0] in (KIND_ENTRY, KIND_ENTRY_STOP)
+    return tail[1][0] in (KIND_ENTRY, KIND_ENTRY_TRIGGERED)
 
 
 @dataclasses.dataclass
@@ -657,6 +658,19 @@ def _retired_exposure(extras: dict, filled: float) -> float:
     if not isinstance(retired_raw, (int, float)):
         return 0.0
     return max(0.0, min(filled, float(retired_raw)))
+
+
+def _is_triggerable_entry(intent: EntryIntent) -> bool:
+    """Whether a venue refusal of ``intent`` as already crossed means Pine triggers it.
+
+    A STOP entry (stop only), a LIMIT entry (limit only), and a stop-limit
+    entry with both prices that the venue holds natively. The LIMIT a
+    triggered stop-limit order sends is a plain LIMIT and counts as the
+    second kind.
+    """
+    if intent.order_type is OrderType.STOP:
+        return intent.stop is not None and intent.limit is None
+    return intent.order_type is OrderType.LIMIT and intent.limit is not None
 
 
 def _sizes_match(actual: float, expected: float) -> bool:
@@ -1298,6 +1312,9 @@ class OrderSyncEngine:
         # is enforced once at startup by ``validate_at_startup``;
         # the engine itself only needs the mode value at dispatch time.
         self._partial_qty_bracket_exit_mode = caps.partial_qty_bracket_exit
+        # A venue without a native stop-limit order gets every Pine stop-limit
+        # order emulated (:meth:`_is_software_stop_limit`).
+        self._software_stop_limit = caps.stop_limit_order is not CapabilityLevel.NATIVE
         # Short-selling runtime gate switch. When the venue cannot hold a
         # negative base position (spot), every sell-side entry dispatch is
         # preflighted against the projected aggregate signed position — see
@@ -1309,8 +1326,8 @@ class OrderSyncEngine:
         # unresolved are parked at startup and hold their intent back until
         # the plugin's resolver settles them
         # (:func:`~pynecore.core.broker.parked_dispatch.inherited_dispatch_in_flight`),
-        # and a stop-fired MARKET is not sent again while its earlier send is
-        # unanswered. A ``NATIVE`` venue answers the second send with the
+        # and a triggered stop-limit LIMIT is not sent again while its earlier
+        # send is unanswered. A ``NATIVE`` venue answers the second send with the
         # first order itself.
         self._hold_inherited_dispatches = (
             caps.idempotency is not CapabilityLevel.NATIVE)
@@ -1342,13 +1359,12 @@ class OrderSyncEngine:
             store_ctx=store_ctx,
             state_change_listener=self._on_partial_bracket_leg_state_change,
         )
-        # Software state machine for the STOP leg of a both-set Pine entry
-        # (``strategy.entry(limit=, stop=)``). The LIMIT leg rests natively;
-        # this engine watches the price and, on a stop cross, cancels the
-        # native LIMIT and fires a MARKET order — so only one OCO leg is ever
-        # native and a double-fill race is impossible. Constructed
-        # unconditionally; armed only when a both-set entry is dispatched.
-        self._entry_stop_engine = SoftwareEntryStopEngine(store_ctx=store_ctx)
+        # Software stop-limit orders: a Pine order with both ``stop`` and
+        # ``limit`` is one stop-limit order. On a venue without a native one
+        # nothing rests before the stop triggers; this state machine watches
+        # the stop and the trigger sends the LIMIT. Constructed
+        # unconditionally; armed only when such an order is dispatched.
+        self._stop_limit_engine = SoftwareStopLimitEngine(store_ctx=store_ctx)
         # One-way emulation engine. Only ever DRIVEN when the broker plugin
         # opts into hedging-mode emulation (``broker.position_port is not
         # None``); for the common netting / one-way-native plugins the dispatch
@@ -2265,13 +2281,12 @@ class OrderSyncEngine:
             # same parent. See the partial-qty bracket exit design
             # dossier §3.5.
             self._partial_bracket_engine.restart_replay()
-            # Rebuild the both-set entry-stop watch ledger from persisted
-            # watch rows. Latched intermediate states (cancel_pending /
-            # stop_market_pending) are reloaded as-is; the first
-            # :meth:`_drive_entry_stop_triggers` re-drives them
-            # deterministically (idempotent cancel / idempotent market POST),
-            # so no demotion or price re-evaluation is needed.
-            self._entry_stop_engine.restart_replay()
+            # Rebuild the stop-limit watch ledger from the persisted watch
+            # rows. An ``armed`` watch is judged against the bars the restart
+            # replays (:meth:`observe_history_bar`), a ``limit_pending`` one
+            # verifies its earlier send before sending again, and a legacy
+            # OCO row is retired (:meth:`_retire_legacy_oco_watches`).
+            self._stop_limit_engine.restart_replay()
             # Rehydrate the broker-native fail-safe manager from the
             # replayed legs. ``NativeFailsafeManager`` was just
             # constructed empty, so without this call there is no
@@ -3595,7 +3610,7 @@ class OrderSyncEngine:
         # catch, so a wedged read could never be abandoned. The verdict is
         # kept for the rest of the cycle: ``_diff_and_dispatch``
         # (which gates only its exposure-opening ``EntryIntent`` branches) and
-        # ``_drive_entry_stop_triggers`` can both open new exposure and must
+        # ``_drive_stop_limit_watches`` can both open new exposure and must
         # obey it too.
         may_open_exposure = self._guard_stuck_reads()
         # A held exit fill (:meth:`_note_unbooked_exit_fill`,
@@ -3764,17 +3779,18 @@ class OrderSyncEngine:
         # otherwise the worst-SL recompute would still see the now-fired
         # leg as armed and emit a stale broker-native level for one bar.
         self._drive_partial_bracket_triggers(last_price=last_price)
-        # Both-set entry STOP leg WATCH phase: a stop cross cancels the
-        # native LIMIT and (only once that cancel is confirmed) fires a
-        # MARKET order. Latched cancel_pending / stop_market_pending watches
-        # are re-driven here too (restart / retry), independent of price.
-        # Gated on the read guard: this path ends in ``execute_entry``, so a
-        # cycle that must not open exposure has to skip it as well. The state
-        # machine is latched and idempotent, so deferring it one cycle is safe.
-        # The partial-bracket and native-failsafe drivers above deliberately
-        # stay ungated — they protect or reduce existing exposure.
+        # A legacy OCO watch row only reduces: its native LIMIT is cancelled
+        # and the row closed, so it runs ungated.
+        self._retire_legacy_oco_watches()
+        # Software stop-limit WATCH phase: a stop cross sends the LIMIT, and a
+        # ``limit_pending`` watch re-drives its send (restart / retry). Gated
+        # on the read guard: the trigger ends in ``execute_entry``, so a cycle
+        # that must not open exposure skips it; the state machine is latched
+        # and idempotent, so deferring it one cycle is safe. The
+        # partial-bracket and native-failsafe drivers above deliberately stay
+        # ungated — they protect or reduce existing exposure.
         if may_open_exposure:
-            self._drive_entry_stop_triggers(last_price=last_price)
+            self._drive_stop_limit_watches(last_price=last_price)
         # Drain native failsafe dispatches into the plugin dispatcher
         # (§2.6 worst-SL drive loop). The manager accumulates snapshots
         # via the leg state-change listener / ``recompute_worst_sl``;
@@ -9269,7 +9285,7 @@ class OrderSyncEngine:
                 with self._follow_up_write_deferred("bracket qty amend"):
                     self._amend_bracket_qty_for_entry_fill(event)
                 self._promote_pending_partial_bracket_legs(event)
-                self._retire_entry_stop_watch_on_fill(event)
+                self._settle_stop_limit_watch_on_fill(event)
             with self._follow_up_write_deferred("OCA cascade cancel"):
                 self._cascade_oca_cancel(event)
             with self._follow_up_write_deferred("OCA cascade reduce"):
@@ -9648,7 +9664,7 @@ class OrderSyncEngine:
                 self._abort_pending_partial_legs_for_dead_entry(
                     key, reason='parent_cancelled',
                 )
-                self._entry_stop_engine.mark_aborted(
+                self._stop_limit_engine.mark_aborted(
                     key, reason='parent_cancelled',
                 )
                 self._order_mapping.pop(key, None)
@@ -9730,7 +9746,7 @@ class OrderSyncEngine:
                 self._abort_pending_partial_legs_for_dead_entry(
                     key, reason='parent_rejected',
                 )
-                self._entry_stop_engine.mark_aborted(
+                self._stop_limit_engine.mark_aborted(
                     key, reason='parent_rejected',
                 )
                 self._order_mapping.pop(key, None)
@@ -9767,7 +9783,7 @@ class OrderSyncEngine:
         """
         filled = event.order.filled_qty
         self._abort_pending_partial_legs_for_dead_entry(key, reason='parent_cancelled')
-        self._entry_stop_engine.mark_aborted(key, reason='parent_cancelled')
+        self._stop_limit_engine.mark_aborted(key, reason='parent_cancelled')
         self._order_mapping.pop(key, None)
         if filled > 0.0:
             sentinel = dataclasses.replace(intent, qty=filled)
@@ -10556,7 +10572,7 @@ class OrderSyncEngine:
         cancel. Trims only the cancelled leg from the intent's mapping; when the
         last mapped leg drops, the intent is retired exactly like the
         unexpected-cancel branch (native fail-safe retired for an unfilled
-        entry, pending partial legs / entry-stop watch aborted, envelope and
+        entry, pending partial legs / stop-limit watch aborted, envelope and
         active-intent slot dropped).
         """
         order_id = event.order.id
@@ -10592,7 +10608,7 @@ class OrderSyncEngine:
         self._abort_pending_partial_legs_for_dead_entry(
             key, reason='native_cancel_all',
         )
-        self._entry_stop_engine.mark_aborted(
+        self._stop_limit_engine.mark_aborted(
             key, reason='native_cancel_all',
         )
         self._order_mapping.pop(key, None)
@@ -11970,20 +11986,20 @@ class OrderSyncEngine:
     def _resolve_parent_opening_ref(self, from_entry: str) -> str | None:
         """Resolve the dispatch ref the parent position actually OPENED under.
 
-        A normal / limit-won entry opens under its native :data:`KIND_ENTRY`
-        client-order-id. A both-set entry whose STOP leg won the OCO opens via
-        the stop-fired MARKET under the deterministic :data:`KIND_ENTRY_STOP`
-        id — the SAME pinned envelope anchor as :data:`KIND_ENTRY`, only the
-        kind char differs. The broker reconcile feed reports the live position
+        A normal entry opens under its native :data:`KIND_ENTRY`
+        client-order-id. A triggered entry (a software stop-limit's LIMIT, a
+        crossed entry's re-send) opens under the deterministic
+        :data:`KIND_ENTRY_TRIGGERED` id — the SAME pinned envelope anchor as
+        :data:`KIND_ENTRY`, only the kind char differs. The broker reconcile feed reports the live position
         under *that* id (the opening row's ``client_order_id``), so every
         native fail-safe parent-ref resolver must key on it: a state registered
         under :data:`KIND_ENTRY` would never see its confirming snapshot,
         escalate to ``DEGRADED``, and silently block new entries / brackets on
         the symbol; the close-time retire would likewise miss it.
 
-        Returns the :data:`KIND_ENTRY_STOP` ref iff a position row was persisted
-        under it — the durable, restart-surviving signal that the stop fired
-        (the entry-stop watch row is terminal-filtered once the stop wins and
+        Returns the :data:`KIND_ENTRY_TRIGGERED` ref iff a position row was persisted
+        under it — the durable, restart-surviving signal that the entry
+        triggered (the stop-limit watch row is closed once its order fills and
         cannot be relied on after restart). Otherwise the :data:`KIND_ENTRY`
         ref. ``None`` when neither a live envelope nor a persisted anchor is
         tracked for ``from_entry`` (mirrors the callers' existing ``None``
@@ -11999,7 +12015,7 @@ class OrderSyncEngine:
         return kind_entry_ref
 
     def _parent_dispatch_refs(self, from_entry: str) -> tuple[str, str] | None:
-        """Return the ``(KIND_ENTRY, KIND_ENTRY_STOP)`` dispatch refs of ``from_entry``.
+        """Return the ``(KIND_ENTRY, KIND_ENTRY_TRIGGERED)`` dispatch refs of ``from_entry``.
 
         Both ids share one pinned envelope anchor and differ only in the kind
         char. Resolved from the live envelope, else rebuilt from the persisted
@@ -12009,7 +12025,7 @@ class OrderSyncEngine:
         if parent_envelope is not None:
             return (
                 parent_envelope.client_order_id(KIND_ENTRY),
-                parent_envelope.client_order_id(KIND_ENTRY_STOP),
+                parent_envelope.client_order_id(KIND_ENTRY_TRIGGERED),
             )
         parent_anchor = self._persisted_envelope_anchors.get(from_entry)
         if parent_anchor is None:
@@ -12037,7 +12053,7 @@ class OrderSyncEngine:
                 run_tag=anchor_tag,
                 pine_id=from_entry,
                 bar_ts_ms=parent_anchor.bar_ts_ms,
-                kind=KIND_ENTRY_STOP,
+                kind=KIND_ENTRY_TRIGGERED,
                 retry_seq=parent_anchor.retry_seq,
             ),
             self._coid_max_len,
@@ -12065,7 +12081,7 @@ class OrderSyncEngine:
 
         Acts only on a DEFINITE mismatch: ``from_entry`` must resolve to a
         current parent (live envelope or persisted anchor) and the leg's ref
-        must match neither its ``KIND_ENTRY`` nor its ``KIND_ENTRY_STOP`` id.
+        must match neither its ``KIND_ENTRY`` nor its ``KIND_ENTRY_TRIGGERED`` id.
         The stale parent's §2.6.7 fail-safe state is retired with the legs (a
         DEGRADED state on a gone parent would block new entries on the
         symbol), and an intent left without legs releases its mapping and
@@ -12114,8 +12130,8 @@ class OrderSyncEngine:
           ``parent_entry_dispatch_ref`` under this entry (must run before the
           partial-bracket cascade evicts them);
         - :meth:`_resolve_parent_opening_ref` for the COID the position opened
-          under (``KIND_ENTRY`` normally, ``KIND_ENTRY_STOP`` when the both-set
-          STOP leg won the OCO), live envelope or restart-anchor rebuild.
+          under (``KIND_ENTRY`` normally, ``KIND_ENTRY_TRIGGERED`` for a
+          triggered entry), live envelope or restart-anchor rebuild.
 
         The latter covers the case where every partial leg already terminated
         (no leg to walk) but the state is still parked — without it a
@@ -13953,374 +13969,416 @@ class OrderSyncEngine:
 
     # === Both-set entry STOP leg (software OCO) ===========================
 
-    def _arm_entry_stop_watch(
-            self, intent: EntryIntent, envelope: DispatchEnvelope,
-    ) -> None:
-        """Persist + register the software price-watch for a both-set entry's
-        STOP leg.
+    def _is_software_stop_limit(self, intent: EntryIntent) -> bool:
+        """Whether the engine emulates ``intent`` as a stop-limit order.
 
-        The native LIMIT leg has already been dispatched by the caller under
-        the parent envelope's :data:`KIND_ENTRY` client-order-id; that id is
-        recorded as the leg-scoped cancel target. The watch row uses the
-        distinct :data:`KIND_ENTRY_STOP_WATCH` id (no exchange order — the
-        engine owns it). Idempotent: a second arm for the same ``pine_id``
-        (e.g. a re-dispatch of an unchanged both-set entry) is a no-op.
+        A Pine order with both ``stop`` and ``limit`` is one stop-limit order;
+        on a venue without a native one
+        (:attr:`~ExchangeCapabilities.stop_limit_order`
+        not ``NATIVE``) the engine watches its stop and sends the LIMIT on the
+        trigger. That LIMIT (``triggered_entry``) is a plain order.
         """
-        pine_id = intent.intent_key
-        if self._entry_stop_engine.has_watch(pine_id):
+        return (self._software_stop_limit and not intent.triggered_entry
+                and intent.stop is not None and intent.limit is not None)
+
+    def _arm_stop_limit_watch(self, intent: EntryIntent, envelope: DispatchEnvelope) -> None:
+        """Arm the software watch of a stop-limit order instead of placing it.
+
+        Nothing goes to the venue: before its stop triggers a stop-limit order
+        cannot fill, and a resting LIMIT would fill on a pullback that Pine
+        never fills on. A stop already passed is triggered by the drive of the
+        same sync. Idempotent: a watch already tracked for the id (the
+        re-emission of the same order after a restart) stays as it is.
+        """
+        if self._stop_limit_engine.has_watch(intent.intent_key):
             return
-        # Both-set only: the watch's KIND_ENTRY leg is the native LIMIT, so a
-        # stop-only entry (no limit) must never arm one — it is a native STOP.
-        if intent.stop is None or intent.limit is None:
-            return
-        watch_coid = envelope.client_order_id(KIND_ENTRY_STOP_WATCH)
-        limit_coid = envelope.client_order_id(KIND_ENTRY)
-        stop_level = float(intent.stop)
-        if self._store_ctx is not None:
-            create_entry_stop_watch_row(
-                self._store_ctx,
-                coid=watch_coid,
-                symbol=intent.symbol,
-                side=intent.side,
-                qty=intent.qty,
-                intent_key=pine_id,
-                pine_entry_id=intent.pine_id,
-                stop_level=stop_level,
-                limit_coid=limit_coid,
-            )
-        self._entry_stop_engine.register_watch(EntryStopWatch(
-            coid=watch_coid,
-            symbol=intent.symbol,
-            pine_id=intent.pine_id,
-            side=intent.side,
-            qty=intent.qty,
-            stop_level=stop_level,
-            limit_coid=limit_coid,
-            state=ENTRY_STOP_STATE_ARMED,
-        ))
+        assert intent.stop is not None and intent.limit is not None
+        watch = self._stop_limit_engine.arm(
+            coid=envelope.client_order_id(KIND_STOP_LIMIT_WATCH),
+            symbol=intent.symbol, pine_id=intent.intent_key, side=intent.side,
+            qty=intent.qty, stop=float(intent.stop), limit=float(intent.limit),
+            bar_ts_ms=self._current_bar_ts_ms,
+        )
         _blog_info(
-            "armed entry-stop watch for %r: native LIMIT rests, software "
-            "STOP @ %s fires a market on cross",
-            pine_id, stop_level,
+            "stop-limit %s armed: nothing rests on the venue until the stop %s "
+            "triggers, then a LIMIT at %s",
+            format_intent_key(intent.intent_key), watch.stop, watch.limit,
         )
 
-    def _retire_entry_stop_watch_on_fill(self, event: OrderEvent) -> None:
-        """Retire a both-set entry-stop watch when its native LIMIT leg fills.
+    def observe_history_bar(self, bar_ts_ms: int, high: float, low: float) -> None:
+        """Judge the armed stop-limit watches against a bar the engine did not see live.
 
-        Only ``armed`` / ``cancel_pending`` watches are retired here: in those
-        states an ENTRY fill for the ``pine_id`` can only be the native LIMIT
-        leg (the stop-fired MARKET has not been placed yet), so the LIMIT won
-        the OCO and the watch must stop watching — no market may ever fire.
+        The runner feeds every bar its live warmup replays. A stop the bar's
+        range reached while the process was away triggered as on TradingView;
+        the next drive sends its LIMIT (see
+        :meth:`~pynecore.core.broker.software_stop_limit_engine.SoftwareStopLimitEngine.observe_history_bar`
+        for which bars count).
 
-        In ``stop_market_pending`` the fill is the stop-fired MARKET itself;
-        :meth:`_fire_entry_stop_market` settles that via ``mark_stop_won``, so
-        this method deliberately ignores it (otherwise a replayed market fill
-        on restart would be mislabelled as a limit win).
+        :param bar_ts_ms: The bar's open time.
+        :param high: The bar's high.
+        :param low: The bar's low.
+        """
+        for watch in self._stop_limit_engine.observe_history_bar(bar_ts_ms, high, low):
+            _blog_info(
+                "stop-limit %s: its stop %s was crossed on bar %d while the bot "
+                "was away; it triggered and its LIMIT at %s goes out next",
+                format_intent_key(watch.pine_id), watch.stop, bar_ts_ms, watch.limit,
+            )
+
+    def _settle_stop_limit_watch_on_fill(self, event: OrderEvent) -> None:
+        """Advance a software stop-limit watch on an entry fill of its Pine id.
+
+        - ``limit_pending``: the fill proves the LIMIT landed → ``triggered``.
+        - ``triggered``: a complete fill ends the order → ``filled``.
+        - ``armed``: nothing rests on the venue for an armed watch, so the fill
+          breaks the model's invariant (a leftover order of a legacy run, an
+          order someone placed under the bot's id). The fill is real exposure
+          and books as the order's fill; the watch takes the filling order as
+          its LIMIT (``triggered``) so it never sends a second one on top, and
+          the violation is logged as an error and journaled.
         """
         pine_id = event.pine_id
         if pine_id is None:
             return
-        watch = self._entry_stop_engine.get_watch(pine_id)
-        if watch is None:
+        watch = self._stop_limit_engine.get_watch(pine_id)
+        if watch is None or watch.legacy:
             return
-        if watch.state in (
-                ENTRY_STOP_STATE_ARMED, ENTRY_STOP_STATE_CANCEL_PENDING,
-        ):
-            self._entry_stop_engine.mark_limit_won(
-                pine_id, reason='native_limit_filled',
+        if watch.state == STOP_LIMIT_STATE_ARMED:
+            _blog_error(
+                "stop-limit %s: an entry fill (order %s, qty %s) arrived while "
+                "its stop had not triggered and nothing of the bot rested on the "
+                "venue; the fill is booked and the watch takes that order as its "
+                "LIMIT, so no second order is sent",
+                format_intent_key(pine_id), event.order.id, event.fill_qty,
             )
+            if self._store_ctx is not None:
+                self._store_ctx.log_event(
+                    'stop_limit_fill_while_armed',
+                    payload={'pine_id': pine_id, 'order_id': event.order.id,
+                             'fill_qty': event.fill_qty, 'stop': watch.stop,
+                             'limit': watch.limit},
+                )
+            self._stop_limit_engine.adopt_fill_while_armed(pine_id)
+            if event.order.id and not self._order_mapping.get(pine_id):
+                self._order_mapping[pine_id] = [event.order.id]
+        elif watch.state == STOP_LIMIT_STATE_LIMIT_PENDING:
+            self._stop_limit_engine.mark_triggered(pine_id)
+        if (self._stop_limit_engine.get_watch(pine_id) is not None
+                and event.order.filled_qty >= event.order.qty - 1e-9):
+            self._stop_limit_engine.mark_filled(pine_id)
 
-    def _drive_entry_stop_triggers(self, *, last_price: float | None) -> None:
-        """Drive the both-set entry STOP leg state machine each sync.
+    def _drive_stop_limit_watches(self, *, last_price: float | None) -> None:
+        """Drive the software stop-limit watches each sync.
 
-        Runs from the tail of :meth:`sync` after :meth:`_diff_and_dispatch`
-        (so a watch armed this cycle is visible) and after
-        :meth:`_drive_partial_bracket_triggers`. For each live watch:
+        Runs from the tail of :meth:`sync` after :meth:`_diff_and_dispatch`, so a
+        watch armed this cycle is judged at once (a stop already passed
+        triggers on its arming sync).
 
-        * ``armed`` — when ``last_price`` has crossed the stop level, latch
-          ``cancel_pending`` and resolve the cancel-then-fire path.
-        * ``cancel_pending`` — re-drive the (idempotent) leg-scoped LIMIT
-          cancel and the hard disposition gate. Reached on the same tick as a
-          fresh cross, on a retry after an UNKNOWN cancel, or on restart.
-        * ``stop_market_pending`` — re-dispatch the MARKET under its persisted
-          id once its earlier send is settled
-          (:meth:`_earlier_stop_market_send_settled`). Reached on a retry
-          after an unknown market disposition, or on restart after the cancel
-          was confirmed but the process died before the market settled.
-
-        Price-independent states (``cancel_pending`` / ``stop_market_pending``)
-        are driven even when ``last_price`` is ``None`` so restart recovery is
-        not gated on a price context.
+        * ``armed`` — the chart price (``last_price``, the bar close at each
+          sync: the price every software trigger of the engine reads) is judged
+          against the stop, and the bar recorded as judged; a stop crossed on
+          a bar the engine did not see live (:meth:`observe_history_bar`)
+          triggers too. A trigger sends the LIMIT
+          (:meth:`_send_triggered_limit`).
+        * ``limit_pending`` — the LIMIT's earlier send is verified and, only
+          when it provably did not land, sent again under its persisted id.
         """
-        watches = [
-            w for w in self._entry_stop_engine.iter_watches()
-            if w.symbol == self._symbol
-        ]
-        if not watches:
-            return
-        for watch in watches:
-            state = watch.state
-            if state == ENTRY_STOP_STATE_ARMED:
-                if last_price is None:
-                    continue
-                if not SoftwareEntryStopEngine.stop_crossed(watch, last_price):
+        for watch in self._stop_limit_engine.iter_watches():
+            if watch.symbol != self._symbol or watch.legacy:
+                continue
+            if watch.state == STOP_LIMIT_STATE_ARMED:
+                crossed = watch.crossed_offline
+                if last_price is not None:
+                    crossed = crossed or SoftwareStopLimitEngine.stop_crossed(watch, last_price)
+                    self._stop_limit_engine.note_judged(watch.pine_id, self._current_bar_ts_ms)
+                if not crossed:
                     continue
                 _blog_info(
-                    "entry-stop %r crossed (price=%s stop=%s): cancelling "
-                    "native LIMIT before firing market",
-                    watch.pine_id, last_price, watch.stop_level,
+                    "stop-limit %s triggered (price=%s stop=%s): sending its LIMIT at %s",
+                    format_intent_key(watch.pine_id), last_price, watch.stop, watch.limit,
                 )
-                if self._entry_stop_engine.begin_cancel(watch.pine_id) is None:
-                    continue
-                self._resolve_entry_stop_cancel_then_fire(watch.pine_id)
-            elif state == ENTRY_STOP_STATE_CANCEL_PENDING:
-                self._resolve_entry_stop_cancel_then_fire(watch.pine_id)
-            elif state == ENTRY_STOP_STATE_MARKET_PENDING:
-                self._fire_entry_stop_market(watch.pine_id)
+                self._send_triggered_limit(watch.pine_id)
+            elif watch.state == STOP_LIMIT_STATE_LIMIT_PENDING:
+                self._send_triggered_limit(watch.pine_id)
 
-    def _resolve_entry_stop_cancel_then_fire(self, pine_id: str) -> None:
-        """Leg-scoped cancel of the native LIMIT, then the hard fire gate.
+    def _send_triggered_limit(self, pine_id: str) -> None:
+        """Send the LIMIT of a triggered software stop-limit order.
 
-        The cancel disposition is the gate (never a halt — forbidden for a
-        live bot):
+        The LIMIT's client order id is persisted on the watch BEFORE the POST
+        (``limit_pending``). A retry, in this process or after a restart,
+        re-enters here: the earlier send is verified first
+        (:meth:`_triggered_send_state`) and the LIMIT goes out again only when
+        it provably did not land, so the order is never placed twice. The
+        LIMIT dispatches through :meth:`_dispatch_new` with every gate; a
+        refusal of a marketable LIMIT is judged by
+        :meth:`_dispatch_crossed_entry`.
 
-        * ``ALREADY_FILLED`` → the LIMIT won the OCO; ``mark_limit_won`` and
-          the market NEVER fires.
-        * ``UNKNOWN`` → stay ``cancel_pending`` and retry next tick; the
-          market NEVER fires while the LIMIT's fate is unknown (a fire here
-          could double-open against a LIMIT that actually filled).
-        * ``CANCEL_CONFIRMED`` / ``TOO_LATE_TO_CANCEL`` / ``STILL_OPEN`` →
-          the LIMIT is provably gone with no fill; fire the MARKET.
+        Under quarantine no new exposure is opened: the triggered order is
+        dropped (a fresh trigger is aborted; an earlier send that landed still
+        books normally).
         """
-        watch = self._entry_stop_engine.get_watch(pine_id)
+        watch = self._stop_limit_engine.get_watch(pine_id)
         if watch is None:
             return
-        cancel = CancelIntent(pine_id=pine_id, symbol=self._symbol)
-        cancel_envelope = self._build_cancel_envelope(cancel)
-        try:
-            outcome = self._run_async(
-                self._broker.execute_cancel_with_outcome(cancel_envelope),
-            )
-        except BrokerManualInterventionError as e:
-            self._record_halt(e)
-            raise
-        except Exception as e:  # noqa: BLE001
-            # Transient / ambiguous cancel failure — treat as UNKNOWN: stay
-            # cancel_pending and retry on the next tick. The market must not
-            # fire until the LIMIT is provably gone.
+        if watch.state == STOP_LIMIT_STATE_LIMIT_PENDING:
+            state = self._triggered_send_state(watch)
+            if state != 'unsent':
+                return
+        if self._quarantined or pine_id in self._forced_cancel_pending:
+            why = ('quarantine_blocked_trigger' if self._quarantined
+                   else 'cancelled_before_send')
             _blog_warning(
-                "entry-stop %r LIMIT cancel raised %s; staying cancel_pending, "
-                "market withheld until disposition resolves",
-                pine_id, type(e).__name__,
+                "stop-limit %s triggered but its LIMIT is not sent (%s); no "
+                "position opened", format_intent_key(pine_id), why,
             )
-            return
-        if outcome is CancelDispositionOutcome.ALREADY_FILLED:
-            _blog_info(
-                "entry-stop %r: native LIMIT already filled — limit won the "
-                "OCO, no market fired",
-                pine_id,
-            )
-            self._entry_stop_engine.mark_limit_won(
-                pine_id, reason='limit_filled_during_stop_cancel',
-            )
-            return
-        if outcome is CancelDispositionOutcome.UNKNOWN:
-            _blog_warning(
-                "entry-stop %r: LIMIT cancel disposition UNKNOWN; staying "
-                "cancel_pending, market withheld until next tick resolves",
-                pine_id,
-            )
-            return
-        # CANCEL_CONFIRMED / TOO_LATE_TO_CANCEL / STILL_OPEN: the LIMIT is
-        # provably gone with no fill — safe to fire the market.
-        self._fire_entry_stop_market(pine_id)
-
-    def _earlier_stop_market_send_settled(self, pine_id: str, market_coid: str | None) -> bool:
-        """Whether a stop-fired MARKET may be sent again after an earlier send of it.
-
-        A watch in ``stop_market_pending`` already sent its MARKET once (or
-        crashed around the send). On a venue that refuses a duplicate client
-        order id the repeat is harmless: the venue answers it with the first
-        order. On any other venue a first send that landed makes the repeat a
-        second position, so the plugin's journal row of the earlier send
-        decides:
-
-        * no row, a ``submitted`` row this process wrote (the send failed
-          before it left), or a row the venue refused (closed ``rejected``,
-          nothing filled) — the earlier send did not land: send again;
-        * a row whose answer is still open
-          (:func:`~pynecore.core.broker.parked_dispatch.awaits_venue_answer`)
-          — hold until the plugin's resolver settles it, reported like a
-          held entry;
-        * any other row — the earlier send landed, so the stop won with that
-          order: the watch settles and nothing is sent.
-
-        :param pine_id: The watch's Pine entry id.
-        :param market_coid: The client order id of the earlier send.
-        :return: Whether the MARKET may be sent now.
-        """
-        if (not self._hold_inherited_dispatches or self._store_ctx is None
-                or market_coid is None):
-            return True
-        row = self._store_ctx.get_order(market_coid)
-        if row is None:
-            return True
-        if row.closed_ts_ms is None and awaits_venue_answer(self._store_ctx, row):
-            self._report_held_dispatch(
-                market_coid,
-                f"entry-stop {pine_id!r} market held: its earlier send {market_coid} "
-                f"is unanswered by the venue; it is sent again only if the venue "
-                f"never took it")
-            return False
-        if row.state == STATE_SUBMITTED and row.closed_ts_ms is None:
-            return True
-        if row.state == STATE_REJECTED and row.filled_qty <= 0.0:
-            return True
-        _blog_info(
-            "entry-stop %r: the earlier market send %s landed (state %s); no "
-            "second market sent", pine_id, market_coid, row.state,
-        )
-        if row.exchange_order_id:
-            self._order_mapping[pine_id] = [row.exchange_order_id]
-        self._entry_stop_engine.mark_stop_won(pine_id)
-        return False
-
-    def _fire_entry_stop_market(self, pine_id: str) -> None:
-        """Dispatch the stop-fired MARKET order for a both-set entry.
-
-        The deterministic :data:`KIND_ENTRY_STOP` client-order-id is persisted
-        BEFORE the POST (via ``confirm_limit_cancelled_fire_market``), so a
-        retry, in this process or after a restart, re-enters here from
-        ``stop_market_pending`` with the SAME id. A venue that refuses a
-        duplicate id answers that repeat with the first order; on any other
-        venue the repeat goes out only once the earlier send provably did not
-        land (:meth:`_earlier_stop_market_send_settled`), never a double-open.
-        A retry whose envelope was rebuilt under a fresh id (the earlier send
-        was resolved as rejected) persists that id on the watch before its
-        POST, so every later retry verifies the send actually in flight.
-        """
-        watch = self._entry_stop_engine.get_watch(pine_id)
-        if watch is None:
-            return
-        # Quarantine gate: the stop-fired MARKET is a new-exposure dispatch
-        # that bypasses ``_dispatch_new`` (it POSTs ``execute_entry``
-        # directly), so it needs its own gate. The preceding LIMIT cancel is
-        # risk-reducing and has already run — the OCO is committed to the
-        # stop side with no safe leg left, so the watch is terminalised and
-        # no position opens. The signal is dropped, not queued — an operator
-        # restart must not fire a market from a cross that happened during
-        # the quarantine. A fresh cross is still ``cancel_pending`` →
-        # ``mark_aborted``; a restart/retry re-entry is already
-        # ``stop_market_pending`` (the market coid persisted, a prior POST
-        # may or may not have landed) → ``mark_stop_won`` stops the retry;
-        # if that earlier POST did land, its fill still books normally.
-        if self._quarantined:
-            _blog_warning(
-                "entry-stop %r stop-fired market blocked by quarantine "
-                "(%s); no position opened",
-                pine_id, self._quarantine_reason,
-            )
-            if self._entry_stop_engine.mark_aborted(
-                    pine_id, reason='quarantine_blocked_market') is None:
-                self._entry_stop_engine.mark_stop_won(pine_id)
-            return
-        if (watch.state == ENTRY_STOP_STATE_MARKET_PENDING
-                and not self._earlier_stop_market_send_settled(pine_id, watch.market_coid)):
+            if self._stop_limit_engine.mark_aborted(pine_id, reason=why) is None:
+                self._stop_limit_engine.abort_unsent(pine_id, reason=why)
             return
         active = self._active_intents.get(pine_id)
-        if isinstance(active, EntryIntent):
-            base = active
-        else:
-            # Restart before the first post-restart diff repopulated
-            # ``_active_intents`` — reconstruct the market intent from the
-            # persisted watch.
-            base = EntryIntent(
-                pine_id=watch.pine_id,
-                symbol=watch.symbol,
-                side=watch.side,
-                qty=watch.qty,
-                order_type=OrderType.MARKET,
-            )
-        market_intent = dataclasses.replace(
-            base,
-            order_type=OrderType.MARKET,
-            limit=None,
-            stop=None,
-            stop_fired_market=True,
+        base = active if isinstance(active, EntryIntent) else EntryIntent(
+            pine_id=pine_id, symbol=watch.symbol, side=watch.side, qty=watch.qty,
+            order_type=OrderType.LIMIT, limit=watch.limit, stop=watch.stop,
         )
-        market_envelope = self._build_envelope(market_intent)
-        market_coid = market_envelope.client_order_id(KIND_ENTRY_STOP)
-        if watch.state == ENTRY_STOP_STATE_CANCEL_PENDING:
-            # Short-selling gate: the stop-fired MARKET POSTs execute_entry
-            # directly, bypassing ``_dispatch_new``'s gate. Inventory can
-            # shrink between the both-set entry's initial preflight and the
-            # stop firing, so re-check the projected signed position before
-            # committing. ``exclude_key=pine_id``: this market REPLACES the
-            # still-active limit intent under the same key, so its own qty must
-            # not be double-counted against itself. Gate the FIRST fire only —
-            # an already-persisted ``stop_market_pending`` POST may be live at
-            # the broker, and halting the idempotent retry would strand
-            # recovery rather than protect anything. Raises (graceful halt) on
-            # a projected-negative sell, never a silent skip.
-            self._enforce_short_gate(market_intent, exclude_key=pine_id)
-            # Persist the market identity BEFORE the POST (verify-before-resend
-            # on restart). No-op when already stop_market_pending (retry path).
-            self._entry_stop_engine.confirm_limit_cancelled_fire_market(
-                pine_id, market_coid=market_coid,
-            )
-        elif market_coid != watch.market_coid:
-            # The earlier send was rejected and its envelope dropped (a
-            # plugin's ``'rejected'`` resolution), so this retry goes out
-            # under a fresh id. That id may carry an earlier send of its own,
-            # which gates the POST like the watch's id did; then it is
-            # persisted BEFORE the POST, so the next retry verifies this send
-            # and not the rejected one.
-            if not self._earlier_stop_market_send_settled(pine_id, market_coid):
+        limit_intent = dataclasses.replace(
+            base, order_type=OrderType.LIMIT, limit=watch.limit, stop=None,
+            triggered_entry=True,
+        )
+        coid = self._build_envelope(limit_intent).client_order_id(KIND_ENTRY_TRIGGERED)
+        if watch.state == STOP_LIMIT_STATE_ARMED:
+            # Short gate: inventory can shrink between the order's placement
+            # and its trigger. ``exclude_key``: the LIMIT replaces the order
+            # under the same key, so its own quantity is not counted twice.
+            self._enforce_short_gate(limit_intent, exclude_key=pine_id)
+            self._stop_limit_engine.begin_trigger(pine_id, order_coid=coid)
+        elif coid != watch.order_coid:
+            if self._triggered_send_state(watch, coid) != 'unsent':
                 return
-            self._entry_stop_engine.rebind_market_coid(pine_id, market_coid=market_coid)
+            self._stop_limit_engine.rebind_order_coid(pine_id, order_coid=coid)
+        parked_before = self._parked_dispatch_coids(pine_id)
         try:
-            orders = self._run_async(
-                self._broker.execute_entry(market_envelope),
-            )
-        except OrderDispositionUnknownError as e:
-            # The market POST timed out; it may or may not have landed. Stay
-            # stop_market_pending — the next tick re-enters with the SAME
-            # deterministic coid, and :meth:`_earlier_stop_market_send_settled`
-            # decides whether it may go out again.
-            _blog_warning(
-                "entry-stop %r market dispatch unknown disposition (coid=%s); "
-                "staying stop_market_pending for idempotent retry: %s",
-                pine_id, e.client_order_id, e,
-            )
-            return
-        except BrokerManualInterventionError as e:
-            self._record_halt(e)
-            raise
+            self._dispatch_new(limit_intent)
         except OrderSkippedByPlugin as e:
-            # Plugin declined (e.g. below min-size). The OCO is already
-            # committed to the stop side (LIMIT cancelled), so there is no
-            # safe leg left — settle as stop_won to stop re-trying and let the
-            # operator observe the skip. The position simply did not open.
+            # Refused for good this time (or declined by the plugin): the
+            # order is spent like any refused entry. The reject counts against
+            # the Pine order, whose re-emission re-arms a fresh watch until
+            # the bounded reject budget silences it.
+            self._log_plugin_skip(e)
+            if isinstance(active, EntryIntent):
+                self._record_entry_reject(pine_id, active, e)
+            self._stop_limit_engine.abort_unsent(pine_id, reason=e.reason or 'skipped')
+            self._active_intents.pop(pine_id, None)
+            self._order_mapping.pop(pine_id, None)
+            return
+        except ExchangeConnectionError as e:
             _blog_warning(
-                "entry-stop %r market dispatch skipped by plugin (%s); no "
-                "position opened",
-                pine_id, e.reason,
-            )
-            self._entry_stop_engine.mark_stop_won(pine_id)
-            return
-        except Exception as e:  # noqa: BLE001
-            _blog_error(
-                "entry-stop %r market dispatch failed (%s: %s); staying "
-                "stop_market_pending for retry",
-                pine_id, type(e).__name__, e,
+                "stop-limit %s LIMIT send interrupted (%s); staying limit_pending, "
+                "the earlier send is verified before the retry",
+                format_intent_key(pine_id), e,
             )
             return
-        self._order_mapping[pine_id] = [o.id for o in orders]
-        self._entry_stop_engine.mark_stop_won(pine_id)
+        if self._parked_dispatch_coids(pine_id) - parked_before:
+            # The venue's answer is unknown; the pending-dispatch verification
+            # settles it and the next drive reads the outcome.
+            return
+        self._stop_limit_engine.mark_triggered(pine_id)
+
+    def _triggered_send_state(self, watch: StopLimitWatch, coid: str | None = None) -> str:
+        """Judge an earlier send of a triggered stop-limit's LIMIT.
+
+        On a venue that refuses a duplicate client order id a repeat is
+        harmless (the venue answers it with the first order), so it may always
+        go. Elsewhere the plugin's journal row of the earlier send decides:
+
+        * no row, a ``submitted`` row this process wrote (the send failed
+          before it left), or a row the venue refused with nothing filled —
+          ``'unsent'``: send again;
+        * a row whose answer is still open
+          (:func:`~pynecore.core.broker.parked_dispatch.awaits_venue_answer`)
+          — ``'held'`` until the plugin's resolver settles it;
+        * any other row — ``'landed'``: the LIMIT is on the venue, so its id
+          is mapped and the watch becomes ``triggered``.
+
+        :param watch: The ``limit_pending`` watch.
+        :param coid: The send to judge; the watch's persisted id by default.
+        :return: ``'unsent'``, ``'held'`` or ``'landed'``.
+        """
+        coid = coid if coid is not None else watch.order_coid
+        if not self._hold_inherited_dispatches or self._store_ctx is None or coid is None:
+            return 'unsent'
+        row = self._store_ctx.get_order(coid)
+        if row is None:
+            return 'unsent'
+        if row.closed_ts_ms is None and awaits_venue_answer(self._store_ctx, row):
+            self._report_held_dispatch(
+                coid,
+                f"stop-limit {watch.pine_id!r} LIMIT held: its earlier send {coid} "
+                f"is unanswered by the venue; it is sent again only if the venue "
+                f"never took it")
+            return 'held'
+        if row.state == STATE_SUBMITTED and row.closed_ts_ms is None:
+            return 'unsent'
+        if row.state == STATE_REJECTED and row.filled_qty <= 0.0:
+            return 'unsent'
         _blog_info(
-            "entry-stop %r: stop fired, market opened -> %s",
-            pine_id, self._order_mapping.get(pine_id),
+            "stop-limit %s: the earlier LIMIT send %s landed (state %s); no "
+            "second order sent", format_intent_key(watch.pine_id), coid, row.state,
         )
+        if row.exchange_order_id:
+            self._order_mapping[watch.pine_id] = [row.exchange_order_id]
+        self._stop_limit_engine.mark_triggered(watch.pine_id)
+        return 'landed'
+
+    def _retire_legacy_oco_watches(self) -> None:
+        """Retire the watch rows of the legacy OCO model, deterministically.
+
+        An earlier version placed a both-set entry as a native LIMIT resting
+        from the start plus a software STOP that fired a MARKET. Such a row
+        is never driven under the stop-limit model:
+
+        * ``armed`` / ``cancel_pending`` — its native LIMIT may still rest
+          and could fill on a pullback the stop-limit order never fills on.
+          The LIMIT is cancelled; on a known outcome the row closes. A cancel
+          that found the LIMIT filled leaves the fill booked as the order's
+          fill. Otherwise the order is released (mapping, active intent,
+          spent envelope anchor), so the Pine re-emission arms a stop-limit
+          watch in its place. An unknown outcome retries next sync.
+        * ``stop_market_pending`` — its MARKET was sent or about to be: the
+          row closes once that send is no longer unanswered; a landed MARKET
+          books through its own journal row.
+        """
+        for watch in self._stop_limit_engine.iter_watches():
+            if watch.symbol != self._symbol or not watch.legacy:
+                continue
+            pine_id = watch.pine_id
+            if watch.state == LEGACY_OCO_STATE_MARKET_PENDING:
+                coid = watch.legacy_market_coid
+                row = (self._store_ctx.get_order(coid)
+                       if self._store_ctx is not None and coid else None)
+                if (row is not None and row.closed_ts_ms is None
+                        and awaits_venue_answer(self._store_ctx, row)):
+                    continue
+                self._stop_limit_engine.retire_legacy(pine_id, reason='legacy_oco_market_settled')
+                _blog_warning(
+                    "stop-limit %s: retired a legacy OCO watch row whose stop-fired "
+                    "market was already sent", format_intent_key(pine_id),
+                )
+                continue
+            cancel = CancelIntent(pine_id=pine_id, symbol=self._symbol)
+            try:
+                outcome = self._run_async(
+                    self._broker.execute_cancel_with_outcome(self._build_cancel_envelope(cancel)),
+                )
+            except BrokerManualInterventionError as e:
+                self._record_halt(e)
+                raise
+            except Exception as e:  # noqa: BLE001
+                _blog_warning(
+                    "stop-limit %s: cancelling the legacy OCO LIMIT raised %s: %s; "
+                    "retrying next sync", format_intent_key(pine_id), type(e).__name__, e,
+                )
+                continue
+            if outcome is CancelDispositionOutcome.UNKNOWN:
+                _blog_warning(
+                    "stop-limit %s: the legacy OCO LIMIT cancel is unresolved; "
+                    "retrying next sync", format_intent_key(pine_id),
+                )
+                continue
+            filled = outcome is CancelDispositionOutcome.ALREADY_FILLED
+            self._stop_limit_engine.retire_legacy(
+                pine_id, reason='legacy_oco_limit_filled' if filled else 'legacy_oco_limit_cancelled',
+            )
+            _blog_warning(
+                "stop-limit %s: retired a legacy OCO watch row and its native LIMIT "
+                "(%s)", format_intent_key(pine_id), outcome.name,
+            )
+            if not filled:
+                self._order_mapping.pop(pine_id, None)
+                self._active_intents.pop(pine_id, None)
+                self._reanchor_envelope_after_reject(pine_id)
+
+    def _modify_software_stop_limit(self, old: Intent, new: Intent) -> bool:
+        """Apply an amend of a software stop-limit order; ``False`` when not one.
+
+        An entry turned into a stop-limit order (no watch yet) leaves the venue
+        and a watch takes its place.
+
+        * ``armed`` — nothing rests on the venue: a still stop-limit order
+          amends the watch; a changed order type drops the watch and the new
+          order is dispatched in its place.
+        * ``triggered`` — the LIMIT rests on the venue: a changed limit or
+          quantity amends it (a changed stop has no effect any more, as on
+          TradingView); another order type retires the watch and the regular
+          cancel-and-replace path takes over (``False``).
+        * ``limit_pending`` — the LIMIT is in flight under its persisted
+          terms: the amend waits for the next sync, as does the amend of an
+          order whose legacy OCO row is still being retired.
+
+        :raises _PartialBracketModifyDeferred: For ``limit_pending``.
+        """
+        if not isinstance(new, EntryIntent) or not isinstance(old, EntryIntent):
+            return False
+        key = new.intent_key
+        still = self._is_software_stop_limit(new)
+        watch = self._stop_limit_engine.get_watch(key)
+        if watch is None and still:
+            if not self._dispatch_cancel_strict(old):
+                raise _PartialBracketModifyDeferred(key)
+            self._order_mapping.pop(key, None)
+            self._reanchor_envelope_after_reject(key)
+            self._dispatch_new(new)
+            return True
+        if watch is None:
+            return False
+        if watch.legacy or watch.state == STOP_LIMIT_STATE_LIMIT_PENDING:
+            _blog_info("stop-limit %s amend deferred: its LIMIT is in flight",
+                       format_intent_key(key))
+            raise _PartialBracketModifyDeferred(key)
+        if watch.state == STOP_LIMIT_STATE_ARMED:
+            if still:
+                assert new.stop is not None and new.limit is not None
+                self._stop_limit_engine.amend(
+                    key, stop=float(new.stop), limit=float(new.limit),
+                    qty=new.qty, side=new.side,
+                )
+                _blog_info("stop-limit %s amended: stop %s, limit %s, qty %s",
+                           format_intent_key(key), new.stop, new.limit, new.qty)
+                return True
+            self._stop_limit_engine.mark_aborted(key, reason='stop_limit_removed_by_modify')
+            self._order_mapping.pop(key, None)
+            self._reanchor_envelope_after_reject(key)
+            self._dispatch_new(new)
+            return True
+        if not still:
+            self._stop_limit_engine.mark_aborted(key, reason='stop_limit_removed_by_modify')
+            return False
+        assert new.limit is not None and new.stop is not None
+        if new.limit == watch.limit and new.qty == watch.qty and new.side == watch.side:
+            self._stop_limit_engine.amend(
+                key, stop=float(new.stop), limit=float(new.limit), qty=new.qty, side=new.side,
+            )
+            return True
+        old_limit = dataclasses.replace(
+            old, order_type=OrderType.LIMIT, limit=watch.limit, stop=None, triggered_entry=True,
+        )
+        new_limit = dataclasses.replace(
+            new, order_type=OrderType.LIMIT, stop=None, triggered_entry=True,
+        )
+        orders = self._run_async_write(self._broker.modify_entry(
+            self._build_envelope(old_limit), self._build_envelope(new_limit),
+        ))
+        prev_ids = list(self._order_mapping.get(key, []))
+        new_ids = [o.id for o in orders]
+        self._order_mapping[key] = new_ids
+        for stale_id in prev_ids:
+            if stale_id not in new_ids:
+                self._retired_entry_order_ids.add(stale_id)
+        self._active_entry_filled_qty[key] = 0.0
+        self._stop_limit_engine.amend(
+            key, stop=float(new.stop), limit=float(new.limit), qty=new.qty, side=new.side,
+        )
+        _blog_info("stop-limit %s: its triggered LIMIT amended to %s x %s",
+                   format_intent_key(key), new.limit, new.qty)
+        return True
 
     def _drive_partial_bracket_triggers(
             self, *, last_price: float | None,
@@ -18088,7 +18146,7 @@ class OrderSyncEngine:
         """
         if not isinstance(intent, EntryIntent) or self._store_ctx is None:
             return False
-        for kind in (KIND_ENTRY, KIND_ENTRY_STOP):
+        for kind in (KIND_ENTRY, KIND_ENTRY_TRIGGERED):
             prior = DispatchEnvelope(
                 intent=intent,
                 run_tag=anchor.run_tag or self._run_tag,
@@ -18231,7 +18289,7 @@ class OrderSyncEngine:
         this run owns — its ``client_order_id`` parses cleanly, its
         ``run_tag`` is one of :meth:`_journaled_run_tags` (our own, or a
         rotated predecessor's whose journal this run adopted), and its kind
-        is :data:`KIND_ENTRY` or :data:`KIND_ENTRY_STOP` — into
+        is :data:`KIND_ENTRY` or :data:`KIND_ENTRY_TRIGGERED` — into
         :attr:`~OrderSyncEngine._restart_live_entry_anchors`, keyed by ``pid_hash`` ->
         ``(bar_ts_ms, retry_seq)``, with the order's own tag in
         :attr:`~OrderSyncEngine._restart_live_entry_tags`. An id that is
@@ -18248,10 +18306,10 @@ class OrderSyncEngine:
         A ``pid_hash`` with more than one DISTINCT ``(bar_ts_ms, retry_seq)``
         among its live orders is ambiguous — the engine never produces two
         live working orders for one entry on the same run — so it is logged
-        and dropped rather than guessed at. The two legs of a both-set entry
-        (:data:`KIND_ENTRY` LIMIT + :data:`KIND_ENTRY_STOP` MARKET) share the
-        same pinned ``(bar_ts_ms, retry_seq)``, so they collapse to a single
-        tuple and are NOT ambiguous.
+        and dropped rather than guessed at. An entry's own order and its
+        triggered order (:data:`KIND_ENTRY` + :data:`KIND_ENTRY_TRIGGERED`)
+        share the same pinned ``(bar_ts_ms, retry_seq)``, so they collapse to
+        a single tuple and are NOT ambiguous.
 
         Every listed order's ids also land in
         :attr:`~OrderSyncEngine._restart_open_order_ids`: the proof that a
@@ -18296,14 +18354,14 @@ class OrderSyncEngine:
                 wire = parse_wire_client_order_id(coid)
                 if (wire is not None
                         and wire.run_tag in owned_tags
-                        and wire.kind in (KIND_ENTRY, KIND_ENTRY_STOP)):
+                        and wire.kind in (KIND_ENTRY, KIND_ENTRY_TRIGGERED)):
                     wire_orders.append((coid, wire.bar_ts_ms, wire.kind))
                     if order.id:
                         wire_order_id_by_coid[coid] = order.id
                         orders_by_id[order.id] = order
                 continue
             if (parsed.run_tag not in owned_tags
-                    or parsed.kind not in (KIND_ENTRY, KIND_ENTRY_STOP)):
+                    or parsed.kind not in (KIND_ENTRY, KIND_ENTRY_TRIGGERED)):
                 continue
             by_pid.setdefault(parsed.pid_hash, set()).add(
                 (parsed.bar_ts_ms, parsed.retry_seq, parsed.run_tag),
@@ -18561,9 +18619,9 @@ class OrderSyncEngine:
         For each live wire order the scan snapshotted, rebuilds the candidate
         canonical id at the order's raw ``bar_ts_ms`` / ``kind`` for every
         ``retry_seq`` below :data:`_WIRE_ADOPT_RETRY_SCAN_MAX` and compares
-        the re-encoded wire form against the echoed id. The two legs of a
-        both-set entry (LIMIT + STOP kinds) share one pinned anchor, so they
-        collapse into a single ``(bar_ts_ms, retry_seq)`` — genuinely
+        the re-encoded wire form against the echoed id. An entry's own and
+        triggered orders share one pinned anchor, so they collapse into a
+        single ``(bar_ts_ms, retry_seq)`` — genuinely
         ambiguous multi-anchor matches are logged and left to reconcile.
 
         :return: ``(anchor, run_tag, matched_wire_coids)`` — ``run_tag`` is
@@ -19734,7 +19792,7 @@ class OrderSyncEngine:
         if (coid_spent_retry != 0
                 or not isinstance(intent, EntryIntent)
                 or intent.order_type is not OrderType.MARKET
-                or intent.stop_fired_market
+                or intent.triggered_entry
                 or intent.is_strategy_order
                 or intent.skip_flip):
             return
@@ -20091,8 +20149,8 @@ class OrderSyncEngine:
         # the consumed exposure. LIMIT/STOP entries are already combined at
         # creation (``strategy.entry`` subtracts the position size — a
         # Pine-visible quantity both TV and the simulator book in full),
-        # and a stop-fired market re-dispatch derives from such a
-        # creation-combined leg — both excluded. ``strategy.order`` is
+        # and a triggered re-dispatch derives from such a
+        # creation-combined order — both excluded. ``strategy.order`` is
         # excluded too: it never auto-reverses — its raw quantity simply
         # nets against the venue position (an opposite-side order(qty=3) on
         # a 5-long reduces to 2, it does not target a 3-short).
@@ -20172,7 +20230,7 @@ class OrderSyncEngine:
         if (_coid_spent_retry == 0
                 and isinstance(intent, EntryIntent)
                 and intent.order_type is OrderType.MARKET
-                and not intent.stop_fired_market
+                and not intent.triggered_entry
                 and not intent.is_strategy_order
                 and not intent.skip_flip
                 and self._position.size != 0.0
@@ -20317,21 +20375,29 @@ class OrderSyncEngine:
                     self._neutralised_parent_entry_pine_ids.discard(
                         intent.pine_id,
                     )
-                if port is not None:
-                    # Hedging-mode emulation: a Pine entry is decomposed over the
-                    # legs by the core engine — a MARKET reversal FIFO-closes the
-                    # opposing legs and opens only the residual, a pure add opens
-                    # the whole size, a resting LIMIT/STOP rests full-size (no
-                    # close at placement). run_reversal reads the legs and plans
-                    # internally, so the engine needs no net-position tracking; it
-                    # returns the opened order(s) — register their real ids.
-                    reversal = self._run_async_write(
-                        self._one_way_emulator.run_reversal(envelope, port),
-                    )
-                    orders = list(reversal.opened_orders)
+                if self._is_software_stop_limit(intent):
+                    # A stop-limit order rests nowhere before its stop
+                    # triggers: the watch is the order until then. No order id
+                    # is mapped, so a restart's adoption scan finds nothing to
+                    # bind and the re-emission re-arms (idempotently).
+                    self._arm_stop_limit_watch(intent, envelope)
                 else:
-                    orders = self._run_async_write(self._broker.execute_entry(envelope))
-                self._order_mapping[intent.intent_key] = [o.id for o in orders]
+                    if port is not None:
+                        # Hedging-mode emulation: a Pine entry is decomposed over
+                        # the legs by the core engine — a MARKET reversal
+                        # FIFO-closes the opposing legs and opens only the
+                        # residual, a pure add opens the whole size, a resting
+                        # LIMIT/STOP rests full-size (no close at placement).
+                        # run_reversal reads the legs and plans internally, so the
+                        # engine needs no net-position tracking; it returns the
+                        # opened order(s) — register their real ids.
+                        reversal = self._run_async_write(
+                            self._one_way_emulator.run_reversal(envelope, port),
+                        )
+                        orders = list(reversal.opened_orders)
+                    else:
+                        orders = self._run_async_write(self._broker.execute_entry(envelope))
+                    self._order_mapping[intent.intent_key] = [o.id for o in orders]
                 # This entry is now live on the wire — reset its cumulative
                 # fill ledger so a stale value from an earlier entry cycle on
                 # the same ``pine_id`` cannot make the short gate
@@ -20347,15 +20413,6 @@ class OrderSyncEngine:
                 self._entry_backing_orders[intent.intent_key] = (
                     self._position.entry_orders.get(intent.pine_id)
                 )
-                # Both-set Pine entry: the dispatch above placed the native
-                # LIMIT leg. Arm the software price-watch for the STOP leg so
-                # a stop cross cancels the LIMIT and fires a MARKET order. The
-                # synthetic stop-fired MARKET re-enters this branch with
-                # ``stop_fired_market=True`` and must NOT re-arm.
-                if (intent.limit is not None
-                        and intent.stop is not None
-                        and not intent.stop_fired_market):
-                    self._arm_entry_stop_watch(intent, envelope)
             elif isinstance(intent, ExitIntent):
                 self._filled_exit_keys.discard(intent.intent_key)
                 # Route engine-trigger partial brackets through the
@@ -20740,6 +20797,9 @@ class OrderSyncEngine:
                 )
                 raise
             self._reanchor_envelope_after_reject(intent.intent_key)
+            if _reject_retry == 0 and e.level_crossed and _is_triggerable_entry(intent):
+                self._dispatch_crossed_entry(intent, e)
+                return
             raise OrderSkippedByPlugin(
                 f"Entry {intent.intent_key} rejected by exchange "
                 f"({type(e).__name__}: {e}); signal dropped, bot continues.",
@@ -20754,6 +20814,90 @@ class OrderSyncEngine:
         except Exception as e:
             self._log_dispatch_failure(intent, e)
             raise
+
+    def _dispatch_crossed_entry(
+            self, intent: EntryIntent, error: ExchangeOrderRejectedError,
+    ) -> None:
+        """Re-dispatch an entry the venue refused as already crossed.
+
+        A STOP entry whose trigger the quote already passed fills at once in
+        Pine, so it goes out as a MARKET order. A native stop-limit order whose
+        stop is already passed is triggered: it goes out as its plain LIMIT. A marketable LIMIT fills at once
+        too, but never beyond its limit: it goes out at market only while a
+        fresh quote (:meth:`~pynecore.core.plugin.broker.BrokerPlugin.get_quote`)
+        is still on the limit's good side — a buy's ask at or below the limit,
+        a sell's bid at or above it. Otherwise the quote moved away, the limit
+        is no longer marketable, and it is sent again as the resting LIMIT it
+        now is. Without a quote nothing is sent: the refusal stays the regular
+        counted entry reject.
+
+        The re-dispatch goes out under the same key with a fresh client order
+        id (the caller re-anchored the envelope; the
+        :data:`~pynecore.core.broker.idempotency.KIND_ENTRY_TRIGGERED` route),
+        the quantity of the refused order (no stop-and-reverse fold, no
+        opposite-entry wait), and every dispatch gate of :meth:`_dispatch_new`.
+        A stop-limit watch whose LIMIT this was persists the new id first. A
+        refusal of the re-dispatch is the regular counted entry reject.
+
+        :param intent: The refused STOP, LIMIT or native stop-limit entry.
+        :param error: The venue's refusal, with ``level_crossed`` set.
+        :raises OrderSkippedByPlugin: When a LIMIT has no quote to judge by.
+        """
+        if intent.order_type is OrderType.STOP:
+            resend = dataclasses.replace(
+                intent, order_type=OrderType.MARKET, limit=None, stop=None,
+                triggered_entry=True,
+            )
+            how = "at market: Pine fills a crossed stop entry at once"
+        elif intent.stop is not None:
+            resend = dataclasses.replace(intent, stop=None, triggered_entry=True)
+            how = "as its plain LIMIT: Pine triggers a crossed stop-limit order at once"
+        else:
+            assert intent.limit is not None
+            quote = self._read_quote(intent.symbol)
+            if quote is None:
+                raise OrderSkippedByPlugin(
+                    f"Entry {format_intent_key(intent.intent_key)} refused as "
+                    f"marketable ({error}) and no quote is known to send it at "
+                    f"market within its limit; signal dropped, bot continues.",
+                    intent_key=intent.intent_key,
+                    reason="broker_rejected_entry",
+                    context={'symbol': intent.symbol, 'pine_id': intent.pine_id,
+                             'reject_type': type(error).__name__},
+                ) from error
+            within = (quote.ask <= intent.limit if intent.side == 'buy'
+                      else quote.bid >= intent.limit)
+            if within:
+                resend = dataclasses.replace(
+                    intent, order_type=OrderType.MARKET, limit=None, stop=None,
+                    triggered_entry=True,
+                )
+                how = (f"at market: the quote (bid {quote.bid}, ask {quote.ask}) "
+                       f"is still within the limit {intent.limit}")
+            else:
+                resend = dataclasses.replace(intent, triggered_entry=True)
+                how = (f"as a resting LIMIT: the quote (bid {quote.bid}, ask "
+                       f"{quote.ask}) moved beyond the limit {intent.limit}")
+        _blog_warning(
+            "entry %s refused with its level already crossed (%s); sending it %s",
+            format_intent_key(intent.intent_key), error, how,
+        )
+        coid = self._build_envelope(resend).client_order_id(KIND_ENTRY_TRIGGERED)
+        self._stop_limit_engine.rebind_order_coid(intent.intent_key, order_coid=coid)
+        self._dispatch_new(resend, _reject_retry=1)
+
+    def _read_quote(self, symbol: str) -> Quote | None:
+        """The venue's fresh quote for ``symbol``, ``None`` when it cannot be read."""
+        getter = getattr(self._broker, 'get_quote', None)
+        if getter is None:
+            return None
+        try:
+            return self._run_async(getter(symbol))
+        except BrokerManualInterventionError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            _blog_warning("quote read for %s failed: %s: %s", symbol, type(e).__name__, e)
+            return None
 
     @staticmethod
     def _log_dispatch_failure(intent: Intent, exc: Exception) -> None:
@@ -21267,8 +21411,8 @@ class OrderSyncEngine:
             )
 
         # Key the fail-safe ownership + leg stamping on the COID the parent
-        # position opened under (KIND_ENTRY normally, KIND_ENTRY_STOP when the
-        # both-set STOP leg won the OCO), live envelope or restart-anchor
+        # position opened under (KIND_ENTRY normally, KIND_ENTRY_TRIGGERED for a
+        # triggered entry), live envelope or restart-anchor
         # rebuild — so the broker reconcile feed, which reports the position
         # under that same COID, confirms the registered state. Resolved BEFORE
         # the envelope build so the soft-skip below leaves no half-registered
@@ -24045,6 +24189,8 @@ class OrderSyncEngine:
         amends_entry = (isinstance(new, EntryIntent) and isinstance(old, EntryIntent)
                         and new.order_type is old.order_type)
         try:
+            if self._modify_software_stop_limit(old, new):
+                return
             if amends_entry:
                 assert isinstance(new, EntryIntent)
                 prev_order_ids = list(self._order_mapping.get(new.intent_key, []))
@@ -24076,40 +24222,6 @@ class OrderSyncEngine:
                 # amend that preserves ``filled_qty`` only over-reserves by the
                 # pre-amend slice — the safe direction, never a short.
                 self._active_entry_filled_qty[new.intent_key] = 0.0
-                # Keep the both-set entry's software STOP leg in step with the
-                # amended native LIMIT. modify_entry preserves the LIMIT's
-                # KIND_ENTRY coid (the envelope anchor is pinned across amend
-                # cycles), so the watch's leg-scoped cancel target stays valid;
-                # only the fire level / size / side change. amend_watch self-
-                # guards (no watch -> no-op), so a plain entry modify is a no-op.
-                #
-                # The software STOP watch exists ONLY for a both-set entry
-                # (native LIMIT + software STOP price-watch). The discriminator
-                # is therefore both-set, NOT ``new.stop is not None``: a
-                # stop-only entry (stop set, no limit) is a native STOP and must
-                # never carry a software watch — keying on ``new.stop`` alone
-                # would arm/keep a watch whose KIND_ENTRY leg is a STOP, not the
-                # LIMIT the watch assumes, double-arming against the native STOP.
-                if new.limit is not None and new.stop is not None:
-                    if self._entry_stop_engine.has_watch(new.intent_key):
-                        self._entry_stop_engine.amend_watch(
-                            new.intent_key,
-                            stop_level=float(new.stop),
-                            qty=new.qty,
-                            side=new.side,
-                        )
-                    else:
-                        # promoted to both-set this amend (from limit-only,
-                        # market, or stop-only): the STOP leg is new.
-                        self._arm_entry_stop_watch(new, new_env)
-                elif self._entry_stop_engine.has_watch(new.intent_key):
-                    # demoted away from both-set (to limit-only, stop-only, or
-                    # market): the software STOP leg is gone; retire the watch
-                    # so no market ever fires (no-op once it has already
-                    # committed to the stop side).
-                    self._entry_stop_engine.mark_aborted(
-                        new.intent_key, reason='entry_stop_removed_by_modify',
-                    )
             elif isinstance(new, ExitIntent) and isinstance(old, ExitIntent):
                 port: PositionPort | None = getattr(self._broker, 'position_port', None)
                 if port is not None:
@@ -24628,12 +24740,27 @@ class OrderSyncEngine:
             self._drop_envelope(old.intent_key)
             return True
         if isinstance(old, EntryIntent):
-            # A both-set entry's STOP leg is a software watch; the strategy
-            # cancel below cancels the native LIMIT working order, so retire
-            # the watch too. No-op when the entry was not both-set.
-            self._entry_stop_engine.mark_aborted(
-                old.intent_key, reason='strategy_cancel',
-            )
+            watch = self._stop_limit_engine.get_watch(old.intent_key)
+            if watch is not None and not watch.legacy:
+                if watch.state == STOP_LIMIT_STATE_ARMED:
+                    # Nothing rests on the venue before the trigger.
+                    self._stop_limit_engine.mark_aborted(old.intent_key, reason='strategy_cancel')
+                    self._order_mapping.pop(old.intent_key, None)
+                    self._drop_envelope(old.intent_key)
+                    return True
+                if watch.state == STOP_LIMIT_STATE_LIMIT_PENDING:
+                    send = self._triggered_send_state(watch)
+                    if send == 'held':
+                        return False
+                    if send == 'unsent':
+                        self._stop_limit_engine.abort_unsent(
+                            old.intent_key, reason='strategy_cancel')
+                        self._order_mapping.pop(old.intent_key, None)
+                        self._drop_envelope(old.intent_key)
+                        return True
+                # ``triggered``: the LIMIT rests on the venue; the regular
+                # cancel below removes it, then the watch ends.
+                self._stop_limit_engine.mark_aborted(old.intent_key, reason='strategy_cancel')
             cancel = CancelIntent(pine_id=old.pine_id, symbol=self._symbol)
         elif isinstance(old, ExitIntent):
             cancel = CancelIntent(
@@ -25218,14 +25345,11 @@ class OrderSyncEngine:
         :meth:`_run_async_recovery`, whose expired bridge wait surfaces as
         ``OrderDispositionUnknownError`` into their park-and-retry, and must
         not halt.
-        The outcome-driven cancel/entry-stop retry loops
-        (:meth:`_drive_cancel_tentative`,
-        :meth:`_resolve_entry_stop_cancel_then_fire`,
-        :meth:`_fire_entry_stop_market`) likewise stay on raw :meth:`_run_async`:
-        they own a stricter state machine that treats a transient as
-        ``UNKNOWN`` / ``cancel_pending`` / ``stop_market_pending`` and retries
-        idempotently, so a central halt would defeat their "never a halt for a
-        live bot" contract.
+        The outcome-driven cancel retry loops (:meth:`_drive_cancel_tentative`,
+        :meth:`_retire_legacy_oco_watches`) likewise stay on raw
+        :meth:`_run_async`: they own a stricter state machine that treats a
+        transient as ``UNKNOWN`` and retries idempotently, so a central halt
+        would defeat their "never a halt for a live bot" contract.
 
         :param coro: A direct order-dispatch broker coroutine.
         :return: The coroutine's result.

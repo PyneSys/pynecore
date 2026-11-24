@@ -40,6 +40,7 @@ __all__ = [
     'VENUE_DRIVEN_CANCEL_REASONS',
     'ExchangePosition',
     'PositionLeg',
+    'Quote',
     'ExchangeCapabilities',
     'EntryIntent',
     'ExitIntent',
@@ -388,6 +389,17 @@ class ExchangePosition:
     margin_mode: str  # "cross" | "isolated" | "cash" (spot)
 
 
+@dataclass(frozen=True)
+class Quote:
+    """A venue's current top of book for one symbol.
+
+    :ivar bid: Best bid.
+    :ivar ask: Best ask.
+    """
+    bid: float
+    ask: float
+
+
 @dataclass
 class PositionLeg:
     """One raw open position ("leg") on a hedging-capable exchange.
@@ -447,12 +459,16 @@ class ExchangeCapabilities:
     # client-side trigger price into a market submit). UNSUPPORTED rejects
     # scripts that use the corresponding Pine parameter.
     #
-    # A both-set Pine entry (``strategy.entry(limit=, stop=)``) is NOT a
-    # single stop-limit primitive — it is two OCO legs. The broker layer
-    # places the LIMIT leg as a native resting order and arms the STOP leg
-    # as a software price-watch that fires a MARKET order, so no dedicated
-    # stop-limit capability is needed.
     stop_order: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+    # A Pine order placed with both ``stop`` and ``limit`` is ONE stop-limit
+    # order: nothing can fill before the stop triggers, then it is a plain
+    # LIMIT at the limit price. NATIVE = the plugin places it as the venue's
+    # own stop-limit order (it receives the entry with both prices set), with
+    # a limit on either side of the stop and a triggered order that rests at
+    # its limit when it cannot fill at once. Anything else: the engine
+    # emulates it (:class:`~pynecore.core.broker.software_stop_limit_engine.SoftwareStopLimitEngine`)
+    # and the plugin only ever sees plain LIMIT entries.
+    stop_limit_order: CapabilityLevel = CapabilityLevel.UNSUPPORTED
     # NATIVE = server-side trailing stop (e.g. Capital.com
     # ``trailingStop=true, stopDistance``). SOFTWARE = plugin tracks the
     # last extreme and amends the SL each tick / bar.
@@ -597,18 +613,20 @@ class EntryIntent:
     comment: str | None = None
     alert_message: str | None = None
     is_strategy_order: bool = False  # True if from strategy.order() (no pyramiding limit)
-    # ``True`` only on the synthetic MARKET intent the entry-stop engine
-    # dispatches when the STOP leg of a both-set Pine entry fires (see
-    # :class:`~pynecore.core.broker.software_entry_stop_engine.SoftwareEntryStopEngine`).
-    # The plugin uses it to pick
-    # :data:`~pynecore.core.broker.idempotency.KIND_ENTRY_STOP` — a distinct
-    # client-order-id from the native LIMIT leg's
-    # :data:`~pynecore.core.broker.idempotency.KIND_ENTRY` — so the stop-fired
-    # market and the just-cancelled limit never share an idempotency key (which
-    # would make the broker's local dedup skip the market POST). ``compare=False``
-    # keeps it out of the diff equality: it is a dispatch route selector derived
-    # by the engine, not Pine-level state the diff needs to sync.
-    stop_fired_market: bool = field(default=False, compare=False)
+    # ``True`` only on an order the engine sends for an entry whose trigger
+    # fired: the LIMIT of a software stop-limit whose stop triggered (see
+    # :class:`~pynecore.core.broker.software_stop_limit_engine.SoftwareStopLimitEngine`),
+    # or the MARKET of a single-level entry the venue refused as already
+    # crossed. The plugin uses it to pick
+    # :data:`~pynecore.core.broker.idempotency.KIND_ENTRY_TRIGGERED` — a
+    # client-order-id distinct from the entry's own
+    # :data:`~pynecore.core.broker.idempotency.KIND_ENTRY` — so the two never
+    # share an idempotency key. The engine sends it with the quantity of the
+    # resting order it stands for, so the market stop-and-reverse fold and the
+    # opposite-entry wait stay out. ``compare=False`` keeps it out of the diff
+    # equality: it is a dispatch route selector derived by the engine, not
+    # Pine-level state the diff needs to sync.
+    triggered_entry: bool = field(default=False, compare=False)
     # ``True`` when the Pine ``Order`` behind this intent re-placed an unfilled
     # same-bar entry under the same id. TradingView modifies the standing order
     # with the RAW quantity — the reversal flip the replaced order carried is not

@@ -99,7 +99,9 @@ class ExchangeOrderRejectedError(BrokerError):
         through it. For an exit the refusal is then Pine's immediate exit
         for a crossed level, not a venue that refuses to protect the
         position: the engine closes the parent at market without
-        quarantining.
+        quarantining. For a single-level STOP or LIMIT entry it means the
+        quote already crossed the entry level, which Pine fills at once: the
+        engine sends the entry at market instead of dropping the signal.
     """
 
     def __init__(

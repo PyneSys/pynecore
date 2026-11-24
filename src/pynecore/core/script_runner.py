@@ -1900,6 +1900,17 @@ class ScriptRunner:
 
     # === Order-processing dispatch =========================================
 
+    def _observe_history_bar(self, candle: OHLCV) -> None:
+        """Show a live warmup bar to the order sync engine.
+
+        A software stop-limit order armed before a restart is judged against
+        the bars it did not see live by their range, so a stop crossed while
+        the bot was away triggers as on TradingView
+        (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.observe_history_bar`).
+        """
+        if self._order_sync_engine is not None:
+            self._order_sync_engine.observe_history_bar(candle.timestamp, candle.high, candle.low)
+
     def _broker_sync(self) -> None:
         """Run one engine sync, parking a recoverable broker connection loss.
 
@@ -3735,6 +3746,7 @@ class ScriptRunner:
                         candle = next_item
                         next_item = next(ohlcv_iterator, LIVE_TRANSITION)
                         caught_up_close = True
+                    self._observe_history_bar(candle)
 
                 # The bar the live feed goes on forming (see the order suppression
                 # below): the downloaded history's partial last bar, which no catch-up

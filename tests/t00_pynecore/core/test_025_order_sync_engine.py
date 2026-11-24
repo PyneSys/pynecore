@@ -34,6 +34,7 @@ from pynecore.core.broker.exceptions import (
     UnexpectedCancelError,
     VenueWritesQuarantinedError,
 )
+from pynecore.core.broker.idempotency import KIND_ENTRY, KIND_ENTRY_TRIGGERED
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import (
     EXTERNAL_FLATTEN_CONFIRM_GRACE_S,
@@ -77,6 +78,7 @@ from pynecore.core.broker.models import (
     InterceptorResult,
     PositionLeg,
     QuarantineEnteredEvent,
+    Quote,
 )
 from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, FailsafeOwner
 from pynecore.core.broker.software_partial_bracket_engine import PartialBracketLeg
@@ -191,9 +193,14 @@ class MockBroker:
     # ``leg_id`` whose ``amend_bracket`` raises ``ExchangeConnectionError`` (a
     # dropped link mid round-trip); ``None`` disables the hook.
     fail_amend_conn_leg: str | None = None
+    #: The venue's fresh quote (:meth:`get_quote`); ``None`` = unknown.
+    quote: Quote | None = None
 
     def get_capabilities(self) -> ExchangeCapabilities:
         return self.capabilities
+
+    async def get_quote(self, symbol: str) -> Quote | None:
+        return self.quote
 
     def _mk_order(self, envelope: DispatchEnvelope, kind: str) -> ExchangeOrder:
         self._next_id += 1
@@ -2645,6 +2652,129 @@ def __test_entry_terminal_plugin_skip_not_released_by_reissue__():
     assert "L" not in engine.active_intents
 
 
+@pytest.mark.parametrize("level", [{"stop": 51_000.0}, {"limit": 51_000.0}])
+def __test_crossed_single_level_entry_reject_goes_out_at_market__(level):
+    """A single-level entry refused as already crossed is sent at market, not dropped."""
+    # Measured live (Capital.com demo, 2026-11-23): a STOP entry whose trigger
+    # the quote had already passed was refused with
+    # ``error.validation.stop.price`` and the signal was dropped, while Pine
+    # fills a crossed STOP (or a marketable LIMIT) at once. The LIMIT goes at
+    # market only while the fresh quote is within its limit.
+    b = MockBroker(quote=Quote(bid=50_999.0, ask=51_000.0))
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, **level)
+    b.raise_on_next_entry = ExchangeOrderRejectedError(
+        "error.validation.stop.price", level_crossed=True,
+    )
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 2
+    rejected, market = b.entry_calls
+    assert market.intent.order_type is OrderType.MARKET
+    assert market.intent.stop is None and market.intent.limit is None
+    assert market.intent.qty == rejected.intent.qty
+    assert market.intent.triggered_entry
+    assert market.client_order_id(KIND_ENTRY_TRIGGERED) != rejected.client_order_id(KIND_ENTRY)
+    assert engine.active_intents["L"] == rejected.intent
+    assert engine.order_mapping["L"] == ["xchg-1"]
+
+    # The diff sees the Pine order as already dispatched: no second entry.
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 2
+
+
+def __test_crossed_stop_limit_entry_reject_is_not_sent_at_market__():
+    """A both-set (stop-limit) entry refused as crossed gets no market re-dispatch."""
+    # A stop-limit order whose stop already passed is triggered: Pine makes it
+    # a LIMIT at the limit price, it never fills at market. The venue holds it
+    # natively here, so the refused order is sent again as its plain LIMIT.
+    b = MockBroker(
+        capabilities=ExchangeCapabilities(short_selling=CapabilityLevel.NATIVE,
+                                          stop_limit_order=CapabilityLevel.NATIVE),
+        quote=Quote(bid=50_999.0, ask=51_000.0),
+    )
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0, stop=51_000.0)
+    b.raise_on_next_entry = ExchangeOrderRejectedError(
+        "error.validation.stop.price", level_crossed=True,
+    )
+
+    engine.sync(BAR_TS)
+
+    assert all(c.intent.order_type is not OrderType.MARKET for c in b.entry_calls)
+    assert [(c.intent.order_type, c.intent.limit, c.intent.stop)
+            for c in b.entry_calls] == [(OrderType.LIMIT, 50_000.0, 51_000.0),
+                                        (OrderType.LIMIT, 50_000.0, None)]
+
+
+def __test_crossed_limit_entry_reject_rests_when_the_quote_moved_away__():
+    """A marketable LIMIT whose quote left its limit is sent again to rest, not at market."""
+    # Pine never fills a limit beyond its price: once the ask is above a buy
+    # limit, a market order would fill worse than the order allows.
+    b = MockBroker(quote=Quote(bid=51_004.0, ask=51_005.0))
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=51_000.0)
+    b.raise_on_next_entry = ExchangeOrderRejectedError(
+        "error.validation.limit.price", level_crossed=True,
+    )
+
+    engine.sync(BAR_TS)
+
+    assert [(c.intent.order_type, c.intent.limit) for c in b.entry_calls] == [
+        (OrderType.LIMIT, 51_000.0), (OrderType.LIMIT, 51_000.0)]
+    assert b.entry_calls[1].intent.triggered_entry
+
+
+def __test_crossed_limit_entry_reject_without_a_quote_is_dropped__():
+    """Without a quote a refused marketable LIMIT is never sent at market."""
+    b = MockBroker(quote=None)
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=51_000.0)
+    b.raise_on_next_entry = ExchangeOrderRejectedError(
+        "error.validation.limit.price", level_crossed=True,
+    )
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert "L" not in engine.active_intents
+
+
+def __test_uncrossed_single_level_entry_reject_is_dropped__():
+    """A reject without ``level_crossed`` keeps the drop-and-re-evaluate path."""
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, stop=51_000.0)
+    b.raise_on_next_entry = ExchangeOrderRejectedError("Capital confirm REJECTED: RISK_CHECK")
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert "L" not in engine.active_intents
+
+
+def __test_rejected_market_resend_of_a_crossed_entry_is_a_counted_reject__():
+    """A refused market re-dispatch is one counted entry reject, never a loop."""
+    from pynecore.core.broker.sync_engine import _ENTRY_REJECT_RETRY_CAP
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, stop=51_000.0)
+    b.always_raise_on_entry = ExchangeOrderRejectedError(
+        "error.validation.stop.price", level_crossed=True,
+    )
+
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 2
+    assert b.entry_calls[1].intent.order_type is OrderType.MARKET
+    assert "L" not in engine.active_intents
+
+    for _ in range(_ENTRY_REJECT_RETRY_CAP + 5):
+        engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 2 * _ENTRY_REJECT_RETRY_CAP
+
+
 def __test_entry_reject_same_bar_retry_bumps_retry_seq__():
     """A same-bar retry after a reject keeps ``bar_ts_ms`` but bumps ``retry_seq`` to 1."""
     # A same-bar retry after an exchange reject must mint a FRESH COID: same
@@ -3494,13 +3624,13 @@ def __test_restart_skips_ambiguous_live_entry_orders__(tmp_path):
 
 def __test_restart_collapses_both_set_entry_legs_to_one_anchor__(tmp_path):
     """Both-set entry legs share one ``(bar, retry_seq)`` tuple, so the anchor is adopted."""
-    # A both-set entry's KIND_ENTRY (LIMIT) and KIND_ENTRY_STOP (MARKET) legs
+    # A both-set entry's KIND_ENTRY (LIMIT) and KIND_ENTRY_TRIGGERED (MARKET) legs
     # share the SAME pinned (bar_ts_ms, retry_seq), so two live legs collapse
     # to one distinct tuple and are NOT treated as ambiguous — the anchor is
     # adopted.
     from pynecore.core.broker.storage import BrokerStore
     from pynecore.core.broker.idempotency import (
-        build_client_order_id, KIND_ENTRY, KIND_ENTRY_STOP,
+        build_client_order_id, KIND_ENTRY, KIND_ENTRY_TRIGGERED,
     )
 
     coid_limit = build_client_order_id(
@@ -3509,7 +3639,7 @@ def __test_restart_collapses_both_set_entry_legs_to_one_anchor__(tmp_path):
     )
     coid_stop = build_client_order_id(
         run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
-        kind=KIND_ENTRY_STOP, retry_seq=1,
+        kind=KIND_ENTRY_TRIGGERED, retry_seq=1,
     )
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")

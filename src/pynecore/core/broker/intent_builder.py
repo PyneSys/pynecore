@@ -62,13 +62,12 @@ def _side_from_size(size: float) -> str:
 def _infer_order_type(limit: float | None, stop: float | None) -> OrderType:
     """Map a Pine entry's ``limit``/``stop`` prices to a broker order type.
 
-    Pine has no "stop-limit" entry. When BOTH prices are set the order is two
-    OCO legs: a LIMIT below the open (guaranteed-price pullback) and a STOP
-    above (market-on-rise). The sync engine realises the both-set case as a
-    native resting LIMIT plus a software price-watch on the stop side, so the
-    inferred type is LIMIT — both-set and limit-only share the same resting
-    leg. The ``EntryIntent`` still carries the ``stop`` price for the engine
-    to arm its watch.
+    When BOTH prices are set the order is one stop-limit order (measured on
+    TradingView): nothing fills before the stop triggers, then it is a LIMIT
+    at the limit price. Its inferred type is LIMIT, the type it rests as once
+    triggered; the ``EntryIntent`` carries the ``stop`` too, which a native
+    stop-limit venue places as the trigger and the engine's software watch
+    judges elsewhere.
     """
     if limit is not None:
         return OrderType.LIMIT

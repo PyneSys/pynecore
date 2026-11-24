@@ -10,7 +10,7 @@ persist-first ledger that lets an interrupted fan-out resume on restart without
 re-closing a leg that already settled.
 
 It is the close/reversal counterpart of
-:class:`~pynecore.core.broker.software_entry_stop_engine.SoftwareEntryStopEngine`
+:class:`~pynecore.core.broker.software_stop_limit_engine.SoftwareStopLimitEngine`
 and :class:`~pynecore.core.broker.software_partial_bracket_engine.SoftwarePartialBracketEngine`:
 one instance per :class:`~pynecore.core.broker.sync_engine.OrderSyncEngine`, the
 persisted close-leg rows in :mod:`~pynecore.core.broker.store_helpers` are the durable
@@ -48,7 +48,7 @@ from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
-    KIND_ENTRY_STOP,
+    KIND_ENTRY_TRIGGERED,
     KIND_EXIT_SL,
     parse_client_order_id,
     parse_wire_client_order_id,
@@ -425,11 +425,11 @@ class OneWayEmulator:
         wrote_breadcrumb = bool(plan.closes) and plan.open_qty > 0.0
         if wrote_breadcrumb and self._store_ctx is not None:
             # The breadcrumb's entry coid must match the kind ``place_leg`` will
-            # persist under: a stop-fired market entry dispatches as
-            # ``KIND_ENTRY_STOP``, so anchoring on ``KIND_ENTRY`` there would
+            # persist under: a triggered market entry dispatches as
+            # ``KIND_ENTRY_TRIGGERED``, so anchoring on ``KIND_ENTRY`` there would
             # make the replay's row-existence check miss the landed entry row
             # and double-open the residual.
-            entry_kind = KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY
+            entry_kind = KIND_ENTRY_TRIGGERED if intent.triggered_entry else KIND_ENTRY
             create_residual_open_row(
                 self._store_ctx,
                 coid=residual_coid,
@@ -1007,7 +1007,7 @@ class OneWayEmulator:
         uses: if the residual's persist-first entry row already landed the breadcrumb
         is simply discharged (the entry / recovery path owns the open), otherwise the
         residual is re-opened under its deterministic entry coid (``KIND_ENTRY``, or
-        ``KIND_ENTRY_STOP`` for a stop-fired reversal) — a duplicate is impossible
+        ``KIND_ENTRY_TRIGGERED`` for a triggered reversal) — a duplicate is impossible
         at the exchange dedup, so a per-sync re-dispatch cannot double-open. A still-ambiguous re-dispatch leaves the row live for the
         next sync to retry rather than halting the bot, mirroring
         :meth:`drain_clearing_rows`. A successful in-session reversal discharges its
@@ -1212,7 +1212,7 @@ class OneWayEmulator:
         ``place_leg`` persist-first write landed and the entry journal / startup
         recovery own it — just clear the breadcrumb; otherwise rebuild the
         dispatch envelope and re-open the residual under the SAME deterministic
-        entry coid (``KIND_ENTRY``, or ``KIND_ENTRY_STOP`` for a stop-fired
+        entry coid (``KIND_ENTRY``, or ``KIND_ENTRY_TRIGGERED`` for a triggered
         reversal; a duplicate is therefore impossible at the exchange dedup),
         then clear it.
         """
@@ -1278,8 +1278,8 @@ class OneWayEmulator:
             )
             return
         # Rebuild the intent with the ORIGINAL dispatch's coid kind: a
-        # stop-fired reversal's residual went out under ``KIND_ENTRY_STOP``
-        # (the plugin picks the kind from ``stop_fired_market``), so the
+        # triggered entry's residual went out under ``KIND_ENTRY_TRIGGERED``
+        # (the plugin picks the kind from ``triggered_entry``), so the
         # replayed ``place_leg`` must persist and dedup under that same coid —
         # otherwise a second ambiguous round-trip would land an entry row the
         # breadcrumb's ``entry_coid`` check never finds, re-opening the
@@ -1302,12 +1302,12 @@ class OneWayEmulator:
             else parsed_wire.kind if parsed_wire is not None
             else None
         )
-        stop_fired = entry_kind == KIND_ENTRY_STOP
+        triggered = entry_kind == KIND_ENTRY_TRIGGERED
         envelope = DispatchEnvelope(
             intent=EntryIntent(
                 pine_id=row.pine_entry_id, symbol=row.symbol, side=row.side,
                 qty=row.qty, order_type=OrderType.MARKET,
-                stop_fired_market=stop_fired,
+                triggered_entry=triggered,
             ),
             run_tag=run_tag, bar_ts_ms=bar_ts_ms, retry_seq=retry_seq,
             coid_max_len=coid_max_len,

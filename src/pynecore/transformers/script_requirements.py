@@ -220,10 +220,10 @@ class ScriptRequirementsTransformer(ast_walk.NodeVisitor):
         if is_strategy_order:
             self._reqs[_FLAG_STRATEGY_ORDER] = True
         if has_limit and has_stop:
-            # Pine has no stop-limit entry: a both-set order is two OCO legs.
-            # The broker layer rests the LIMIT leg natively and fires the STOP
-            # leg as a software price-watch → MARKET order, so the script needs
-            # both the limit and market capabilities (not a native stop entry).
+            # A both-set order is one stop-limit order: after its stop
+            # triggers it is a LIMIT, which a venue may refuse as marketable
+            # and the engine then sends at market. The script needs both the
+            # limit and market capabilities (not a native stop entry).
             self._reqs[_FLAG_LIMIT] = True
             self._reqs[_FLAG_MARKET] = True
         elif has_limit:

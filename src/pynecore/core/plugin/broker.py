@@ -50,6 +50,7 @@ if TYPE_CHECKING:
         ExchangeCapabilities,
         OrderEvent,
         PositionLeg,
+        Quote,
     )
 
 __all__ = ['BrokerPlugin', 'PositionPort']
@@ -647,12 +648,13 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         | limit only          | LIMIT        | price    | None     |
         | stop only           | STOP         | None     | trigger  |
 
-        A both-set Pine entry (``limit`` AND ``stop``) is not a stop-limit
-        order — Pine has none. The sync engine splits it into two OCO legs
-        before dispatch: the LIMIT leg arrives here as ``order_type=LIMIT``,
-        and if the stop side triggers the engine sends a separate
-        ``order_type=MARKET`` entry. The plugin therefore never receives a
-        single both-set order — only plain MARKET / LIMIT / STOP.
+        | stop and limit      | LIMIT        | price    | trigger  |
+
+        The last row is a stop-limit order: nothing fills before the stop
+        triggers, then it is a plain LIMIT. A plugin receives it only when it
+        declares :attr:`~ExchangeCapabilities.stop_limit_order`
+        ``NATIVE``; on any other venue the engine watches the stop itself and
+        sends the plain LIMIT (``triggered_entry``) when it triggers.
         """
 
     @abstractmethod
@@ -911,6 +913,20 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     @abstractmethod
     async def get_balance(self) -> dict[str, float]:
         """Get available balance per currency."""
+
+    async def get_quote(self, symbol: str) -> 'Quote | None':
+        """Read the venue's current bid and ask for ``symbol``, fresh.
+
+        The engine reads it before it sends a limit entry the venue refused as
+        marketable at market: the market order may only go while the quote is
+        still on the limit's good side (a buy's ask at or below the limit, a
+        sell's bid at or above it), as a limit never fills beyond its price.
+
+        A plugin whose venue refuses a marketable limit order implements it as
+        a fresh read, not a cached stream value. The default ``None`` means the
+        quote is unknown: the engine then never sends such an entry at market.
+        """
+        return None
 
     # === Live order stream ===
 

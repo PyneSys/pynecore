@@ -3,13 +3,13 @@
 A both-set Pine entry (``strategy.entry(limit=, stop=)``) is a native LIMIT
 working order plus a software price-watch on the STOP side. When the STOP leg
 wins the OCO, the position opens via the stop-fired MARKET under the
-deterministic ``KIND_ENTRY_STOP`` client-order-id — NOT the native LIMIT's
+deterministic ``KIND_ENTRY_TRIGGERED`` client-order-id — NOT the native LIMIT's
 ``KIND_ENTRY`` id.
 
 The broker reconcile feed reports the live position under the id it opened
 under, so every native fail-safe parent-ref resolver must key on that id.
 :meth:`OrderSyncEngine._resolve_parent_opening_ref` is the single resolver:
-it returns the ``KIND_ENTRY_STOP`` id iff a position row was persisted under it
+it returns the ``KIND_ENTRY_TRIGGERED`` id iff a position row was persisted under it
 (the durable, restart-surviving signal that the stop fired — the entry-stop
 watch row is terminal-filtered once the stop wins), otherwise ``KIND_ENTRY``.
 
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pynecore.core.broker.idempotency import KIND_ENTRY, KIND_ENTRY_STOP
+from pynecore.core.broker.idempotency import KIND_ENTRY, KIND_ENTRY_TRIGGERED
 from pynecore.core.broker.models import (
     CapabilityLevel,
     EntryIntent,
@@ -119,7 +119,7 @@ def __test_resolve_returns_none_when_parent_untracked__():
 def __test_resolve_returns_kind_entry_when_no_stop_row__(tmp_path):
     """Resolver returns the ``KIND_ENTRY`` id when no stop position row exists."""
     # Limit-won (or not-yet-resolved) entry: the position opened — if at all —
-    # under the native LIMIT's KIND_ENTRY id; no KIND_ENTRY_STOP row exists.
+    # under the native LIMIT's KIND_ENTRY id; no KIND_ENTRY_TRIGGERED row exists.
     store, ctx = _make_store(tmp_path)
     eng = _engine(ctx)
     env = eng._build_envelope(_both_set_entry())
@@ -128,13 +128,13 @@ def __test_resolve_returns_kind_entry_when_no_stop_row__(tmp_path):
 
 
 def __test_resolve_returns_kind_entry_stop_when_stop_row_present__(tmp_path):
-    """Resolver returns the ``KIND_ENTRY_STOP`` id once a stop position row is persisted."""
+    """Resolver returns the ``KIND_ENTRY_TRIGGERED`` id once a stop position row is persisted."""
     # Stop-won: the stop-fired MARKET persisted a position row under the
-    # deterministic KIND_ENTRY_STOP id; the resolver must reflect it.
+    # deterministic KIND_ENTRY_TRIGGERED id; the resolver must reflect it.
     store, ctx = _make_store(tmp_path)
     eng = _engine(ctx)
     env = eng._build_envelope(_both_set_entry())
-    stop_ref = env.client_order_id(KIND_ENTRY_STOP)
+    stop_ref = env.client_order_id(KIND_ENTRY_TRIGGERED)
     _persist_stop_position(ctx, stop_ref)
     assert eng._resolve_parent_opening_ref("Long") == stop_ref
     assert stop_ref != env.client_order_id(KIND_ENTRY)
@@ -142,15 +142,15 @@ def __test_resolve_returns_kind_entry_stop_when_stop_row_present__(tmp_path):
 
 
 def __test_resolve_kind_entry_stop_survives_restart__(tmp_path):
-    """Resolver rebuilds the ``KIND_ENTRY_STOP`` id from the anchor alone after a restart."""
+    """Resolver rebuilds the ``KIND_ENTRY_TRIGGERED`` id from the anchor alone after a restart."""
     # Restart-fragility guard: after a restart only the persisted envelope
     # anchor survives (the entry-stop watch row is terminal-filtered once the
-    # stop won). The resolver must still rebuild the SAME KIND_ENTRY_STOP id
+    # stop won). The resolver must still rebuild the SAME KIND_ENTRY_TRIGGERED id
     # from the anchor and find the durable stop position row.
     store, ctx = _make_store(tmp_path)
     eng = _engine(ctx)
     env = eng._build_envelope(_both_set_entry())
-    stop_ref = env.client_order_id(KIND_ENTRY_STOP)
+    stop_ref = env.client_order_id(KIND_ENTRY_TRIGGERED)
     _persist_stop_position(ctx, stop_ref)
 
     # Simulate restart: the live envelope is gone, only the anchor remains.
@@ -164,7 +164,7 @@ def __test_resolve_kind_entry_stop_survives_restart__(tmp_path):
 
 def __test_resolve_kind_entry_on_restart_without_stop_row__(tmp_path):
     """Resolver rebuilds the ``KIND_ENTRY`` id from the anchor on restart with no stop row."""
-    # Restart, limit-won: no KIND_ENTRY_STOP row -> rebuild the KIND_ENTRY id.
+    # Restart, limit-won: no KIND_ENTRY_TRIGGERED row -> rebuild the KIND_ENTRY id.
     store, ctx = _make_store(tmp_path)
     eng = _engine(ctx)
     env = eng._build_envelope(_both_set_entry())
@@ -181,16 +181,16 @@ def __test_resolve_kind_entry_on_restart_without_stop_row__(tmp_path):
 # === retire path keyed on the opening ref ===============================
 
 def __test_retire_clears_stop_won_state_under_kind_entry_stop_ref__(tmp_path):
-    """Retire resolves the ``KIND_ENTRY_STOP`` ref and marks its fail-safe state RETIRED."""
+    """Retire resolves the ``KIND_ENTRY_TRIGGERED`` ref and marks its fail-safe state RETIRED."""
     # End-to-end of the F3 bug: the reconcile feed registers the fail-safe
-    # state under the KIND_ENTRY_STOP id (the id the position opened under).
+    # state under the KIND_ENTRY_TRIGGERED id (the id the position opened under).
     # On close, _retire_native_failsafe_for_entry must resolve THAT id and
     # clear the state — keying on KIND_ENTRY (the pre-fix behaviour) would
     # strand it.
     store, ctx = _make_store(tmp_path)
     eng = _engine(ctx)
     env = eng._build_envelope(_both_set_entry())
-    stop_ref = env.client_order_id(KIND_ENTRY_STOP)
+    stop_ref = env.client_order_id(KIND_ENTRY_TRIGGERED)
     _persist_stop_position(ctx, stop_ref)
 
     eng._native_failsafe_manager.register_parent(

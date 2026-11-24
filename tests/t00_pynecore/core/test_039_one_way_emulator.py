@@ -22,7 +22,7 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
-from pynecore.core.broker.idempotency import KIND_CLOSE, KIND_ENTRY_STOP
+from pynecore.core.broker.idempotency import KIND_CLOSE, KIND_ENTRY_TRIGGERED
 from pynecore.core.broker.models import (
     CancelIntent,
     CloseIntent,
@@ -407,7 +407,7 @@ def _entry_env(side, qty, *, symbol="EURUSD", pine_id="Long",
     intent = EntryIntent(
         pine_id=pine_id, symbol=symbol, side=side, qty=qty,
         order_type=order_type, limit=limit, stop=stop,
-        stop_fired_market=stop_fired,
+        triggered_entry=stop_fired,
     )
     return DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000)
 
@@ -1187,9 +1187,9 @@ def __test_restart_replay_skips_residual_when_entry_row_exists__(tmp_path):
 
 
 def __test_stop_fired_reversal_breadcrumb_anchors_on_entry_stop_coid__(tmp_path):
-    """A stop-fired reversal's breadcrumb entry coid uses KIND_ENTRY_STOP, so replay finds the row."""
-    # A stop-fired market reversal dispatches its residual under KIND_ENTRY_STOP
-    # (the plugin picks the kind from stop_fired_market). The breadcrumb's
+    """A stop-fired reversal's breadcrumb entry coid uses KIND_ENTRY_TRIGGERED, so replay finds the row."""
+    # A stop-fired market reversal dispatches its residual under KIND_ENTRY_TRIGGERED
+    # (the plugin picks the kind from triggered_entry). The breadcrumb's
     # entry_coid must anchor on that SAME coid: anchoring on KIND_ENTRY would
     # make the replay's row-existence check miss the landed entry row and
     # double-open the residual.
@@ -1206,10 +1206,10 @@ def __test_stop_fired_reversal_breadcrumb_anchors_on_entry_stop_coid__(tmp_path)
         _run(eng.run_reversal(env, port))
     rows = list(iter_active_residual_opens(ctx))
     assert len(rows) == 1
-    stop_coid = env.client_order_id(KIND_ENTRY_STOP)
+    stop_coid = env.client_order_id(KIND_ENTRY_TRIGGERED)
     assert (rows[0].extras or {})[EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID] == stop_coid
     # The ambiguous send actually landed: the plugin's persist-first entry row
-    # exists under the KIND_ENTRY_STOP coid. Replay must find it and discharge
+    # exists under the KIND_ENTRY_TRIGGERED coid. Replay must find it and discharge
     # the breadcrumb WITHOUT re-opening the residual.
     ctx.upsert_order(stop_coid, symbol="EURUSD", side="buy", qty=1.0,
                      state="confirmed", pine_entry_id="Long")
@@ -1221,10 +1221,10 @@ def __test_stop_fired_reversal_breadcrumb_anchors_on_entry_stop_coid__(tmp_path)
 
 
 def __test_replay_restores_stop_fired_flag_on_residual_redispatch__(tmp_path):
-    """Residual replay re-dispatches a stop-fired reversal with stop_fired_market restored."""
+    """Residual replay re-dispatches a stop-fired reversal with triggered_entry restored."""
     # The re-dispatched place_leg must persist and dedup under the SAME
-    # KIND_ENTRY_STOP coid as the original attempt, so the rebuilt intent needs
-    # the stop_fired_market flag back — recovered from the persisted coid's
+    # KIND_ENTRY_TRIGGERED coid as the original attempt, so the rebuilt intent needs
+    # the triggered_entry flag back — recovered from the persisted coid's
     # kind code.
     class _CapturingPort(_FakePort):
         def __init__(self, legs):
@@ -1236,14 +1236,14 @@ def __test_replay_restores_stop_fired_flag_on_residual_redispatch__(tmp_path):
             return await super().place_leg(envelope, qty)
 
     store, ctx = _make_store(tmp_path)
-    entry_coid = _entry_env("buy", 2.0).client_order_id(KIND_ENTRY_STOP)
+    entry_coid = _entry_env("buy", 2.0).client_order_id(KIND_ENTRY_TRIGGERED)
     _seed_residual(ctx, entry_coid=entry_coid, qty=2.0)
     port = _CapturingPort([])
     eng = OneWayEmulator(store_ctx=ctx)
     _run(eng.restart_replay(port))
     assert port.placed == [("EURUSD", 2.0)]
     intent = port.place_envelopes[0].intent
-    assert isinstance(intent, EntryIntent) and intent.stop_fired_market is True
+    assert isinstance(intent, EntryIntent) and intent.triggered_entry is True
     assert list(iter_active_residual_opens(ctx)) == []
     store.close()
 

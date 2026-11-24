@@ -551,3 +551,38 @@ def __test_paper_without_history_trades_waits_for_the_live_edge__(tmp_path):
     """A paper run that starts flat at the transition skips the catch-up bars too"""
     # Entered at the first fresh bar's close (bar 4), filled at bar 5's open
     assert __test_helper_paper_sizes(tmp_path, "paper_flat", False) == [0, 0, 0, 0, 0, 1]
+
+
+def __test_warmup_bars_are_shown_to_the_stop_limit_watches__(tmp_path):
+    """Every history bar a live start replays reaches the engine with its range.
+
+    A software stop-limit order armed before a restart judges the bars it did
+    not see live by their high / low; the timestamps are the bars' open times
+    in milliseconds, the unit of the engine's bar clock.
+    """
+    script_path = __test_helper_write_script(tmp_path, "warmup_watch", '''\
+        """
+        @pyne
+        """
+        from pynecore.lib import close, plot, script
+
+        @script.strategy("Warmup watch")
+        def main():
+            plot(close, "close")
+    ''')
+    plugin = MockBroker()
+    clock = [0.0]
+    feed = __test_helper_feed(clock, 3, [
+        (__test_helper_bar(3), __test_helper_on_time(3)),
+    ])
+    runner = __test_helper_broker_runner(script_path, plugin, feed, clock)
+    engine = runner._order_sync_engine
+    assert engine is not None
+    seen: list[tuple[int, float, float]] = []
+    engine.observe_history_bar = (  # type: ignore[method-assign]
+        lambda ts, high, low: seen.append((ts, high, low)))
+
+    list(runner.run_iter())
+
+    assert seen == [(bar.timestamp, bar.high, bar.low)
+                    for bar in (__test_helper_bar(i) for i in range(3))]
