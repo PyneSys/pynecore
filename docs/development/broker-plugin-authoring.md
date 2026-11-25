@@ -368,6 +368,21 @@ the broker-native execution/deal id. A `None` `fill_id` bypasses the gate,
 so it is only allowed on paths where your own persisted `filled_qty`
 cursor guarantees no other path re-emits the same execution.
 
+`journal_fill_qty` is the same slice in the unit your journal counts the
+order's `filled_qty` in: the amount this execution raises that row's
+`filled_qty` by. Set it on **every** fill event (`fill_qty` set), whether or
+not the order has a journal row. It differs from `fill_qty` wherever the
+position moves by another figure than the journal records: a spot buy whose
+fee is charged in the base coin (`fill_qty` fee-net, the row gross), an
+inverse contract fill (`fill_qty` in base units, the row in contracts).
+Where the two units agree, pass `fill_qty`; when you split or shrink a fill
+event, split its journal quantity the same way. The engine sums it per order
+(the binding book's fill cursor), and a restart resumes the stored book only
+when no live or recently closed journal row of the run shows more
+`filled_qty` than that sum; a fill without it is booked, reported at ERROR,
+and leaves the cursor behind, so the restart adopts the position FIFO from
+the journal instead.
+
 ### 3. `ExchangeOrder.client_order_id` echo is mandatory
 
 Every `ExchangeOrder` you return or embed in an event must carry the
@@ -394,6 +409,13 @@ silently breaks and the bot can double-open.
   post-cancel disposition is readable. The inherited default collapses
   everything to `UNKNOWN`, which keeps cancel-tentative orders resolvable
   only through broker-pushed events.
+  An order that filled before the cancel answers `ALREADY_FILLED` only
+  while its position is still open: the engine restores the bracket
+  protection onto it. When the plugin's journal proves both the fill and
+  the close of that position (booked earlier, e.g. before a restart),
+  answer `FILLED_AND_CLOSED` instead: the engine resolves the cancel
+  without restoring anything, booking a fill or re-arming it on restart.
+  `UNKNOWN` for that case is retried until the stale grace halts the bot.
 - Override `modify_entry()` / `modify_exit()` with the venue's in-place
   amend whenever one exists. The inherited defaults are cancel+recreate;
   for `modify_exit` that opens a window with **no protection live**.
@@ -520,6 +542,11 @@ raw exchange support:
 - `short_selling=NATIVE` on margin/CFD venues that hold signed positions;
   leave it `UNSUPPORTED` on spot (see "No shorting" below — it arms the
   startup reject and the engine's projected-position runtime gate).
+- `sized_leg_bracket` is read only for a plugin with a `position_port`:
+  `NATIVE` when `amend_bracket` can limit a leg's protection to a quantity
+  below the venue position it is written on, `SOFTWARE` when the venue
+  bracket always covers the whole position (see "Protecting less than the
+  whole leg" below). Leaving it `UNSUPPORTED` behaves like `SOFTWARE`.
 
 ## Idempotency: the client-order-id chain
 
@@ -724,11 +751,12 @@ Pine strategy semantics are one-way; a hedging-mode account holds multiple
 broker legs per symbol. Do not emulate netting inside the plugin — opt
 into the core `OneWayEmulator` by setting `self.position_port = self` once
 you know the account is hedging-mode (leave it `None` for netting
-accounts), and implement the six `PositionPort` primitives
+accounts), and implement the eight `PositionPort` primitives
 (`fetch_raw_positions`, `get_volume_quantizer`, `close_leg`,
-`reject_out_of_range`, `place_leg`, `amend_bracket`). Each primitive
-touches exactly ONE broker entity; the emulator owns all FIFO/netting and
-crash-replay logic.
+`close_leg_executed`, `reject_out_of_range`, `place_leg`, `amend_bracket`,
+`bracket_matches`).
+Each primitive touches exactly ONE broker entity; the emulator owns all
+FIFO/netting and crash-replay logic.
 
 On a hedging account `fetch_raw_positions()` returns the legs this run
 opened, and `get_position()` their net. Another party's leg on the same
@@ -758,9 +786,186 @@ replay can send different levels under a coid used before, so never
 dedup or skip an amend by its coid, always write the levels you receive.
 A re-amend with the levels the leg already holds must be harmless. The
 optional
-`supports_partial_leg_close = False` attribute makes the emulator
-atomically skip plans containing partial leg slices on venues whose
-position close is full-row only (Capital.com).
+`supports_partial_leg_close = False` attribute makes the emulator close
+the whole leg wherever a plan would slice one, on venues whose position
+close is full-row only (Capital.com). The script asked to reduce risk, so
+the position ends up smaller than asked, never larger; each widened close
+is logged at WARNING with the asked and the closed quantity.
+
+A MARKET reversal on a hedging account closes the opposing legs and opens
+only the residual in the order's own direction. `close_leg` only
+dispatches a close, and a close can still execute in part (a reduce-only
+IOC market close cancelled after a partial fill), so the core opens the
+residual only once a fresh `fetch_raw_positions()` read shows no opposing
+leg. If the read right after the closes still lists one, the residual is
+not opened in that dispatch: on each following sync the core asks
+`close_leg_executed` what the close executed, re-sends only the part that
+provably did not, and calls `place_leg` for the residual (under the
+reversal's own entry coid) on the first sync whose read shows
+the opposing legs gone. So `fetch_raw_positions()` must report a leg as
+long as the venue still holds any of it: a leg dropped from the read
+before its close executed opens the residual beside it.
+
+### Tell the restart replay what a leg close executed
+
+A crash between a `close_leg` call and its return, a timeout, or a guard
+re-firing on a close already sent leaves the close's outcome unknown: it
+may have executed in full, in part, or not at all. The core never re-sends
+such a close under a `coid` it already used, and it never assumes your
+venue dedups a re-send. Before it sends anything it asks
+`close_leg_executed(symbol, leg_id, coids, since_ms)`: `coids` are every
+client order id the core recorded for that close, oldest first, and
+`since_ms` is when the first one was about to be sent (local clock). The
+core also compares the leg's size with the size it recorded at dispatch,
+and re-sends only the part neither measure accounts for, under a new
+`coid`.
+
+There are exactly three answers, and each must come from venue evidence:
+
+- **A positive volume**: the broker-grid volume (the unit of
+  `close_leg`'s `volume`) those closes provably executed, once none of
+  them can execute any more.
+- **`0`**: the venue proves none of them executed and none can execute any
+  more.
+- **`None`** (cannot tell yet): a close still working, a read that failed,
+  timed out or came back short, or an empty read made before the venue's
+  own indexing or publish delay has passed. The core sends nothing, keeps
+  the leg's protection, and asks again on the next sync.
+
+Obligations that follow from these answers:
+
+- The core records each `coid` before it calls `close_leg`, so a crash can
+  leave a `coid` that never reached your plugin or the venue. Once the
+  venue's records provably cover `since_ms` and hold nothing for it,
+  answer `0` for it. Answering `None` forever leaves the close
+  undecidable and the leg's close stuck.
+- Judge every `coid` by what the venue holds, never only by your own local
+  records. The send may come from an earlier run instance of the bot, or
+  your local row for it may be gone to retention; neither proves the venue
+  never received it.
+- An empty venue read is evidence of absence only after the venue's own
+  indexing or publish delay for `since_ms` has passed, and only when the
+  read covers `since_ms`. Before that, answer `None`. A history that ages
+  records out cannot prove absence for a send older than its window.
+- A failed, timed-out or partial read is always `None`, never `0`.
+- If your records cannot tell these closes from another reduction of the
+  same leg after `since_ms` (the venue's close request carries no client
+  id), count that reduction too. Counting too much leaves the leg less
+  reduced, which the reconcile settles; counting too little closes it
+  twice.
+- On a venue whose position close is full-row only, a row still open
+  proves its close did not execute, once no close of it can still be
+  working.
+- A re-send's `coid` carries a suffix after the leg close's own id; map it
+  back with `close_leg_row_client_order_id` when you look up the core's
+  close-leg row in `close_leg`.
+
+### Report the outcome of `amend_bracket` truthfully
+
+The core writes a leg again only when it knows what became of the leg's
+previous write. A write that timed out can still reach the venue later;
+if a newer write went out in between, the late one replaces it and the
+position is left on an older stop. So the outcome of every
+`amend_bracket` call is part of the contract:
+
+| What happened                                                  | Raise                                                                    |
+|----------------------------------------------------------------|--------------------------------------------------------------------------|
+| The venue confirmed the write                                  | nothing (return)                                                         |
+| The venue answered and did not apply it                        | `ExchangeOrderRejectedError` (or a subclass), `ExchangeRateLimitError`   |
+| The request never left the client                              | `ExchangeConnectionError`                                                |
+| The request may have reached the venue and no answer came back | `OrderDispositionUnknownError`                                           |
+
+Never report the last case as a rejection, not even on an attach: the
+core treats a rejection as a verdict and may send the leg something else
+at once.
+
+After an unknown outcome (and while a call the engine stopped waiting for
+is still running) the emulator holds the leg: no different write goes
+out. Only the identical write may be repeated, because whichever of the
+two arrives last leaves the same protection. On each following sync the
+emulator asks `bracket_matches(symbol, leg_id, side=, tp_price=,
+sl_price=, trail_offset=, qty=)` whether the leg holds exactly the
+protection that write carries:
+
+- Read the leg's protection from the venue. Do not answer from a cache
+  your own writes feed.
+- Compare after your own conversion to the broker grid (tick rounding).
+- All-`None` levels ask whether the leg carries no protection at all.
+- A trailing stop the venue has moved still matches: compare what
+  identifies the write (the trailing flag or distance, the take-profit),
+  not the stop price the venue trails.
+- A leg that is no longer open matches nothing: return `False`.
+- When the venue does not report what tells the write from the leg's
+  earlier protection, return `None` ("cannot tell"). The typical case is a
+  trailing stop whose distance the venue does not return: an amend from
+  one trailing stop to another with the take-profit kept looks the same
+  whether it landed or not. Return `None` only when every level the read
+  does report agrees; a level that differs is a `False`.
+- A failed read raises like `fetch_raw_positions`. Never guess.
+
+`True` settles the write as landed. With `False` the leg stays held for
+`UNSETTLED_WRITE_WINDOW_S` (30 s, counted from the first such read),
+after which the write counts as lost and the leg is written again. That
+window is a core assumption, not a measured property of any venue.
+
+`None` neither confirms the write nor counts it as lost. The leg stays
+held for the same window and nothing is repeated in it. After the window
+the leg is written once more with the levels its exits ask for (the same
+write when they did not change), and that write's own outcome settles the
+leg. If an identical repeat the venue confirmed went out inside the
+window, that repeat already re-asserted the levels and nothing more is
+sent. A re-sent trailing write carries the stop and distance the exits ask
+for, like any amend: on a venue that takes the stop from the amend, a
+trailing stop the venue has moved since is written back to that level.
+
+The same rule holds off the emulator: after an `execute_exit` or
+`modify_exit` that raised `OrderDispositionUnknownError`, the engine
+sends no further `modify_exit` for that exit until the parked dispatch
+is resolved or the same window has passed.
+
+### Protecting less than the whole leg
+
+A bracket on a hedging venue is usually an attribute of the whole
+position: when it fires, the whole position closes. Two cases need less:
+
+- **A partly offset leg.** A long leg of 10 beside an opposing leg of 4 is
+  a net long 6. A bracket on the whole leg closes 10 and leaves the book
+  short 4.
+- **A shared venue position.** On a venue with one position per side, the
+  position can hold exposure another run or a manual trade opened. Report
+  the run's own share as `PositionLeg.qty` and the venue position's size
+  as `PositionLeg.venue_qty` (leave it `None` when they are equal). A
+  bracket on the whole position would close the other party's exposure
+  too.
+
+Either case can start or end while a bracket is already on the leg. While
+any leg carries protection, the core re-reads the legs with
+`fetch_raw_positions` once per sync and re-decides the protection of a
+leg whose share changed: a whole-position bracket is cleared (after the
+software guard below is armed) once the leg is shared, and written again
+(before the guard is dropped) once it is not. A switch whose write did
+not go through is tried again on the next sync. Report `venue_qty` on every
+read, not only on the first one after a fill.
+
+Every `amend_bracket` call therefore carries `qty`, the quantity the
+protection may close. What the core does with a leg that needs less than
+its venue position protected depends on `sized_leg_bracket`:
+
+- `NATIVE`: the call carries the smaller `qty`, and the protection you
+  write must close at most that much.
+- anything else: the core never writes a venue bracket on such a leg
+  (and clears one it wrote there before). It guards the leg in software:
+  it watches the price and, when a level is reached, closes exactly the
+  protected quantity with `close_leg`. `qty` in your `amend_bracket` is
+  then always the whole venue position, and you may ignore it.
+
+The software guard runs only while the bot runs, and its trailing stop
+starts again from the current price after a restart; the core logs each
+guarded leg once at WARNING. On a port with
+`supports_partial_leg_close = False` the guard cannot close a part of a
+leg either, so a partly offset leg there carries no protection until the
+opposing leg is closed (logged once at ERROR). Declare `NATIVE` only for
+behaviour you measured on the venue.
 
 ## Spot venues: opt into the core inventory layer
 

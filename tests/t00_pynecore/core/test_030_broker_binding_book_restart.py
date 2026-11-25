@@ -8,6 +8,7 @@ written to the store after every change and resumed from there when it holds
 the adopted position and saw every fill the journal shows; otherwise the FIFO
 adoption stands and the book stays unfaithful.
 """
+import dataclasses
 import itertools
 import json
 import logging
@@ -36,7 +37,13 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
-from pynecore.core.broker.storage import ENTRY_BOOK_EVENT_KIND, BrokerStore, RunContext
+from pynecore.core.broker.storage import (
+    ENTRY_BOOK_CURSOR_EVENT_KIND,
+    ENTRY_BOOK_EVENT_KIND,
+    ENTRY_FILL_ORDER_EVENT_KIND,
+    BrokerStore,
+    RunContext,
+)
 from pynecore.core.broker.sync_engine import OrderSyncEngine
 from pynecore.lib.strategy import Order, _order_type_close, _order_type_entry
 
@@ -205,7 +212,8 @@ def _start(store: BrokerStore, position: float,
 def _fill(side: str, qty: float, *, pine_id: str, order_id: str,
           leg: LegType = LegType.ENTRY, from_entry: str | None = None,
           event_type: str = 'filled', filled_qty: float | None = None,
-          remaining_qty: float = 0.0) -> OrderEvent:
+          remaining_qty: float = 0.0, journal_qty: float | None = None) -> OrderEvent:
+    """A fill of ``qty``; the journal records it as ``journal_qty`` (``qty`` by default)."""
     order = ExchangeOrder(
         id=order_id, symbol=SYMBOL, side=side, order_type=OrderType.MARKET, qty=qty,
         filled_qty=qty if filled_qty is None else filled_qty, remaining_qty=remaining_qty,
@@ -215,6 +223,7 @@ def _fill(side: str, qty: float, *, pine_id: str, order_id: str,
     return OrderEvent(
         order=order, event_type=event_type, fill_price=50_000.0, fill_qty=qty,
         timestamp=0.0, pine_id=pine_id, leg_type=leg, from_entry=from_entry,
+        journal_fill_qty=qty if journal_qty is None else journal_qty,
     )
 
 
@@ -320,6 +329,13 @@ def _stored_book(ctx: RunContext) -> dict | None:
     return latest[1] if latest is not None else None
 
 
+def _stored_cursors(ctx: RunContext) -> dict[str, float]:
+    """The fill cursors the store holds next to the book, one keyed event each."""
+    return {key: payload['qty']
+            for key, payload in ctx.keyed_events_for_run_id(
+                ENTRY_BOOK_CURSOR_EVENT_KIND).items()}
+
+
 def _book(pos: BrokerPosition) -> list[tuple[str | None, float]]:
     return [(binding.entry_id, binding.bound) for binding in pos.bindings]
 
@@ -379,7 +395,7 @@ def __test_a_restart_resumes_the_c432_book_and_keeps_l1_x__(
         stored = _stored_book(ctx)
         assert stored is not None
         assert stored['bindings'] == [] and stored['faithful'] is True
-        assert stored['fill_cursors'] == {}
+        assert 'fill_cursors' not in stored and _stored_cursors(ctx) == {}
         ctx.close()
 
 
@@ -757,7 +773,7 @@ def __test_the_stored_book_does_not_grow_with_the_orders_cycled_under_an_open_en
         assert _book(pos) == [("L1", 1.0)]
         stored = _stored_book(ctx)
         assert stored is not None
-        cursors = stored['fill_cursors']
+        cursors = _stored_cursors(ctx)
         recent = itertools.chain(
             ctx.iter_live_orders(),
             ctx.iter_orders_closed_since_for_run_id(int(clock[0] * 1000) - 60_000))
@@ -854,5 +870,256 @@ def __test_a_journal_read_failure_while_pruning_does_not_stop_the_fill_handling_
         stored = _stored_book(ctx)
         assert stored is not None
         assert [binding['entry_id'] for binding in stored['bindings']] == ["L1", "L2"]
-        assert "ent-L2" in stored['fill_cursors']
+        assert "ent-L2" in _stored_cursors(ctx)
+        ctx.close()
+
+
+@pytest.mark.parametrize(("fill_qty", "journal_qty"), [
+    pytest.param(0.999, 1.0, id="spot_base_fee_net"),
+    pytest.param(0.002, 100.0, id="inverse_contracts"),
+])
+def __test_a_restart_compares_the_book_with_the_journal_in_the_journal_unit__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture,
+        fill_qty: float, journal_qty: float) -> None:
+    """The fill moves the position by one figure and the journal row by another.
+
+    Bybit spot books a buy fee-net in base units while the row keeps the gross
+    executed quantity; Bybit inverse books base units while the row counts
+    contracts. The fill cursor sums the journal quantities the fills carry, so
+    the stored book that saw every fill is resumed, not discarded for a unit
+    mismatch.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, pos, venue = _start(store, 0.0)
+        pos.entry_orders["L1"] = Order("L1", 1.0, order_type=_order_type_entry)
+        engine.sync(BAR_TS + 60_000)
+        _journal_entry_fill(ctx, "L1", journal_qty)
+        venue.position = _long(fill_qty)
+        _deliver(engine, _fill('buy', fill_qty, pine_id="L1", order_id="ent-L1",
+                               journal_qty=journal_qty))
+        engine.sync(BAR_TS + 2 * 60_000)
+        assert _book(pos) == [("L1", fill_qty)]
+        assert set(_stored_cursors(ctx).values()) == {journal_qty}
+        ctx.close()
+
+        with caplog.at_level(logging.WARNING):
+            ctx, engine, pos, venue = _start(store, fill_qty)
+
+        assert not _rejections(caplog)
+        assert _book(pos) == [("L1", fill_qty)] and pos.book_faithful
+        ctx.close()
+
+
+def __test_a_fill_without_a_journal_quantity_is_reported_and_never_vouched_for__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A plugin that leaves ``journal_fill_qty`` unset breaks the port contract.
+
+    The fill is booked, the violation is reported once per order at ERROR, and
+    its order's cursor does not move: the restart finds the journal ahead of
+    the book and adopts the position FIFO instead of trusting a cursor in
+    another unit.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, pos, venue = _start(store, 0.0)
+        pos.entry_orders["L1"] = Order("L1", 1.0, order_type=_order_type_entry, limit=49_000.0)
+        engine.sync(BAR_TS + 60_000)
+        _journal_entry_fill(ctx, "L1", 0.4)
+        venue.position = _long(0.4)
+        unmeasured = dataclasses.replace(
+            _fill('buy', 0.4, pine_id="L1", order_id="ent-L1", event_type='partial',
+                  filled_qty=0.4, remaining_qty=0.6),
+            journal_fill_qty=None)
+        with caplog.at_level(logging.ERROR):
+            _deliver(engine, unmeasured)
+            _journal_entry_fill(ctx, "L1", 0.8)
+            venue.position = _long(0.8)
+            _deliver(engine, dataclasses.replace(unmeasured, order=dataclasses.replace(
+                unmeasured.order, filled_qty=0.8, remaining_qty=0.2)))
+        assert pos.size == pytest.approx(0.8)
+        reports = [r for r in caplog.records if "carries no journal quantity" in r.getMessage()]
+        assert len(reports) == 1 and reports[0].levelno == logging.ERROR
+        resting = list(venue.open_orders)
+        ctx.close()
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            ctx, engine, pos, venue = _start(store, 0.8, resting)
+
+        rejections = _rejections(caplog)
+        assert len(rejections) == 1
+        assert "the journal shows 0.8 filled of order" in rejections[0]
+        assert not pos.book_faithful
+        ctx.close()
+
+
+def __test_a_spot_book_write_stores_only_the_cursors_that_changed__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """On spot the entry rows stay live until flat, and so do their fill cursors.
+
+    L1 stays open while C0..C7 each open and take profit; every entry row stays
+    live, so the restart check needs every one of their cursors. They are kept
+    as one keyed event each, and a book write replaces only the cursors its
+    change moved: the book event stays the size of its open bindings and no
+    write rewrites the cursors of earlier cycles. The restart resumes the book
+    from the cursors the keyed events hold.
+    """
+    clock = [time.time()]
+    monkeypatch.setattr(time, 'time', lambda: clock[0])
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx, engine, pos, venue = _start(store, 0.0, shape="keep_until_flat")
+        _open_pyramid(ctx, engine, pos, venue, ("L1",))
+        written: list[int] = []
+        replace = ctx.replace_keyed_events
+
+        def _count(kind, values, removed=()):
+            written.append(len(values) + len(list(removed)))
+            return replace(kind, values, removed)
+
+        monkeypatch.setattr(ctx, 'replace_keyed_events', _count)
+        book_bytes: list[int] = []
+        for cycle in range(8):
+            pine_id = f"C{cycle}"
+            bar = BAR_TS + (10 + cycle * 2) * 60_000
+            clock[0] += 300.0
+            pos.entry_orders[pine_id] = Order(pine_id, 1.0, order_type=_order_type_entry)
+            pos.exit_orders[(f"{pine_id}-X", pine_id)] = Order(
+                pine_id, -1.0, order_type=_order_type_close, exit_id=f"{pine_id}-X",
+                limit=51_000.0, stop=49_000.0)
+            engine.sync(bar)
+            _journal_entry_fill(ctx, pine_id, 1.0)
+            venue.position = _long(2.0)
+            _deliver(engine, _fill('buy', 1.0, pine_id=pine_id, order_id=f"ent-{pine_id}"))
+            engine.sync(bar)
+            _take_profit(ctx, engine, venue, pine_id)
+            engine.sync(bar + 60_000)
+            stored = _stored_book(ctx)
+            assert stored is not None
+            book_bytes.append(len(json.dumps(stored)))
+
+        assert _book(pos) == [("L1", 1.0)]
+        assert max(book_bytes) == min(book_bytes)
+        assert max(written) <= 4
+        live_entries = [row for row in ctx.iter_live_orders()
+                        if row.from_entry is None and row.filled_qty > 0.0]
+        assert len(live_entries) == 9
+        cursors = _stored_cursors(ctx)
+        for row in live_entries:
+            assert max(cursors.get(key, 0.0)
+                       for key in OrderSyncEngine._journal_row_keys(row)  # type: ignore[attr-defined]
+                       ) == row.filled_qty
+        monkeypatch.undo()
+        resting = list(venue.open_orders)
+        ctx.close()
+
+        ctx, engine, pos, venue = _start(store, 1.0, resting, shape="keep_until_flat")
+        assert _book(pos) == [("L1", 1.0)] and pos.book_faithful
+        ctx.close()
+
+
+def __test_the_retention_purge_keeps_the_stored_fill_cursors__(tmp_path: Path) -> None:
+    """The keyed cursor events are what a restart judges the book with; age never purges them."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = store.open_run(_identity(), script_source="src", script_path="t030.py")
+        ctx.replace_keyed_events(ENTRY_BOOK_CURSOR_EVENT_KIND,
+                                 {"ent-A": {'qty': 1.0}, "ent-B": {'qty': 2.0}})
+        ctx.replace_keyed_events(ENTRY_BOOK_CURSOR_EVENT_KIND,
+                                 {"ent-A": {'qty': 1.5}}, removed=["ent-B"])
+        ctx.close()
+
+        store.cleanup_old_data(retention_days=-1)
+
+        ctx = store.open_run(_identity(), script_source="src", script_path="t030.py")
+        assert _stored_cursors(ctx) == {"ent-A": 1.5}
+        assert len(list(ctx.iter_events_by_kind_for_run_id(ENTRY_BOOK_CURSOR_EVENT_KIND))) == 1
+        ctx.close()
+
+
+def _fill_b_before_a(store: BrokerStore, *, route_c: bool | None = None) -> None:
+    """One process: entry A is sent first, entry B second, and B fills first.
+
+    The binding book opens B's binding first, so a close that names no entry
+    settles B first. With ``route_c`` set, a third entry C is sent and filled
+    after both; with ``route_c=False`` the process stops right after the
+    plugin journaled C's fill, before the engine routed it.
+    """
+    ctx, engine, pos, venue = _start(store, 0.0)
+    ids = ("A", "B") if route_c is None else ("A", "B", "C")
+    for i, pine_id in enumerate(ids, start=1):
+        pos.entry_orders[pine_id] = Order(pine_id, 1.0, order_type=_order_type_entry)
+        engine.sync(BAR_TS + i * 60_000)
+    fills = ("B", "A") if route_c is None else ("B", "A", "C")
+    for i, pine_id in enumerate(fills, start=1):
+        _journal_entry_fill(ctx, pine_id, 1.0)
+        venue.position = _long(float(i))
+        if pine_id == "C" and not route_c:
+            break
+        _deliver(engine, _fill('buy', 1.0, pine_id=pine_id, order_id=f"ent-{pine_id}"))
+        engine.sync(BAR_TS + (10 + i) * 60_000)
+    assert _book(pos)[:2] == [("B", 1.0), ("A", 1.0)]
+    places = {key: payload['seq'] for key, payload in ctx.keyed_events_for_run_id(
+        ENTRY_FILL_ORDER_EVENT_KIND).items()}
+    assert places["ent-B"] < places["ent-A"]
+    ctx.close()
+
+
+def __test_a_rejected_book_is_rebuilt_in_fill_order_not_creation_order__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The fallback book trims and orders the entries the way the binding book settled them.
+
+    A was sent before B, but B filled first. While the bot is down one unit is
+    closed without naming an entry; the stored book (A and B) no longer fits
+    the venue's one unit and is rejected. A close naming no entry settles the
+    entry that filled first, B, so the unit left is A's — the cTrader journal
+    debits such a close in the same order. Rebuilt in creation order, the
+    book would bind the unit to B.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        _fill_b_before_a(store)
+
+        with caplog.at_level(logging.WARNING):
+            ctx, _engine, pos, _venue = _start(store, 1.0)
+
+        assert len(_rejections(caplog)) == 1
+        assert [trade.entry_id for trade in pos.open_trades] == ["A"]
+        assert _book(pos) == [("A", 1.0)] and not pos.book_faithful
+        ctx.close()
+
+
+def __test_an_entry_whose_fill_was_never_booked_follows_the_placed_ones__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Rows with a recorded place go by it; a row the engine never booked comes after them.
+
+    The process stops after the plugin journaled C's fill, before the engine
+    routed it: the stored book (B, A) misses C and is rejected. The rebuilt
+    book holds B, A, C: the fill order the engine recorded, then C.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        _fill_b_before_a(store, route_c=False)
+
+        with caplog.at_level(logging.WARNING):
+            ctx, _engine, pos, _venue = _start(store, 3.0)
+
+        assert len(_rejections(caplog)) == 1
+        assert [trade.entry_id for trade in pos.open_trades] == ["B", "A", "C"]
+        assert _book(pos) == [("B", 1.0), ("A", 1.0), ("C", 1.0)]
+        ctx.close()
+
+
+def __test_the_fill_order_is_kept_across_restarts_and_by_the_retention_purge__(
+        tmp_path: Path) -> None:
+    """A later process numbers its fills after the earlier ones; age never purges a place."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        _fill_b_before_a(store)
+        store.cleanup_old_data(retention_days=-1)
+
+        ctx, engine, pos, venue = _start(store, 2.0)
+        pos.entry_orders["D"] = Order("D", 1.0, order_type=_order_type_entry)
+        engine.sync(BAR_TS + 30 * 60_000)
+        _journal_entry_fill(ctx, "D", 1.0)
+        venue.position = _long(3.0)
+        _deliver(engine, _fill('buy', 1.0, pine_id="D", order_id="ent-D"))
+        engine.sync(BAR_TS + 31 * 60_000)
+        places = {key: payload['seq'] for key, payload in ctx.keyed_events_for_run_id(
+            ENTRY_FILL_ORDER_EVENT_KIND).items()}
+        assert places["ent-B"] < places["ent-A"] < places["ent-D"]
         ctx.close()

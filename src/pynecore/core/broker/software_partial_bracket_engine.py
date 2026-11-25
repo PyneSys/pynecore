@@ -36,6 +36,7 @@ through the regular ``_dispatch_new`` path before calling the
 matching settling method on the state machine. See the partial-qty
 bracket exit design dossier §3 for the full lifecycle.
 """
+import functools
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterable
 
@@ -52,6 +53,7 @@ from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL,
     EXTRAS_KEY_TRAIL_ACTIVATION_OFFSET,
     EXTRAS_KEY_TRIGGER_LEVEL,
+    EXTRAS_KEY_TRIGGER_CLOSE_COID,
     EXTRAS_KEY_TRIGGER_OFFSET,
     LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL,
@@ -139,6 +141,18 @@ class PartialBracketLeg:
     oca_group: str | None = None
     oca_type: str | None = None
     extras: dict = field(default_factory=dict)
+    # Trail-only, memory only: the most favourable price a tick showed whose
+    # activation or move a failed store write left unapplied (this leg's own
+    # write, or another leg's that aborted the tick before it reached this
+    # one). The next tick applies it first, so the observed high-water mark
+    # is never lost.
+    unapplied_trail_price: float | None = None
+    # The client order id of the close this ``triggering`` leg sent or is
+    # about to send (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_TRIGGER_CLOSE_COID`),
+    # recorded before the venue call. While set, the leg's close may be on the
+    # venue: the leg is held, never re-armed blind
+    # (:meth:`SoftwarePartialBracketEngine.iter_held_trigger_legs`).
+    close_attempt_coid: str | None = None
 
     @property
     def key(self) -> LegKey:
@@ -165,6 +179,14 @@ class PartialBracketSafetyVerdict:
 # parent direction has not been observed yet.
 _SIDE_LONG = 'long'
 _SIDE_SHORT = 'short'
+
+
+def _more_favourable_trail_price(
+        leg: 'PartialBracketLeg', retained: float | None, price: float) -> float:
+    """The price a trail leg trails from: ``price``, or ``retained`` when it is more favourable."""
+    if retained is None:
+        return price
+    return max(price, retained) if leg.side == 'sell' else min(price, retained)
 
 
 def _parent_sign(side: str) -> int | None:
@@ -207,8 +229,19 @@ class SoftwarePartialBracketEngine:
             store_ctx: 'RunContext | None',
             *,
             state_change_listener: 'Callable[[PartialBracketLeg, str | None, str], None] | None' = None,
+            owe_write: 'Callable[[str, Callable[[], None]], None] | None' = None,
     ) -> None:
+        """
+        :param store_ctx: The run's store; ``None`` keeps the ledger in memory only.
+        :param state_change_listener: Fired after every leg-state mutation.
+        :param owe_write: Runs a leg write that follows a venue write, owing it
+            when it fails (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._owe_store_write`).
+            Such a transition (a sent close settled, a failed dispatch re-armed)
+            is already decided, so its memory change stands and the row catches
+            up later. ``None`` runs the write directly.
+        """
         self._store_ctx = store_ctx
+        self._owe_write = owe_write
         # Listener fired after every leg-state mutation (register / transition).
         # The sync engine wires this to drive the §2.6 worst-SL recompute
         # so the broker-native fail-safe state machine sees every armed /
@@ -389,6 +422,7 @@ class SoftwarePartialBracketEngine:
                 continue
             extras_patch: dict | None = None
             level = leg.trigger_level
+            activation: float | None = None
             # For trail legs we resolve the *activation* level — the
             # leg stays in pre-activation phase until WATCH observes
             # the price crossing it. TP / SL legs have no activation
@@ -402,7 +436,6 @@ class SoftwarePartialBracketEngine:
                     )
                 if activation is None:
                     continue
-                leg.trail_activation_level = activation
                 extras_patch = {EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL: activation}
             else:
                 if level is None and resolver is not None:
@@ -410,9 +443,8 @@ class SoftwarePartialBracketEngine:
                                              parent_sign=parent_sign)
                 if level is None:
                     continue
-                leg.trigger_level = level
-            old_state = leg.leg_state
-            leg.leg_state = LEG_STATE_ARMED
+            # The row commits before memory: a failed write leaves the leg
+            # ``pending_entry`` in both, so a repeated promotion arms it.
             if self._store_ctx is not None:
                 update_engine_trigger_partial_leg_state(
                     self._store_ctx,
@@ -421,6 +453,12 @@ class SoftwarePartialBracketEngine:
                     trigger_level=level,
                     extras_patch=extras_patch,
                 )
+            if activation is not None:
+                leg.trail_activation_level = activation
+            else:
+                leg.trigger_level = level
+            old_state = leg.leg_state
+            leg.leg_state = LEG_STATE_ARMED
             # Fire the state-change listener so the §2.6 worst-SL
             # recompute picks up the just-armed leg's absolute SL.
             # Without this notification, ``_recompute_native_failsafe_for_parent``
@@ -469,91 +507,124 @@ class SoftwarePartialBracketEngine:
         triggering: list[PartialBracketLeg] = []
         if parent_snapshot is None:
             return triggering
-        # Same-tick reservation: when more than one armed leg under the
-        # same (symbol, from_entry) crosses on the same tick, each call
-        # to :meth:`_safety_check` would otherwise cap against the
-        # unchanged ``parent.size``. The loop decrements the remaining
-        # parent size as legs are accepted so two 0.75 legs on a 1.0
-        # position cannot collectively dispatch 1.5 and flip the parent.
-        remaining_by_parent: dict[tuple[str, str], float] = {}
-        # OCA groups that already produced a triggering leg in *this*
-        # tick. Used to skip incompatible siblings (e.g. TP + SL crossing
-        # together on a gap) without cancelling them: cancelling SL/trail
-        # legs synchronously here would fire the §2.6 worst-SL recompute
-        # listener and drop the broker-native stop *before* the
-        # triggered TP's CLOSE has been accepted/filled. If the close
-        # fails, times out, or the process crashes between detection and
-        # dispatch, the parent would be left with no software *and* no
-        # native protection. Keep the siblings ``armed`` instead; the
-        # cascade cancel runs later, on the ``triggering → triggered``
-        # transition once the close is confirmed (Slice B dispatch
-        # wiring) or on the parent-flat observation.
+        # A leg write that fails aborts the tick. Every armed trail the tick
+        # has not reached yet keeps the quote as if its own write had failed
+        # (:attr:`PartialBracketLeg.unapplied_trail_price`), so the next tick
+        # trails each of them from it, not only the leg whose write failed.
+        visited: set[LegKey] = set()
         reserved_oca_groups: set[str] = set()
-        # Cross-tick reservation: a sibling already in ``triggering`` /
-        # ``triggered_failed`` / ``triggered_unknown`` from an earlier
-        # tick still has an in-flight close — the cascade cancel runs
-        # only on the ``triggering → triggered`` confirmation. Until
-        # then, another armed sibling in the same OCA group must not be
-        # allowed to cross and dispatch a second close (e.g. TP close
-        # pending, then price reverses into the SL/trail level on the
-        # next tick): that would over-reduce the parent before the
-        # first close resolves. Seed the reservation set so the
-        # per-iteration skip below covers in-flight siblings too.
-        for leg in self._legs.values():
-            if leg.symbol != symbol:
-                continue
-            if leg.oca_group is None:
-                continue
-            if leg.leg_state in (
-                    LEG_STATE_TRIGGERING,
-                    LEG_STATE_TRIGGERED_FAILED,
-                    LEG_STATE_TRIGGERED_UNKNOWN,
-            ):
-                reserved_oca_groups.add(leg.oca_group)
-        for leg in list(self._legs.values()):
-            if leg.symbol != symbol:
-                continue
-            if leg.leg_state != LEG_STATE_ARMED:
-                continue
-            if (leg.oca_group is not None
-                    and leg.oca_group in reserved_oca_groups):
-                # Sibling in the same OCA group already crossed this
-                # tick; skip without cancelling so SL protection stays
-                # in place until the winning leg's close is confirmed.
-                continue
-            # Trail legs are armed *before* activation and intentionally
-            # carry ``trigger_level=None`` until the price crosses
-            # ``trail_activation_level``. Run :meth:`_maybe_advance_trail`
-            # first so a pre-activation tick can seed the initial stop;
-            # only after that does a missing ``trigger_level`` mean the
-            # leg has nothing to compare against this tick (still
-            # pre-activation, or non-trail leg without a resolved level).
-            if leg.leg_kind == LEG_KIND_TRAIL_PARTIAL:
-                self._maybe_advance_trail(leg, last_price)
-            if leg.trigger_level is None:
-                continue
-            if not self._is_triggered(leg, last_price=last_price,
-                                      bid=bid, ask=ask):
-                continue
-            parent_key = (leg.symbol, leg.from_entry)
-            remaining = remaining_by_parent.get(parent_key, parent_snapshot.size)
-            verdict = self._safety_check(leg, parent_snapshot,
-                                         remaining_size=remaining)
-            if not verdict.ok:
-                self._transition(
-                    leg, LEG_STATE_ABORTED_PARENT_GONE,
-                    close_row=True,
-                    extras_patch={'safety_abort_reason': verdict.reason},
+        try:
+            # Every close a tick hands over is settled before the next tick:
+            # confirmed, or re-armed by its failure. A leg still ``triggering``
+            # here was never dispatched, because the tick or the dispatch loop
+            # that marked it ended on an error, so it is re-armed and judged
+            # again against this snapshot. A leg that recorded its close's
+            # client order id may have sent it: it stays held for the venue
+            # evidence (:meth:`iter_held_trigger_legs`).
+            for leg in list(self._legs.values()):
+                if (leg.symbol == symbol and leg.leg_state == LEG_STATE_TRIGGERING
+                        and leg.close_attempt_coid is None):
+                    self._transition(
+                        leg, LEG_STATE_ARMED, close_row=False,
+                        extras_patch={'rearmed_undispatched_trigger': True},
+                    )
+            # Same-tick reservation: when more than one armed leg under the
+            # same (symbol, from_entry) crosses on the same tick, each call
+            # to :meth:`_safety_check` would otherwise cap against the
+            # unchanged ``parent.size``. The loop decrements the remaining
+            # parent size as legs are accepted so two 0.75 legs on a 1.0
+            # position cannot collectively dispatch 1.5 and flip the parent.
+            remaining_by_parent: dict[tuple[str, str], float] = {}
+            # OCA groups that already produced a triggering leg in *this*
+            # tick. Used to skip incompatible siblings (e.g. TP + SL crossing
+            # together on a gap) without cancelling them: cancelling SL/trail
+            # legs synchronously here would fire the §2.6 worst-SL recompute
+            # listener and drop the broker-native stop *before* the
+            # triggered TP's CLOSE has been accepted/filled. If the close
+            # fails, times out, or the process crashes between detection and
+            # dispatch, the parent would be left with no software *and* no
+            # native protection. Keep the siblings ``armed`` instead; the
+            # cascade cancel runs later, on the ``triggering → triggered``
+            # transition once the close is confirmed (Slice B dispatch
+            # wiring) or on the parent-flat observation.
+            # Cross-tick reservation: a sibling already in ``triggering`` /
+            # ``triggered_failed`` / ``triggered_unknown`` from an earlier
+            # tick still has an in-flight close — the cascade cancel runs
+            # only on the ``triggering → triggered`` confirmation. Until
+            # then, another armed sibling in the same OCA group must not be
+            # allowed to cross and dispatch a second close (e.g. TP close
+            # pending, then price reverses into the SL/trail level on the
+            # next tick): that would over-reduce the parent before the
+            # first close resolves. Seed the reservation set so the
+            # per-iteration skip below covers in-flight siblings too.
+            for leg in self._legs.values():
+                if leg.symbol != symbol:
+                    continue
+                if leg.oca_group is None:
+                    continue
+                if leg.leg_state in (
+                        LEG_STATE_TRIGGERING,
+                        LEG_STATE_TRIGGERED_FAILED,
+                        LEG_STATE_TRIGGERED_UNKNOWN,
+                ):
+                    reserved_oca_groups.add(leg.oca_group)
+            for leg in list(self._legs.values()):
+                visited.add(leg.key)
+                if leg.symbol != symbol:
+                    continue
+                if leg.leg_state != LEG_STATE_ARMED:
+                    continue
+                if (leg.oca_group is not None
+                        and leg.oca_group in reserved_oca_groups):
+                    # Sibling in the same OCA group already crossed this
+                    # tick; skip without cancelling so SL protection stays
+                    # in place until the winning leg's close is confirmed.
+                    continue
+                # Trail legs are armed *before* activation and intentionally
+                # carry ``trigger_level=None`` until the price crosses
+                # ``trail_activation_level``. Run :meth:`_maybe_advance_trail`
+                # first so a pre-activation tick can seed the initial stop;
+                # only after that does a missing ``trigger_level`` mean the
+                # leg has nothing to compare against this tick (still
+                # pre-activation, or non-trail leg without a resolved level).
+                if leg.leg_kind == LEG_KIND_TRAIL_PARTIAL:
+                    self._maybe_advance_trail(leg, last_price)
+                if leg.trigger_level is None:
+                    continue
+                if not self._is_triggered(leg, last_price=last_price,
+                                          bid=bid, ask=ask):
+                    continue
+                parent_key = (leg.symbol, leg.from_entry)
+                remaining = remaining_by_parent.get(parent_key, parent_snapshot.size)
+                verdict = self._safety_check(leg, parent_snapshot,
+                                             remaining_size=remaining)
+                if not verdict.ok:
+                    self._transition(
+                        leg, LEG_STATE_ABORTED_PARENT_GONE,
+                        close_row=True,
+                        extras_patch={'safety_abort_reason': verdict.reason},
+                    )
+                    continue
+                remaining_by_parent[parent_key] = max(
+                    0.0, remaining - verdict.effective_close_qty,
                 )
-                continue
-            remaining_by_parent[parent_key] = max(
-                0.0, remaining - verdict.effective_close_qty,
-            )
-            self._transition(leg, LEG_STATE_TRIGGERING, close_row=False,
-                             qty=verdict.effective_close_qty)
-            triggering.append(leg)
-            if leg.oca_group is not None:
-                reserved_oca_groups.add(leg.oca_group)
+                self._transition(leg, LEG_STATE_TRIGGERING, close_row=False,
+                                 qty=verdict.effective_close_qty)
+                triggering.append(leg)
+                if leg.oca_group is not None:
+                    reserved_oca_groups.add(leg.oca_group)
+        except Exception:
+            if last_price is not None:
+                for leg in self._legs.values():
+                    if (leg.key not in visited and leg.symbol == symbol
+                            and leg.leg_state == LEG_STATE_ARMED
+                            and leg.leg_kind == LEG_KIND_TRAIL_PARTIAL
+                            and leg.trigger_offset is not None
+                            and (leg.oca_group is None
+                                 or leg.oca_group not in reserved_oca_groups)):
+                        leg.unapplied_trail_price = _more_favourable_trail_price(
+                            leg, leg.unapplied_trail_price, last_price)
+            raise
         return triggering
 
     # noinspection PyMethodMayBeStatic
@@ -627,14 +698,36 @@ class SoftwarePartialBracketEngine:
            a long parent trail can only rise, a short can only fall.
 
         Both transitions persist the new ``trigger_level`` /
-        ``trail_activation_level`` so a restart mid-trail does not lose
-        the high-water mark or the activation state.
+        ``trail_activation_level`` before memory takes it, so a restart
+        mid-trail does not lose the high-water mark or the activation state.
+        A failed write keeps the price it was computed from
+        (:attr:`PartialBracketLeg.unapplied_trail_price`) and re-raises; the
+        next tick trails from the more favourable of that price and its own,
+        so a quote that has already crossed the stop the lost move would have
+        set still triggers.
         """
         if leg.leg_kind != LEG_KIND_TRAIL_PARTIAL:
             return
         if last_price is None or leg.trigger_offset is None:
             return
         parent_long = leg.side == 'sell'
+        price = _more_favourable_trail_price(leg, leg.unapplied_trail_price, last_price)
+        try:
+            self._advance_trail(leg, price, parent_long=parent_long)
+        except Exception:
+            leg.unapplied_trail_price = price
+            raise
+        leg.unapplied_trail_price = None
+
+    def _advance_trail(
+            self,
+            leg: PartialBracketLeg,
+            last_price: float,
+            *,
+            parent_long: bool,
+    ) -> None:
+        """One activation or move of :meth:`_maybe_advance_trail` at ``last_price``."""
+        assert leg.trigger_offset is not None
         if leg.trail_activation_level is not None:
             # Pre-activation: wait for the activation threshold.
             activation = leg.trail_activation_level
@@ -652,8 +745,6 @@ class SoftwarePartialBracketEngine:
             # over-shoot — until another favourable tick arrived.
             initial_stop = (last_price - leg.trigger_offset) if parent_long \
                 else (last_price + leg.trigger_offset)
-            leg.trail_activation_level = None
-            leg.trigger_level = initial_stop
             if self._store_ctx is not None:
                 update_engine_trigger_partial_leg_state(
                     self._store_ctx,
@@ -662,6 +753,8 @@ class SoftwarePartialBracketEngine:
                     trigger_level=initial_stop,
                     extras_patch={EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL: None},
                 )
+            leg.trail_activation_level = None
+            leg.trigger_level = initial_stop
             if self._state_change_listener is not None:
                 # No state transition — but the trail leg's worst-SL
                 # contribution just changed (pre-activation watch level
@@ -680,7 +773,6 @@ class SoftwarePartialBracketEngine:
             new_level = candidate
         else:
             return
-        leg.trigger_level = new_level
         if self._store_ctx is not None:
             update_engine_trigger_partial_leg_state(
                 self._store_ctx,
@@ -688,6 +780,7 @@ class SoftwarePartialBracketEngine:
                 new_leg_state=leg.leg_state,
                 trigger_level=new_level,
             )
+        leg.trigger_level = new_level
         if self._state_change_listener is not None:
             # Trail leg moved its trigger_level while staying armed —
             # the §2.6 failsafe manager needs the new contribution.
@@ -758,6 +851,67 @@ class SoftwarePartialBracketEngine:
 
     # === Close-dispatch settling ==========================================
 
+    def record_trigger_close_attempt(self, leg_key: LegKey, *, close_coid: str) -> None:
+        """Record the client order id of the close a ``triggering`` leg sends next.
+
+        Called right before the venue call, and again for every re-send under a
+        new client order id. The row commits first: a failed write raises
+        before anything is sent. From then on the close may be on the venue,
+        so the leg is held until its outcome is known
+        (:meth:`iter_held_trigger_legs`) and never re-armed blind.
+
+        :param leg_key: The ``triggering`` leg.
+        :param close_coid: The close's client order id.
+        """
+        leg = self._legs.get(leg_key)
+        if leg is None or leg.leg_state != LEG_STATE_TRIGGERING:
+            return
+        if self._store_ctx is not None:
+            update_engine_trigger_partial_leg_state(
+                self._store_ctx, coid=leg.coid, new_leg_state=LEG_STATE_TRIGGERING,
+                extras_patch={EXTRAS_KEY_TRIGGER_CLOSE_COID: close_coid},
+                close_row=False,
+            )
+        leg.close_attempt_coid = close_coid
+        leg.extras[EXTRAS_KEY_TRIGGER_CLOSE_COID] = close_coid
+
+    def iter_held_trigger_legs(self) -> list[PartialBracketLeg]:
+        """The ``triggering`` legs whose recorded close is not settled.
+
+        Such a leg comes from an earlier process (restored by
+        :meth:`restart_replay`) or from a dispatch whose outcome is unknown
+        (:meth:`mark_trigger_dispatch_unknown`): its close may have reached
+        the venue, so the
+        sync engine settles it from the venue evidence of
+        :attr:`PartialBracketLeg.close_attempt_coid` — sent
+        (:meth:`confirm_trigger_dispatched`), refused or never sent
+        (:meth:`release_held_trigger`) — and sends nothing for it meanwhile.
+        Its OCA group stays reserved while it is held.
+        """
+        return [leg for leg in self._legs.values()
+                if leg.leg_state == LEG_STATE_TRIGGERING
+                and leg.close_attempt_coid is not None]
+
+    def release_held_trigger(self, leg_key: LegKey, *, reason: str) -> None:
+        """Re-arm a held leg whose close provably did not execute.
+
+        The venue refused the close, or it never reached the venue. The row
+        commits first; a failed write leaves the leg held for the next try.
+
+        :param leg_key: The held leg.
+        :param reason: Audit reason recorded on the row.
+        """
+        leg = self._legs.get(leg_key)
+        if (leg is None or leg.leg_state != LEG_STATE_TRIGGERING
+                or leg.close_attempt_coid is None):
+            return
+        self._transition(
+            leg, LEG_STATE_ARMED, close_row=False,
+            extras_patch={EXTRAS_KEY_TRIGGER_CLOSE_COID: None,
+                          'held_close_released': reason},
+        )
+        leg.close_attempt_coid = None
+
     def confirm_trigger_dispatched(
             self,
             leg_key: LegKey,
@@ -774,7 +928,9 @@ class SoftwarePartialBracketEngine:
         :attr:`PartialBracketLeg.oca_group` with
         :attr:`OcaType.CANCEL` semantics. ``close_pine_id`` is
         the synthesised exit id stamped on the close envelope so the
-        cascade audit row can correlate the two.
+        cascade audit row can correlate the two. The close is sent, so the
+        leg and its siblings leave the ledger at once and their row writes
+        are owed when they fail.
 
         :return: List of OCA siblings that were cascaded by this
             settlement; empty if the leg has no OCA group or no
@@ -791,11 +947,12 @@ class SoftwarePartialBracketEngine:
         # ``triggering`` for this call (siblings already in a terminal
         # state are skipped by the cascade), and the final transition
         # below flips it to :data:`LEG_STATE_TRIGGERED` and closes the row.
-        cascaded = self.cascade_cancel_oca(leg_key)
+        cascaded = self.cascade_cancel_oca(leg_key, owed=True)
         self._transition(
             leg, LEG_STATE_TRIGGERED,
             close_row=True,
             extras_patch={'close_pine_id': close_pine_id},
+            owed=True,
         )
         return cascaded
 
@@ -814,7 +971,9 @@ class SoftwarePartialBracketEngine:
         ambiguity). The leg lands briefly in
         :data:`LEG_STATE_TRIGGERED_FAILED` for the audit row, then
         demotes back to :data:`LEG_STATE_ARMED` so the next price
-        tick re-evaluates against a fresh parent snapshot. Idempotent
+        tick re-evaluates against a fresh parent snapshot. The dispatch
+        outcome decided the re-arm, so the leg is ``armed`` in memory at once
+        and its row writes are owed when they fail. Idempotent
         no-op when the leg is not in :data:`LEG_STATE_TRIGGERING`.
         """
         leg = self._legs.get(leg_key)
@@ -824,11 +983,9 @@ class SoftwarePartialBracketEngine:
             leg, LEG_STATE_TRIGGERED_FAILED,
             close_row=False,
             extras_patch={'trigger_failed_reason': reason},
+            owed=True,
         )
-        self._transition(
-            leg, LEG_STATE_ARMED,
-            close_row=False,
-        )
+        self._rearm_settled_trigger(leg)
 
     def mark_trigger_dispatch_unknown(
             self,
@@ -838,18 +995,21 @@ class SoftwarePartialBracketEngine:
     ) -> None:
         """Settle a :data:`LEG_STATE_TRIGGERING` leg as a parked dispatch.
 
-        Used when the close dispatch raised
+        Used when the close dispatch's outcome is not known: it raised
         :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`
-        — the broker may or may not have accepted the order. The leg
-        lands briefly in :data:`LEG_STATE_TRIGGERED_UNKNOWN` for the
-        audit row, then demotes back to :data:`LEG_STATE_ARMED` so the
-        next price tick re-evaluates the trigger. The sync engine's
-        regular parked-dispatch resolution path (``_verify_pending_dispatches``)
-        will reconcile any in-flight close that did in fact land — the
-        re-armed leg's :meth:`_safety_check` caps against the live
-        parent size and avoids over-closing if the prior attempt
-        already reduced the position. Idempotent no-op when the leg
-        is not in :data:`LEG_STATE_TRIGGERING`.
+        (parked) or failed in a way that may have reached the venue. The leg
+        lands briefly in :data:`LEG_STATE_TRIGGERED_UNKNOWN` for the audit
+        row. A leg that recorded its close's client order id
+        (:meth:`record_trigger_close_attempt`) may have sent it, and the venue
+        may have executed it: it goes back to :data:`LEG_STATE_TRIGGERING`
+        and stays held, its OCA group reserved, until the sync engine settles
+        it from the venue evidence of that id (:meth:`iter_held_trigger_legs`);
+        a second close would over-close or even flip the position. A leg
+        whose failure came before that record sent nothing and demotes to
+        :data:`LEG_STATE_ARMED`, so the next price tick re-evaluates the
+        trigger. As in :meth:`mark_trigger_dispatch_failed`, the memory change
+        stands at once and the row writes are owed when they fail. Idempotent
+        no-op when the leg is not in :data:`LEG_STATE_TRIGGERING`.
         """
         leg = self._legs.get(leg_key)
         if leg is None or leg.leg_state != LEG_STATE_TRIGGERING:
@@ -858,11 +1018,24 @@ class SoftwarePartialBracketEngine:
             leg, LEG_STATE_TRIGGERED_UNKNOWN,
             close_row=False,
             extras_patch={'trigger_unknown_reason': reason},
+            owed=True,
         )
-        self._transition(
-            leg, LEG_STATE_ARMED,
-            close_row=False,
-        )
+        if leg.close_attempt_coid is not None:
+            self._transition(leg, LEG_STATE_TRIGGERING, close_row=False, owed=True)
+            return
+        self._rearm_settled_trigger(leg)
+
+    def _rearm_settled_trigger(self, leg: PartialBracketLeg) -> None:
+        """Re-arm a leg its close dispatch settled, its row write owed when it fails.
+
+        The recorded close client order id is cleared with it: the close was
+        refused, or nothing was sent.
+        """
+        patch = None
+        if leg.close_attempt_coid is not None:
+            patch = {EXTRAS_KEY_TRIGGER_CLOSE_COID: None}
+            leg.close_attempt_coid = None
+        self._transition(leg, LEG_STATE_ARMED, close_row=False, extras_patch=patch, owed=True)
 
     # === OCA cascade ======================================================
 
@@ -871,6 +1044,7 @@ class SoftwarePartialBracketEngine:
             triggered_key: LegKey,
             *,
             reason: str = 'oca_sibling_triggered',
+            owed: bool = False,
     ) -> list[PartialBracketLeg]:
         """Cancel every armed sibling sharing the triggered leg's OCA group.
 
@@ -886,6 +1060,12 @@ class SoftwarePartialBracketEngine:
         :data:`~pynecore.core.broker.store_helpers.LEG_STATE_TRIGGERED`
         after the close fill). Siblings already in a terminal state
         are skipped.
+
+        :param triggered_key: The leg whose trigger cascades to its siblings.
+        :param reason: Audit reason recorded on each cancelled sibling's row.
+        :param owed: The cascade follows a sent close: the siblings leave the
+            ledger at once and their row writes are owed
+            (:meth:`~SoftwarePartialBracketEngine._transition`).
         """
         triggered = self._legs.get(triggered_key)
         if triggered is None or triggered.oca_group is None:
@@ -909,6 +1089,7 @@ class SoftwarePartialBracketEngine:
                 sibling, LEG_STATE_CASCADED_CANCEL,
                 close_row=True,
                 extras_patch={'cascade_reason': reason},
+                owed=owed,
             )
             cancelled.append(sibling)
         return cancelled
@@ -1140,17 +1321,20 @@ class SoftwarePartialBracketEngine:
             parent_from_entry: str,
             *,
             reason: str,
+            parent_gone: bool = False,
     ) -> list[PartialBracketLeg]:
         """Resolve :meth:`mark_legs_cancel_tentative` forward for one parent.
 
         Called when the cancel-retry-loop receives a
         :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED`,
-        :attr:`CancelDispositionOutcome.STILL_OPEN`, or
-        :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL` outcome,
+        :attr:`CancelDispositionOutcome.STILL_OPEN`,
+        :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL`, or
+        :attr:`CancelDispositionOutcome.FILLED_AND_CLOSED` outcome,
         or when a parent CANCELLED order event arrives for a parent
         currently in cancel-tentative. The tentative legs are flipped
-        to :data:`LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED` (terminal)
-        and their rows are closed.
+        to :data:`LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED` (terminal;
+        :data:`LEG_STATE_ABORTED_PARENT_GONE` with ``parent_gone``) and
+        their rows are closed.
 
         Idempotent: if no tentative leg matches the parent (because
         a previous call already terminated them), this is a no-op.
@@ -1158,6 +1342,9 @@ class SoftwarePartialBracketEngine:
         :param parent_from_entry: The parent ``EntryIntent.intent_key``
             whose tentative legs are being confirmed-cancelled.
         :param reason: Audit reason recorded on the leg row's extras.
+        :param parent_gone: The parent filled and its position has closed
+            since (:attr:`CancelDispositionOutcome.FILLED_AND_CLOSED`): the
+            legs end as :data:`LEG_STATE_ABORTED_PARENT_GONE`.
         :return: List of legs that were transitioned. Empty if no
             tentative leg matched (idempotent no-op).
         """
@@ -1167,9 +1354,13 @@ class SoftwarePartialBracketEngine:
             if leg.from_entry == parent_from_entry
             and leg.leg_state == LEG_STATE_CANCEL_TENTATIVE
         ]
+        terminal_state = (
+            LEG_STATE_ABORTED_PARENT_GONE if parent_gone
+            else LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED
+        )
         for leg in targets:
             self._transition(
-                leg, LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED,
+                leg, terminal_state,
                 close_row=True,
                 extras_patch={
                     'abort_reason': reason,
@@ -1218,11 +1409,7 @@ class SoftwarePartialBracketEngine:
         journal's regular replay but before the first
         :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.sync`. Terminal rows
         are filtered out by
-        :func:`iter_active_engine_trigger_partial_legs`; active rows
-        in ``triggering`` / ``triggered_failed`` / ``triggered_unknown``
-        are reloaded as-is and the next :meth:`on_price_tick` re-
-        evaluates them (the sync engine's reconciliation path
-        decides whether the prior trigger landed or needs retry).
+        :func:`iter_active_engine_trigger_partial_legs`.
 
         Stale-price recovery (§3.5): when this method observes an
         ``armed`` leg whose ``trigger_level`` has already been crossed
@@ -1237,14 +1424,17 @@ class SoftwarePartialBracketEngine:
         :data:`LEG_STATE_TRIGGERED_FAILED` or
         :data:`LEG_STATE_TRIGGERED_UNKNOWN` are intermediate — the
         process crashed between trigger detection and the close
-        dispatch settling. :meth:`on_price_tick` only advances
-        ``armed`` legs, and no other code path acts on those
-        intermediate states, so they would remain stuck across the
-        restart. Demote them back to ``armed`` here so the next tick
-        re-evaluates the trigger against a fresh parent snapshot;
-        if the prior close already landed at the broker, the parent
-        size will have shrunk and the safety check will cap or abort
-        the re-fire accordingly.
+        dispatch settling. A ``triggering`` or ``triggered_unknown`` leg
+        that recorded its close's client order id
+        (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_TRIGGER_CLOSE_COID`)
+        may have sent it, and the venue may have executed it: a second
+        close would over-close or even flip the position. Such a leg is
+        held in ``triggering`` with its OCA group reserved
+        (:meth:`iter_held_trigger_legs`) until the sync engine settles it
+        from the venue evidence of that client order id. Every other
+        intermediate leg never sent a close, or its close was refused
+        (``triggered_failed``): it is demoted back to ``armed`` so the next
+        tick re-evaluates the trigger against a fresh parent snapshot.
         """
         if self._store_ctx is None:
             return
@@ -1263,7 +1453,14 @@ class SoftwarePartialBracketEngine:
             self._legs_by_parent.setdefault(
                 (leg.symbol, leg.from_entry), set(),
             ).add(leg.key)
-            if leg.leg_state in (
+            if leg.close_attempt_coid is not None:
+                if leg.leg_state == LEG_STATE_TRIGGERED_UNKNOWN:
+                    self._transition(
+                        leg, LEG_STATE_TRIGGERING,
+                        close_row=False,
+                        extras_patch={'held_after_restart_from': leg.leg_state},
+                    )
+            elif leg.leg_state in (
                     LEG_STATE_TRIGGERING,
                     LEG_STATE_TRIGGERED_FAILED,
                     LEG_STATE_TRIGGERED_UNKNOWN,
@@ -1284,26 +1481,40 @@ class SoftwarePartialBracketEngine:
             close_row: bool,
             extras_patch: dict | None = None,
             qty: float | None = None,
+            owed: bool = False,
     ) -> None:
+        """Move ``leg`` to ``new_state``, in its row and in memory.
+
+        By default the row commits first: a failed write raises with the leg
+        as the store holds it, so the caller's retry finds the transition
+        still to do. ``owed`` is for a transition a venue write already
+        decided (:attr:`~SoftwarePartialBracketEngine._owe_write`): memory moves
+        first and a failed row write is owed instead of raised.
+        """
+        store_ctx = self._store_ctx
+        write = None if store_ctx is None else functools.partial(
+            update_engine_trigger_partial_leg_state, store_ctx, coid=leg.coid,
+            new_leg_state=new_state, qty=qty,
+            extras_patch=None if extras_patch is None else dict(extras_patch),
+            close_row=close_row,
+        )
+        if write is not None and not owed:
+            write()
         old_state = leg.leg_state
         leg.leg_state = new_state
         if qty is not None:
             leg.qty = qty
         if extras_patch:
             leg.extras.update(extras_patch)
-        if self._store_ctx is not None:
-            update_engine_trigger_partial_leg_state(
-                self._store_ctx,
-                coid=leg.coid,
-                new_leg_state=new_state,
-                qty=qty,
-                extras_patch=extras_patch,
-                close_row=close_row,
-            )
         if self._state_change_listener is not None:
             self._state_change_listener(leg, old_state, new_state)
         if close_row:
             self._evict(leg.key)
+        if write is not None and owed:
+            if self._owe_write is None:
+                write()
+            else:
+                self._owe_write(f"partial bracket leg {leg.coid} -> {new_state}", write)
 
     def _evict(self, key: LegKey) -> None:
         leg = self._legs.pop(key, None)
@@ -1376,8 +1587,8 @@ def _leg_from_row(row: 'OrderRow') -> PartialBracketLeg | None:
     # :meth:`SoftwarePartialBracketEngine.iter_cancel_tentative_parents`
     # and the post-restart
     # :meth:`OrderSyncEngine._rehydrate_cancel_tentative_from_replayed_legs`
-    # rehydrate can see it. The ``restart_replay`` only re-arms the three
-    # in-flight engine-owned states (``triggering`` / ``triggered_failed``
+    # rehydrate can see it. The ``restart_replay`` only re-arms or holds the
+    # three in-flight engine-owned states (``triggering`` / ``triggered_failed``
     # / ``triggered_unknown``), so a tentative row loaded here stays
     # tentative until the cancel-retry loop resolves it.
     if leg_state not in LEG_STATE_LIVE:
@@ -1393,6 +1604,8 @@ def _leg_from_row(row: 'OrderRow') -> PartialBracketLeg | None:
     trail_activation_offset = extras.get(EXTRAS_KEY_TRAIL_ACTIVATION_OFFSET)
     pine_id = row.pine_entry_id or ''
     from_entry = row.from_entry or ''
+    close_attempt_coid = extras.get(EXTRAS_KEY_TRIGGER_CLOSE_COID) if leg_state in (
+        LEG_STATE_TRIGGERING, LEG_STATE_TRIGGERED_UNKNOWN) else None
     return PartialBracketLeg(
         coid=row.client_order_id,
         symbol=row.symbol,
@@ -1413,4 +1626,5 @@ def _leg_from_row(row: 'OrderRow') -> PartialBracketLeg | None:
         oca_group=extras.get(EXTRAS_KEY_OCA_GROUP),
         oca_type=extras.get(EXTRAS_KEY_OCA_TYPE),
         extras=dict(extras),
+        close_attempt_coid=close_attempt_coid,
     )

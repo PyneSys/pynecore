@@ -27,7 +27,7 @@ shape.
 See ``docs/pynecore/plugin-system/broker/broker-plugin-responsibility-review.md``
 section §4 for the rationale.
 """
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from time import time as epoch_time
 from typing import Any, TYPE_CHECKING
 
@@ -35,6 +35,7 @@ from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 if TYPE_CHECKING:
     from pynecore.core.broker.models import PositionLeg
+    from pynecore.core.broker.ownership_journal import OwnershipJournal
     from pynecore.core.broker.storage import OrderRow, RunContext
 
 __all__ = [
@@ -86,6 +87,7 @@ __all__ = [
     'EXTRAS_KEY_OCA_GROUP',
     'EXTRAS_KEY_OCA_TYPE',
     'EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS',
+    'EXTRAS_KEY_TRIGGER_CLOSE_COID',
     'create_entry_order_row',
     'record_server_ref',
     'mark_confirmed_with_fill',
@@ -115,15 +117,28 @@ __all__ = [
     'EXTRAS_KEY_CLOSE_LEG_ID',
     'EXTRAS_KEY_CLOSE_PARENT_COID',
     'EXTRAS_KEY_CLOSE_LEG_VOLUME',
+    'EXTRAS_KEY_CLOSE_LEG_PRE_VOLUME',
+    'EXTRAS_KEY_CLOSE_LEG_ATTEMPTS',
+    'EXTRAS_KEY_CLOSE_LEG_SINCE_MS',
+    'EXTRAS_KEY_CLOSE_LEG_RESERVED',
     'create_close_leg_row',
     'update_close_leg_state',
     'iter_active_close_legs',
+    'reserve_close_leg_send',
+    'release_close_leg_send',
+    'lower_close_leg_send_pre_volume',
+    'finish_close_leg_row',
+    'iter_close_leg_sends',
     'STATE_RESIDUAL_OPEN',
     'EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID',
     'EXTRAS_KEY_RESIDUAL_OPEN_RUN_TAG',
     'EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS',
     'EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ',
+    'EXTRAS_KEY_RESIDUAL_OPEN_CLOSE_PLAN',
+    'EXTRAS_KEY_RESIDUAL_OPEN_COUNTED_CLOSES',
+    'count_residual_open_close',
     'create_residual_open_row',
+    'advance_residual_open_attempt',
     'iter_active_residual_opens',
     'clear_residual_open_row',
     'STATE_BRACKET_OWN',
@@ -142,6 +157,7 @@ __all__ = [
     'EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET',
     'EXTRAS_KEY_BRACKET_OWN_OCA_NAME',
     'EXTRAS_KEY_BRACKET_OWN_OCA_TYPE',
+    'EXTRAS_KEY_BRACKET_OWN_SOFTWARE',
     'create_bracket_ownership_row',
     'update_bracket_ownership_state',
     'iter_active_bracket_ownerships',
@@ -343,7 +359,8 @@ LEG_STATE_CASCADED_CANCEL_BY_NATIVE_SL = 'cascaded_cancel_by_native_sl'
 # ``reconcile()`` cancel-retry-loop resolves it within the stale-grace
 # window (default 10s) by re-invoking ``execute_cancel_with_outcome``;
 # the outcome flips the leg to ``aborted_parent_never_arrived`` (on
-# ``CANCEL_CONFIRMED``) or back to ``pending_entry`` / ``armed`` (on
+# ``CANCEL_CONFIRMED``), to ``aborted_parent_gone`` (on
+# ``FILLED_AND_CLOSED``) or back to ``pending_entry`` / ``armed`` (on
 # ``ALREADY_FILLED``). Stale-grace expiry promotes the parent to
 # ``DEGRADED_HALT``. See the cancel-tentative state design dossier.
 LEG_STATE_CANCEL_TENTATIVE = 'cancel_tentative'
@@ -419,6 +436,13 @@ EXTRAS_KEY_OCA_TYPE = 'oca_type'
 # ``pending_entry`` / ``armed`` on restore, or forward to
 # ``aborted_parent_never_arrived`` on confirmed cancel).
 EXTRAS_KEY_CANCEL_TENTATIVE_SINCE_TS_MS = 'cancel_tentative_since_ts_ms'
+# Client order id of the close a ``triggering`` leg is about to send, written
+# before the venue call. While set on a ``triggering`` (or, after a crash
+# between the settling writes, ``triggered_unknown``) row, the close may have
+# reached the venue: a restart holds the leg until the venue evidence of that
+# client order id decides it, and never sends a second close for it. Cleared
+# when the leg re-arms.
+EXTRAS_KEY_TRIGGER_CLOSE_COID = 'trigger_close_coid'
 
 
 # === Stop-limit watch constants ============================================
@@ -516,9 +540,12 @@ STATE_CLOSE_LEG = 'close_leg'
 # ``extras[EXTRAS_KEY_CLOSE_LEG_STATE]`` phases of one fanned close leg.
 # ``pending`` — row persisted, the per-leg close has NOT been acked yet.
 # ``dispatched`` — the transport's ``close_leg`` returned without raising
-#   (terminal; the row is closed). ``restart_replay`` resumes only ``pending``
-#   legs (a crash before the ack) and reconciles each against the live legs
-#   before re-dispatching, so an already-executed close is never repeated.
+#   (terminal; the row is closed once no send of it is reserved any more, see
+#   :data:`EXTRAS_KEY_CLOSE_LEG_RESERVED`). ``restart_replay`` resumes only ``pending``
+#   legs (a crash before the ack) and, before it re-sends anything, establishes
+#   what the close already executed (the venue's record of every attempt, and
+#   how much the leg lost since the dispatch), so an executed close is never
+#   repeated.
 CLOSE_LEG_STATE_PENDING = 'pending'
 CLOSE_LEG_STATE_DISPATCHED = 'dispatched'
 
@@ -535,6 +562,26 @@ EXTRAS_KEY_CLOSE_LEG_ID = 'close_leg_id'
 EXTRAS_KEY_CLOSE_PARENT_COID = 'close_parent_coid'
 # Broker-grid integer volume dispatched for this leg (audit + replay residual).
 EXTRAS_KEY_CLOSE_LEG_VOLUME = 'close_leg_volume'
+# Broker-grid size of the leg when its close was dispatched: the replay reads
+# how much the leg lost since then as evidence of what the close executed.
+EXTRAS_KEY_CLOSE_LEG_PRE_VOLUME = 'close_leg_pre_volume'
+# Every client-order-id the leg's close went out under, oldest first: the row's
+# own coid, then each replay re-send of the part still open. The replay asks the
+# venue what all of them executed before it sends anything more.
+EXTRAS_KEY_CLOSE_LEG_ATTEMPTS = 'close_leg_attempts'
+# Epoch ms (local clock) when the first of those sends was about to go out: the
+# ``since_ms`` the venue is asked from. Kept in extras because reopening the row
+# for a later settlement restarts its ``created_ts_ms``.
+EXTRAS_KEY_CLOSE_LEG_SINCE_MS = 'close_leg_since_ms'
+# The sends of the leg's close the position read may not show yet, oldest
+# first: ``[[attempt_coid, volume, pre_volume, since_ms, sent_ns], ...]`` with
+# the send's broker-grid volume, the leg's broker-grid size the send is
+# credited from, the epoch ms the venue is asked about it from, and the epoch
+# ns it went out at (the send order across rows). A send is recorded BEFORE its
+# wire call and dropped once the read or the venue's record shows it; the row
+# stays live while any send is listed, so a restart rebuilds the reserved view
+# from it.
+EXTRAS_KEY_CLOSE_LEG_RESERVED = 'close_leg_reserved'
 
 
 # === One-way emulation residual-open constants =============================
@@ -561,6 +608,26 @@ EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID = 'residual_open_entry_coid'
 EXTRAS_KEY_RESIDUAL_OPEN_RUN_TAG = 'residual_open_run_tag'
 EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS = 'residual_open_bar_ts_ms'
 EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ = 'residual_open_retry_seq'
+# The entry coid and ``retry_seq`` name the open's CURRENT attempt. A
+# ``place_leg`` that raised
+# :class:`~pynecore.core.broker.exceptions.ExchangeConnectionError` (the request
+# never left the client) may leave its persist-first ``submitted`` entry row
+# behind; the breadcrumb then moves on to the next attempt
+# (:func:`advance_residual_open_attempt`), so only a row of the current attempt's
+# coid reads as an open that went out.
+# The close plan of a reversal-path reduction or flatten that was cut short after
+# a close went out (``qty`` 0, nothing to open): ``[[leg_id, pine_qty], ...]``.
+# Recovery closes only these legs, at most the planned quantity of each, never
+# every opposing leg the book shows.
+EXTRAS_KEY_RESIDUAL_OPEN_CLOSE_PLAN = 'residual_open_close_plan'
+# The close-leg row coids a reversal's breadcrumb has counted against its
+# combined order: ``[coid, ...]``. A reversal's breadcrumb is written with the
+# combined order size Pine dispatched as its ``qty``; every close-leg row the
+# reversal's closes go out under is counted once, lowering ``qty`` by the Pine
+# quantity it closes, so ``qty`` is always what is left to open. A close a
+# drain sends because an earlier close of another intent executed less than it
+# held is counted just like the reversal's own planned ones.
+EXTRAS_KEY_RESIDUAL_OPEN_COUNTED_CLOSES = 'residual_open_counted_closes'
 
 
 # === One-way emulation bracket-ownership constants =========================
@@ -644,6 +711,13 @@ EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET = 'bracket_own_trail_offset'
 # reduce group is a cascade no-op, so the gap only ever loses an explicit group).
 EXTRAS_KEY_BRACKET_OWN_OCA_NAME = 'bracket_own_oca_name'
 EXTRAS_KEY_BRACKET_OWN_OCA_TYPE = 'bracket_own_oca_type'
+# ``True`` while the leg is protected by the emulator's software leg guard and
+# carries NO venue bracket of this run (the venue bracket could not be limited
+# to the protected quantity). Absent or ``False`` means the leg may hold a venue
+# bracket this run wrote, which a switch to the software guard must clear first.
+# The flag is set only after that clear is confirmed and dropped before a venue
+# bracket is written again, so a crash in between leaves the conservative state.
+EXTRAS_KEY_BRACKET_OWN_SOFTWARE = 'bracket_own_software'
 
 
 # === Entry order row lifecycle =============================================
@@ -847,7 +921,14 @@ def mark_disposition_unknown(
     Used when a POST times out or the response is missing the server
     reference. The row is *not* deleted — recovery on the next restart
     re-evaluates it against the exchange's authoritative view.
+
+    From this state on, a resolver may settle the dispatch from venue data
+    (:func:`~pynecore.core.broker.parked_dispatch.awaits_venue_answer`), which
+    can happen before the engine parks it. The verdict slot is opened first
+    (:meth:`~RunContext.await_park_row`), so a verdict recorded in that gap
+    lands with the park row instead of finding neither.
     """
+    store.await_park_row(coid)
     store.set_order_state(coid, STATE_DISPOSITION_UNKNOWN)
 
 
@@ -865,9 +946,13 @@ def mark_rejected(
     dispatch can land on the venue, and a live row reads as an order
     the run still owns (an entry awaiting its fill defers every exit on
     its side). The engine clears its intent slot on the next sync.
+
+    Both writes share one transaction: a ``rejected`` row left live is
+    not pending, so no recovery pass would ever close it.
     """
-    store.set_order_state(coid, STATE_REJECTED)
-    store.close_order(coid)
+    with store.transaction():
+        store.set_order_state(coid, STATE_REJECTED)
+        store.close_order(coid)
 
 
 # === Recovery query ========================================================
@@ -1707,8 +1792,8 @@ def update_engine_trigger_partial_leg_state(
         the upsert — typically empty, used by audit-rich call sites
         (e.g. failure-reason capture on ``triggered_failed``).
     :param close_row: When ``True``, also calls
-        :meth:`RunContext.close_order` after the state update. The
-        engine sets this on every transition into
+        :meth:`RunContext.close_order` after the state update, in the
+        same transaction. The engine sets this on every transition into
         :data:`LEG_STATE_TERMINAL`.
     :raises ValueError: When ``new_leg_state`` is not one of the
         canonical :data:`LEG_STATE_*` values.
@@ -1731,9 +1816,11 @@ def update_engine_trigger_partial_leg_state(
     upsert_fields: dict[str, Any] = {'extras': merged}
     if qty is not None:
         upsert_fields['qty'] = qty
-    store.upsert_order(coid, **upsert_fields)
-    if close_row:
-        store.close_order(coid)
+    # One transaction: a terminal state never lands on a row left live.
+    with store.transaction():
+        store.upsert_order(coid, **upsert_fields)
+        if close_row:
+            store.close_order(coid)
 
 
 def iter_active_engine_trigger_partial_legs(
@@ -1772,7 +1859,7 @@ def iter_active_engine_trigger_partial_legs(
 # === One-way emulation close-leg helpers ===================================
 
 def create_close_leg_row(
-        store: 'RunContext',
+        store: 'OwnershipJournal',
         *,
         coid: str,
         symbol: str,
@@ -1783,6 +1870,7 @@ def create_close_leg_row(
         parent_close_coid: str,
         leg_id: str,
         leg_volume: int,
+        leg_pre_volume: int,
         extra_payload: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist one one-way emulation close-leg row (PERSIST-FIRST).
@@ -1798,7 +1886,8 @@ def create_close_leg_row(
     (``f"{parent_close_coid}:{leg_id}"``), so a restart that re-runs the same
     dispatch upserts the SAME row rather than duplicating it.
 
-    :param store: The active run context.
+    :param store: The active run context, or the emulator's in-memory journal
+        on a run without a store.
     :param coid: The leg row's deterministic client-order-id.
     :param symbol: Exchange-side symbol.
     :param side: The close side (opposite the position direction being reduced).
@@ -1808,6 +1897,7 @@ def create_close_leg_row(
     :param parent_close_coid: The CloseIntent dispatch's ``KIND_CLOSE`` coid.
     :param leg_id: Broker leg id (cTrader ``positionId``) this row closes.
     :param leg_volume: Broker-grid integer volume dispatched for the leg.
+    :param leg_pre_volume: Broker-grid size of the leg as the close is dispatched.
     :param extra_payload: Additional plugin-specific extras to merge.
     """
     extras: dict[str, Any] = {
@@ -1815,6 +1905,9 @@ def create_close_leg_row(
         EXTRAS_KEY_CLOSE_LEG_ID: leg_id,
         EXTRAS_KEY_CLOSE_PARENT_COID: parent_close_coid,
         EXTRAS_KEY_CLOSE_LEG_VOLUME: leg_volume,
+        EXTRAS_KEY_CLOSE_LEG_PRE_VOLUME: leg_pre_volume,
+        EXTRAS_KEY_CLOSE_LEG_ATTEMPTS: [coid],
+        EXTRAS_KEY_CLOSE_LEG_SINCE_MS: int(epoch_time() * 1000),
     }
     if extra_payload:
         extras.update(extra_payload)
@@ -1822,21 +1915,24 @@ def create_close_leg_row(
     # coid; reopen so the re-persisted row rejoins the live set (upsert_order
     # does not clear ``closed_ts_ms`` on its own). No-op when the row is absent
     # or already live.
-    store.reopen_order(coid)
-    store.upsert_order(
-        coid,
-        symbol=symbol,
-        side=side,
-        qty=qty,
-        state=STATE_CLOSE_LEG,
-        intent_key=intent_key,
-        pine_entry_id=pine_entry_id,
-        extras=extras,
-    )
+    # One write: a row reopened but not re-persisted would carry the stale
+    # state of its earlier lifecycle.
+    with store.transaction():
+        store.reopen_order(coid)
+        store.upsert_order(
+            coid,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            state=STATE_CLOSE_LEG,
+            intent_key=intent_key,
+            pine_entry_id=pine_entry_id,
+            extras=extras,
+        )
 
 
 def update_close_leg_state(
-        store: 'RunContext',
+        store: 'OwnershipJournal',
         *,
         coid: str,
         new_state: str,
@@ -1847,7 +1943,7 @@ def update_close_leg_state(
 
     Set ``close_row=True`` for the terminal :data:`CLOSE_LEG_STATE_DISPATCHED`
     transition (the per-leg close acked), which also calls
-    :meth:`RunContext.close_order` so the row leaves
+    :meth:`~OwnershipJournal.close_order` so the row leaves
     :func:`iter_active_close_legs`'s live set.
 
     :param store: The active run context.
@@ -1864,18 +1960,20 @@ def update_close_leg_state(
             f"{{CLOSE_LEG_STATE_PENDING, CLOSE_LEG_STATE_DISPATCHED}}, "
             f"got {new_state!r}"
         )
-    existing = store.get_order(coid)
-    merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}
-    merged[EXTRAS_KEY_CLOSE_LEG_STATE] = new_state
-    if extras_patch:
-        merged.update(extras_patch)
-    store.upsert_order(coid, extras=merged)
-    if close_row:
-        store.close_order(coid)
+    # One write: a terminal state left on a live row is read by no later pass.
+    with store.transaction():
+        existing = store.get_order(coid)
+        merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}
+        merged[EXTRAS_KEY_CLOSE_LEG_STATE] = new_state
+        if extras_patch:
+            merged.update(extras_patch)
+        store.upsert_order(coid, extras=merged)
+        if close_row:
+            store.close_order(coid)
 
 
 def iter_active_close_legs(
-        store: 'RunContext',
+        store: 'OwnershipJournal',
 ) -> Iterator['OrderRow']:
     """Iterate live (pending) close-leg rows for restart replay.
 
@@ -1896,10 +1994,137 @@ def iter_active_close_legs(
         yield row
 
 
+def reserve_close_leg_send(
+        store: 'OwnershipJournal',
+        coid: str,
+        *,
+        attempt_coid: str,
+        volume: int,
+        pre_volume: int,
+        since_ms: int,
+        sent_ns: int,
+) -> None:
+    """Record one send of a leg close on its row before the send goes out.
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    :param coid: The close-leg row's client-order-id.
+    :param attempt_coid: The client-order-id the send goes out under.
+    :param volume: The broker-grid volume of the send.
+    :param pre_volume: The leg's broker-grid size the send is credited from.
+    :param since_ms: Epoch ms the venue is asked about the send from.
+    :param sent_ns: Epoch ns of the send, ordering it among every send.
+    """
+    existing = store.get_order(coid)
+    if existing is None:
+        return
+    extras: dict[str, Any] = dict(existing.extras or {})
+    sends = [list(sent) for sent in extras.get(EXTRAS_KEY_CLOSE_LEG_RESERVED) or ()
+             if str(sent[0]) != attempt_coid]
+    sends.append([attempt_coid, int(volume), int(pre_volume), int(since_ms), int(sent_ns)])
+    extras[EXTRAS_KEY_CLOSE_LEG_RESERVED] = sends
+    store.upsert_order(coid, extras=extras)
+
+
+def release_close_leg_send(store: 'OwnershipJournal', coid: str, attempt_coid: str) -> None:
+    """Drop one reserved send of a leg close from its row.
+
+    A :data:`CLOSE_LEG_STATE_DISPATCHED` row with no reserved send left is
+    closed: its close is fully accounted for.
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    :param coid: The close-leg row's client-order-id.
+    :param attempt_coid: The client-order-id of the send to drop.
+    """
+    # One span: a dispatched row left live without a reserved send is read
+    # by no later pass, so nothing would ever close it.
+    with store.transaction():
+        existing = store.get_order(coid)
+        if existing is None:
+            return
+        extras: dict[str, Any] = dict(existing.extras or {})
+        sends = [list(sent) for sent in extras.get(EXTRAS_KEY_CLOSE_LEG_RESERVED) or ()
+                 if str(sent[0]) != attempt_coid]
+        extras[EXTRAS_KEY_CLOSE_LEG_RESERVED] = sends
+        store.upsert_order(coid, extras=extras)
+        if (not sends and existing.closed_ts_ms is None
+                and extras.get(EXTRAS_KEY_CLOSE_LEG_STATE) == CLOSE_LEG_STATE_DISPATCHED):
+            store.close_order(coid)
+
+
+def lower_close_leg_send_pre_volume(
+        store: 'OwnershipJournal', coid: str, attempt_coid: str, pre_volume: int,
+) -> None:
+    """Lower the leg size a reserved send is credited from.
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    :param coid: The close-leg row's client-order-id.
+    :param attempt_coid: The client-order-id of the send.
+    :param pre_volume: The new broker-grid leg size.
+    """
+    existing = store.get_order(coid)
+    if existing is None:
+        return
+    extras: dict[str, Any] = dict(existing.extras or {})
+    sends = [list(sent) for sent in extras.get(EXTRAS_KEY_CLOSE_LEG_RESERVED) or ()]
+    for sent in sends:
+        if str(sent[0]) == attempt_coid:
+            sent[2] = int(pre_volume)
+    extras[EXTRAS_KEY_CLOSE_LEG_RESERVED] = sends
+    store.upsert_order(coid, extras=extras)
+
+
+def finish_close_leg_row(
+        store: 'OwnershipJournal', coid: str, *, release_sends: bool = False,
+) -> None:
+    """Mark a close-leg row :data:`CLOSE_LEG_STATE_DISPATCHED` and close it once accounted for.
+
+    The row is closed when none of its sends is reserved any more; otherwise
+    it stays live until the last one is dropped (:func:`release_close_leg_send`).
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    :param coid: The close-leg row's client-order-id.
+    :param release_sends: ``True`` when the leg is gone, so no send of it can
+        still take anything from it: every reserved send is dropped and the
+        row closed.
+    """
+    # One span: a dispatched row left live without a reserved send is read
+    # by no later pass, so nothing would ever close it.
+    with store.transaction():
+        existing = store.get_order(coid)
+        if existing is None:
+            return
+        patch: dict[str, Any] = {}
+        if release_sends:
+            patch[EXTRAS_KEY_CLOSE_LEG_RESERVED] = []
+        update_close_leg_state(store, coid=coid, new_state=CLOSE_LEG_STATE_DISPATCHED,
+                               extras_patch=patch)
+        current = store.get_order(coid)
+        sends = (current.extras or {}).get(EXTRAS_KEY_CLOSE_LEG_RESERVED) if current else None
+        if not sends:
+            store.close_order(coid)
+
+
+def iter_close_leg_sends(
+        store: 'OwnershipJournal', symbol: str,
+) -> Iterator[tuple['OrderRow', list[Any]]]:
+    """Iterate the reserved sends of the live close-leg rows of ``symbol``.
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    :param symbol: The traded symbol.
+    :return: ``(row, [attempt_coid, volume, pre_volume, since_ms, sent_ns])``
+        pairs, in no particular order.
+    """
+    for row in store.iter_live_orders():
+        if row.state != STATE_CLOSE_LEG or row.symbol != symbol:
+            continue
+        for sent in (row.extras or {}).get(EXTRAS_KEY_CLOSE_LEG_RESERVED) or ():
+            yield row, list(sent)
+
+
 # === One-way emulation residual-open helpers ===============================
 
 def create_residual_open_row(
-        store: 'RunContext',
+        store: 'OwnershipJournal',
         *,
         coid: str,
         symbol: str,
@@ -1911,6 +2136,7 @@ def create_residual_open_row(
         run_tag: str,
         bar_ts_ms: int,
         retry_seq: int,
+        close_plan: Sequence[tuple[str, float]] | None = None,
 ) -> None:
     """Persist a reversal's residual-OPEN breadcrumb (PERSIST-FIRST).
 
@@ -1927,11 +2153,14 @@ def create_residual_open_row(
     The ``coid`` is the reversal's ``KIND_CLOSE`` parent coid suffixed
     ``":residual"``, so a restart re-run upserts the SAME row.
 
-    :param store: The active run context.
+    :param store: The active run context, or the emulator's in-memory journal
+        on a run without a store.
     :param coid: The breadcrumb row's deterministic client-order-id.
     :param symbol: Exchange-side symbol.
     :param side: The residual open's side (the entry's own direction).
-    :param qty: The residual open quantity (Pine units).
+    :param qty: The combined order size of a reversal (Pine units), lowered by
+        each close it counts (:func:`count_residual_open_close`); ``0`` for a
+        cut-short reduction or flatten.
     :param intent_key: The owning :class:`~pynecore.core.broker.models.EntryIntent`'s diff key.
     :param pine_entry_id: The owning ``strategy.entry(id=...)`` value.
     :param entry_coid: The residual ``place_leg``'s deterministic entry coid
@@ -1940,6 +2169,9 @@ def create_residual_open_row(
     :param run_tag: Dispatch envelope run tag (to rebuild the envelope on replay).
     :param bar_ts_ms: Dispatch envelope bar timestamp.
     :param retry_seq: Dispatch envelope retry sequence.
+    :param close_plan: ``(leg_id, pine_qty)`` of every close of a cut-short
+        reduction or flatten (:data:`EXTRAS_KEY_RESIDUAL_OPEN_CLOSE_PLAN`);
+        ``None`` for a reversal, which closes every opposing leg.
     """
     extras: dict[str, Any] = {
         EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID: entry_coid,
@@ -1947,26 +2179,84 @@ def create_residual_open_row(
         EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS: bar_ts_ms,
         EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ: retry_seq,
     }
-    store.reopen_order(coid)
-    store.upsert_order(
-        coid,
-        symbol=symbol,
-        side=side,
-        qty=qty,
-        state=STATE_RESIDUAL_OPEN,
-        intent_key=intent_key,
-        pine_entry_id=pine_entry_id,
-        extras=extras,
-    )
+    if close_plan is not None:
+        extras[EXTRAS_KEY_RESIDUAL_OPEN_CLOSE_PLAN] = [
+            [leg_id, qty] for leg_id, qty in close_plan]
+    # One write: a breadcrumb reopened but not re-persisted would replay the
+    # close plan and the open of its earlier lifecycle.
+    with store.transaction():
+        store.reopen_order(coid)
+        store.upsert_order(
+            coid,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            state=STATE_RESIDUAL_OPEN,
+            intent_key=intent_key,
+            pine_entry_id=pine_entry_id,
+            extras=extras,
+        )
 
 
-def clear_residual_open_row(store: 'RunContext', coid: str) -> None:
+def advance_residual_open_attempt(
+        store: 'OwnershipJournal', coid: str, *, entry_coid: str, retry_seq: int,
+) -> None:
+    """Move a live breadcrumb's residual open on to its next attempt.
+
+    Called after a ``place_leg`` that provably never left the client: the
+    entry row that ``place_leg`` may have left under the old coid is no
+    evidence of the next attempt, which goes out under ``entry_coid``. A no-op
+    for an absent row.
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    :param coid: The breadcrumb's client-order-id.
+    :param entry_coid: The next attempt's deterministic entry coid.
+    :param retry_seq: The next attempt's ``retry_seq``.
+    """
+    existing = store.get_order(coid)
+    if existing is None:
+        return
+    extras: dict[str, Any] = dict(existing.extras or {})
+    extras[EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID] = entry_coid
+    extras[EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ] = retry_seq
+    store.upsert_order(coid, extras=extras)
+
+
+def count_residual_open_close(
+        store: 'OwnershipJournal', coid: str, *, close_coid: str, qty: float,
+) -> None:
+    """Count one close-leg row of a reversal against its combined order.
+
+    Lowers the breadcrumb's ``qty`` (what is left to open) by ``qty`` the first
+    time ``close_coid`` is counted (:data:`EXTRAS_KEY_RESIDUAL_OPEN_COUNTED_CLOSES`);
+    a row already counted is a re-send of the same close and lowers nothing. A
+    no-op for an absent or closed breadcrumb.
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    :param coid: The breadcrumb's client-order-id.
+    :param close_coid: The close-leg row's client-order-id.
+    :param qty: The Pine quantity the close takes off the opposing exposure.
+    """
+    with store.transaction():
+        existing = store.get_order(coid)
+        if existing is None or existing.closed_ts_ms is not None:
+            return
+        extras: dict[str, Any] = dict(existing.extras or {})
+        counted = [str(c) for c in extras.get(EXTRAS_KEY_RESIDUAL_OPEN_COUNTED_CLOSES) or ()]
+        if close_coid in counted:
+            return
+        extras[EXTRAS_KEY_RESIDUAL_OPEN_COUNTED_CLOSES] = [*counted, close_coid]
+        remaining = round(max(0.0, existing.qty - max(0.0, float(qty))), 12)
+        store.upsert_order(coid, qty=remaining, extras=extras)
+
+
+def clear_residual_open_row(store: 'OwnershipJournal', coid: str) -> None:
     """Finalise a residual-open breadcrumb once the open is durable / replayed."""
     store.close_order(coid)
 
 
 def iter_active_residual_opens(
-        store: 'RunContext',
+        store: 'OwnershipJournal',
 ) -> Iterator['OrderRow']:
     """Iterate live residual-open breadcrumbs for restart replay.
 
@@ -1974,7 +2264,8 @@ def iter_active_residual_opens(
     are not yet closed — a reversal whose residual open was recorded but whose
     durability (its own entry row) the crash may have pre-empted.
 
-    :param store: The active run context.
+    :param store: The active run context, or the emulator's in-memory journal
+        on a run without a store.
     """
     for row in store.iter_live_orders():
         if row.state == STATE_RESIDUAL_OPEN:
@@ -1984,7 +2275,7 @@ def iter_active_residual_opens(
 # === One-way emulation bracket-ownership helpers ===========================
 
 def create_bracket_ownership_row(
-        store: 'RunContext',
+        store: 'OwnershipJournal',
         *,
         coid: str,
         symbol: str,
@@ -2016,9 +2307,9 @@ def create_bracket_ownership_row(
     id (``f"{attach_coid}:{leg_id}"``), so a re-attach upserts the SAME row and
     two different exits (distinct attach coids) own disjoint coid namespaces. The
     ``from_entry`` is written to its own column so the clear path can pre-filter
-    the live set cheaply via :meth:`RunContext.iter_live_orders`.
+    the live set cheaply via :meth:`~OwnershipJournal.iter_live_orders`.
 
-    :param store: The active run context.
+    :param store: The ownership journal: the run's store, or the emulator's in-memory one.
     :param coid: The ownership row's deterministic client-order-id.
     :param symbol: Exchange-side symbol.
     :param side: The exit (bracket) side.
@@ -2055,22 +2346,25 @@ def create_bracket_ownership_row(
     # SAME derived coid; reopen so the re-persisted row rejoins the live set
     # (upsert_order does not clear ``closed_ts_ms`` on its own). No-op when the
     # row is absent or already live.
-    store.reopen_order(coid)
-    store.upsert_order(
-        coid,
-        symbol=symbol,
-        side=side,
-        qty=qty,
-        state=STATE_BRACKET_OWN,
-        intent_key=intent_key,
-        pine_entry_id=pine_entry_id,
-        from_entry=from_entry,
-        extras=extras,
-    )
+    # One write: a row reopened but not re-persisted would carry the stale
+    # state of its earlier lifecycle.
+    with store.transaction():
+        store.reopen_order(coid)
+        store.upsert_order(
+            coid,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            state=STATE_BRACKET_OWN,
+            intent_key=intent_key,
+            pine_entry_id=pine_entry_id,
+            from_entry=from_entry,
+            extras=extras,
+        )
 
 
 def update_bracket_ownership_state(
-        store: 'RunContext',
+        store: 'OwnershipJournal',
         *,
         coid: str,
         new_state: str,
@@ -2081,10 +2375,10 @@ def update_bracket_ownership_state(
 
     Set ``close_row=True`` for the terminal :data:`BRACKET_OWN_STATE_RELEASED`
     transition (the bracket cleared from this leg), which also calls
-    :meth:`RunContext.close_order` so the row leaves
+    :meth:`~OwnershipJournal.close_order` so the row leaves
     :func:`iter_active_bracket_ownerships`'s live set.
 
-    :param store: The active run context.
+    :param store: The ownership journal: the run's store, or the emulator's in-memory one.
     :param coid: The ownership row's client-order-id.
     :param new_state: Target :data:`BRACKET_OWN_STATE_ACTIVE` /
         :data:`BRACKET_OWN_STATE_CLEARING` / :data:`BRACKET_OWN_STATE_RELEASED`.
@@ -2102,18 +2396,20 @@ def update_bracket_ownership_state(
             f"{{BRACKET_OWN_STATE_ACTIVE, BRACKET_OWN_STATE_CLEARING, "
             f"BRACKET_OWN_STATE_RELEASED}}, got {new_state!r}"
         )
-    existing = store.get_order(coid)
-    merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}
-    merged[EXTRAS_KEY_BRACKET_OWN_STATE] = new_state
-    if extras_patch:
-        merged.update(extras_patch)
-    store.upsert_order(coid, extras=merged)
-    if close_row:
-        store.close_order(coid)
+    # One write: a terminal state left on a live row is read by no later pass.
+    with store.transaction():
+        existing = store.get_order(coid)
+        merged: dict[str, Any] = dict(existing.extras or {}) if existing is not None else {}
+        merged[EXTRAS_KEY_BRACKET_OWN_STATE] = new_state
+        if extras_patch:
+            merged.update(extras_patch)
+        store.upsert_order(coid, extras=merged)
+        if close_row:
+            store.close_order(coid)
 
 
 def iter_active_bracket_ownerships(
-        store: 'RunContext',
+        store: 'OwnershipJournal',
         *,
         from_entry: str | None = None,
 ) -> Iterator['OrderRow']:
@@ -2125,9 +2421,9 @@ def iter_active_bracket_ownerships(
     ``intent_key`` to touch only the legs a specific exit owns; the restart pass
     re-asserts every active row against the live broker legs.
 
-    :param store: The active run context.
+    :param store: The ownership journal: the run's store, or the emulator's in-memory one.
     :param from_entry: Optional parent-entry filter, passed to
-        :meth:`RunContext.iter_live_orders` (the indexed ``from_entry`` column).
+        :meth:`~OwnershipJournal.iter_live_orders` (the indexed ``from_entry`` column).
     """
     for row in store.iter_live_orders(from_entry=from_entry):
         if row.state != STATE_BRACKET_OWN:

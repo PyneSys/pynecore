@@ -135,6 +135,9 @@ class _CompletePort:
     async def close_leg(self, symbol, leg_id, volume, coid):
         pass
 
+    async def close_leg_executed(self, symbol, leg_id, coids, since_ms):
+        return 0
+
     async def reject_out_of_range(self, envelope, qty):
         pass
 
@@ -142,8 +145,12 @@ class _CompletePort:
         return []
 
     async def amend_bracket(self, symbol, leg_id, *, side, tp_price,
-                            sl_price, trail_offset, coid):
+                            sl_price, trail_offset, qty, coid):
         pass
+
+    async def bracket_matches(self, symbol, leg_id, *, side, tp_price,
+                              sl_price, trail_offset, qty):
+        return True
 
 
 # === Conforming baseline ===

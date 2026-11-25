@@ -24,12 +24,15 @@ state machine so the parity test can compare both paths byte-for-byte
 before any production code path is rewritten. The replacement plan is
 documented in ``docs/pynecore/plugin-system/broker/broker-plugin-responsibility-review.md``.
 """
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import TracebackType
 from typing import Any, Literal, Protocol, TYPE_CHECKING
 
 from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
+    JournalWriteError,
     OrderDispositionUnknownError,
 )
 from pynecore.core.broker.models import (
@@ -45,6 +48,8 @@ from pynecore.core.broker.store_helpers import (
     KIND_MODIFY_ENTRY,
     KIND_MODIFY_EXIT,
     KIND_PARTIAL_CLOSE,
+    PENDING_DISPATCH_STATES,
+    STATE_DISPOSITION_UNKNOWN,
     create_cancel_command_row,
     create_close_target_row,
     create_entry_order_row,
@@ -700,6 +705,127 @@ class ModifyExitDispatchHooks(Protocol):
         ...
 
 
+# === Venue-write spans =====================================================
+
+class _BeforeVenueWrite:
+    """The persist-first writes of a dispatch, made before its venue call.
+
+    The writes are one transaction, so a failure leaves no row behind, and a
+    storage error is raised as
+    :class:`~pynecore.core.broker.exceptions.JournalWriteError`: nothing was
+    sent, and the sync loop retries the dispatch on its next pass.
+    """
+
+    def __init__(self, store: 'RunContext', what: str) -> None:
+        self._span = store.transaction()
+        self._what = what
+
+    def __enter__(self) -> None:
+        self._span.__enter__()
+
+    def __exit__(
+            self, exc_type: type[BaseException] | None, exc: BaseException | None,
+            tb: TracebackType | None,
+    ) -> None:
+        try:
+            self._span.__exit__(exc_type, exc, tb)
+        except sqlite3.Error as error:
+            raise JournalWriteError(f"{self._what} dispatch", error) from error
+        if isinstance(exc, sqlite3.Error):
+            raise JournalWriteError(f"{self._what} dispatch", exc) from exc
+
+
+class _AfterVenueWrite:
+    """The steps of a dispatch from its venue call on.
+
+    A storage error from here on may follow a write the venue accepted, so it
+    is raised as an unknown disposition of the dispatch: the engine parks it,
+    and the command row is marked
+    :data:`~pynecore.core.broker.store_helpers.STATE_DISPOSITION_UNKNOWN`
+    (with the server reference, once the venue gave one), the state the
+    running process's verification resolves from venue data
+    (:func:`~pynecore.core.broker.parked_dispatch.awaits_venue_answer`); a row
+    left ``submitted`` would be read by a restart's recovery only. A storage
+    error raised while a definitive venue reject was being booked re-raises
+    that reject instead, and the row is marked rejected: the venue holds
+    nothing. Either mark is a follow-up write whose fact already stands, so a
+    failure of it too is owed
+    (:meth:`~RunContext.owe_write`); a row whose
+    dispatch reached a later state meanwhile is left as it is.
+
+    :ivar server_ref: The venue's reference for the dispatch, set by the
+        journal as soon as the venue returned one.
+    """
+
+    def __init__(self, store: 'RunContext', coid: str, what: str,
+                 intent_key: str | None) -> None:
+        self._store = store
+        self._coid = coid
+        self._what = what
+        self._intent_key = intent_key
+        self.server_ref: str | None = None
+
+    def __enter__(self) -> '_AfterVenueWrite':
+        return self
+
+    def __exit__(
+            self, exc_type: type[BaseException] | None, exc: BaseException | None,
+            tb: TracebackType | None,
+    ) -> None:
+        if not isinstance(exc, sqlite3.Error):
+            return
+        booked = exc.__context__
+        if isinstance(booked, ExchangeOrderRejectedError):
+            self._mark(rejected=True, reason=str(booked))
+            raise booked from exc
+        self._mark(rejected=False, reason=str(exc))
+        raise OrderDispositionUnknownError(
+            f"{self._what} dispatch {self._coid}: the journal write after the venue "
+            f"call failed ({exc}); the outcome is resolved from venue data",
+            client_order_id=self._coid, cause=exc,
+        ) from exc
+
+    def _mark(self, *, rejected: bool, reason: str) -> None:
+        """Land the command row's verdict, owing it when the store fails again."""
+        store = self._store
+        coid = self._coid
+        intent_key = self._intent_key
+        server_ref = self.server_ref
+        kind = 'rejected' if rejected else 'disposition_unknown'
+
+        def mark() -> None:
+            row = store.get_order(coid)
+            if (row is None or row.closed_ts_ms is not None
+                    or row.state not in PENDING_DISPATCH_STATES
+                    or (not rejected and row.state == STATE_DISPOSITION_UNKNOWN)):
+                return
+            with store.transaction():
+                if rejected:
+                    mark_rejected(store, coid=coid)
+                else:
+                    if server_ref is not None:
+                        store.add_ref(coid, 'deal_reference', server_ref)
+                    mark_disposition_unknown(store, coid=coid)
+                store.log_event(
+                    kind, client_order_id=coid, intent_key=intent_key,
+                    payload={'phase': 'journal_write', 'reason': reason},
+                )
+
+        store.owe_write(f"{kind} {coid}", mark)
+
+
+def _before_venue_write(store: 'RunContext', what: str) -> _BeforeVenueWrite:
+    """Span the persist-first writes of a dispatch (:class:`_BeforeVenueWrite`)."""
+    return _BeforeVenueWrite(store, what)
+
+
+def _after_venue_write(
+        store: 'RunContext', coid: str, what: str, intent_key: str | None,
+) -> _AfterVenueWrite:
+    """Span a dispatch from its venue call on (:class:`_AfterVenueWrite`)."""
+    return _AfterVenueWrite(store, coid, what, intent_key)
+
+
 # === Journal ===============================================================
 
 @dataclass
@@ -759,126 +885,135 @@ class DispatchJournal:
         :raises ExchangeOrderRejectedError: If ``confirm_submission``
             reported a definitive reject.
         """
-        # (1) PERSIST submitted row + audit event.
-        create_entry_order_row(
-            self.store,
-            coid=coid,
-            symbol=intent.symbol,
-            side=intent.side,
-            qty=qty,
-            intent_key=intent.intent_key,
-            pine_entry_id=intent.pine_id,
-            kind=kind,
-            order_type=intent.order_type.value,
-        )
-        submit_payload = {'kind': kind, 'order_type': intent.order_type.value}
-        if audit_payload:
-            submit_payload.update(audit_payload)
-        self.store.log_event(
-            'dispatch_submitted',
-            client_order_id=coid,
-            intent_key=intent.intent_key,
-            payload=submit_payload,
-        )
-
-        # (2) SUBMIT — network errors raise OrderDispositionUnknownError.
-        # A synchronous reject (4xx with a reason string) raises
-        # ExchangeOrderRejectedError; the canonical pattern is to defer
-        # rejection to the confirm phase, but a plugin may legitimately
-        # raise here when the POST itself definitively rejects (e.g. a
-        # well-formed exchange error response with no server reference
-        # to confirm against). The journal terminates the row safely
-        # either way — leaving it ``submitted`` would make it look
-        # pending and recovery would retry an order the exchange already
-        # rejected.
-        try:
-            submit = await hooks.submit(coid=coid, intent=intent, qty=qty)
-        except OrderDispositionUnknownError as exc:
-            mark_disposition_unknown(self.store, coid=coid)
+        with _before_venue_write(self.store, 'entry'):
+            # (1) PERSIST submitted row + audit event.
+            create_entry_order_row(
+                self.store,
+                coid=coid,
+                symbol=intent.symbol,
+                side=intent.side,
+                qty=qty,
+                intent_key=intent.intent_key,
+                pine_entry_id=intent.pine_id,
+                kind=kind,
+                order_type=intent.order_type.value,
+            )
+            submit_payload = {'kind': kind, 'order_type': intent.order_type.value}
+            if audit_payload:
+                submit_payload.update(audit_payload)
             self.store.log_event(
-                'disposition_unknown',
+                'dispatch_submitted',
                 client_order_id=coid,
                 intent_key=intent.intent_key,
-                payload={'phase': 'submit', 'reason': str(exc)},
+                payload=submit_payload,
             )
-            raise
-        except ExchangeOrderRejectedError as exc:
-            mark_rejected(self.store, coid=coid)
-            self.store.log_event(
-                'rejected',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'phase': 'submit', 'reason': str(exc)},
-            )
-            raise
 
-        # (3) PERSIST server reference + advance state.
-        record_server_ref(
-            self.store,
-            coid=coid,
-            deal_reference=submit.server_ref,
-            kind=kind,
-            order_type=intent.order_type.value,
-        )
-        self.store.log_event(
-            'deal_reference_seen',
-            client_order_id=coid,
-            payload={'deal_reference': submit.server_ref},
-        )
+        with _after_venue_write(self.store, coid, 'entry', intent.intent_key) as span:
+            # (2) SUBMIT — network errors raise OrderDispositionUnknownError.
+            # A synchronous reject (4xx with a reason string) raises
+            # ExchangeOrderRejectedError; the canonical pattern is to defer
+            # rejection to the confirm phase, but a plugin may legitimately
+            # raise here when the POST itself definitively rejects (e.g. a
+            # well-formed exchange error response with no server reference
+            # to confirm against). The journal terminates the row safely
+            # either way — leaving it ``submitted`` would make it look
+            # pending and recovery would retry an order the exchange already
+            # rejected.
+            try:
+                submit = await hooks.submit(coid=coid, intent=intent, qty=qty)
+            except OrderDispositionUnknownError as exc:
+                with self.store.transaction():
+                    mark_disposition_unknown(self.store, coid=coid)
+                    self.store.log_event(
+                        'disposition_unknown',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'submit', 'reason': str(exc)},
+                    )
+                raise
+            except ExchangeOrderRejectedError as exc:
+                with self.store.transaction():
+                    mark_rejected(self.store, coid=coid)
+                    self.store.log_event(
+                        'rejected',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'submit', 'reason': str(exc)},
+                    )
+                raise
 
-        # (4) CONFIRM — reject raises ExchangeOrderRejectedError,
-        #     timeout raises OrderDispositionUnknownError.
-        try:
-            confirm = await hooks.confirm_submission(
-                coid=coid, intent=intent, server_ref=submit.server_ref,
-            )
-        except ExchangeOrderRejectedError as exc:
-            mark_rejected(self.store, coid=coid)
-            self.store.log_event(
-                'rejected',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'reason': str(exc)},
-            )
-            raise
-        except OrderDispositionUnknownError as exc:
-            mark_disposition_unknown(self.store, coid=coid)
-            self.store.log_event(
-                'disposition_unknown',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'phase': 'confirm', 'reason': str(exc)},
-            )
-            raise
+            # (3) PERSIST server reference + advance state.
+            span.server_ref = submit.server_ref
+            with self.store.transaction():
+                record_server_ref(
+                    self.store,
+                    coid=coid,
+                    deal_reference=submit.server_ref,
+                    kind=kind,
+                    order_type=intent.order_type.value,
+                )
+                self.store.log_event(
+                    'deal_reference_seen',
+                    client_order_id=coid,
+                    payload={'deal_reference': submit.server_ref},
+                )
 
-        # (5) PERSIST confirmed + fill (if any).
-        mark_confirmed_with_fill(
-            self.store,
-            coid=coid,
-            exchange_id=confirm.exchange_id,
-            is_filled=confirm.is_filled,
-            filled_qty=confirm.filled_qty,
-            fill_price=confirm.fill_price,
-        )
-        self.store.log_event(
-            'confirmed',
-            client_order_id=coid,
-            exchange_order_id=confirm.exchange_id,
-            intent_key=intent.intent_key,
-            payload={
-                'is_filled': confirm.is_filled,
-                'fill_price': confirm.fill_price,
-            },
-        )
+            # (4) CONFIRM — reject raises ExchangeOrderRejectedError,
+            #     timeout raises OrderDispositionUnknownError.
+            try:
+                confirm = await hooks.confirm_submission(
+                    coid=coid, intent=intent, server_ref=submit.server_ref,
+                )
+            except ExchangeOrderRejectedError as exc:
+                with self.store.transaction():
+                    mark_rejected(self.store, coid=coid)
+                    self.store.log_event(
+                        'rejected',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'reason': str(exc)},
+                    )
+                raise
+            except OrderDispositionUnknownError as exc:
+                with self.store.transaction():
+                    mark_disposition_unknown(self.store, coid=coid)
+                    self.store.log_event(
+                        'disposition_unknown',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'confirm', 'reason': str(exc)},
+                    )
+                raise
 
-        # (6) Return the ExchangeOrder built from final row state.
-        row = self.store.get_order(coid)
-        if row is None:
-            raise RuntimeError(
-                f"DispatchJournal.run_entry: row vanished after confirm "
-                f"(coid={coid!r})"
-            )
-        return [hooks.exchange_order_from_state(row=row, intent=intent)]
+            # (5) PERSIST confirmed + fill (if any).
+            with self.store.transaction():
+                mark_confirmed_with_fill(
+                    self.store,
+                    coid=coid,
+                    exchange_id=confirm.exchange_id,
+                    is_filled=confirm.is_filled,
+                    filled_qty=confirm.filled_qty,
+                    fill_price=confirm.fill_price,
+                )
+                self.store.log_event(
+                    'confirmed',
+                    client_order_id=coid,
+                    exchange_order_id=confirm.exchange_id,
+                    intent_key=intent.intent_key,
+                    payload={
+                        'is_filled': confirm.is_filled,
+                        'fill_price': confirm.fill_price,
+                    },
+                )
+
+            # (6) Return the ExchangeOrder built from final row state.
+            row = self.store.get_order(coid)
+            if row is None:
+                raise RuntimeError(
+                    f"DispatchJournal.run_entry: row vanished after confirm "
+                    f"(coid={coid!r})"
+                )
+            return [hooks.exchange_order_from_state(row=row, intent=intent)]
 
     # --- Close path --------------------------------------------------------
 
@@ -936,79 +1071,84 @@ class DispatchJournal:
             hooks: CloseDispatchHooks,
             audit_payload: dict | None,
     ) -> ExchangeOrder:
-        # (1) PERSIST command row + audit event.
-        target_ids = [r.exchange_order_id for r in targets]
-        create_close_target_row(
-            self.store,
-            coid=coid,
-            symbol=intent.symbol,
-            side=intent.side,
-            qty=intent.qty,
-            intent_key=intent.intent_key,
-            kind=KIND_FULL_CLOSE,
-            extra_payload={'targets': list(target_ids)},
-        )
-        submit_payload: dict[str, Any] = {
-            'kind': KIND_FULL_CLOSE,
-            'targets': target_ids,
-        }
-        if audit_payload:
-            submit_payload.update(audit_payload)
-        self.store.log_event(
-            'dispatch_submitted',
-            client_order_id=coid,
-            intent_key=intent.intent_key,
-            payload=submit_payload,
-        )
-
-        # (2) SUBMIT — per-target DELETE chain inside the hook.
-        try:
-            outcome = await hooks.submit_full_close(
-                coid=coid, intent=intent, targets=targets,
+        with _before_venue_write(self.store, 'full close'):
+            # (1) PERSIST command row + audit event.
+            target_ids = [r.exchange_order_id for r in targets]
+            create_close_target_row(
+                self.store,
+                coid=coid,
+                symbol=intent.symbol,
+                side=intent.side,
+                qty=intent.qty,
+                intent_key=intent.intent_key,
+                kind=KIND_FULL_CLOSE,
+                extra_payload={'targets': list(target_ids)},
             )
-        except OrderDispositionUnknownError as exc:
-            mark_disposition_unknown(self.store, coid=coid)
+            submit_payload: dict[str, Any] = {
+                'kind': KIND_FULL_CLOSE,
+                'targets': target_ids,
+            }
+            if audit_payload:
+                submit_payload.update(audit_payload)
             self.store.log_event(
-                'disposition_unknown',
+                'dispatch_submitted',
                 client_order_id=coid,
                 intent_key=intent.intent_key,
-                payload={'phase': 'full_close_delete', 'reason': str(exc)},
+                payload=submit_payload,
             )
-            raise
-        except ExchangeOrderRejectedError as exc:
-            mark_rejected(self.store, coid=coid)
-            self.store.log_event(
-                'rejected',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'phase': 'full_close_delete', 'reason': str(exc)},
-            )
-            raise
 
-        # (3) PERSIST closing state + targets.
-        mark_closing(
-            self.store,
-            coid=coid,
-            kind=KIND_FULL_CLOSE,
-            targets=outcome.applied_targets,
-        )
-        self.store.log_event(
-            'close_dispatched',
-            client_order_id=coid,
-            intent_key=intent.intent_key,
-            payload={'mode': 'full', 'applied_targets': outcome.applied_targets},
-        )
+        with _after_venue_write(self.store, coid, 'full close', intent.intent_key):
+            # (2) SUBMIT — per-target DELETE chain inside the hook.
+            try:
+                outcome = await hooks.submit_full_close(
+                    coid=coid, intent=intent, targets=targets,
+                )
+            except OrderDispositionUnknownError as exc:
+                with self.store.transaction():
+                    mark_disposition_unknown(self.store, coid=coid)
+                    self.store.log_event(
+                        'disposition_unknown',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'full_close_delete', 'reason': str(exc)},
+                    )
+                raise
+            except ExchangeOrderRejectedError as exc:
+                with self.store.transaction():
+                    mark_rejected(self.store, coid=coid)
+                    self.store.log_event(
+                        'rejected',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'full_close_delete', 'reason': str(exc)},
+                    )
+                raise
 
-        # (4) Return the synthetic ExchangeOrder built by the hook.
-        row = self.store.get_order(coid)
-        if row is None:
-            raise RuntimeError(
-                f"DispatchJournal._run_full_close: row vanished after closing "
-                f"(coid={coid!r})"
+            # (3) PERSIST closing state + targets, with its audit event.
+            with self.store.transaction():
+                mark_closing(
+                    self.store,
+                    coid=coid,
+                    kind=KIND_FULL_CLOSE,
+                    targets=outcome.applied_targets,
+                )
+                self.store.log_event(
+                    'close_dispatched',
+                    client_order_id=coid,
+                    intent_key=intent.intent_key,
+                    payload={'mode': 'full', 'applied_targets': outcome.applied_targets},
+                )
+
+            # (4) Return the synthetic ExchangeOrder built by the hook.
+            row = self.store.get_order(coid)
+            if row is None:
+                raise RuntimeError(
+                    f"DispatchJournal._run_full_close: row vanished after closing "
+                    f"(coid={coid!r})"
+                )
+            return hooks.exchange_order_from_state(
+                row=row, intent=intent, outcome=outcome,
             )
-        return hooks.exchange_order_from_state(
-            row=row, intent=intent, outcome=outcome,
-        )
 
     async def _run_partial_close(
             self,
@@ -1018,95 +1158,103 @@ class DispatchJournal:
             hooks: CloseDispatchHooks,
             audit_payload: dict | None,
     ) -> ExchangeOrder:
-        # (1) PERSIST command row + audit event.
-        create_close_target_row(
-            self.store,
-            coid=coid,
-            symbol=intent.symbol,
-            side=intent.side,
-            qty=intent.qty,
-            intent_key=intent.intent_key,
-            kind=KIND_PARTIAL_CLOSE,
-        )
-        submit_payload: dict[str, Any] = {'kind': KIND_PARTIAL_CLOSE}
-        if audit_payload:
-            submit_payload.update(audit_payload)
-        self.store.log_event(
-            'dispatch_submitted',
-            client_order_id=coid,
-            intent_key=intent.intent_key,
-            payload=submit_payload,
-        )
-
-        # (2) SUBMIT — opposite-direction POST + race detection inside the hook.
-        try:
-            outcome = await hooks.submit_partial_close(
-                coid=coid, intent=intent,
-            )
-        except OrderDispositionUnknownError as exc:
-            mark_disposition_unknown(self.store, coid=coid)
-            self.store.log_event(
-                'disposition_unknown',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'phase': 'partial_close_post', 'reason': str(exc)},
-            )
-            raise
-        except ExchangeOrderRejectedError as exc:
-            mark_rejected(self.store, coid=coid)
-            self.store.log_event(
-                'rejected',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'phase': 'partial_close_post', 'reason': str(exc)},
-            )
-            raise
-
-        # (3) PERSIST server ref (if any).
-        if outcome.deal_reference is not None:
-            record_close_server_ref(
+        with _before_venue_write(self.store, 'partial close'):
+            # (1) PERSIST command row + audit event.
+            create_close_target_row(
                 self.store,
                 coid=coid,
-                deal_reference=outcome.deal_reference,
+                symbol=intent.symbol,
+                side=intent.side,
+                qty=intent.qty,
+                intent_key=intent.intent_key,
                 kind=KIND_PARTIAL_CLOSE,
             )
+            submit_payload: dict[str, Any] = {'kind': KIND_PARTIAL_CLOSE}
+            if audit_payload:
+                submit_payload.update(audit_payload)
             self.store.log_event(
-                'deal_reference_seen',
+                'dispatch_submitted',
                 client_order_id=coid,
-                payload={'deal_reference': outcome.deal_reference},
+                intent_key=intent.intent_key,
+                payload=submit_payload,
             )
 
-        # (4) PERSIST completion. The helper only advances state;
-        # ``close_order`` is issued *after* the ``confirmed`` event so
-        # the audit order is consistent.
-        mark_close_completed(
-            self.store,
-            coid=coid,
-            kind=KIND_PARTIAL_CLOSE,
-        )
-        self.store.log_event(
-            'confirmed',
-            client_order_id=coid,
-            exchange_order_id=outcome.exchange_id,
-            intent_key=intent.intent_key,
-            payload={
-                'mode': 'partial',
-                'applied_targets': outcome.applied_targets,
-                'fill_price': outcome.fill_price,
-            },
-        )
-        self.store.close_order(coid)
+        with _after_venue_write(self.store, coid, 'partial close', intent.intent_key) as span:
+            # (2) SUBMIT — opposite-direction POST + race detection inside the hook.
+            try:
+                outcome = await hooks.submit_partial_close(
+                    coid=coid, intent=intent,
+                )
+            except OrderDispositionUnknownError as exc:
+                with self.store.transaction():
+                    mark_disposition_unknown(self.store, coid=coid)
+                    self.store.log_event(
+                        'disposition_unknown',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'partial_close_post', 'reason': str(exc)},
+                    )
+                raise
+            except ExchangeOrderRejectedError as exc:
+                with self.store.transaction():
+                    mark_rejected(self.store, coid=coid)
+                    self.store.log_event(
+                        'rejected',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'partial_close_post', 'reason': str(exc)},
+                    )
+                raise
 
-        # (5) Return the ExchangeOrder built by the hook.
-        row = self.store.get_order(coid)
-        if row is None:
-            raise RuntimeError(
-                f"DispatchJournal._run_partial_close: row vanished after confirm "
-                f"(coid={coid!r})"
+            # (3) PERSIST server ref (if any).
+            span.server_ref = outcome.deal_reference
+            if outcome.deal_reference is not None:
+                with self.store.transaction():
+                    record_close_server_ref(
+                        self.store,
+                        coid=coid,
+                        deal_reference=outcome.deal_reference,
+                        kind=KIND_PARTIAL_CLOSE,
+                    )
+                    self.store.log_event(
+                        'deal_reference_seen',
+                        client_order_id=coid,
+                        payload={'deal_reference': outcome.deal_reference},
+                    )
+
+            # (4) PERSIST completion. The helper only advances state;
+            # ``close_order`` is issued *after* the ``confirmed`` event so
+            # the audit order is consistent. One span: a ``confirmed`` row
+            # left live is not pending, so no recovery pass would ever close it.
+            with self.store.transaction():
+                mark_close_completed(
+                    self.store,
+                    coid=coid,
+                    kind=KIND_PARTIAL_CLOSE,
+                )
+                self.store.log_event(
+                    'confirmed',
+                    client_order_id=coid,
+                    exchange_order_id=outcome.exchange_id,
+                    intent_key=intent.intent_key,
+                    payload={
+                        'mode': 'partial',
+                        'applied_targets': outcome.applied_targets,
+                        'fill_price': outcome.fill_price,
+                    },
+                )
+                self.store.close_order(coid)
+
+            # (5) Return the ExchangeOrder built by the hook.
+            row = self.store.get_order(coid)
+            if row is None:
+                raise RuntimeError(
+                    f"DispatchJournal._run_partial_close: row vanished after confirm "
+                    f"(coid={coid!r})"
+                )
+            return hooks.exchange_order_from_state(
+                row=row, intent=intent, outcome=outcome,
             )
-        return hooks.exchange_order_from_state(
-            row=row, intent=intent, outcome=outcome,
-        )
 
     # --- Cancel path -------------------------------------------------------
 
@@ -1137,86 +1285,93 @@ class DispatchJournal:
         agg_qty = sum(max(0.0, r.qty - r.filled_qty) for r in targets)
         primary_side = targets[0].side if targets else 'buy'
 
-        # (1) PERSIST command row + audit event.
-        create_cancel_command_row(
-            self.store,
-            coid=coid,
-            symbol=intent.symbol,
-            side=primary_side,
-            qty=agg_qty,
-            intent_key=intent.intent_key,
-            pine_entry_id=intent.pine_id,
-            from_entry=intent.from_entry,
-            target_coids=target_coids,
-        )
-        submit_payload: dict[str, Any] = {
-            'kind': KIND_CANCEL,
-            'target_coids': target_coids,
-        }
-        if audit_payload:
-            submit_payload.update(audit_payload)
-        self.store.log_event(
-            'dispatch_submitted',
-            client_order_id=coid,
-            intent_key=intent.intent_key,
-            payload=submit_payload,
-        )
-
-        # (2) SUBMIT — per-target sweep inside the hook.
-        try:
-            outcome = await hooks.submit_cancel(
-                coid=coid, intent=intent, targets=targets,
+        with _before_venue_write(self.store, 'cancel'):
+            # (1) PERSIST command row + audit event.
+            create_cancel_command_row(
+                self.store,
+                coid=coid,
+                symbol=intent.symbol,
+                side=primary_side,
+                qty=agg_qty,
+                intent_key=intent.intent_key,
+                pine_entry_id=intent.pine_id,
+                from_entry=intent.from_entry,
+                target_coids=target_coids,
             )
-        except OrderDispositionUnknownError as exc:
-            mark_disposition_unknown(self.store, coid=coid)
+            submit_payload: dict[str, Any] = {
+                'kind': KIND_CANCEL,
+                'target_coids': target_coids,
+            }
+            if audit_payload:
+                submit_payload.update(audit_payload)
             self.store.log_event(
-                'disposition_unknown',
+                'dispatch_submitted',
                 client_order_id=coid,
                 intent_key=intent.intent_key,
-                payload={'phase': 'cancel_sweep', 'reason': str(exc)},
+                payload=submit_payload,
             )
-            raise
-        except ExchangeOrderRejectedError as exc:
-            mark_rejected(self.store, coid=coid)
-            self.store.log_event(
-                'rejected',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'phase': 'cancel_sweep', 'reason': str(exc)},
-            )
-            raise
 
-        # (3) PERSIST completion with reason_path.
-        mark_cancel_completed(
-            self.store,
-            coid=coid,
-            reason_path=outcome.reason_path,
-            extra_payload={
-                'applied_target_coids': outcome.applied_target_coids,
-            },
-        )
-        self.store.log_event(
-            'confirmed',
-            client_order_id=coid,
-            intent_key=intent.intent_key,
-            payload={
-                'reason_path': outcome.reason_path,
-                'cleared_legs': outcome.cleared_legs,
-                'applied_target_coids': outcome.applied_target_coids,
-            },
-        )
-        self.store.close_order(coid)
+        with _after_venue_write(self.store, coid, 'cancel', intent.intent_key):
+            # (2) SUBMIT — per-target sweep inside the hook.
+            try:
+                outcome = await hooks.submit_cancel(
+                    coid=coid, intent=intent, targets=targets,
+                )
+            except OrderDispositionUnknownError as exc:
+                with self.store.transaction():
+                    mark_disposition_unknown(self.store, coid=coid)
+                    self.store.log_event(
+                        'disposition_unknown',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'cancel_sweep', 'reason': str(exc)},
+                    )
+                raise
+            except ExchangeOrderRejectedError as exc:
+                with self.store.transaction():
+                    mark_rejected(self.store, coid=coid)
+                    self.store.log_event(
+                        'rejected',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={'phase': 'cancel_sweep', 'reason': str(exc)},
+                    )
+                raise
 
-        # (4) Return the synthetic ExchangeOrder built by the hook.
-        row = self.store.get_order(coid)
-        if row is None:
-            raise RuntimeError(
-                f"DispatchJournal.run_cancel: row vanished after confirm "
-                f"(coid={coid!r})"
+            # (3) PERSIST completion with reason_path. One span: a
+            # ``confirmed`` row left live is not pending, so no recovery pass
+            # would ever close it.
+            with self.store.transaction():
+                mark_cancel_completed(
+                    self.store,
+                    coid=coid,
+                    reason_path=outcome.reason_path,
+                    extra_payload={
+                        'applied_target_coids': outcome.applied_target_coids,
+                    },
+                )
+                self.store.log_event(
+                    'confirmed',
+                    client_order_id=coid,
+                    intent_key=intent.intent_key,
+                    payload={
+                        'reason_path': outcome.reason_path,
+                        'cleared_legs': outcome.cleared_legs,
+                        'applied_target_coids': outcome.applied_target_coids,
+                    },
+                )
+                self.store.close_order(coid)
+
+            # (4) Return the synthetic ExchangeOrder built by the hook.
+            row = self.store.get_order(coid)
+            if row is None:
+                raise RuntimeError(
+                    f"DispatchJournal.run_cancel: row vanished after confirm "
+                    f"(coid={coid!r})"
+                )
+            return hooks.exchange_order_from_state(
+                row=row, intent=intent, outcome=outcome,
             )
-        return hooks.exchange_order_from_state(
-            row=row, intent=intent, outcome=outcome,
-        )
 
     # --- Modify entry path -------------------------------------------------
 
@@ -1242,89 +1397,98 @@ class DispatchJournal:
         :param audit_payload: Optional extras for the
             ``dispatch_submitted`` event payload.
         """
-        # (1) PERSIST command row + audit event.
-        new_level = float(new_intent.limit if new_intent.limit is not None
-                          else new_intent.stop or 0.0)
-        create_modify_entry_row(
-            self.store,
-            coid=coid,
-            target_coid=target_coid,
-            symbol=new_intent.symbol,
-            side=new_intent.side,
-            qty=qty,
-            intent_key=new_intent.intent_key,
-            new_level=new_level,
-            pine_entry_id=new_intent.pine_id,
-        )
-        submit_payload: dict[str, Any] = {
-            'kind': KIND_MODIFY_ENTRY,
-            'target_coid': target_coid,
-            'new_level': new_level,
-        }
-        if audit_payload:
-            submit_payload.update(audit_payload)
-        self.store.log_event(
-            'dispatch_submitted',
-            client_order_id=coid,
-            intent_key=new_intent.intent_key,
-            payload=submit_payload,
-        )
-
-        # (2) SUBMIT — PUT + confirm inside the hook.
-        try:
-            outcome = await hooks.submit_amend(
-                coid=coid, target_coid=target_coid,
-                old_intent=old_intent, new_intent=new_intent,
+        with _before_venue_write(self.store, 'modify entry'):
+            # (1) PERSIST command row + audit event.
+            new_level = float(new_intent.limit if new_intent.limit is not None
+                              else new_intent.stop or 0.0)
+            create_modify_entry_row(
+                self.store,
+                coid=coid,
+                target_coid=target_coid,
+                symbol=new_intent.symbol,
+                side=new_intent.side,
+                qty=qty,
+                intent_key=new_intent.intent_key,
+                new_level=new_level,
+                pine_entry_id=new_intent.pine_id,
             )
-        except OrderDispositionUnknownError as exc:
-            mark_disposition_unknown(self.store, coid=coid)
+            submit_payload: dict[str, Any] = {
+                'kind': KIND_MODIFY_ENTRY,
+                'target_coid': target_coid,
+                'new_level': new_level,
+            }
+            if audit_payload:
+                submit_payload.update(audit_payload)
             self.store.log_event(
-                'disposition_unknown',
+                'dispatch_submitted',
                 client_order_id=coid,
                 intent_key=new_intent.intent_key,
-                payload={'phase': 'modify_entry_put', 'reason': str(exc)},
+                payload=submit_payload,
             )
-            raise
-        except ExchangeOrderRejectedError as exc:
-            mark_rejected(self.store, coid=coid)
-            self.store.log_event(
-                'rejected',
-                client_order_id=coid,
-                intent_key=new_intent.intent_key,
-                payload={'phase': 'modify_entry_put', 'reason': str(exc)},
-            )
-            raise
 
-        # (3) PERSIST server ref + completion.
-        self.store.add_ref(coid, 'deal_reference', outcome.server_ref)
-        self.store.log_event(
-            'deal_reference_seen',
-            client_order_id=coid,
-            payload={'deal_reference': outcome.server_ref},
-        )
-        mark_modify_completed(
-            self.store,
-            coid=coid,
-            extra_payload={'echoed_level': outcome.new_level},
-        )
-        self.store.log_event(
-            'confirmed',
-            client_order_id=coid,
-            intent_key=new_intent.intent_key,
-            payload={'new_level': outcome.new_level},
-        )
-        self.store.close_order(coid)
+        with _after_venue_write(
+                self.store, coid, 'modify entry', new_intent.intent_key) as span:
+            # (2) SUBMIT — PUT + confirm inside the hook.
+            try:
+                outcome = await hooks.submit_amend(
+                    coid=coid, target_coid=target_coid,
+                    old_intent=old_intent, new_intent=new_intent,
+                )
+            except OrderDispositionUnknownError as exc:
+                with self.store.transaction():
+                    mark_disposition_unknown(self.store, coid=coid)
+                    self.store.log_event(
+                        'disposition_unknown',
+                        client_order_id=coid,
+                        intent_key=new_intent.intent_key,
+                        payload={'phase': 'modify_entry_put', 'reason': str(exc)},
+                    )
+                raise
+            except ExchangeOrderRejectedError as exc:
+                with self.store.transaction():
+                    mark_rejected(self.store, coid=coid)
+                    self.store.log_event(
+                        'rejected',
+                        client_order_id=coid,
+                        intent_key=new_intent.intent_key,
+                        payload={'phase': 'modify_entry_put', 'reason': str(exc)},
+                    )
+                raise
 
-        # (4) Return the engine-facing list.
-        row = self.store.get_order(coid)
-        if row is None:
-            raise RuntimeError(
-                f"DispatchJournal.run_modify_entry: row vanished after confirm "
-                f"(coid={coid!r})"
+            # (3) PERSIST server ref + completion. One span: a ``confirmed``
+            # row left live is not pending, so no recovery pass would ever
+            # close it.
+            span.server_ref = outcome.server_ref
+            with self.store.transaction():
+                self.store.add_ref(coid, 'deal_reference', outcome.server_ref)
+                self.store.log_event(
+                    'deal_reference_seen',
+                    client_order_id=coid,
+                    payload={'deal_reference': outcome.server_ref},
+                )
+                mark_modify_completed(
+                    self.store,
+                    coid=coid,
+                    extra_payload={'echoed_level': outcome.new_level},
+                )
+                self.store.log_event(
+                    'confirmed',
+                    client_order_id=coid,
+                    intent_key=new_intent.intent_key,
+                    payload={'new_level': outcome.new_level},
+                )
+                self.store.close_order(coid)
+
+            # (4) Return the engine-facing list.
+            row = self.store.get_order(coid)
+            if row is None:
+                raise RuntimeError(
+                    f"DispatchJournal.run_modify_entry: row vanished after confirm "
+                    f"(coid={coid!r})"
+                )
+            return hooks.exchange_order_from_state(
+                row=row, new_intent=new_intent, outcome=outcome,
             )
-        return hooks.exchange_order_from_state(
-            row=row, new_intent=new_intent, outcome=outcome,
-        )
 
     # --- Modify exit path --------------------------------------------------
 
@@ -1360,111 +1524,121 @@ class DispatchJournal:
         :param audit_payload: Optional extras for the
             ``dispatch_submitted`` event payload.
         """
-        # (1) PERSIST command row + audit event.
-        create_modify_exit_row(
-            self.store,
-            coid=coid,
-            target_coid=target_coid,
-            symbol=new_intent.symbol,
-            side=new_intent.side,
-            qty=qty,
-            intent_key=new_intent.intent_key,
-            new_tp=new_intent.tp_price,
-            new_sl=new_intent.sl_price,
-            new_trail=new_intent.trail_offset,
-            new_trail_price=new_intent.trail_price,
-            pine_entry_id=new_intent.pine_id,
-            from_entry=new_intent.from_entry,
-        )
-        submit_payload: dict[str, Any] = {
-            'kind': KIND_MODIFY_EXIT,
-            'target_coid': target_coid,
-            'new_tp': new_intent.tp_price,
-            'new_sl': new_intent.sl_price,
-            'new_trail': new_intent.trail_offset,
-        }
-        if audit_payload:
-            submit_payload.update(audit_payload)
-        self.store.log_event(
-            'dispatch_submitted',
-            client_order_id=coid,
-            intent_key=new_intent.intent_key,
-            payload=submit_payload,
-        )
-
-        # (2) SUBMIT — PUT + confirm inside the hook; ambiguous-path
-        # leg seeding is the hook's responsibility before re-raising.
-        try:
-            outcome = await hooks.submit_amend(
-                coid=coid, target_coid=target_coid,
-                old_intent=old_intent, new_intent=new_intent,
+        with _before_venue_write(self.store, 'modify exit'):
+            # (1) PERSIST command row + audit event.
+            create_modify_exit_row(
+                self.store,
+                coid=coid,
+                target_coid=target_coid,
+                symbol=new_intent.symbol,
+                side=new_intent.side,
+                qty=qty,
+                intent_key=new_intent.intent_key,
+                new_tp=new_intent.tp_price,
+                new_sl=new_intent.sl_price,
+                new_trail=new_intent.trail_offset,
+                new_trail_price=new_intent.trail_price,
+                pine_entry_id=new_intent.pine_id,
+                from_entry=new_intent.from_entry,
             )
-        except OrderDispositionUnknownError as exc:
-            mark_disposition_unknown(self.store, coid=coid)
+            submit_payload: dict[str, Any] = {
+                'kind': KIND_MODIFY_EXIT,
+                'target_coid': target_coid,
+                'new_tp': new_intent.tp_price,
+                'new_sl': new_intent.sl_price,
+                'new_trail': new_intent.trail_offset,
+            }
+            if audit_payload:
+                submit_payload.update(audit_payload)
             self.store.log_event(
-                'disposition_unknown',
+                'dispatch_submitted',
                 client_order_id=coid,
                 intent_key=new_intent.intent_key,
-                payload={'phase': 'modify_exit_put', 'reason': str(exc)},
+                payload=submit_payload,
             )
-            raise
-        except ExchangeOrderRejectedError as exc:
-            mark_rejected(self.store, coid=coid)
-            self.store.log_event(
-                'rejected',
-                client_order_id=coid,
-                intent_key=new_intent.intent_key,
-                payload={'phase': 'modify_exit_put', 'reason': str(exc)},
+
+        with _after_venue_write(
+                self.store, coid, 'modify exit', new_intent.intent_key) as span:
+            # (2) SUBMIT — PUT + confirm inside the hook; ambiguous-path
+            # leg seeding is the hook's responsibility before re-raising.
+            try:
+                outcome = await hooks.submit_amend(
+                    coid=coid, target_coid=target_coid,
+                    old_intent=old_intent, new_intent=new_intent,
+                )
+            except OrderDispositionUnknownError as exc:
+                with self.store.transaction():
+                    mark_disposition_unknown(self.store, coid=coid)
+                    self.store.log_event(
+                        'disposition_unknown',
+                        client_order_id=coid,
+                        intent_key=new_intent.intent_key,
+                        payload={'phase': 'modify_exit_put', 'reason': str(exc)},
+                    )
+                raise
+            except ExchangeOrderRejectedError as exc:
+                with self.store.transaction():
+                    mark_rejected(self.store, coid=coid)
+                    self.store.log_event(
+                        'rejected',
+                        client_order_id=coid,
+                        intent_key=new_intent.intent_key,
+                        payload={'phase': 'modify_exit_put', 'reason': str(exc)},
+                    )
+                raise
+
+            # (3) PERSIST server ref.
+            span.server_ref = outcome.server_ref
+            with self.store.transaction():
+                self.store.add_ref(coid, 'deal_reference', outcome.server_ref)
+                self.store.log_event(
+                    'deal_reference_seen',
+                    client_order_id=coid,
+                    payload={'deal_reference': outcome.server_ref},
+                )
+
+            # (4) MIRROR bracket legs BEFORE marking the command row terminal.
+            # The command row stays live (and recoverable) until the legs are
+            # written, so a crash between the broker-accepted PUT and the
+            # mirror callback leaves recovery able to re-run the verdict
+            # (confirms/{ref} → ACCEPTED) and replay the mirror on next sync
+            # via the snapshot reconciler. Once mark_modify_completed +
+            # close_order run, the row leaves the live set and the leg state
+            # must already be durable.
+            hooks.mirror_bracket_legs(
+                target_row=target_row, new_intent=new_intent, outcome=outcome,
             )
-            raise
 
-        # (3) PERSIST server ref.
-        self.store.add_ref(coid, 'deal_reference', outcome.server_ref)
-        self.store.log_event(
-            'deal_reference_seen',
-            client_order_id=coid,
-            payload={'deal_reference': outcome.server_ref},
-        )
+            # (5) PERSIST terminal completion + close. One span: a
+            # ``confirmed`` row left live is not pending, so no recovery pass
+            # would ever close it.
+            with self.store.transaction():
+                mark_modify_completed(
+                    self.store,
+                    coid=coid,
+                    extra_payload={'post_put_state': dict(outcome.post_put_state)},
+                )
+                self.store.log_event(
+                    'confirmed',
+                    client_order_id=coid,
+                    intent_key=new_intent.intent_key,
+                    payload={
+                        'deal_status': outcome.deal_status,
+                        'post_put_state': dict(outcome.post_put_state),
+                    },
+                )
+                self.store.close_order(coid)
 
-        # (4) MIRROR bracket legs BEFORE marking the command row terminal.
-        # The command row stays live (and recoverable) until the legs are
-        # written, so a crash between the broker-accepted PUT and the
-        # mirror callback leaves recovery able to re-run the verdict
-        # (confirms/{ref} → ACCEPTED) and replay the mirror on next sync
-        # via the snapshot reconciler. Once mark_modify_completed +
-        # close_order run, the row leaves the live set and the leg state
-        # must already be durable.
-        hooks.mirror_bracket_legs(
-            target_row=target_row, new_intent=new_intent, outcome=outcome,
-        )
-
-        # (5) PERSIST terminal completion + close.
-        mark_modify_completed(
-            self.store,
-            coid=coid,
-            extra_payload={'post_put_state': dict(outcome.post_put_state)},
-        )
-        self.store.log_event(
-            'confirmed',
-            client_order_id=coid,
-            intent_key=new_intent.intent_key,
-            payload={
-                'deal_status': outcome.deal_status,
-                'post_put_state': dict(outcome.post_put_state),
-            },
-        )
-        self.store.close_order(coid)
-
-        # (6) Return the engine-facing list.
-        row = self.store.get_order(coid)
-        if row is None:
-            raise RuntimeError(
-                f"DispatchJournal.run_modify_exit: row vanished after confirm "
-                f"(coid={coid!r})"
+            # (6) Return the engine-facing list.
+            row = self.store.get_order(coid)
+            if row is None:
+                raise RuntimeError(
+                    f"DispatchJournal.run_modify_exit: row vanished after confirm "
+                    f"(coid={coid!r})"
+                )
+            return hooks.exchange_order_from_state(
+                row=row, new_intent=new_intent, outcome=outcome,
             )
-        return hooks.exchange_order_from_state(
-            row=row, new_intent=new_intent, outcome=outcome,
-        )
 
     # --- Recovery path -----------------------------------------------------
 
@@ -1500,7 +1674,10 @@ class DispatchJournal:
                 continue
             refs = _collect_refs_for(self.store, coid=row.client_order_id)
             outcome = await hooks.resume_pending_dispatch(row=row, refs=refs)
-            resolutions.append(self._apply_resume_outcome(row, outcome))
+            # One span per verdict: a command row confirmed but left live
+            # is no longer pending, so no later pass would close it.
+            with self.store.transaction():
+                resolutions.append(self._apply_resume_outcome(row, outcome))
         return resolutions
 
     def _apply_resume_outcome(
@@ -1684,36 +1861,38 @@ class DispatchJournal:
         :raises ValueError: when ``outcome.kind`` is ``'filled'`` but
             ``outcome.filled_qty`` is ``None``.
         """
-        if outcome.kind == 'filled':
-            if outcome.filled_qty is None:
-                raise ValueError(
-                    f"ReconcileOutcome kind='filled' requires filled_qty, "
-                    f"got None (coid={coid!r}, reason={outcome.reason!r})"
+        # One span: the state transition and its audit event commit together.
+        with self.store.transaction():
+            if outcome.kind == 'filled':
+                if outcome.filled_qty is None:
+                    raise ValueError(
+                        f"ReconcileOutcome kind='filled' requires filled_qty, "
+                        f"got None (coid={coid!r}, reason={outcome.reason!r})"
+                    )
+                mark_reconcile_filled(
+                    self.store,
+                    coid=coid,
+                    filled_qty=outcome.filled_qty,
+                    new_state=outcome.new_state,
+                    extras_patch=outcome.extras_patch,
                 )
-            mark_reconcile_filled(
-                self.store,
-                coid=coid,
-                filled_qty=outcome.filled_qty,
-                new_state=outcome.new_state,
-                extras_patch=outcome.extras_patch,
+            else:
+                mark_reconcile_terminal_close(
+                    self.store,
+                    coid=coid,
+                    new_state=outcome.new_state,
+                    extras_patch=outcome.extras_patch,
+                    close_row=outcome.close_row,
+                )
+            self.store.log_event(
+                outcome.audit_event,
+                client_order_id=coid,
+                exchange_order_id=outcome.exchange_order_id,
+                payload=(
+                    dict(outcome.audit_payload)
+                    if outcome.audit_payload is not None else None
+                ),
             )
-        else:
-            mark_reconcile_terminal_close(
-                self.store,
-                coid=coid,
-                new_state=outcome.new_state,
-                extras_patch=outcome.extras_patch,
-                close_row=outcome.close_row,
-            )
-        self.store.log_event(
-            outcome.audit_event,
-            client_order_id=coid,
-            exchange_order_id=outcome.exchange_order_id,
-            payload=(
-                dict(outcome.audit_payload)
-                if outcome.audit_payload is not None else None
-            ),
-        )
 
 
 # === Recovery support types ================================================

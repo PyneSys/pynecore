@@ -21,6 +21,7 @@ __all__ = [
     'ExchangeOrderRejectedError',
     'ExchangeRateLimitError',
     'InsufficientMarginError',
+    'JournalWriteError',
     'MarketClosedError',
     'OrderDispositionUnknownError',
     'OrderSkippedByPlugin',
@@ -87,6 +88,29 @@ class VenueWritesQuarantinedError(ExchangeConnectionError):
             f"intervention and leaves the venue untouched until an operator "
             f"resume"
         )
+
+
+class JournalWriteError(ExchangeConnectionError):
+    """A journal write failed before anything was sent to the venue.
+
+    Raised in place of the raw storage error (``sqlite3.Error``) by a
+    persist-first write path when the write that must precede the venue call
+    does not commit. The write is rolled back and the venue call is never
+    made, so nothing is sent and nothing is advanced. It is an
+    :class:`ExchangeConnectionError` on purpose, like
+    :class:`VenueWritesQuarantinedError`: every write path already treats that
+    as "the request never left the client — keep the state and retry later",
+    and the sync loop retries the dispatch on the next sync. A storage failure
+    AFTER the venue accepted a write is raised as
+    :class:`OrderDispositionUnknownError` instead, so the dispatch parks and is
+    resolved from venue data.
+
+    :ivar cause: The underlying storage error.
+    """
+
+    def __init__(self, what: str, cause: BaseException) -> None:
+        super().__init__(f"{what}: journal write failed before the venue call ({cause})")
+        self.cause = cause
 
 
 class ExchangeOrderRejectedError(BrokerError):

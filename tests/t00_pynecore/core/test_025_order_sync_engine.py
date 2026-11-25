@@ -9,13 +9,15 @@ A stubbed :attr:`lib._script.initial_capital` keeps
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
+import sqlite3
 import time
 import threading
 from concurrent import futures
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -29,6 +31,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
     InsufficientMarginError,
+    JournalWriteError,
     MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -50,7 +53,7 @@ from pynecore.core.broker.sync_engine import (
     _OPPOSITE_ENTRY_FILL_WAIT_S,
     _bracket_skip_reason,
 )
-from pynecore.core.broker.one_way_emulator import BracketFanResult
+from pynecore.core.broker.one_way_emulator import BracketFanResult, LegSettleResult
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REDUCE_ONLY,
@@ -87,9 +90,16 @@ from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, Failsaf
 from pynecore.core.broker.software_partial_bracket_engine import PartialBracketLeg
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.run_identity import RunIdentity
+from pynecore.core.broker import one_way_emulator as _one_way_emulator
 from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING as _BRACKET_OWN_STATE_CLEARING,
+    EXTRAS_KEY_BRACKET_OWN_LEG_ID as _EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    EXTRAS_KEY_BRACKET_OWN_SL as _EXTRAS_KEY_BRACKET_OWN_SL,
     EXTRAS_KEY_BRACKET_OWN_STATE as _EXTRAS_KEY_BRACKET_OWN_STATE,
+    EXTRAS_KEY_BRACKET_OWN_TP as _EXTRAS_KEY_BRACKET_OWN_TP,
+    EXTRAS_KEY_CLOSE_PARENT_COID as _EXTRAS_KEY_CLOSE_PARENT_COID,
+    STATE_CLOSE_LEG as _STATE_CLOSE_LEG,
+    create_bracket_ownership_row as _create_bracket_ownership_row,
     iter_active_bracket_ownerships as _iter_active_bracket_ownerships,
     LEG_KIND_SL_PARTIAL as _LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL as _LEG_KIND_TP_PARTIAL,
@@ -198,6 +208,8 @@ class MockBroker:
     # Number of upcoming ``amend_bracket`` calls that raise
     # ``OrderDispositionUnknownError`` (ambiguous timeout) before succeeding.
     fail_amend_unknown_count: int = 0
+    # What each leg holds at the venue: the levels of the last confirmed amend.
+    leg_brackets: dict = field(default_factory=dict)
     # ``leg_id`` whose ``amend_bracket`` raises ``ExchangeConnectionError`` (a
     # dropped link mid round-trip); ``None`` disables the hook.
     fail_amend_conn_leg: str | None = None
@@ -346,6 +358,9 @@ class MockBroker:
     async def close_leg(self, symbol, leg_id, volume, coid):
         self.close_leg_calls.append((leg_id, volume))
 
+    async def close_leg_executed(self, symbol, leg_id, coids, since_ms):
+        return 0
+
     async def reject_out_of_range(self, envelope, qty):
         return None
 
@@ -354,7 +369,7 @@ class MockBroker:
         return [self._mk_order(envelope, 'e')]
 
     async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
-                            trail_offset, coid):
+                            trail_offset, qty, coid):
         self.amend_calls.append((leg_id, tp_price, sl_price))
         if self.fail_amend_conn_leg is not None and leg_id == self.fail_amend_conn_leg:
             raise ExchangeConnectionError("amend link dropped")
@@ -363,6 +378,12 @@ class MockBroker:
             raise OrderDispositionUnknownError(
                 "amend timed out", client_order_id=coid,
             )
+        self.leg_brackets[leg_id] = (tp_price, sl_price, trail_offset)
+
+    async def bracket_matches(self, symbol, leg_id, *, side, tp_price, sl_price,
+                              trail_offset, qty):
+        return self.leg_brackets.get(leg_id, (None, None, None)) == (
+            tp_price, sl_price, trail_offset)
 
 
 # === Helpers ===
@@ -6641,13 +6662,20 @@ def __test_spot_close_withhold_releases_after_the_wait_bound__(monkeypatch):
     assert not engine._pre_clear_filled_entries  # noqa
 
 
-def __test_spot_full_close_dispatches_after_a_confirmed_pre_clear_cancel__(caplog):
-    """A confirmed pre-clear cancel lets the close go out, with no second cancel.
+@pytest.mark.parametrize('outcome', [
+    CancelDispositionOutcome.CANCEL_CONFIRMED,
+    CancelDispositionOutcome.FILLED_AND_CLOSED,
+])
+def __test_spot_full_close_dispatches_after_a_confirmed_pre_clear_cancel__(caplog, outcome):
+    """A definitive pre-clear cancel lets the close go out, with no second cancel.
 
-    The venue's ``CANCELLED`` echo of the swept leg is the engine's own
-    cancel, not an external one.
+    A leg the venue reports filled with its position closed since is
+    definitive too: its fill is booked already, so it neither withholds the
+    close nor falls back to the journaled cancel. The venue's ``CANCELLED``
+    echo of a cancelled swept leg is the engine's own cancel, not an
+    external one.
     """
-    b, engine, outcome_calls = _spot_long_with_exit(CancelDispositionOutcome.CANCEL_CONFIRMED)
+    b, engine, outcome_calls = _spot_long_with_exit(outcome)
     leg_ids = [
         order_id
         for key, intent in engine.active_intents.items() if isinstance(intent, ExitIntent)
@@ -6660,6 +6688,9 @@ def __test_spot_full_close_dispatches_after_a_confirmed_pre_clear_cancel__(caplo
     assert len(outcome_calls) == 1
     assert len(b.cancel_calls) == 0
     assert len(b.close_calls) == 1
+    assert not engine._pre_clear_filled_entries  # type: ignore[attr-defined]
+    if outcome is not CancelDispositionOutcome.CANCEL_CONFIRMED:
+        return
 
     caplog.clear()
     with caplog.at_level(logging.INFO):
@@ -13703,7 +13734,7 @@ def __test_bracket_reject_defensive_close_without_broker_order_drops_marker__():
     b.raw_legs = [_pleg("9", "buy", 1.0)]
 
     async def _reject_amend(symbol, leg_id, *, side, tp_price, sl_price,
-                            trail_offset, coid):
+                            trail_offset, qty, coid):
         # The venue flipped the position between the entry fill and the
         # bracket attach: the long the reject names is gone, a short sits
         # in its place, so the defensive close finds no leg to reduce.
@@ -15864,13 +15895,86 @@ def __test_emulated_entry_reversal_routes_through_position_port__():
     b.position_port = b
     # Short 2 leg; a combined buy 3 reverses -> close the short, open residual 1.
     b.raw_legs = [_pleg("9", "sell", 2.0, open_time=1.0)]
-    engine, _pos = _mk_engine(b)
+    engine, pos = _mk_engine(b)
     entry = EntryIntent(pine_id="L", symbol=SYMBOL, side="buy", qty=3.0,
                         order_type=OrderType.MARKET)
     engine._dispatch_new(entry)
     assert b.close_leg_calls == [("9", 2)]  # opposing leg FIFO-closed
-    assert b.place_leg_calls == [1.0]       # residual opened via the port
+    # The venue still lists the short right after the close: the residual is
+    # not opened beside it.
+    assert b.place_leg_calls == []
+    assert engine.order_mapping[entry.intent_key] == []
     assert b.entry_calls == []              # execute_entry NOT called
+    # The diff loop registers the dispatched intent; the next sync sees the
+    # short gone, and its residual drain opens the residual via the port and
+    # maps the order id to the reversal's entry intent.
+    engine._active_intents[entry.intent_key] = entry  # type: ignore[attr-defined]
+    b.raw_legs = []
+    pos.entry_orders["L"] = _entry_order("L", 3.0)
+    engine.sync(BAR_TS)
+    assert b.close_leg_calls == [("9", 2)]
+    assert b.place_leg_calls == [1.0]       # residual opened via the port
+    assert b.entry_calls == []
+    assert engine.order_mapping[entry.intent_key] == ["xchg-1"]
+
+
+def __test_an_entry_owing_its_reversal_residual_is_not_amended_or_reopened__():
+    """A same-bar change of an entry whose market reversal still owes its residual waits for it.
+
+    Buy 3 against a short of 2 closes the short and owes a one-unit residual,
+    which opens once the read shows the short gone. Pine changes the entry to
+    4 units on the same bar while the short is still listed: amending or
+    re-dispatching the entry would open a second order next to the owed
+    residual. The entry stays as it is until the residual opened.
+    """
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("9", "sell", 2.0, open_time=1.0)]
+    engine, pos = _mk_engine(b)
+    entry = EntryIntent(pine_id="L", symbol=SYMBOL, side="buy", qty=3.0,
+                        order_type=OrderType.MARKET)
+    engine._dispatch_new(entry)
+    assert b.close_leg_calls == [("9", 2)] and b.place_leg_calls == []
+    engine._active_intents[entry.intent_key] = entry  # type: ignore[attr-defined]
+    pos.entry_orders["L"] = _entry_order("L", 4.0)
+    engine.sync(BAR_TS)
+    assert b.modify_entry_calls == [] and b.place_leg_calls == [] and b.entry_calls == []
+    assert engine.active_intents[entry.intent_key] == entry
+    # The short is gone: the residual opens under the reversal first; only
+    # then is the entry free for Pine's change.
+    b.raw_legs = []
+    engine.sync(BAR_TS)
+    assert b.place_leg_calls[0] == 1.0
+
+
+def __test_a_residual_opened_without_an_active_entry_is_adopted_not_dispatched_again__():
+    """Pine's re-emission of a committed reversal's entry adopts the residual its breadcrumb opened.
+
+    Buy 3 against a short of 2 closes the short and owes a one-unit residual.
+    A fresh engine after a restart has no active intent for the entry: the
+    drain opens the residual first, and Pine re-emits the entry in the same
+    sync. Dispatching it again would open the whole three units next to the
+    residual; the residual's order is mapped to the entry, so the re-emitted
+    entry adopts it instead.
+    """
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("9", "sell", 2.0, open_time=1.0)]
+    engine, pos = _mk_engine(b)
+    entry = EntryIntent(pine_id="L", symbol=SYMBOL, side="buy", qty=3.0,
+                        order_type=OrderType.MARKET)
+    engine._dispatch_new(entry)
+    assert b.close_leg_calls == [("9", 2)] and b.place_leg_calls == []
+    # No active intent and no order mapping, as on a fresh engine: the short
+    # is gone, the drain opens the residual and Pine re-emits the entry.
+    engine._order_mapping.pop(entry.intent_key, None)  # type: ignore[attr-defined]
+    b.raw_legs = []
+    pos.entry_orders["L"] = _entry_order("L", 3.0)
+    engine.sync(BAR_TS)
+    assert b.place_leg_calls == [1.0]
+    assert b.entry_calls == []
+    assert engine.active_intents[entry.intent_key] == entry
+    assert engine.order_mapping[entry.intent_key] == ["xchg-1"]
 
 
 def __test_emulated_close_below_grid_skips_non_halting__():
@@ -16204,6 +16308,44 @@ def __test_restart_reconstructs_one_way_bracket_and_adopts__(tmp_path):
                    for r in iter_active_bracket_ownerships(ctx))  # still protected
 
 
+def __test_a_storage_failure_in_the_restart_settle_is_retried_not_raised__(tmp_path):
+    """A failed store read in the pre-script restart settle never stops the runner."""
+    import sqlite3
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        real_iter = ctx.iter_live_orders
+        failed: list[int] = []
+
+        def iter_live_orders(*args, **kwargs):
+            if not failed:
+                failed.append(1)
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_iter(*args, **kwargs)
+
+        ctx.iter_live_orders = iter_live_orders  # type: ignore[method-assign]
+        engine.settle_restart_state(BAR_TS)
+        assert failed == [1]
+        assert engine._pine_bracket_reconstruct_done is False  # type: ignore[attr-defined]
+        assert engine._storage_failed_syncs == 1  # type: ignore[attr-defined]
+        assert not engine.halted and not engine.quarantined
+
+        engine.settle_restart_state(BAR_TS + 60_000)
+        assert engine._pine_bracket_reconstruct_done is True  # type: ignore[attr-defined]
+        assert ("X", "L") in pos.exit_orders
+        ctx.iter_live_orders = real_iter  # type: ignore[method-assign]
+        ctx.close()
+
+
 def __test_first_bar_cancel_survives_restart_settle__(tmp_path):
     """settle_restart_state rebuilds the bracket BEFORE the first-bar script, so a
     first-bar strategy.cancel takes effect instead of being overwritten.
@@ -16245,6 +16387,635 @@ def __test_first_bar_cancel_survives_restart_settle__(tmp_path):
         assert ("X", "L") not in pos.exit_orders  # cancel NOT overwritten
         assert ("1", None, None) in b.amend_calls  # live bracket cleared
         assert list(iter_active_bracket_ownerships(ctx)) == []  # row released
+
+
+def __test_a_first_bar_cancel_after_a_failed_restart_settle_is_applied_once_settled__(tmp_path):
+    """A cancel the script issues while the restart is unsettled deletes the venue exit later.
+
+    The settle before the first-bar script fails on the store, so the script
+    runs against a book without the rebuilt exit and its ``strategy.cancel``
+    removes nothing. While the store stays down no sync sends anything; once a
+    sync settles the restart, the recorded cancel removes the rebuilt exit and
+    the diff clears the venue bracket, which no later sync re-places.
+    """
+    import sqlite3
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        real_iter = ctx.iter_live_orders
+        down = [True]
+
+        def iter_live_orders(*args, **kwargs):
+            if down[0]:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_iter(*args, **kwargs)
+
+        ctx.iter_live_orders = iter_live_orders  # type: ignore[method-assign]
+        assert engine.settle_restart_state(BAR_TS) is False
+        assert ("X", "L") not in pos.exit_orders
+        # The first-bar script cancels the exit it placed before the restart
+        pos._remove_order_by_id("X")
+        amends_before = list(b.amend_calls)
+        engine.sync(BAR_TS)
+        # Unsettled: nothing derived from the unrebuilt book is sent
+        assert b.amend_calls == amends_before
+        assert (b.entry_calls, b.exit_calls, b.close_calls, b.cancel_calls) == ([], [], [], [])
+        assert engine._pine_bracket_reconstruct_done is False  # type: ignore[attr-defined]
+
+        down[0] = False
+        engine.sync(BAR_TS + 60_000)
+        assert engine._pine_bracket_reconstruct_done is True  # type: ignore[attr-defined]
+        assert ("X", "L") not in pos.exit_orders
+        assert ("1", None, None) in b.amend_calls  # venue bracket cleared
+        assert list(iter_active_bracket_ownerships(ctx)) == []
+        assert pos.restart_cancels is None
+
+        cleared_at = b.amend_calls.index(("1", None, None))
+        engine.sync(BAR_TS + 120_000)
+        assert ("1", 120.0, 90.0) not in b.amend_calls[cleared_at:]  # never re-placed
+        assert ("X", "L") not in pos.exit_orders
+        ctx.iter_live_orders = real_iter  # type: ignore[method-assign]
+        ctx.close()
+
+
+
+def __test_the_restart_replay_never_re_asserts_a_bracket_cancelled_while_unsettled__(tmp_path):
+    """A cancel recorded before the replay ran clears the venue bracket without re-arming it.
+
+    The settle fails before the one-way replay (the entry-anchor scan cannot
+    read the venue), the first-bar script cancels the exit, and the next sync
+    runs the replay. The cancelled exit's ownership rows are retired by that
+    replay, so the venue sees only the clear, never the cancelled levels again.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        _persist_bracket_ownership(ctx, leg_id="2", intent_key="Y\0L", pine_id="Y")
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0), _pleg("2", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        assert engine.settle_restart_state(BAR_TS) is False
+        assert b.amend_calls == []  # the replay was not reached
+        pos._remove_order_by_id("X")  # the first-bar script
+
+        engine.sync(BAR_TS)
+        assert engine._pine_bracket_reconstruct_done is True  # type: ignore[attr-defined]
+        assert ("1", 120.0, 90.0) not in b.amend_calls  # never re-armed
+        assert ("1", None, None) in b.amend_calls  # cleared
+        assert ("2", 120.0, 90.0) in b.amend_calls  # the other exit is re-asserted
+        assert ("X", "L") not in pos.exit_orders
+        assert ("Y", "L") in pos.exit_orders
+        assert [row.intent_key for row in iter_active_bracket_ownerships(ctx)] == ["Y\0L"]
+
+        engine.sync(BAR_TS + 60_000)
+        assert ("1", 120.0, 90.0) not in b.amend_calls
+
+
+def __test_an_exit_id_placed_again_for_another_entry_spares_no_cancelled_bracket__(tmp_path):
+    """A cancelled exit re-placed under its id for another entry still has its bracket retired.
+
+    While the restart is unsettled the script cancels ``X`` (the exit of ``L``)
+    and places ``X`` for ``OTHER``. Only an exit placed again for the same entry
+    is the script's own: the replay never re-arms ``L``'s cancelled levels.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        assert engine.settle_restart_state(BAR_TS) is False
+        # The first-bar script
+        pos._remove_order_by_id("X")
+        pos.exit_orders[("X", "OTHER")] = _exit_order("OTHER", -1.0, "X", limit=130.0, stop=80.0)
+
+        engine.sync(BAR_TS)
+        assert engine._pine_bracket_reconstruct_done is True  # type: ignore[attr-defined]
+        assert ("1", 120.0, 90.0) not in b.amend_calls  # L's cancelled levels never re-armed
+        assert ("1", None, None) in b.amend_calls
+        assert ("X", "L") not in pos.exit_orders
+        assert ("X", "OTHER") in pos.exit_orders
+        assert [row.intent_key for row in iter_active_bracket_ownerships(ctx)
+                if row.from_entry == "L"] == []
+
+
+def __test_a_cancel_all_while_the_restart_is_unsettled_retires_the_rebuilt_entry__(tmp_path):
+    """A ``strategy.cancel_all`` before the settle succeeds still cancels a rebuilt working entry."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    live_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        _seed_live_entry_order_row(ctx, coid=live_coid, order_id="wo-1", pine_id="L")
+        b = MockBroker()
+        b.open_orders = [_live_stop_entry_order(live_coid, order_id="wo-1", stop=1.30000)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        assert engine.settle_restart_state(BAR_TS) is False
+        assert "L" not in pos.entry_orders
+        pos._cancel_all_orders()  # the first-bar script
+        b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        engine.sync(BAR_TS)
+        assert b.cancel_calls == [] and b.entry_calls == []  # unsettled: nothing sent
+
+        engine.sync(BAR_TS + 60_000)
+        assert "L" not in pos.entry_orders
+        assert len(b.cancel_calls) == 1  # the live working order is retired
+        assert b.entry_calls == []
+        assert "L" not in engine._order_mapping  # type: ignore[attr-defined]
+
+
+def __test_a_cancel_recorded_while_unsettled_spares_the_scripts_own_order__(tmp_path):
+    """A recorded cancel only removes rebuilt orders, never one the script placed itself."""
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
+
+    live_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        _seed_live_entry_order_row(ctx, coid=live_coid, order_id="wo-1", pine_id="L")
+        b = MockBroker()
+        b.open_orders = [_live_stop_entry_order(live_coid, order_id="wo-1", stop=1.30000)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        assert engine.settle_restart_state(BAR_TS) is False
+        # The script cancels "L", then places a new "L" of its own
+        pos._remove_order_by_id("L")
+        pos.reconstruct_entry_order(pine_id="L", side="buy", qty=1.0, limit=None, stop=1.25)
+        own = pos.entry_orders["L"]
+        assert engine.settle_restart_state(BAR_TS) is True
+        assert pos.entry_orders.get("L") is own
+
+
+def _persist_stable_bracket_ownership(ctx) -> None:
+    """Persist the ownership row of exit ``X`` of ``L`` on leg 1 under the emulator's own row key."""
+    _create_bracket_ownership_row(
+        ctx, coid="bo:X\0L:1", symbol=SYMBOL, side="sell", qty=2.0,
+        intent_key="X\0L", pine_entry_id="X", from_entry="L",
+        leg_id="1", attach_coid="t-attach",
+        tp_price=120.0, sl_price=90.0, trail_price=None, trail_offset=None,
+        oca_name=None, oca_type=None,
+    )
+
+
+def __test_a_rebuilt_exit_placed_again_with_other_levels_is_amended_after_restart__(tmp_path):
+    """The first script after a settled restart moving a persisted exit's levels amends the venue.
+
+    The rebuild puts the exit back with the levels the venue holds; the script
+    then places it again with other ones. The diff amends the bracket to the
+    script's levels instead of adopting the new exit over the old protection.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_stable_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        assert engine.settle_restart_state(BAR_TS) is True
+        # The first-bar script
+        pos.exit_orders[("X", "L")] = _exit_order("L", -2.0, "X", limit=125.0, stop=95.0)
+        engine.sync(BAR_TS)
+        assert b.leg_brackets["1"][:2] == (125.0, 95.0)
+        assert [(_row.extras or {}).get(_EXTRAS_KEY_BRACKET_OWN_SL)
+                for _row in _iter_active_bracket_ownerships(ctx)] == [95.0]
+
+        sent = len(b.amend_calls)
+        engine.sync(BAR_TS + 60_000)
+        assert len(b.amend_calls) == sent
+
+
+def __test_a_rebuilt_exit_the_script_keeps_is_adopted_without_an_amend__(tmp_path):
+    """A rebuilt exit the first script places again unchanged is adopted, not re-sent."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_stable_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        assert engine.settle_restart_state(BAR_TS) is True
+        sent = len(b.amend_calls)
+        pos.exit_orders[("X", "L")] = _exit_order("L", -2.0, "X", limit=120.0, stop=90.0)
+        engine.sync(BAR_TS)
+        assert len(b.amend_calls) == sent
+        assert "X\0L" in engine.active_intents
+
+
+@pytest.mark.parametrize("verdict", ["moved", "rejected", "stateful", "changed", "handed"])
+def __test_the_unsettled_replay_asserts_a_replacement_only_as_the_interceptors_leave_it__(
+        tmp_path, verdict):
+    """An exit placed again while the restart is unsettled reaches the replay through the interceptors.
+
+    An interceptor moves the replacement's stop, or rejects the replacement:
+    the replay sends the moved stop (never the script's own one), or clears
+    the bracket (never the replaced levels). A stateful interceptor, which
+    would move the stop elsewhere on a second call, is asked once in the sync
+    that replays: the replay and the diff carry that one decision, so the
+    venue gets one stop. A decision lives for one attempt: when the replay's
+    write fails and the interceptor's policy changes before the next sync,
+    that sync asserts the new stop. The same holds when a settle that
+    replayed hands its decision to the next sync and that sync ends on a
+    storage failure before its diff: the sync after it asks again.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_stable_bracket_ownership(ctx)
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+
+        calls: list[float] = []
+        policy_stop = [85.0]
+
+        def interceptor(intent) -> InterceptorResult:
+            if not isinstance(intent, ExitIntent) or intent.sl_price != 95.0:
+                return InterceptorResult(intent=intent)
+            calls.append(intent.sl_price)
+            if verdict in ("changed", "handed"):
+                return InterceptorResult(intent=intent, modified_stop=policy_stop[0])
+            if verdict == "stateful":
+                return InterceptorResult(intent=intent, modified_stop=85.0 + len(calls) - 1)
+            if verdict == "rejected":
+                return InterceptorResult(intent=intent, rejected=True, reject_reason="no")
+            return InterceptorResult(intent=intent, modified_stop=85.0)
+
+        engine.register_interceptor(interceptor)
+        b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        assert engine.settle_restart_state(BAR_TS) is False
+        # The first-bar script
+        pos.exit_orders[("X", "L")] = _exit_order("L", -2.0, "X", limit=125.0, stop=95.0)
+        if verdict == "changed":
+            b.fail_amend_conn_leg = "1"
+            engine.sync(BAR_TS)
+            assert b.amend_calls == [("1", 125.0, 85.0)]
+            b.fail_amend_conn_leg = None
+            policy_stop[0] = 86.0
+            engine.sync(BAR_TS + 60_000)
+            assert b.amend_calls[1:] == [("1", 125.0, 86.0)]
+            assert b.leg_brackets["1"][:2] == (125.0, 86.0)
+            return
+        if verdict == "handed":
+            assert engine.settle_restart_state(BAR_TS) is True
+            assert b.amend_calls == [("1", 125.0, 85.0)]
+            policy_stop[0] = 86.0
+            drain = engine._drain_events  # type: ignore[attr-defined]
+            failures = [sqlite3.OperationalError("disk I/O error")]
+
+            def drain_events(*args, **kwargs):
+                if failures:
+                    raise failures.pop()
+                return drain(*args, **kwargs)
+
+            engine._drain_events = drain_events  # type: ignore[attr-defined]
+            engine.sync(BAR_TS)
+            assert failures == []
+            assert b.amend_calls == [("1", 125.0, 85.0)]
+            engine.sync(BAR_TS + 60_000)
+            assert b.amend_calls[1:] == [("1", 125.0, 86.0)]
+            assert b.leg_brackets["1"][:2] == (125.0, 86.0)
+            return
+        engine.sync(BAR_TS)
+        if verdict == "stateful":
+            assert len(calls) == 1
+            assert b.amend_calls == [("1", 125.0, 85.0)]
+            return
+        engine.sync(BAR_TS + 60_000)
+        assert ("1", 120.0, 90.0) not in b.amend_calls
+        assert ("1", 125.0, 95.0) not in b.amend_calls
+        if verdict == "moved":
+            assert b.amend_calls == [("1", 125.0, 85.0)]
+        else:
+            assert b.amend_calls == [("1", None, None)]
+            assert list(_iter_active_bracket_ownerships(ctx)) == []
+
+
+@pytest.mark.parametrize("change", ["stop", "qty"])
+@pytest.mark.parametrize("settled", [True, False], ids=["settled", "unsettled"])
+def __test_a_rebuilt_entry_redeclared_otherwise_is_modified_after_restart__(
+        tmp_path, settled, change):
+    """The first script after a restart changing a live working entry's level or size modifies it.
+
+    Whether the restart settled before the script or only in the sync after it.
+    """
+    from pynecore.core.broker.idempotency import build_client_order_id
+
+    live_coid = build_client_order_id(
+        run_tag=RUN_TAG, pine_id="L", bar_ts_ms=BAR_TS,
+        kind=KIND_ENTRY, retry_seq=0,
+    )
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t025.py")
+        _seed_live_entry_order_row(ctx, coid=live_coid, order_id="wo-1", pine_id="L")
+        b = MockBroker()
+        b.open_orders = [_live_stop_entry_order(live_coid, order_id="wo-1", stop=1.30000)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b,  # type: ignore[arg-type]
+            position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
+            mintick=1.0, store_ctx=ctx,
+        )
+        if not settled:
+            b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        assert engine.settle_restart_state(BAR_TS) is settled
+        # The first-bar script re-declares the entry at another stop
+        qty, stop = (1.0, 1.25) if change == "stop" else (2.0, 1.30000)
+        pos.reconstruct_entry_order(pine_id="L", side="buy", qty=qty, limit=None, stop=stop)
+        engine.sync(BAR_TS)
+        engine.sync(BAR_TS + 60_000)
+        assert b.entry_calls == []
+        assert len(b.modify_entry_calls) == 1
+        old, new = b.modify_entry_calls[0]
+        assert (old.intent.qty, old.intent.stop) == (1.0, 1.30000)
+        assert (new.intent.qty, new.intent.stop) == (qty, stop)
+
+
+def __test_the_runner_retries_a_failed_restart_settle_before_the_first_script__(monkeypatch):
+    """The first fresh bar retries a failed settle a bounded number of times, later bars once."""
+    from pynecore.core import script_runner
+    monkeypatch.setattr(script_runner, "STARTUP_RECONCILE_RETRY_BASE_S", 0.0)
+    answers = [False, False, True]
+    calls: list[int] = []
+
+    class Engine:
+        venue_writes_blocked = False
+
+        @staticmethod
+        def settle_restart_state(bar_ts_ms: int) -> bool:
+            calls.append(bar_ts_ms)
+            return answers.pop(0) if answers else False
+
+    runner = SimpleNamespace(_restart_settle_waited=False)
+    script_runner.ScriptRunner._settle_restart_before_script(
+        runner, Engine(), BAR_TS)  # type: ignore[arg-type]
+    assert calls == [BAR_TS] * 3  # settled on the second retry, before the script
+
+    calls.clear()
+    script_runner.ScriptRunner._settle_restart_before_script(
+        runner, Engine(), BAR_TS + 60_000)  # type: ignore[arg-type]
+    assert calls == [BAR_TS + 60_000]  # later bars: one attempt, the sync retries
+
+    fresh = SimpleNamespace(_restart_settle_waited=False)
+    calls.clear()
+    script_runner.ScriptRunner._settle_restart_before_script(
+        fresh, Engine(), BAR_TS)  # type: ignore[arg-type]
+    assert calls == [BAR_TS] * (1 + script_runner.RESTART_SETTLE_RETRIES)  # bounded
+
+
+# --- Restart-cancel matrix: an unsettled restart ends like a settled one ---
+
+_RESTART_CANCEL_SHAPES = {
+    # leg ids, then (leg id, intent key, exit id, tp, sl) per ownership row
+    "single": (("1",), (("1", "X\0L", "X", 120.0, 90.0),)),
+    "merged": (("1",), (("1", "X\0L", "X", 120.0, 90.0), ("1", "Y\0L", "Y", 130.0, 85.0))),
+    "pyramided": (("1", "2"), (("1", "X\0L", "X", 120.0, 90.0),
+                               ("2", "X\0L", "X", 120.0, 90.0))),
+}
+
+
+def _restart_cancel_superseded(rows, cancel: str | None, action: str) -> list[tuple]:
+    """The ownership rows of a matrix shape whose exit the script cancels or replaces."""
+    return [row for row in rows
+            if cancel is None or cancel == row[2] or (action == "same" and row[1] == "X\0L")]
+
+
+def _restart_cancel_matrix_run(tmp_path, monkeypatch, *, shape: str, cancel: str | None,
+                               action: str, outcome: str | None,
+                               place_next_bar: bool) -> dict:
+    """One restart-cancel scenario through the real engine; ``outcome=None`` is the baseline.
+
+    The baseline settles the restart before the first-bar script. The other
+    outcomes leave it unsettled while the script runs: ``same_bar`` settles in
+    the bar's sync, ``later`` two bars later (the script acts on the next bar),
+    ``retire_fault`` / ``reconstruct_fault`` hit a store failure in the middle of
+    the cancelled-owner retirement / the book rebuild of the first settling
+    sync, and settle on the next one. The script cancels on the first bar and
+    places on it, or on the next bar with ``place_next_bar``.
+    """
+    legs, rows = _RESTART_CANCEL_SHAPES[shape]
+    run_dir = tmp_path / f"{outcome or 'baseline'}"
+    run_dir.mkdir()
+    with BrokerStore(run_dir / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        for n, (leg_id, intent_key, exit_id, tp, sl) in enumerate(rows):
+            _create_bracket_ownership_row(
+                ctx, coid=f"bo:{intent_key}:{leg_id}", symbol=SYMBOL, side="sell", qty=2.0,
+                intent_key=intent_key, pine_entry_id=exit_id, from_entry="L",
+                leg_id=leg_id, attach_coid=f"t-attach-{n}",
+                tp_price=tp, sl_price=sl, trail_price=None, trail_offset=None,
+                oca_name=None, oca_type=None,
+            )
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg(leg_id, "buy", 2.0) for leg_id in legs]
+        sent: list[tuple[str, tuple]] = []
+        real_amend = b.amend_bracket
+
+        async def amend_bracket(symbol, leg_id, *, side, tp_price, sl_price,
+                                trail_offset, qty, coid):
+            sent.append((coid, (leg_id, tp_price, sl_price)))
+            await real_amend(symbol, leg_id, side=side, tp_price=tp_price, sl_price=sl_price,
+                             trail_offset=trail_offset, qty=qty, coid=coid)
+
+        b.amend_bracket = amend_bracket  # type: ignore[method-assign]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+
+        faults: list[str] = []
+        if outcome == "retire_fault":
+            real_update = _one_way_emulator.update_bracket_ownership_state
+            updates = [0]
+            # Inside the pre-replay pass: its second row write, or its only one
+            fail_at = 2 if len(_restart_cancel_superseded(rows, cancel, action)) >= 2 else 1
+
+            def update_bracket_ownership_state(*args, **kwargs):
+                updates[0] += 1
+                if updates[0] == fail_at and not faults:
+                    faults.append("retire")
+                    raise sqlite3.OperationalError("disk I/O error")
+                return real_update(*args, **kwargs)
+
+            monkeypatch.setattr(_one_way_emulator, "update_bracket_ownership_state",
+                                update_bracket_ownership_state)
+        if outcome == "reconstruct_fault":
+            real_partial = engine._reconstruct_partial_bracket_exits  # type: ignore[attr-defined]
+
+            def reconstruct_partial_bracket_exits():
+                if not faults:
+                    faults.append("reconstruct")
+                    raise sqlite3.OperationalError("disk I/O error")
+                return real_partial()
+
+            engine._reconstruct_partial_bracket_exits = (  # type: ignore[attr-defined]
+                reconstruct_partial_bracket_exits)
+
+        def script_cancel():
+            if cancel is None:
+                pos._cancel_all_orders()
+            else:
+                pos._remove_order_by_id(cancel)
+
+        def script_place():
+            if action == "same":
+                pos.exit_orders[("X", "L")] = _exit_order("L", -2.0, "X", limit=125.0, stop=95.0)
+            elif action == "other":
+                pos.exit_orders[("X", "OTHER")] = _exit_order(
+                    "OTHER", -1.0, "X", limit=130.0, stop=80.0)
+            elif action == "new":
+                pos.exit_orders[("Z", "L")] = _exit_order("L", -2.0, "Z", limit=125.0, stop=95.0)
+
+        if outcome is None:
+            assert engine.settle_restart_state(BAR_TS) is True
+        else:
+            b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+            assert engine.settle_restart_state(BAR_TS) is False
+        writes_before_script = len(sent)
+        script_cancel()
+        if not place_next_bar:
+            script_place()
+        if outcome == "later":
+            b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        engine.sync(BAR_TS)
+        if place_next_bar:
+            script_place()
+        if outcome == "later":
+            b.raise_on_next_get_open_orders = ExchangeConnectionError("socket closed")
+        engine.sync(BAR_TS + 60_000)
+        engine.sync(BAR_TS + 120_000)
+        engine.sync(BAR_TS + 180_000)
+        assert engine._pine_bracket_reconstruct_done is True  # type: ignore[attr-defined]
+        assert pos.restart_cancels is None
+        assert not engine.halted and not engine.quarantined
+        if outcome == "reconstruct_fault" or (
+                outcome == "retire_fault" and _restart_cancel_superseded(rows, cancel, action)):
+            assert faults, "the store fault was never reached"
+        book = {key: (order.limit, order.stop) for key, order in pos.exit_orders.items()}
+        owners = sorted((
+            (row.intent_key, (row.extras or {}).get(_EXTRAS_KEY_BRACKET_OWN_LEG_ID),
+             (row.extras or {}).get(_EXTRAS_KEY_BRACKET_OWN_TP),
+             (row.extras or {}).get(_EXTRAS_KEY_BRACKET_OWN_SL))
+            for row in _iter_active_bracket_ownerships(ctx)
+        ), key=repr)
+        # A write sent again under its coid (a retry after a store failure)
+        # is one write
+        distinct: list[tuple] = []
+        coids: dict[tuple[str, str], set] = {}
+        for n, (coid, write) in enumerate(sent):
+            coids.setdefault((coid, write[0]), set()).add(write)
+            if (coid, write) not in sent[:n]:
+                distinct.append(write if n >= writes_before_script else ("pre",) + write)
+        result = {
+            "pre_script": [write[1:] for write in distinct if write[0] == "pre"],
+            "writes": [write for write in distinct if write[0] != "pre"],
+            "other_writes": (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+                             len(b.cancel_calls), list(b.close_leg_calls),
+                             list(b.place_leg_calls)),
+            "venue": {leg_id: levels[:2] for leg_id, levels in b.leg_brackets.items()},
+            "book": book,
+            "owners": owners,
+            "coids": coids,
+        }
+        ctx.close()
+        monkeypatch.undo()
+        return result
+
+
+@pytest.mark.parametrize("outcome", ["same_bar", "later", "retire_fault", "reconstruct_fault"])
+@pytest.mark.parametrize("action", ["none", "same", "other", "new"])
+@pytest.mark.parametrize("cancel", ["X", "L", None], ids=["exit", "entry", "all"])
+@pytest.mark.parametrize("shape", list(_RESTART_CANCEL_SHAPES))
+def __test_an_unsettled_restart_cancel_ends_like_a_settled_one__(
+        tmp_path, monkeypatch, shape, cancel, action, outcome):
+    """A cancel issued while the restart is unsettled sends what a settled restart would.
+
+    The baseline settles the restart before the first-bar script. Against it,
+    the unsettled run sends the same venue writes apart from order (minus the
+    replay's re-assert of levels the script then replaced), never a level the
+    script cancelled, no coid for two different writes, and ends with the same
+    venue protection, Pine book and ownership rows.
+    """
+    base = _restart_cancel_matrix_run(tmp_path, monkeypatch, shape=shape, cancel=cancel,
+                                      action=action, outcome=None,
+                                      place_next_bar=outcome == "later")
+    run = _restart_cancel_matrix_run(tmp_path, monkeypatch, shape=shape, cancel=cancel,
+                                     action=action, outcome=outcome,
+                                     place_next_bar=outcome == "later")
+    # A leg one of whose owners the script cancelled or replaced: what the
+    # baseline's replay re-asserted there before the script is superseded, so
+    # the unsettled run never sends it; every other write is the baseline's.
+    _legs, rows = _RESTART_CANCEL_SHAPES[shape]
+    superseded = {row[0] for row in _restart_cancel_superseded(rows, cancel, action)}
+    expected = base["writes"] + [write for write in base["pre_script"]
+                                 if write[0] not in superseded]
+    cancelled = [write for write in base["pre_script"]
+                 if write[0] in superseded and write not in base["writes"]]
+    assert run["pre_script"] == []
+    assert not collections.Counter(run["writes"]) - collections.Counter(expected)
+    assert not any(write in cancelled for write in run["writes"])
+    assert run["other_writes"] == base["other_writes"]
+    assert all(len(sent) == 1 for sent in run["coids"].values()), run["coids"]
+    assert run["venue"] == base["venue"]
+    assert run["book"] == base["book"]
+    assert run["owners"] == base["owners"]
 
 
 def _seed_live_entry_order_row(ctx, *, coid: str, order_id: str, pine_id: str,
@@ -17145,7 +17916,7 @@ class _StopDistanceVenue:
         self.calls: list[tuple[str, float | None, float | None]] = []
 
     async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
-                            trail_offset, coid):
+                            trail_offset, qty, coid):
         self.calls.append((leg_id, tp_price, sl_price))
         if self.throttled:
             raise ExchangeRateLimitError("too many requests", retry_after=1.0)
@@ -19799,6 +20570,44 @@ def __test_venue_driven_cancel_of_a_resting_entry_retires_it_without_policy__(tm
         ctx.close()
 
 
+def __test_a_failed_audit_never_cuts_the_routing_short_and_lands_once__(tmp_path):
+    """An audit write that fails is owed: the event's routing completes, the audit lands once."""
+    import sqlite3
+    from pynecore.core.broker.storage import BrokerStore
+    b = MockBroker()
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        engine.sync(BAR_TS)
+        deal_id = engine.order_mapping["L"][0]
+        real_log_event = ctx.log_event
+        failed: list[str] = []
+
+        def log_event(kind, *args, **fields):
+            if kind == 'venue_driven_cancel' and not failed:
+                failed.append(kind)
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_log_event(kind, *args, **fields)
+
+        ctx.log_event = log_event  # type: ignore[method-assign]
+        engine._route_event(replace(
+            _cancelled_event(deal_id), cancel_reason=CANCEL_REASON_VENUE_REJECTED,
+        ))
+        assert failed == ['venue_driven_cancel']
+        assert "L" not in engine.order_mapping
+        assert "L" not in engine.active_intents
+        assert list(ctx.iter_events_by_kind_since('venue_driven_cancel', 0)) == []
+
+        engine.sync(BAR_TS + 60_000)
+        audited = list(ctx.iter_events_by_kind_since('venue_driven_cancel', 0))
+        assert [e['cancel_reason'] for e in audited] == [CANCEL_REASON_VENUE_REJECTED]
+        assert len(b.entry_calls) == 2
+        assert not engine.halted and not engine.quarantined
+        ctx.log_event = real_log_event  # type: ignore[method-assign]
+        ctx.close()
+
+
 def __test_venue_driven_cancel_of_a_partially_filled_entry_consumes_it__(tmp_path):
     """The venue cancels the unfilled remainder of a partially filled resting entry.
 
@@ -20067,7 +20876,7 @@ def __test_hedging_exit_cancel_bridge_timeout_does_not_crash__(tmp_path):
             stalled = threading.Event()
 
             async def _stalled_amend(symbol, leg_id, *, side, tp_price, sl_price,
-                                     trail_offset, coid):
+                                     trail_offset, qty, coid):
                 stalled.set()
                 await release.wait()
 
@@ -20079,6 +20888,86 @@ def __test_hedging_exit_cancel_bridge_timeout_does_not_crash__(tmp_path):
             assert engine._cancel_disposition_pending == {}
     finally:
         _stop_test_loop(loop, release)
+
+
+def __test_a_stalled_retirement_cannot_overwrite_a_newer_stop__(tmp_path):
+    """A retirement the bridge gave up on holds the leg until it ends, so it cannot land last.
+
+    The stalled clear keeps running on the broker loop after the bridge wait
+    expired. A fresh attach of the exit sent meanwhile would reach the venue
+    first and be wiped when the clear finally lands, leaving the position
+    without its stop.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+
+    loop, release = _start_test_loop()
+    try:
+        with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+            ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+            b = MockBroker()
+            b.position_port = b
+            b.raw_legs = [_pleg("1", "buy", 2.0)]
+            engine = OrderSyncEngine(
+                broker=b,  # type: ignore[arg-type]
+                position=BrokerPosition(),
+                symbol=SYMBOL,
+                run_tag=RUN_TAG,
+                event_loop=loop,
+                execute_timeout=0.1,
+                store_ctx=ctx,
+            )
+            ex = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                            qty=2.0, tp_price=120.0, sl_price=90.0)
+            engine._dispatch_new(ex)
+
+            stalled = threading.Event()
+            venue_writes: list[tuple[float | None, float | None]] = []
+            healthy_amend = b.amend_bracket
+
+            async def _stalled_amend(symbol, leg_id, *, side, tp_price, sl_price,
+                                     trail_offset, qty, coid):
+                stalled.set()
+                await release.wait()
+                venue_writes.append((tp_price, sl_price))
+
+            async def _recording_amend(symbol, leg_id, *, side, tp_price, sl_price,
+                                       trail_offset, qty, coid):
+                venue_writes.append((tp_price, sl_price))
+                await healthy_amend(symbol, leg_id, side=side, tp_price=tp_price,
+                                    sl_price=sl_price, trail_offset=trail_offset,
+                                    qty=qty, coid=coid)
+
+            b.amend_bracket = _stalled_amend
+            engine._dispatch_cancel(ex)
+            assert stalled.is_set()
+            # The script places the exit again with a new stop while the clear
+            # is still in flight: it is parked, nothing reaches the venue.
+            b.amend_bracket = _recording_amend
+            newer = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                               qty=2.0, tp_price=120.0, sl_price=95.0)
+            engine._dispatch_new(newer)
+            engine._active_intents[newer.intent_key] = newer
+            assert venue_writes == []
+
+            # The clear lands late. The settle pass then brings the leg to the
+            # exit's levels: the newer stop is the LAST write on the venue.
+            emulator = engine._one_way_emulator
+            asyncio.run_coroutine_threadsafe(
+                _release_and_let_finish(release, emulator), loop).result(timeout=5.0)
+            engine._settle_one_way_leg_writes(b)
+            assert venue_writes == [(None, None), (120.0, 95.0)]
+            assert engine.pending_verification == {}
+    finally:
+        _stop_test_loop(loop, release)
+
+
+async def _release_and_let_finish(release: asyncio.Event, emulator) -> None:
+    """Free the stalled port call and yield until its write is settled by its own return."""
+    release.set()
+    for _ in range(100):
+        if not emulator._unsettled_writes:
+            return
+        await asyncio.sleep(0)
 
 
 # --- External-intervention quarantine -------------------------------------------
@@ -20279,3 +21168,1193 @@ def __test_finalize_halt_books_past_a_further_halting_event__():
             len(b.cancel_calls)) == writes_before
     with pytest.raises(BrokerManualInterventionError, match="someone else"):
         engine.raise_if_halted()
+
+
+# === One-way: sized protection and unsettled protection writes ===
+
+def __test_a_fired_software_leg_guard_closes_only_the_protected_quantity_of_its_leg__(tmp_path):
+    """A partly offset leg is closed by its software guard for the net quantity, not whole.
+
+    Long 10 on leg "1", an opposing 4 on leg "2": the position is net long 6.
+    A venue bracket on leg "1" would close 10 and leave the book short 4.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    store = BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker")
+    ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("1", "buy", 10.0, open_time=1.0),
+                  _pleg("2", "sell", 4.0, open_time=2.0)]
+    engine, _pos = _mk_engine(b, store_ctx=ctx)
+    ex = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                    qty=6.0, tp_price=120.0, sl_price=90.0)
+    engine._dispatch_new(ex)
+    assert b.amend_calls == []  # no venue bracket on the partly offset leg
+    assert engine.order_mapping[ex.intent_key] == ["bracket:1"]
+
+    engine._drive_software_leg_guards(last_price=100.0)
+    assert b.close_leg_calls == []
+    engine._drive_software_leg_guards(last_price=89.0)
+    assert b.close_leg_calls == [("1", 6)]
+    assert b.close_calls == [] and b.amend_calls == []
+    # The guard is done: a further tick beyond the stop sends nothing more.
+    engine._drive_software_leg_guards(last_price=88.0)
+    assert b.close_leg_calls == [("1", 6)]
+    # The close's envelope is retired; its fill is recognised by its label.
+    assert "__pyne_leg_guard__1" not in engine._envelopes
+    assert engine._leg_guard_close_entries == {"__pyne_leg_guard__1": "L"}
+    store.close()
+
+
+def __test_a_skipped_software_leg_guard_close_keeps_the_guard_armed__():
+    """A guard close the plugin declines is tried again on the next price."""
+    from pynecore.core.broker.exceptions import OrderSkippedByPlugin
+    b = MockBroker()
+    b.position_port = b
+    b.raw_legs = [_pleg("1", "buy", 10.0, open_time=1.0),
+                  _pleg("2", "sell", 4.0, open_time=2.0)]
+    engine, _pos = _mk_engine(b)
+    engine._dispatch_new(ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL,
+                                    side="sell", qty=6.0, sl_price=90.0))
+    sent: list[tuple[str, int]] = []
+    declined = [True]
+
+    async def _close_leg(symbol, leg_id, volume, coid):
+        if declined[0]:
+            raise OrderSkippedByPlugin("leg busy", intent_key="x", reason="leg_busy")
+        sent.append((leg_id, volume))
+
+    b.close_leg = _close_leg
+    engine._drive_software_leg_guards(last_price=89.0)
+    assert sent == []
+    declined[0] = False
+    engine._drive_software_leg_guards(last_price=89.0)
+    assert sent == [("1", 6)]
+
+
+def __test_an_attach_without_a_verdict_is_settled_from_the_venue_and_unparked__(tmp_path):
+    """A parked one-way attach is confirmed by reading the leg, and a newer modify waits for it."""
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 2.0)]
+        engine, _pos = _mk_engine(b, store_ctx=ctx)
+        ex = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=2.0, tp_price=120.0, sl_price=90.0)
+        b.fail_amend_unknown_count = 1
+        engine._dispatch_new(ex)
+        assert len(engine.pending_verification) == 1  # parked, fate unknown
+        engine._active_intents[ex.intent_key] = ex
+        # The venue applied the write although no answer came back.
+        b.leg_brackets["1"] = (120.0, 90.0, None)
+        # A different stop must not go out while that write is unsettled.
+        newer = ExitIntent(pine_id="X", from_entry="L", symbol=SYMBOL, side="sell",
+                           qty=2.0, tp_price=120.0, sl_price=95.0)
+        engine._dispatch_modify(ex, newer)
+        assert b.amend_calls == [("1", 120.0, 90.0)]
+
+        engine._settle_one_way_leg_writes(b)
+        # Settled as landed; the leg is brought to the levels asked for now,
+        # and the parked dispatches of the exit are retired.
+        assert b.amend_calls == [("1", 120.0, 90.0), ("1", 120.0, 95.0)]
+        assert engine.pending_verification == {}
+        assert engine.order_mapping[ex.intent_key] == ["bracket:1"]
+
+
+def __test_a_direct_exit_modify_waits_for_an_earlier_one_without_a_verdict__(monkeypatch):
+    """Off the emulator too, a modify of unknown outcome holds the next modify of the exit.
+
+    The earlier request may still reach the venue; sent after it, the newer
+    levels would be replaced by the older ones when it lands.
+    """
+    from pynecore.core.broker import sync_engine as sync_engine_module
+    clock = [1000.0]
+    monkeypatch.setattr(sync_engine_module.time, "monotonic", lambda: clock[0])
+    b = MockBroker()
+    engine, pos = _mk_engine_with_sink(b, [])
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    pos.exit_orders[("TP", "L")] = _exit_order("L", -1.0, "TP", limit=120.0, stop=90.0)
+    engine.sync(BAR_TS)
+    assert len(b.exit_calls) == 1
+
+    pos.exit_orders[("TP", "L")] = _exit_order("L", -1.0, "TP", limit=120.0, stop=92.0)
+    b.raise_on_next_modify_exit = OrderDispositionUnknownError(
+        "amend timed out", client_order_id="parked-amend")
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.modify_exit_calls) == 1 and "parked-amend" in engine.pending_verification
+
+    # A newer stop while the first modify has no verdict: nothing is sent.
+    pos.exit_orders[("TP", "L")] = _exit_order("L", -1.0, "TP", limit=120.0, stop=95.0)
+    clock[0] += 5.0
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.modify_exit_calls) == 1
+
+    # Once the window has passed the earlier write can no longer land late.
+    clock[0] += sync_engine_module.UNSETTLED_WRITE_WINDOW_S
+    engine.sync(BAR_TS + 180_000)
+    assert len(b.modify_exit_calls) == 2
+    assert b.modify_exit_calls[1][1].intent.sl_price == 95.0
+
+
+
+def __test_a_partial_close_on_a_whole_leg_only_venue_closes_the_whole_leg__():
+    """Where a leg cannot be reduced, a close of a part of it closes it whole.
+
+    The script asks to close 1 of a 3-unit leg. The venue only closes whole
+    legs, so 3 go out; the fill of 3 flattens the book and the run goes on.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long(b, engine, pos, qty=3.0)
+    b.position_port = b
+    b.supports_partial_leg_close = False
+    b.raw_legs = [_pleg("1", "buy", 3.0, open_time=1.0)]
+
+    engine._dispatch_new(CloseIntent(pine_id="L", symbol=SYMBOL, side="sell", qty=1.0))
+    assert b.close_leg_calls == [("1", 3)]
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 3.0, 50_100.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="venue-close-1"),
+        pine_id=None, from_entry="L",
+    ))
+    assert pos.size == 0.0
+    assert engine.halted is False
+
+
+def __test_a_partial_exit_trigger_on_a_whole_leg_only_venue_closes_the_whole_leg__():
+    """A fired partial ``strategy.exit`` closes its whole leg where a leg cannot be reduced.
+
+    The exit covers 1 of a 3-unit leg. Its stop fires; the venue only closes
+    whole legs, so 3 go out. The fill of 3 flattens the book, the leg of the
+    partial bracket is retired with its parent and the run goes on.
+    """
+    from pynecore.core.broker.software_partial_bracket_engine import PartialBracketLeg
+    from pynecore.core.broker.store_helpers import (
+        LEG_KIND_SL_PARTIAL, LEG_STATE_TRIGGERING,
+    )
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    _open_long(b, engine, pos, qty=3.0)
+    b.position_port = b
+    b.supports_partial_leg_close = False
+    b.raw_legs = [_pleg("1", "buy", 3.0, open_time=1.0)]
+    leg = PartialBracketLeg(
+        coid='leg-sl', symbol=SYMBOL, pine_id='X1', from_entry='L',
+        leg_kind=LEG_KIND_SL_PARTIAL, leg_state=LEG_STATE_TRIGGERING,
+        side='sell', qty=1.0, intent_key="X1\0L", parent_pine_entry_id='L',
+        parent_entry_dispatch_ref='parent-coid', intent_partial_qty=1.0,
+        trigger_level=49_900.0, oca_group=None, oca_type=None,
+    )
+    pbe = engine._partial_bracket_engine  # type: ignore[attr-defined]
+    pbe._legs[leg.key] = leg
+    pbe._legs_by_parent.setdefault((leg.symbol, leg.from_entry), set()).add(leg.key)
+
+    engine._dispatch_partial_bracket_close(leg)  # type: ignore[attr-defined]
+    assert b.close_leg_calls == [("1", 3)]
+    assert not engine.halted
+
+    b.raw_legs = []
+    b.position = None
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 3.0, 49_900.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="venue-close-1", fill_id="pt-1"),
+        pine_id=None, from_entry="__pyne_partial_trigger__X1\0L\0sl_partial",
+    ))
+    assert pos.size == 0.0
+    assert pos.open_trades == []
+    engine.sync(BAR_TS + 60_000, last_price=49_900.0)
+    assert not engine.halted
+    assert list(pbe.iter_legs()) == []
+
+
+def __test_one_way_replay_settles_unsettled_leg_writes_before_it_runs__():
+    """A replay held by an unsettled leg write can progress: the settlement runs first.
+
+    The settle pass of a sync sits after the replay, so a replay that ended
+    unknown and then wanted a different write on that leg bailed every sync
+    before the one pass that could release the leg.
+    """
+    b = MockBroker()
+    b.position_port = b
+    engine, _pos = _mk_engine(b)
+    calls: list[str] = []
+    emulator = engine._one_way_emulator
+
+    async def _settle(symbol, port, now):
+        calls.append('settle')
+        return LegSettleResult()
+
+    async def _replay(port):
+        calls.append('replay')
+        if calls.count('replay') == 1:
+            raise OrderDispositionUnknownError("replayed amend timed out", client_order_id="c")
+        return True
+
+    emulator.needs_settling = lambda: True
+    emulator.settle_leg_writes = _settle
+    emulator.restart_replay = _replay
+    engine.sync(BAR_TS)
+    assert calls[:2] == ['settle', 'replay']
+    assert engine._one_way_replay_done is False
+    engine.sync(BAR_TS + 60_000)
+    assert calls[2:4] == ['settle', 'replay']
+    assert engine._one_way_replay_done is True
+
+
+def __test_a_storage_failure_ends_the_sync_and_retries_it__():
+    """A raw storage error of a dispatch ends the sync without stopping the run."""
+    import sqlite3
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    b.raise_on_next_entry = sqlite3.OperationalError("disk I/O error")
+
+    engine.sync(BAR_TS)
+
+    assert len(b.entry_calls) == 1
+    assert not engine.halted
+    # Nothing uncommitted is kept: the entry is not taken for live.
+    assert "L" not in engine.active_intents
+    assert "L" not in engine.order_mapping
+    # The next sync re-dispatches it.
+    engine.sync(BAR_TS)
+    assert len(b.entry_calls) == 2
+    assert engine.active_intents.keys() == {"L"}
+
+
+def __test_a_persistent_storage_failure_quarantines_after_the_bounded_retry__():
+    """A store that keeps failing quarantines the bot after the bounded retry; it never exits."""
+    import sqlite3
+    from pynecore.core.broker.models import QuarantineKind
+    from pynecore.core.broker.sync_engine import STORAGE_FAILURE_HALT_SYNCS
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    for _ in range(STORAGE_FAILURE_HALT_SYNCS - 1):
+        b.raise_on_next_entry = sqlite3.OperationalError("database or disk is full")
+        engine.sync(BAR_TS)
+        assert not engine.quarantined
+    b.raise_on_next_entry = sqlite3.OperationalError("database or disk is full")
+    engine.sync(BAR_TS)
+    assert engine.quarantined
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert not engine.halted
+    # Alive but opening nothing: the next sync runs and sends no entry.
+    calls = len(b.entry_calls)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == calls
+    assert not engine.halted
+
+
+def __test_a_clean_sync_resets_the_storage_failure_count__():
+    """Only consecutive failed syncs count toward the halt."""
+    import sqlite3
+    from pynecore.core.broker.sync_engine import STORAGE_FAILURE_HALT_SYNCS
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    for _ in range(STORAGE_FAILURE_HALT_SYNCS - 1):
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        b.raise_on_next_entry = sqlite3.OperationalError("disk I/O error")
+        engine.sync(BAR_TS)
+    engine.sync(BAR_TS)
+    assert engine.active_intents.keys() == {"L"}
+    pos.entry_orders["S"] = _entry_order("S", 1.0, limit=50_000.0)
+    b.raise_on_next_entry = sqlite3.OperationalError("disk I/O error")
+    engine.sync(BAR_TS)
+    assert not engine.halted
+
+
+# === Storage fault injection over a multi-bar scenario ===================
+
+
+class _ProcessCrash(BaseException):
+    """The process dies at an injected write: no ``except Exception`` handler sees it."""
+
+
+class _FaultyConnection:
+    """A store connection whose ``fail_at``-th armed write statement fails once.
+
+    With ``crash`` set the failing write kills the process instead
+    (:class:`_ProcessCrash`), and the uncommitted transaction is lost.
+    """
+
+    _WRITES = ('INSERT', 'UPDATE', 'DELETE', 'REPLAC')
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+        self.armed = False
+        self.writes = 0
+        self.fail_at: int | None = None
+        self.failed_sql: str | None = None
+        self.crash = False
+
+    def _count(self, sql: str) -> None:
+        if not self.armed or sql.lstrip()[:6].upper() not in self._WRITES:
+            return
+        index = self.writes
+        self.writes += 1
+        if index == self.fail_at:
+            import sqlite3
+            self.failed_sql = sql
+            if self.crash:
+                raise _ProcessCrash(sql)
+            raise sqlite3.OperationalError("disk I/O error (injected)")
+
+    def execute(self, sql, *args):
+        self._count(sql)
+        return self._conn.execute(sql, *args)
+
+    def executemany(self, sql, *args):
+        self._count(sql)
+        return self._conn.executemany(sql, *args)
+
+    def __enter__(self):
+        return self._conn.__enter__()
+
+    def __exit__(self, *exc):
+        return self._conn.__exit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+@dataclass
+class _JournalingHedgeBroker(MockBroker):
+    """A hedging venue that journals its legs the way a plugin does.
+
+    The plugin-side rows are written unarmed (the fault injection covers the
+    Core's writes), so a restart adopts the position from the journal.
+    """
+    faulty: Any = None
+    store_ctx: Any = None
+    port_writes: list[tuple] = field(default_factory=list)
+
+    def _unarmed(self, write) -> None:
+        armed, self.faulty.armed = self.faulty.armed, False
+        try:
+            write()
+        finally:
+            self.faulty.armed = armed
+
+    async def place_leg(self, envelope, qty):
+        coid = envelope.client_order_id('e')
+        self.port_writes.append(('place', coid, qty))
+        intent = envelope.intent
+        self._unarmed(lambda: self.store_ctx.upsert_order(
+            coid, symbol=SYMBOL, side=intent.side, qty=qty, state='confirmed',
+            intent_key=intent.intent_key, pine_entry_id=intent.pine_id,
+            exchange_order_id=f"xchg-{coid[-6:]}", filled_qty=0.0,
+            extras={'kind': 'position'},
+        ))
+        return await super().place_leg(envelope, qty)
+
+    async def close_leg(self, symbol, leg_id, volume, coid):
+        self.port_writes.append(('close', coid, leg_id, volume))
+        await super().close_leg(symbol, leg_id, volume, coid)
+
+    async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
+                            trail_offset, qty, coid):
+        self.port_writes.append(('amend', leg_id, tp_price, sl_price, qty))
+        await super().amend_bracket(symbol, leg_id, side=side, tp_price=tp_price,
+                                    sl_price=sl_price, trail_offset=trail_offset,
+                                    qty=qty, coid=coid)
+
+    async def execute_cancel(self, envelope):
+        self.port_writes.append(('cancel', envelope.intent.intent_key))
+
+        def close_rows() -> None:
+            for row in list(self.store_ctx.iter_live_orders()):
+                if (row.intent_key == envelope.intent.intent_key
+                        and row.filled_qty == 0.0
+                        and (row.extras or {}).get('kind') == 'position'):
+                    self.store_ctx.close_order(row.client_order_id)
+        self._unarmed(close_rows)
+        return await super().execute_cancel(envelope)
+
+    def journal_fill(self, pine_id: str, filled: float) -> None:
+        """Journal an entry row's fill (``filled`` units, 0 closes the row)."""
+        def write() -> None:
+            row = next(row for row in self.store_ctx.iter_live_orders()
+                       if row.pine_entry_id == pine_id and row.from_entry is None
+                       and (row.extras or {}).get('kind') == 'position')
+            self.store_ctx.upsert_order(row.client_order_id, qty=max(filled, row.qty)
+                                        if row.filled_qty < filled else filled,
+                                        filled_qty=filled)
+            if filled == 0.0:
+                self.store_ctx.close_order(row.client_order_id)
+        self._unarmed(write)
+
+
+def _hedge_venue(b: MockBroker, legs: list[PositionLeg]) -> None:
+    b.raw_legs = legs
+    net = sum(leg.qty if leg.side == 'buy' else -leg.qty for leg in legs)
+    b.position = None if net == 0.0 else ExchangePosition(
+        symbol=SYMBOL, side='long' if net > 0 else 'short', size=abs(net),
+        entry_price=100.0, unrealized_pnl=0.0, liquidation_price=None,
+        leverage=1.0, margin_mode='cross',
+    )
+
+
+def _journal_view(ctx) -> dict:
+    """The run's journal, without timestamps.
+
+    Of the binding books only the newest is compared: trimming the older ones
+    is a cleanup the next book write repeats
+    (:meth:`~pynecore.core.broker.storage.RunContext.delete_superseded_events`),
+    so a failed trim leaves one more superseded book, which nothing reads.
+    """
+    from pynecore.core.broker.storage import ENTRY_BOOK_EVENT_KIND
+    conn = ctx._store._conn
+    orders = sorted(
+        (row['client_order_id'], row['state'], row['qty'], row['filled_qty'],
+         row['closed_ts_ms'] is not None)
+        for row in conn.execute(
+            "SELECT * FROM orders WHERE run_instance_id IN "
+            "(SELECT run_instance_id FROM runs WHERE run_id = ?)", (ctx.run_id,))
+    )
+    events = sorted(
+        (row['kind'], row['client_order_id'] or '')
+        for row in conn.execute(
+            "SELECT kind, client_order_id FROM events WHERE kind != ? AND run_instance_id IN "
+            "(SELECT run_instance_id FROM runs WHERE run_id = ?)",
+            (ENTRY_BOOK_EVENT_KIND, ctx.run_id))
+    )
+    envelopes, pending = ctx.replay()
+    latest = ctx.latest_event_for_run_id((ENTRY_BOOK_EVENT_KIND,))
+    book = None if latest is None else {
+        key: value for key, value in latest[1].items() if key != 'written_ms'}
+    return {'orders': orders, 'events': events, 'book': book,
+            'envelopes': sorted(envelopes), 'pending': sorted(pending)}
+
+
+def _run_storage_fault_scenario(tmp_path, fail_at: int | None) -> dict:
+    """Entry + bracket, amend, partial close, hedge reversal, cancel, restart.
+
+    Every ``sync`` / ``settle_restart_state`` / event hand-over runs with the
+    store armed; the ``fail_at``-th write statement among them fails once.
+    Each bar syncs three times on the same bar timestamp, the cadence of a
+    live run within one bar, so a write that failed lands on the same bar
+    and the run stays comparable to the fault-free one.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.lib.strategy import _exit_order_key
+    out: dict = {'raised': []}
+    with BrokerStore(tmp_path / f"fi-{fail_at}.sqlite", plugin_name="testbroker") as store:
+        faulty = _FaultyConnection(store._conn)
+        store._conn = faulty  # type: ignore[assignment]
+        faulty.fail_at = fail_at
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = _JournalingHedgeBroker(faulty=faulty, store_ctx=ctx)
+        b.position_port = b
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        ts = BAR_TS
+
+        def call(fn, *args) -> None:
+            faulty.armed = True
+            try:
+                fn(*args)
+            except Exception as exc:
+                out['raised'].append(f"{type(exc).__name__}: {exc}")
+            finally:
+                faulty.armed = False
+
+        def bar() -> None:
+            nonlocal ts
+            ts += 60_000
+            for _ in range(3):
+                call(engine.sync, ts)
+
+        def fill(side, qty, *, pine_id, fill_id, leg=LegType.ENTRY) -> None:
+            event = replace(_fill_event(side, qty, 100.0, pine_id=pine_id, leg=leg,
+                                        xchg_id=f"x-{fill_id}", fill_id=fill_id),
+                            journal_fill_qty=qty)
+            call(engine.on_order_event, event)
+            bar()
+
+        # 1. A MARKET entry with a stop exit; its fill attaches the bracket.
+        pos.entry_orders["L"] = _entry_order("L", 2.0)
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", -2.0, "L-X", stop=90.0)
+        bar()
+        _hedge_venue(b, [_pleg("7", "buy", 2.0, open_time=1.0)])
+        b.journal_fill("L", 2.0)
+        fill('buy', 2.0, pine_id="L", fill_id="f-L")
+        # 2. The stop is amended.
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", -2.0, "L-X", stop=95.0)
+        bar()
+        # 3. Half the position is closed.
+        close = Order("L", -1.0, order_type=_order_type_close,
+                      exit_id="Close entry(s) order L")
+        pos.exit_orders[_exit_order_key(close)] = close
+        bar()
+        _hedge_venue(b, [_pleg("7", "buy", 1.0, open_time=1.0)])
+        b.journal_fill("L", 1.0)
+        fill('sell', 1.0, pine_id="L", fill_id="f-C", leg=LegType.CLOSE)
+        # 4. A MARKET short reverses the rest: the leg closes, then S opens.
+        pos.exit_orders.pop(("L-X", "L"), None)
+        pos.entry_orders.pop("L", None)
+        pos.entry_orders["S"] = _entry_order("S", -1.0)
+        bar()
+        marker = engine._pending_reversal_opens.get("S")  # type: ignore[attr-defined]
+        assert marker is not None or fail_at is not None
+        if marker is not None:
+            _hedge_venue(b, [])
+            b.journal_fill("L", 0.0)
+            fill('sell', 1.0, pine_id=marker.close_pine_id, fill_id="f-R",
+                 leg=LegType.CLOSE)
+        _hedge_venue(b, [_pleg("8", "sell", 1.0, open_time=2.0)])
+        if any(row.pine_entry_id == "S" for row in ctx.iter_live_orders()):
+            b.journal_fill("S", 1.0)
+        fill('sell', 1.0, pine_id="S", fill_id="f-S")
+        # 5. A resting entry, then its cancel.
+        pos.entry_orders["P"] = _entry_order("P", -1.0, limit=110.0)
+        bar()
+        pos.entry_orders.pop("P")
+        bar()
+        out['first'] = {
+            'size': pos.size, 'avg': pos.avg_price, 'netprofit': pos.netprofit,
+            'closed': [(t.entry_id, t.size, t.exit_price) for t in pos.closed_trades],
+            'open': [(t.entry_id, t.size) for t in pos.open_trades],
+            'owed': list(engine._owed_store_writes),  # type: ignore[attr-defined]
+            'journal': _journal_view(ctx),
+        }
+        # 6. Restart: a new process of the run adopts the short.
+        ctx.close()
+        ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b.store_ctx = ctx2
+        engine2, pos2 = _mk_engine(b, store_ctx=ctx2)
+        engine2.reconcile()
+        ts += 60_000
+        call(engine2.settle_restart_state, ts)
+        engine = engine2
+        for _ in range(2):
+            bar()
+        out['second'] = {
+            'size': pos2.size, 'open': [(t.entry_id, t.size) for t in pos2.open_trades],
+            'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
+            'halted': engine2.halted, 'quarantined': engine2.quarantined,
+            'journal': _journal_view(ctx2),
+        }
+        out['port_writes'] = list(b.port_writes)
+        out['writes'] = faulty.writes
+        out['failed_sql'] = faulty.failed_sql
+        ctx2.close()
+    return out
+
+
+def _storage_fault_hedging(tmp_path, fail_at: int | None) -> dict:
+    """The hedging scenario's run, in the shape the fault matrix compares."""
+    run = _run_storage_fault_scenario(tmp_path, fail_at)
+    run['compared'] = {'first': run['first'], 'second': run['second']}
+    run['sends'] = [write[1] for write in run['port_writes'] if write[0] in ('place', 'close')]
+    run['venue_writes'] = run['port_writes']
+    return run
+
+
+def _storage_fault_partial_bracket(
+        tmp_path, fail_at: int | None, *, close_journal: str = 'row') -> dict:
+    """The partial-bracket scenario's run, in the shape the fault matrix compares."""
+    run = _run_partial_bracket_fault_scenario(tmp_path, fail_at, close_journal=close_journal)
+    run['compared'] = {key: run[key] for key in (
+        'pending', 'armed', 'trailed', 'triggered', 'first', 'second')}
+    run['sends'] = run['calls']['entry'] + run['calls']['close_coids']
+    run['venue_writes'] = [(kind, value) for kind, values in sorted(run['calls'].items())
+                           if kind != 'close_coids' for value in values]
+    return run
+
+
+def _storage_fault_partial_bracket_unsent_close(tmp_path, fail_at: int | None) -> dict:
+    """The partial-bracket run whose first TP close the plugin's journal failed to record."""
+    return _storage_fault_partial_bracket(tmp_path, fail_at, close_journal='journal_fail')
+
+
+@pytest.mark.parametrize('scenario,writes', [
+    (_storage_fault_hedging, 63),
+    (_storage_fault_partial_bracket, 69),
+    (_storage_fault_partial_bracket_unsent_close, 66),
+], ids=['hedging', 'partial_bracket', 'partial_bracket_unsent_close'])
+def __test_every_single_store_write_failure_keeps_the_storage_contract__(
+        tmp_path, scenario, writes):
+    """Each write of a whole scenario fails once in turn; the run ends as without faults.
+
+    Two scenarios: a hedging run (:func:`_run_storage_fault_scenario`: entry
+    and bracket, amend, partial close, reversal, cancel, restart) and a
+    software partial-bracket run (:func:`_run_partial_bracket_fault_scenario`:
+    pending legs, promotion, trail, trigger and OCA cascade, a cancel-tentative
+    resolution, restart). Each is run fault-free, then once per write
+    statement the Core makes in it (the restart's included), that one write
+    failing. Every run keeps the storage failure contract: nothing raises out
+    of ``sync`` / ``settle_restart_state`` / the event hand-over, nothing is
+    sent twice, every fill is booked once, and the books, the legs, the
+    journal and the venue writes end as in the fault-free run with no owed
+    write left. The venue writes are compared as a multiset: a park the
+    failure caused can reorder two writes of one sync.
+    """
+    import collections
+    base = scenario(tmp_path, None)
+    assert base['raised'] == []
+    assert len(base['sends']) == len(set(base['sends'])), "a send went out twice"
+    assert base['first']['owed'] == [] and base['second']['owed'] == []
+    if scenario is _storage_fault_hedging:
+        assert base['first']['size'] == -1.0 and base['second']['size'] == -1.0
+    total = base['writes']
+    assert total == writes
+    for index in range(total):
+        run = scenario(tmp_path, index)
+        where = f"write #{index} ({(run['failed_sql'] or '').split('(')[0].strip()})"
+        assert run['failed_sql'] is not None, where
+        assert run['raised'] == [], where
+        assert len(run['sends']) == len(set(run['sends'])), f"{where}: a send went out twice"
+        assert (collections.Counter(run['venue_writes'])
+                == collections.Counter(base['venue_writes'])), where
+        for key, value in base['compared'].items():
+            assert run['compared'][key] == value, f"{where}: {key}"
+
+
+@pytest.mark.parametrize('crash_at', range(71))
+def __test_a_crash_at_any_partial_bracket_store_write_restarts_to_a_settled_end__(
+        tmp_path, crash_at):
+    """The process dies at each write of the partial-bracket scenario in turn.
+
+    The ``crash_at``-th write kills the process
+    (:func:`_run_partial_bracket_fault_scenario` with ``crash``): its open
+    transaction is lost and the next process restarts from the journal and
+    the venue (the position the first process opened, its fill replayed).
+    Whatever was in flight, the restart sends no exit's close twice (neither
+    again under its client order id nor as a second close under a new one),
+    settles a leg whose close the venue took from the plugin's journal row of
+    that close, leaves no leg half-way (``triggering``, ``triggered_*``,
+    ``cancel_tentative``) or differing from its row, owes no write and keeps
+    the run going.
+    """
+    from pynecore.core.broker.store_helpers import (
+        LEG_STATE_CANCEL_TENTATIVE, LEG_STATE_TRIGGERED_FAILED, LEG_STATE_TRIGGERED_UNKNOWN,
+    )
+    base = _run_partial_bracket_fault_scenario(tmp_path, None, crash=True)
+    assert base['writes'] == 71 and not base['crashed']
+    run = _run_partial_bracket_fault_scenario(tmp_path, crash_at, crash=True)
+    assert run['crashed'] and run['raised'] == []
+    closed_exits = collections.Counter(
+        pine_id.split('__', 2)[2].split('\0')[0] for pine_id in run['accepted_closes'])
+    assert all(count == 1 for count in closed_exits.values()), closed_exits
+    close_coids = run['calls']['close_coids']
+    assert len(close_coids) == len(set(close_coids)), close_coids
+    second = run['second']
+    assert second['legs'] == second['leg_rows']
+    assert not [leg for leg in second['legs'] if leg[1] in (
+        _LEG_STATE_TRIGGERING, LEG_STATE_TRIGGERED_FAILED, LEG_STATE_TRIGGERED_UNKNOWN,
+        LEG_STATE_CANCEL_TENTATIVE)]
+    assert second['tentative'] == [] and second['owed'] == []
+    assert not second['halted'] and not second['quarantined']
+
+
+def _partial_bracket_view(engine) -> list[tuple]:
+    """The engine-trigger legs as memory holds them."""
+    return sorted(
+        (leg.coid, leg.leg_state, leg.qty, leg.trigger_level, leg.trail_activation_level)
+        for leg in engine._partial_bracket_engine.iter_legs()  # type: ignore[attr-defined]
+    )
+
+
+def _partial_bracket_rows(ctx) -> list[tuple]:
+    """The engine-trigger legs as the store holds them."""
+    from pynecore.core.broker.store_helpers import (
+        EXTRAS_KEY_LEG_STATE, EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL, EXTRAS_KEY_TRIGGER_LEVEL,
+        STATE_PARTIAL_BRACKET_LEG,
+    )
+    return sorted(
+        (row.client_order_id, (row.extras or {}).get(EXTRAS_KEY_LEG_STATE), row.qty,
+         (row.extras or {}).get(EXTRAS_KEY_TRIGGER_LEVEL),
+         (row.extras or {}).get(EXTRAS_KEY_TRAIL_ACTIVATION_LEVEL))
+        for row in ctx.iter_live_orders() if row.state == STATE_PARTIAL_BRACKET_LEG
+    )
+
+
+def _run_partial_bracket_fault_scenario(
+        tmp_path, fail_at: int | None, *, crash: bool = False,
+        crash_after_tp_close: bool = False, close_journal: str = 'row',
+        after_first_restart_bar: Callable[[Any], None] | None = None) -> dict:
+    """Partial brackets (pending, armed, trail, trigger, cascade), a cancel-tentative, restart.
+
+    With ``crash`` the ``fail_at``-th write kills the first process instead of
+    failing once: the run skips straight to the restart, which replays the
+    journal and drives the legs to their end (the TP and the trail cross).
+    ``crash_after_tp_close`` kills it at the first Core write after the venue
+    took the TP's close instead. ``close_journal`` is how the venue's plugin
+    journals a close: ``'row'`` a persist-first row with the venue's verdict
+    and the executed quantity (Bybit, Capital.com), ``'pending'`` such a row
+    whose verdict the dead process never wrote, ``'cancelled'`` a row the
+    venue acknowledged and then ended with nothing filled, ``'lost_ack'`` a
+    row whose first TP close executed while its answer was lost (the dispatch
+    raises an unknown disposition, the row stays ``disposition_unknown``),
+    ``'journal_fail'`` like ``'row'``, but the plugin's persist-first write of
+    the first TP close fails, so that close is never sent
+    (:class:`~pynecore.core.broker.exceptions.JournalWriteError`; the venue
+    refuses no close then),
+    ``'journal_fail_fanned'`` the same failure after a hedging fan-out sent
+    the close's first leg (its close-leg row is in the journal),
+    ``'event'`` no row but a ``close_dispatched`` event once the venue
+    acknowledged it (cTrader), ``'none'`` nothing.
+    ``after_first_restart_bar`` runs with the restarted run's store after its
+    first bar.
+    """
+    out: dict = {'raised': [], 'crashed': False, 'tp_ack_lost': False,
+                 'journal_failed': None}
+    restart_bars = crash or crash_after_tp_close or close_journal == 'lost_ack'
+    path = tmp_path / f"pb-{fail_at}-{crash}-{crash_after_tp_close}-{close_journal}.sqlite"
+    with BrokerStore(path, plugin_name="testbroker") as store:
+        faulty = _FaultyConnection(store._conn)
+        store._conn = faulty  # type: ignore[assignment]
+        faulty.fail_at = fail_at
+        faulty.crash = crash
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = _software_partial_native_exit_broker()
+        accepted_closes: list[str] = []
+        real_close = b.execute_close
+        journal = {'ctx': ctx}
+
+        def journal_close(write) -> None:
+            # The plugin's own rows are written unarmed: the fault injection
+            # covers the Core's writes.
+            armed, faulty.armed = faulty.armed, False
+            try:
+                write(journal['ctx'])
+            finally:
+                faulty.armed = armed
+
+        async def _close(envelope):
+            coid = envelope.client_order_id('c')
+            intent = envelope.intent
+            rows = close_journal in ('row', 'pending', 'cancelled', 'lost_ack', 'journal_fail')
+            if (close_journal in ('journal_fail', 'journal_fail_fanned')
+                    and '\0tp_partial' in intent.pine_id and out['journal_failed'] is None):
+                # The plugin's persist-first row does not commit: no venue call.
+                out['journal_failed'] = coid
+                if close_journal == 'journal_fail_fanned':
+                    # A fan-out's first leg went out before its next leg's row failed.
+                    journal_close(lambda c: c.upsert_order(
+                        f"{coid}:leg-1", symbol=SYMBOL, side=intent.side, qty=intent.qty,
+                        state=_STATE_CLOSE_LEG, intent_key=intent.intent_key,
+                        extras={_EXTRAS_KEY_CLOSE_PARENT_COID: coid}))
+                raise JournalWriteError(
+                    f"close {coid}", sqlite3.OperationalError("disk I/O error (injected)"))
+            if rows:
+                journal_close(lambda c: c.upsert_order(
+                    coid, symbol=SYMBOL, side=intent.side, qty=intent.qty,
+                    state='submitted', intent_key=intent.intent_key,
+                    extras={'kind': 'close'}))
+            try:
+                order = await real_close(envelope)
+            except ExchangeOrderRejectedError:
+                if rows:
+                    journal_close(lambda c: (c.set_order_state(coid, 'rejected'),
+                                             c.close_order(coid)))
+                raise
+            accepted_closes.append(envelope.intent.pine_id)
+            tp_close = '\0tp_partial' in intent.pine_id
+            if close_journal == 'lost_ack' and tp_close and not out['tp_ack_lost']:
+                # The venue took the close; its answer never came back.
+                out['tp_ack_lost'] = True
+                journal_close(lambda c: c.set_order_state(coid, 'disposition_unknown'))
+                raise OrderDispositionUnknownError("close answer lost", client_order_id=coid)
+            if crash_after_tp_close and tp_close and not out['crashed']:
+                faulty.fail_at = faulty.writes
+                faulty.crash = True
+                if close_journal == 'pending':
+                    return order
+            if close_journal in ('row', 'lost_ack', 'journal_fail'):
+                # The market close executed in full.
+                journal_close(lambda c: (c.upsert_order(coid, state='confirmed',
+                                                        exchange_order_id=order.id,
+                                                        filled_qty=intent.qty),
+                                         c.close_order(coid)))
+            elif close_journal == 'cancelled':
+                # Acknowledged, then ended by the venue with nothing filled.
+                journal_close(lambda c: (c.upsert_order(coid, state='confirmed',
+                                                        exchange_order_id=order.id),
+                                         c.close_order(coid)))
+            elif close_journal == 'event':
+                journal_close(lambda c: c.log_event(
+                    'close_dispatched', client_order_id=coid,
+                    exchange_order_id=order.id, intent_key=intent.intent_key))
+            return order
+
+        b.execute_close = _close  # type: ignore[method-assign]
+
+        def mk_engine(store_ctx) -> tuple[OrderSyncEngine, BrokerPosition]:
+            position = BrokerPosition()
+            return OrderSyncEngine(
+                broker=b, position=position,  # type: ignore[arg-type]
+                symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=store_ctx,
+                reconcile_every_n_syncs=1,
+            ), position
+
+        engine, pos = mk_engine(ctx)
+        ts = BAR_TS
+        cancel_outcomes: list = []
+
+        async def _cancel_with_outcome(_envelope):
+            # A settled cancel stays settled: its last outcome answers every retry.
+            return cancel_outcomes.pop(0) if len(cancel_outcomes) > 1 else cancel_outcomes[0]
+
+        b.execute_cancel_with_outcome = _cancel_with_outcome  # type: ignore[attr-defined]
+
+        def call(fn, *args, **kwargs) -> None:
+            faulty.armed = True
+            try:
+                fn(*args, **kwargs)
+            except Exception as exc:
+                out['raised'].append(f"{type(exc).__name__}: {exc}")
+            finally:
+                faulty.armed = False
+
+        def bar(price: float | None = None) -> None:
+            nonlocal ts
+            ts += 60_000
+            for _ in range(3):
+                call(engine.sync, ts, last_price=price)
+
+        def fill(side, qty, price, *, pine_id, fill_id, leg=LegType.ENTRY) -> None:
+            call(engine.on_order_event, _fill_event(
+                side, qty, price, pine_id=pine_id, leg=leg, xchg_id=f"x-{fill_id}",
+                fill_id=fill_id))
+            call(engine.apply_async_events)
+
+        def first_process() -> None:
+            # 1. A MARKET entry with a partial TP/SL exit and a partial trailing exit.
+            pos.entry_orders["L"] = _entry_order("L", 2.0)
+            pos.exit_orders[("X", "L")] = _exit_order("L", -0.5, "X", limit=120.0, stop=90.0)
+            pos.exit_orders[("T", "L")] = _exit_order(
+                "L", -0.5, "T", trail_price=105.0, trail_offset=3.0)
+            bar()
+            out['pending'] = (_partial_bracket_view(engine), _partial_bracket_rows(ctx))
+            # 2. Its fill arms the legs; the trail activates and moves.
+            fill('buy', 2.0, 100.0, pine_id="L", fill_id="f-L")
+            b.position = ExchangePosition(
+                symbol=SYMBOL, side='long', size=2.0, entry_price=100.0, unrealized_pnl=0.0,
+                liquidation_price=None, leverage=1.0, margin_mode='cross')
+            bar(101.0)
+            out['armed'] = (_partial_bracket_view(engine), _partial_bracket_rows(ctx))
+            bar(106.0)
+            bar(110.0)
+            out['trailed'] = (_partial_bracket_view(engine), _partial_bracket_rows(ctx))
+            # 3. The TP crosses: the venue refuses the first close (or, with a
+            # failing plugin journal, the first close is never sent), the leg
+            # re-arms and the next sync sends it; the SL sibling cascades.
+            if close_journal not in ('journal_fail', 'journal_fail_fanned'):
+                b.raise_on_next_close = ExchangeOrderRejectedError("below the minimum size")
+            bar(121.0)
+            out['triggered'] = (_partial_bracket_view(engine), _partial_bracket_rows(ctx))
+            out['close_calls'] = [e.intent.qty for e in b.close_calls]
+            # 4. A resting entry with a partial exit; its cancel times out, then resolves.
+            pos.entry_orders["P"] = _entry_order("P", 1.0, limit=80.0)
+            pos.exit_orders[("PX", "P")] = _exit_order("P", -0.4, "PX", limit=95.0, stop=70.0)
+            bar(121.0)
+            b.raise_on_next_cancel = OrderDispositionUnknownError(
+                "cancel timed out", client_order_id="xchg-P")
+            cancel_outcomes.append(CancelDispositionOutcome.CANCEL_CONFIRMED)
+            pos.entry_orders.pop("P")
+            pos.exit_orders.pop(("PX", "P"))
+            bar(121.0)
+            bar(121.0)
+            out['first'] = {
+                'size': pos.size, 'legs': _partial_bracket_view(engine),
+                'leg_rows': _partial_bracket_rows(ctx),
+                'tentative': sorted(engine._cancel_disposition_pending),  # type: ignore[attr-defined]
+                'owed': list(engine._owed_store_writes),  # type: ignore[attr-defined]
+                'journal': _journal_view(ctx),
+            }
+
+        def crashed(dead_ctx) -> None:
+            # The dead process commits nothing more: its open transaction is
+            # lost and it never closes its run.
+            out['crashed'] = True
+            faulty.crash = False
+            if faulty._conn.in_transaction:
+                faulty._conn.rollback()
+            store._txn_depth = 0  # type: ignore[attr-defined]
+            if dead_ctx._owner_lock is not None:
+                store._release_owner_lock(dead_ctx._owner_lock)  # type: ignore[attr-defined]
+            b.raise_on_next_close = None
+            b.raise_on_next_cancel = None
+
+        try:
+            first_process()
+            ctx.close()
+        except _ProcessCrash:
+            crashed(ctx)
+        # 5. Restart: the new process replays the legs. With ``crash`` the
+        # restart itself may die too; the process after it takes over.
+        while True:
+            ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+            journal['ctx'] = ctx2
+            engine2, _ = mk_engine(ctx2)
+            engine = engine2
+            try:
+                engine2.reconcile()
+                ts += 60_000
+                call(engine2.settle_restart_state, ts)
+                if (restart_bars
+                        and any(e.intent.pine_id == "L" for e in b.entry_calls)):
+                    # The venue holds the position the first process opened,
+                    # and its fill feed replays the entry's fill.
+                    b.position = ExchangePosition(
+                        symbol=SYMBOL, side='long', size=2.0, entry_price=100.0,
+                        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+                        margin_mode='cross')
+                    fill('buy', 2.0, 100.0, pine_id="L", fill_id="f-L")
+                if restart_bars:
+                    bar(121.0)
+                    out['held'] = {
+                        'legs': _partial_bracket_view(engine2),
+                        'close_coids': [e.client_order_id('c') for e in b.close_calls],
+                        'quarantined': engine2.quarantined,
+                    }
+                    if after_first_restart_bar is not None:
+                        after_first_restart_bar(ctx2)
+                    bar(121.0)
+                bar(110.0)
+                if restart_bars:
+                    bar(110.0)
+                break
+            except _ProcessCrash:
+                crashed(ctx2)
+        out['second'] = {
+            'legs': _partial_bracket_view(engine2),
+            'leg_rows': _partial_bracket_rows(ctx2),
+            'tentative': sorted(engine2._cancel_disposition_pending),  # type: ignore[attr-defined]
+            'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
+            'halted': engine2.halted, 'quarantined': engine2.quarantined,
+            'journal': _journal_view(ctx2),
+        }
+        out['calls'] = {
+            'entry': [e.client_order_id('e') for e in b.entry_calls],
+            'close': [e.intent.qty for e in b.close_calls],
+            'close_coids': [e.client_order_id('c') for e in b.close_calls],
+            'cancel': [e.intent.intent_key for e in b.cancel_calls],
+        }
+        out['accepted_closes'] = accepted_closes
+        out['close_sends'] = [(e.intent.pine_id, e.client_order_id('c')) for e in b.close_calls]
+        out['writes'] = faulty.writes
+        out['failed_sql'] = faulty.failed_sql
+        ctx2.close()
+    return out
+
+
+def _tp_close_coids(run: dict) -> list[str]:
+    """The client order ids of every TP close the run sent, in order."""
+    return [coid for pine_id, coid in run['close_sends'] if '\0tp_partial' in pine_id]
+
+
+def _held_partial_bracket_errors(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records
+            if record.levelname == 'ERROR' and 'held: its close' in record.getMessage()]
+
+
+def __test_a_restart_settles_a_partial_close_the_venue_executed_without_sending_it_again__(
+        tmp_path):
+    """The process dies right after the venue executed the TP's close.
+
+    The leg row is still ``triggering`` with the close's client order id. The
+    restart holds it, finds the venue's evidence that the close executed (the
+    plugin's row with its filled quantity) and settles the leg as the dead
+    process owed it: the
+    leg ends ``triggered``, its SL sibling cascades, and no second TP close
+    goes out, under its id or a new one. The trail of the other exit keeps
+    working, and nothing quarantines or halts.
+    """
+    run = _run_partial_bracket_fault_scenario(
+        tmp_path, None, crash_after_tp_close=True, close_journal='row')
+    assert run['crashed'] and run['raised'] == []
+    tp_closes = _tp_close_coids(run)
+    # The refused first send and the accepted re-send, both before the crash.
+    assert len(tp_closes) == len(set(tp_closes)) == 2
+    assert run['held']['close_coids'][-1] == tp_closes[-1]
+    # Settled on the restart's first bar: the TP and its SL sibling are gone.
+    assert [leg[1] for leg in run['held']['legs']] == ['armed']
+    assert not run['held']['quarantined']
+    closed = collections.Counter(pine_id.split('\0')[2] for pine_id in run['accepted_closes'])
+    assert closed == {'tp_partial': 1, 'trail_partial': 1}
+    second = run['second']
+    assert second['legs'] == second['leg_rows'] == []
+    assert second['owed'] == [] and not second['halted'] and not second['quarantined']
+
+
+@pytest.mark.parametrize('close_journal', ['none', 'event', 'cancelled'])
+def __test_a_restart_holds_a_partial_close_no_venue_record_can_settle__(
+        tmp_path, caplog, close_journal):
+    """No record shows whether a close executed; the process dies after the venue took it.
+
+    The plugin records nothing of the close, only the venue's acknowledgement
+    (``close_dispatched``), or a row the venue acknowledged and ended with
+    nothing filled: an acknowledged order can end unfilled, and a zero-fill
+    end looks like a fill not recorded. Nothing will ever say whether the
+    close executed, so it is never sent
+    again: the leg stays held in ``triggering`` with its row, its SL sibling
+    neither triggers nor cascades, the hold is reported once at ERROR with the
+    close's client order id, and the bot is quarantined (alive, new entries
+    blocked) without halting. The trail of the other exit keeps protecting
+    and closes on its own cross.
+    """
+    import logging
+    caplog.set_level(logging.WARNING)
+    run = _run_partial_bracket_fault_scenario(
+        tmp_path, None, crash_after_tp_close=True, close_journal=close_journal)
+    assert run['crashed'] and run['raised'] == []
+    tp_closes = _tp_close_coids(run)
+    assert len(tp_closes) == len(set(tp_closes)) == 2
+    second = run['second']
+    assert second['legs'] == second['leg_rows']
+    # The held TP and its SL sibling; the trail closed on its own cross.
+    assert sorted(leg[1] for leg in second['legs']) == ['armed', _LEG_STATE_TRIGGERING]
+    closed = collections.Counter(pine_id.split('\0')[2] for pine_id in run['accepted_closes'])
+    assert closed == {'tp_partial': 1, 'trail_partial': 1}
+    errors = _held_partial_bracket_errors(caplog)
+    assert len(errors) == 1 and tp_closes[-1] in errors[0]
+    assert second['quarantined'] and not second['halted'] and second['owed'] == []
+
+
+def __test_a_restart_holds_a_partial_close_until_the_plugin_journal_answers__(
+        tmp_path, caplog):
+    """The plugin's row of a close the dead process sent still waits for the venue.
+
+    The leg stays held while the row is ``submitted`` (the plugin's resolver
+    owns that answer): no second close, no quarantine, one ERROR report. Once
+    the row is resolved as refused, the leg re-arms and its next cross sends a
+    close under a fresh client order id, never the refused one.
+    """
+    import logging
+    caplog.set_level(logging.WARNING)
+
+    def refuse(ctx) -> None:
+        coid = next(row.client_order_id for row in ctx.iter_live_orders()
+                    if (row.extras or {}).get('kind') == 'close')
+        ctx.set_order_state(coid, 'rejected')
+        ctx.close_order(coid)
+
+    held_run = _run_partial_bracket_fault_scenario(
+        tmp_path / 'held', None, crash_after_tp_close=True, close_journal='pending')
+    assert held_run['crashed'] and held_run['raised'] == []
+    tp_closes = _tp_close_coids(held_run)
+    assert len(tp_closes) == len(set(tp_closes)) == 2
+    second = held_run['second']
+    assert second['legs'] == second['leg_rows']
+    assert [leg[1] for leg in second['legs']].count(_LEG_STATE_TRIGGERING) == 1
+    assert not second['quarantined'] and not second['halted']
+    errors = _held_partial_bracket_errors(caplog)
+    assert len(errors) == 1 and tp_closes[-1] in errors[0]
+
+    caplog.clear()
+    refused_run = _run_partial_bracket_fault_scenario(
+        tmp_path / 'refused', None, crash_after_tp_close=True, close_journal='pending',
+        after_first_restart_bar=refuse)
+    assert refused_run['raised'] == []
+    assert [leg[1] for leg in refused_run['held']['legs']].count(_LEG_STATE_TRIGGERING) == 1
+    tp_closes = _tp_close_coids(refused_run)
+    assert len(tp_closes) == len(set(tp_closes)) == 3
+    second = refused_run['second']
+    assert second['legs'] == second['leg_rows']
+    assert _LEG_STATE_TRIGGERING not in [leg[1] for leg in second['legs']]
+    assert not second['quarantined'] and not second['halted'] and second['owed'] == []
+
+
+def __test_a_partial_close_whose_answer_was_lost_is_held_in_process_and_across_a_restart__(
+        tmp_path, caplog):
+    """The venue executed the TP's close, but its answer was lost.
+
+    The dispatch parks with an unknown disposition and the plugin's row stays
+    ``disposition_unknown``. The leg is held on the close's client order id:
+    the TP keeps crossing on the later syncs of the same process and after a
+    restart, yet no second close goes out, under that id or a new one, and its
+    SL sibling neither triggers nor cascades. Once the plugin's journal shows
+    the close executed, the restarted run settles the leg (``triggered``, the
+    sibling cascaded) without a close and without quarantine.
+    """
+    import logging
+    caplog.set_level(logging.WARNING)
+
+    def executed(ctx) -> None:
+        coid = next(row.client_order_id for row in ctx.iter_live_orders()
+                    if (row.extras or {}).get('kind') == 'close')
+        ctx.upsert_order(coid, state='confirmed', filled_qty=0.5)
+        ctx.close_order(coid)
+
+    run = _run_partial_bracket_fault_scenario(
+        tmp_path, None, close_journal='lost_ack', after_first_restart_bar=executed)
+    assert run['tp_ack_lost'] and run['raised'] == []
+    tp_closes = _tp_close_coids(run)
+    # The refused first send and the send whose answer was lost.
+    assert len(tp_closes) == len(set(tp_closes)) == 2
+    assert run['first']['legs'] == run['first']['leg_rows']
+    assert [leg[1] for leg in run['first']['legs']].count(_LEG_STATE_TRIGGERING) == 1
+    assert [leg[1] for leg in run['held']['legs']].count(_LEG_STATE_TRIGGERING) == 1
+    assert not run['held']['quarantined']
+    # Reported once by each process that holds it.
+    errors = _held_partial_bracket_errors(caplog)
+    assert len(errors) == 2 and all(tp_closes[-1] in error for error in errors)
+    second = run['second']
+    assert second['legs'] == second['leg_rows']
+    assert _LEG_STATE_TRIGGERING not in [leg[1] for leg in second['legs']]
+    closed = collections.Counter(pine_id.split('\0')[2] for pine_id in run['accepted_closes'])
+    assert closed == {'tp_partial': 1, 'trail_partial': 1}
+    assert second['owed'] == [] and not second['halted'] and not second['quarantined']
+
+
+def __test_a_partial_close_the_plugin_journal_failed_to_record_re_arms_without_a_hold__(
+        tmp_path, caplog):
+    """The plugin's persist-first write of the TP's close fails before its venue call.
+
+    The Core recorded the close's client order id on the leg first, but the
+    plugin raised :class:`~pynecore.core.broker.exceptions.JournalWriteError`
+    and no row of the close exists, so nothing was sent. The leg is not held:
+    it re-arms, the next tick sends the close under the same unused id, and
+    the run ends as without the failure, with no hold reported and no
+    quarantine.
+    """
+    import logging
+    caplog.set_level(logging.WARNING)
+    base = _run_partial_bracket_fault_scenario(tmp_path / 'base', None)
+    run = _run_partial_bracket_fault_scenario(
+        tmp_path / 'failed', None, close_journal='journal_fail')
+    failed_coid = run['journal_failed']
+    assert failed_coid is not None
+    tp_closes = _tp_close_coids(run)
+    assert len(tp_closes) == len(set(tp_closes))
+    # The unsent id is the one the next send goes out under.
+    assert tp_closes[0] == failed_coid
+    assert _held_partial_bracket_errors(caplog) == []
+    closed = collections.Counter(pine_id.split('\0')[2] for pine_id in run['accepted_closes'])
+    assert closed == collections.Counter(
+        pine_id.split('\0')[2] for pine_id in base['accepted_closes'])
+    for key in ('first', 'second'):
+        assert run[key]['legs'] == run[key]['leg_rows'] == base[key]['legs'], key
+        assert run[key]['owed'] == [], key
+    assert not run['second']['quarantined'] and not run['second']['halted']
+
+
+def __test_a_partial_close_whose_fan_out_journal_failed_after_a_sent_leg_stays_held__(
+        tmp_path, caplog):
+    """The journal write fails after a hedging fan-out already sent a leg of the close.
+
+    The failure is a :class:`~pynecore.core.broker.exceptions.JournalWriteError`
+    too, but the journal holds the close-leg row of the leg that went out, so
+    the close may be on the venue: the leg is held on its client order id, no
+    second TP close goes out, the hold is reported once and the bot is
+    quarantined (alive) until the evidence or the operator settles it.
+    """
+    import logging
+    caplog.set_level(logging.WARNING)
+    run = _run_partial_bracket_fault_scenario(
+        tmp_path, None, close_journal='journal_fail_fanned')
+    failed_coid = run['journal_failed']
+    assert failed_coid is not None
+    assert failed_coid not in _tp_close_coids(run)
+    assert [pine_id for pine_id in run['accepted_closes'] if '\0tp_partial' in pine_id] == []
+    second = run['second']
+    assert second['legs'] == second['leg_rows']
+    assert [leg[1] for leg in second['legs']].count(_LEG_STATE_TRIGGERING) == 1
+    errors = _held_partial_bracket_errors(caplog)
+    assert len(errors) == 2 and all(failed_coid in error for error in errors)
+    assert second['quarantined'] and not second['halted'] and second['owed'] == []

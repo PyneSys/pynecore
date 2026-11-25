@@ -846,6 +846,7 @@ def _exit_fill(qty: float, *, leg_type: LegType = LegType.TAKE_PROFIT,
         ),
         event_type="filled", fill_price=51_000.0, fill_qty=qty, timestamp=0.0,
         pine_id="L-X", from_entry="L", leg_type=leg_type, fill_id=fill_id,
+        journal_fill_qty=qty,
     )
 
 
@@ -1916,7 +1917,7 @@ class _BracketPort:
         return lambda units: int(units * 100)
 
     async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
-                            trail_offset, coid) -> None:
+                            trail_offset, qty, coid) -> None:
         if self.refusals:
             raise self.refusals.pop(0)
         self.amended.append((leg_id, tp_price, sl_price))

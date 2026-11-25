@@ -12,6 +12,9 @@ leg's residual, finalising a vanished leg without re-closing it, and staying
 idempotent across repeated replays.
 """
 import asyncio
+import sqlite3
+from dataclasses import replace
+from collections.abc import Iterable, Iterator
 
 import pytest
 
@@ -20,12 +23,16 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
+    JournalWriteError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
-from pynecore.core.broker.idempotency import KIND_CANCEL, KIND_CLOSE, KIND_ENTRY_TRIGGERED
+from pynecore.core.broker.idempotency import (
+    KIND_CANCEL, KIND_CLOSE, KIND_ENTRY, KIND_ENTRY_TRIGGERED,
+)
 from pynecore.core.broker.models import (
     CancelIntent,
+    CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
     EntryIntent,
@@ -33,19 +40,26 @@ from pynecore.core.broker.models import (
     OrderType,
     PositionLeg,
 )
+import pynecore.core.broker.one_way_emulator as one_way_emulator_module
 from pynecore.core.broker.one_way_emulator import (
     BOOK_INCOMPLETE_GRACE_S,
+    UNSETTLED_WRITE_WINDOW_S,
     BracketFanResult,
     ClearFanResult,
     CloseFanResult,
+    LegSettleResult,
     OneWayEmulator,
+    close_leg_attempt_client_order_id,
+    close_leg_client_order_id,
+    close_leg_row_client_order_id,
 )
-from pynecore.core.broker.storage import BrokerStore, RunContext, RunIdentity
+from pynecore.core.broker.storage import BrokerStore, OrderRow, RunContext, RunIdentity
 from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING,
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    EXTRAS_KEY_BRACKET_OWN_SOFTWARE,
     EXTRAS_KEY_BRACKET_OWN_STATE,
     EXTRAS_KEY_BRACKET_OWN_TP,
     EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID,
@@ -101,7 +115,30 @@ class _FakePort:
         self.closed: list[tuple[str, str, int, str]] = []
         self.placed: list[tuple[str, float]] = []
         self.amended: list[tuple[str, str, float | None, float | None, float | None, str]] = []
+        # The protected quantity of every confirmed amend, in call order.
+        self.amended_qty: list[tuple[str, float]] = []
+        # What each leg holds at the venue: (tp, sl, trail, qty) of the last
+        # write that took effect. An amend of unknown outcome takes effect
+        # only when ``unknown_amends_land`` is set.
+        self.venue: dict[str, tuple[float | None, float | None, float | None, float]] = {}
+        self.unknown_amends_land = False
+        # When True, bracket_matches answers "cannot tell" (None), modelling a
+        # venue that does not report what tells the write from the leg's
+        # earlier protection (a trailing distance it does not return).
+        self.cannot_tell = False
+        self.match_calls = 0
         self.fetch_calls = 0
+        # What the venue records each close coid executed (broker grid), and
+        # whether it can answer at all: ``None`` models records that cannot
+        # settle a close yet (still working, or a read that came back short).
+        self.executed_by_coid: dict[str, int] = {}
+        self.executed_unknown = False
+        self.executed_queries: list[tuple[str, tuple[str, ...]]] = []
+        # When True, a close executes in full at once: the next read no longer
+        # lists the closed volume (a venue whose position view is current as
+        # soon as the close call returns). Off by default, so the legs stay
+        # listed exactly as a test set them.
+        self.closes_execute = False
 
     def set_legs(self, legs: list[PositionLeg]) -> None:
         self._legs = list(legs)
@@ -119,6 +156,24 @@ class _FakePort:
                 self._fail_close_leg_id is None or leg_id == self._fail_close_leg_id):
             raise self._fail_close_leg
         self.closed.append((symbol, leg_id, volume, coid))
+        if self.closes_execute:
+            left = []
+            for leg in self._legs:
+                if leg.leg_id == leg_id:
+                    remaining = leg.qty - volume / self.volume_scale
+                    if remaining <= 1e-12:
+                        continue
+                    leg = replace(leg, qty=remaining)
+                left.append(leg)
+            self._legs = left
+
+    async def close_leg_executed(
+            self, symbol: str, leg_id: str, coids, since_ms: int,
+    ) -> int | None:
+        self.executed_queries.append((leg_id, tuple(coids)))
+        if self.executed_unknown:
+            return None
+        return sum(self.executed_by_coid.get(coid, 0) for coid in coids)
 
     async def reject_out_of_range(self, envelope: DispatchEnvelope, qty: float) -> None:
         if qty < self._min_qty or (self._max_qty is not None and qty > self._max_qty):
@@ -137,23 +192,38 @@ class _FakePort:
     async def amend_bracket(
             self, symbol: str, leg_id: str, *,
             side: str, tp_price: float | None, sl_price: float | None,
-            trail_offset: float | None, coid: str,
+            trail_offset: float | None, qty: float, coid: str,
     ) -> None:
         if leg_id == self._fail_amend_leg:
             raise ExchangeOrderRejectedError(f"amend rejected for leg {leg_id}")
         if self.fail_amend_unknown or leg_id == self.fail_amend_unknown_leg:
+            if self.unknown_amends_land:
+                self.venue[leg_id] = (tp_price, sl_price, trail_offset, qty)
             raise OrderDispositionUnknownError(
                 f"amend disposition unknown for leg {leg_id}", client_order_id=coid,
             )
         self.amended.append((leg_id, side, tp_price, sl_price, trail_offset, coid))
+        self.amended_qty.append((leg_id, qty))
+        self.venue[leg_id] = (tp_price, sl_price, trail_offset, qty)
+
+    async def bracket_matches(
+            self, symbol: str, leg_id: str, *,
+            side: str, tp_price: float | None, sl_price: float | None,
+            trail_offset: float | None, qty: float,
+    ) -> bool | None:
+        self.match_calls += 1
+        if self.cannot_tell:
+            return None
+        return self.venue.get(leg_id, (None, None, None, qty)) == (
+            tp_price, sl_price, trail_offset, qty)
 
 
 def _leg(leg_id, side, qty, *, symbol="EURUSD", open_time=0.0, price=1.10,
-         entry_id=None) -> PositionLeg:
+         entry_id=None, venue_qty=None) -> PositionLeg:
     return PositionLeg(
         leg_id=leg_id, symbol=symbol, side=side, qty=qty,
         entry_price=price, open_time=open_time, unrealized_pnl=0.0,
-        entry_id=entry_id,
+        entry_id=entry_id, venue_qty=venue_qty,
     )
 
 
@@ -254,16 +324,33 @@ def __test_run_close_shortfall_surfaced_not_halted__():
     assert res.shortfall == 2.0 and res.skipped is False
 
 
-def __test_run_close_partial_leg_unsupported_skips_atomically__():
-    """A plan with a partial slice on a no-partial port skips BEFORE any dispatch."""
+def __test_run_close_partial_leg_unsupported_closes_the_whole_leg__(monkeypatch):
+    """A slice of a leg on a no-partial port closes that leg whole, with a warning."""
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        "pynecore.core.broker.one_way_emulator._blog_warning",
+        lambda msg, *args, **_kw: warnings.append(msg % args),
+    )
     port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
                       _leg("11", "buy", 2.0, open_time=1.0)])
     port.supports_partial_leg_close = False
     eng = OneWayEmulator(store_ctx=None)
-    with pytest.raises(OrderSkippedByPlugin) as exc:
-        _run(eng.run_close(_close_env("sell", 2.0), port))
-    assert exc.value.reason == "partial_leg_close_unsupported"
-    assert port.closed == []
+    res = _run(eng.run_close(_close_env("sell", 2.0), port))
+    assert _dispatched(port) == [("10", 3)]
+    assert res.dispatched_qty == 3.0 and res.skipped is False
+    assert len([w for w in warnings if "whole leg is closed" in w]) == 1
+
+
+def __test_run_close_past_a_whole_leg_widens_only_the_sliced_leg__():
+    """Whole legs of the plan stay as planned; only the sliced leg is widened."""
+    port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
+                      _leg("11", "buy", 2.0, open_time=1.0),
+                      _leg("12", "buy", 1.0, open_time=2.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=None)
+    res = _run(eng.run_close(_close_env("sell", 4.0), port))
+    assert _dispatched(port) == [("10", 3), ("11", 2)]
+    assert res.dispatched_qty == 5.0
 
 
 def __test_run_close_whole_legs_pass_without_partial_support__():
@@ -377,6 +464,44 @@ def _make_store(tmp_path) -> tuple[BrokerStore, RunContext]:
     return store, ctx
 
 
+class _Journal:
+    """Where an emulator keeps its bracket ownership: an on-disk store, or no store.
+
+    Without a store the emulator keeps the ownership rows in memory; the
+    in-session scenarios run in both modes and must behave the same.
+    """
+
+    def __init__(self, mode: str, tmp_path) -> None:
+        self.mode = mode
+        self._store: BrokerStore | None = None
+        self._ctx: RunContext | None = None
+        if mode == "store":
+            self._store, self._ctx = _make_store(tmp_path)
+        self._emulator: OneWayEmulator | None = None
+
+    def emulator(self, **kwargs) -> OneWayEmulator:
+        self._emulator = OneWayEmulator(store_ctx=self._ctx, **kwargs)
+        return self._emulator
+
+    def rows(self) -> list[OrderRow]:
+        """The live ownership rows: read from the store itself, or from the emulator."""
+        if self._ctx is not None:
+            return list(iter_active_bracket_ownerships(self._ctx))
+        assert self._emulator is not None
+        return list(self._emulator.iter_bracket_ownerships())
+
+    def close(self) -> None:
+        if self._store is not None:
+            self._store.close()
+
+
+@pytest.fixture(params=["store", "memory"])
+def journal(request, tmp_path) -> Iterator[_Journal]:
+    j = _Journal(request.param, tmp_path)
+    yield j
+    j.close()
+
+
 def __test_run_close_persists_and_finalises_leg_rows__(tmp_path):
     """``run_close`` persists each close-leg row and finalises them all on success."""
     store, ctx = _make_store(tmp_path)
@@ -390,7 +515,7 @@ def __test_run_close_persists_and_finalises_leg_rows__(tmp_path):
     store.close()
 
 
-def _pending_leg_row(ctx, *, leg_id, volume, qty):
+def _pending_leg_row(ctx, *, leg_id, volume, qty, pre_volume=None):
     create_close_leg_row(
         ctx,
         coid=f"t000-x-y-c:{leg_id}",
@@ -402,6 +527,7 @@ def _pending_leg_row(ctx, *, leg_id, volume, qty):
         parent_close_coid="t000-x-y-c",
         leg_id=leg_id,
         leg_volume=volume,
+        leg_pre_volume=volume if pre_volume is None else pre_volume,
     )
 
 
@@ -486,6 +612,524 @@ def __test_restart_replay_keeps_refused_close_leg_pending__(tmp_path):
     store.close()
 
 
+def __test_restart_replay_never_repeats_an_executed_partial_close__(tmp_path):
+    """A partial close that executed before the crash is not sent again.
+
+    Four of a ten-unit leg were closed, the venue executed them, and the
+    process died before the ack: the leg is six now. Capping the replay at the
+    live size would send four again and leave two; the replay reads the
+    executed part from the leg's recorded size and sends nothing.
+    """
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 6.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == []
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_restart_replay_trusts_the_venue_record_over_a_grown_leg__(tmp_path):
+    """A leg that grew after the close still counts the close the venue executed.
+
+    The four-unit close executed, and an add filled on the same venue position
+    (hedge-mode side positions grow): the leg went 10 -> 12 -> 8, so its size
+    shows only two units gone. The venue's record of the close's own id says
+    four executed, and nothing is re-sent.
+    """
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 8.0, open_time=0.0)])
+    port.executed_by_coid["t000-x-y-c:10"] = 4
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == []
+    assert port.executed_queries == [("10", ("t000-x-y-c:10",))]
+    store.close()
+
+
+def __test_restart_replay_sends_only_the_unexecuted_part_under_a_new_id__(tmp_path):
+    """A close the venue executed in part is completed under a fresh attempt id.
+
+    The id is recorded on the row before the send, so a second crash leaves a
+    replay that asks the venue about both sends before it sends anything.
+    """
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=12)
+    # One of the four executed, and an add of one filled since: 12 -> 13 -> 12.
+    port = _FakePort([_leg("10", "buy", 12.0, open_time=0.0)])
+    port.executed_by_coid["t000-x-y-c:10"] = 1
+    port._fail_close_leg = OrderDispositionUnknownError("timeout", client_order_id="x")
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.restart_replay(port))
+    [row] = list(iter_active_close_legs(ctx))
+    assert row.extras["close_leg_attempts"] == ["t000-x-y-c:10", "t000-x-y-c:10#r1"]
+    # The re-send of three executed after all; the next replay sends nothing.
+    port._fail_close_leg = None
+    port.executed_by_coid["t000-x-y-c:10#r1"] = 3
+    port.set_legs([_leg("10", "buy", 9.0, open_time=0.0)])
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == []
+    assert port.executed_queries[-1] == ("10", ("t000-x-y-c:10", "t000-x-y-c:10#r1"))
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_restart_replay_completes_a_partly_executed_close__(tmp_path):
+    """The part of a close the venue provably did not execute is sent once."""
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 9.0, open_time=0.0)])
+    port.executed_by_coid["t000-x-y-c:10"] = 1
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == [("EURUSD", "10", 3, "t000-x-y-c:10#r1")]
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_restart_replay_waits_when_the_close_outcome_is_unknown__(tmp_path):
+    """No evidence of what the close executed: nothing is sent, the row waits.
+
+    The venue cannot settle the close yet and the leg's size does not account
+    for it: a re-send could close the leg twice, so the replay reports itself
+    incomplete (the bot is not halted) and asks again on the next sync.
+    """
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0)])
+    port.executed_unknown = True
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is False
+    assert _run(eng.restart_replay(port)) is False
+    assert port.closed == []
+    assert [row.client_order_id for row in iter_active_close_legs(ctx)] == ["t000-x-y-c:10"]
+    # The venue now shows the close never executed: the owed close goes out once.
+    port.executed_unknown = False
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == [("EURUSD", "10", 4, "t000-x-y-c:10#r1")]
+    store.close()
+
+
+def __test_restart_replay_settles_an_unknown_outcome_the_leg_size_proves__(tmp_path):
+    """The venue cannot answer, but the leg already lost the whole close: settled, nothing sent."""
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 6.0, open_time=0.0)])
+    port.executed_unknown = True
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == []
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_overlapping_replays_never_send_the_same_close_twice__(tmp_path):
+    """A replay still running when the next starts owns its row; the second sends nothing.
+
+    The engine's bridge can stop waiting for a slow replay while it keeps
+    running, and the next sync starts another. Both would read the same
+    attempts and send the same remainder under the same new id.
+    """
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+
+    class _SlowPort(_FakePort):
+        def __init__(self, legs) -> None:
+            super().__init__(legs)
+            self.gate = asyncio.Event()
+
+        async def close_leg_executed(self, symbol, leg_id, coids, since_ms):
+            await self.gate.wait()
+            return 0
+
+    async def scenario(port: _SlowPort) -> tuple[bool, bool]:
+        eng = OneWayEmulator(store_ctx=ctx)
+        first = asyncio.create_task(eng.restart_replay(port))
+        await asyncio.sleep(0)
+        second = await eng.restart_replay(port)
+        port.gate.set()
+        return await first, second
+
+    port = _SlowPort([_leg("10", "buy", 10.0, open_time=0.0)])
+    assert _run(scenario(port)) == (True, False)
+    assert port.closed == [("EURUSD", "10", 4, "t000-x-y-c:10#r1")]
+    store.close()
+
+
+def __test_a_refired_leg_guard_never_resends_a_close_of_unknown_outcome__(tmp_path):
+    """A software guard firing again after an unknown close sends only what is provably owed.
+
+    The first close ended without a verdict and the position read does not
+    show it yet. Re-sending the guard's quantity under the same id could close
+    the leg twice on a venue that does not dedup it: the repeat waits for the
+    venue's record, and sends nothing once that shows the close executed.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0),
+                      _leg("20", "sell", 4.0, open_time=1.0)],
+                     fail_close_leg=OrderDispositionUnknownError("timeout", client_order_id="x"))
+    intent = CloseIntent(pine_id="__pyne_leg_guard__10", symbol="EURUSD", side="sell",
+                         qty=6.0, immediately=True, synthetic_kind='leg_guard',
+                         target_leg_id="10")
+    envelope = DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000)
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_close(envelope, port))
+    [row] = list(iter_active_close_legs(ctx))
+    port._fail_close_leg = None
+    port.executed_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_close(envelope, port))
+    assert port.closed == []
+    port.executed_unknown = False
+    port.executed_by_coid[row.client_order_id] = 6
+    res = _run(eng.run_close(envelope, port))
+    assert port.closed == [] and res.legs == (("10", 0),) and res.skipped is False
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_the_residual_drain_settles_an_unknown_reversal_close_first__(tmp_path):
+    """The in-session residual drain never re-sends a reversal close blindly.
+
+    The reversal's close ended without a verdict. The drain neither re-closes
+    the leg under the same id nor opens the residual while that close cannot
+    be settled; once the venue shows it never executed, the owed close goes out
+    once under a new id. That close is only dispatched, so the residual opens
+    on a later pass, once the book shows the opposing leg gone.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0)],
+                     fail_close_leg=OrderDispositionUnknownError("timeout", client_order_id="x"))
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    [row] = list(iter_active_close_legs(ctx))
+    port._fail_close_leg = None
+    port.executed_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.drain_residual_opens(port))
+    assert port.closed == [] and port.placed == []
+    assert len(list(iter_active_residual_opens(ctx))) == 1
+    port.executed_unknown = False
+    _run(eng.drain_residual_opens(port))
+    assert port.closed == [("EURUSD", "20", 1, f"{row.client_order_id}#r1")]
+    assert port.placed == []
+    assert len(list(iter_active_residual_opens(ctx))) == 1
+    assert list(iter_active_close_legs(ctx)) == []
+    # The re-sent close filled: the next pass opens the residual, once.
+    port.set_legs([])
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 2.0)]
+    assert port.closed == [("EURUSD", "20", 1, f"{row.client_order_id}#r1")]
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def _guard_env(qty: float) -> DispatchEnvelope:
+    intent = CloseIntent(pine_id="__pyne_leg_guard__10", symbol="EURUSD", side="sell",
+                         qty=qty, immediately=True, synthetic_kind='leg_guard',
+                         target_leg_id="10")
+    return DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000)
+
+
+def __test_a_refired_guard_without_a_store_never_resends_a_close_of_unknown_outcome__():
+    """A run without a store keeps the close's sends in memory: the repeat waits for evidence.
+
+    Without a row the guard re-firing on the next price would send the same
+    six units again under the same id while the first close's outcome is
+    still unknown.
+    """
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0),
+                      _leg("20", "sell", 4.0, open_time=1.0)],
+                     fail_close_leg=OrderDispositionUnknownError("timeout", client_order_id="x"))
+    eng = OneWayEmulator(store_ctx=None)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_close(_guard_env(6.0), port))
+    port._fail_close_leg = None
+    port.executed_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_close(_guard_env(6.0), port))
+    assert port.closed == []
+    [(_leg_id, (coid,))] = port.executed_queries
+    port.executed_unknown = False
+    port.executed_by_coid[coid] = 6
+    res = _run(eng.run_close(_guard_env(6.0), port))
+    assert port.closed == [] and res.legs == (("10", 0),) and res.dispatched_qty == 0.0
+
+
+def __test_a_settled_close_retry_never_sends_more_than_is_safe_now__(tmp_path):
+    """The owed part of an earlier close is capped by what the fresh plan may close.
+
+    The guard's six-unit close provably never executed, but an opposing leg
+    grew meanwhile and only one unit of the long survives the netting: the
+    retry sends one, never six (which would flip the position five short),
+    and the fan reports the one it sent.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0),
+                      _leg("20", "sell", 4.0, open_time=1.0)],
+                     fail_close_leg=OrderDispositionUnknownError("timeout", client_order_id="x"))
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_close(_guard_env(6.0), port))
+    [row] = list(iter_active_close_legs(ctx))
+    port._fail_close_leg = None
+    port.set_legs([_leg("10", "buy", 10.0, open_time=0.0),
+                   _leg("20", "sell", 9.0, open_time=1.0)])
+    res = _run(eng.run_close(_guard_env(6.0), port))
+    assert port.closed == [("EURUSD", "10", 1, f"{row.client_order_id}#r1")]
+    assert res.legs == (("10", 1),) and res.dispatched_qty == 1.0
+    store.close()
+
+
+def __test_a_reopened_close_row_is_judged_from_its_first_send__(tmp_path):
+    """A repeat of a settled close asks the venue from the first send, not from the reopen.
+
+    Reopening the row restarts its creation time; a venue asked from then
+    would miss the earlier send's executions and the repeat would close the
+    leg again.
+    """
+    class _SincePort(_FakePort):
+        def __init__(self, legs) -> None:
+            super().__init__(legs)
+            self.since: list[int] = []
+
+        async def close_leg_executed(self, symbol, leg_id, coids, since_ms):
+            self.since.append(since_ms)
+            return await super().close_leg_executed(symbol, leg_id, coids, since_ms)
+
+    store, ctx = _make_store(tmp_path)
+    port = _SincePort([_leg("10", "buy", 10.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_close(_guard_env(6.0), port))
+    [(_sym, _leg_id, _volume, coid)] = port.closed
+    row = ctx.get_order(coid)
+    # The row stays live while its send is reserved (the read does not show it).
+    assert row is not None and row.extras["close_leg_state"] == "dispatched"
+    first_send = row.extras["close_leg_since_ms"]
+    # The guard fires again before the fill is visible in the book.
+    port.executed_by_coid[coid] = 6
+    res = _run(eng.run_close(_guard_env(6.0), port))
+    assert port.since == [first_send]
+    assert res.legs == (("10", 0),) and len(port.closed) == 1
+    store.close()
+
+
+def __test_restart_replay_never_flips_the_net_position__(tmp_path):
+    """A replayed close is capped by the net exposure of its side in the fresh read.
+
+    The four-unit close provably never executed, but an opposing leg of eight
+    now offsets most of the ten-unit long: only two may close without turning
+    the position short.
+    """
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0),
+                      _leg("20", "sell", 8.0, open_time=1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == [("EURUSD", "10", 2, "t000-x-y-c:10#r1")]
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_restart_replay_never_flips_the_net_position_on_a_whole_leg_port__(tmp_path):
+    """A port that only closes whole legs gets no re-send whose whole leg would flip the net.
+
+    Two units of the ten-unit long may close against the eight-unit short,
+    but the port would close all ten and leave the account eight short.
+    """
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0),
+                      _leg("20", "sell", 8.0, open_time=1.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == []
+    store.close()
+
+
+def __test_a_whole_leg_port_re_send_closes_the_whole_leg_when_that_is_safe__(tmp_path):
+    """The owed part of a close is sent as the whole leg where that keeps the net side."""
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == [("EURUSD", "10", 10, "t000-x-y-c:10#r1")]
+    store.close()
+
+
+def __test_a_whole_leg_port_re_send_never_closes_exposure_the_run_does_not_own__(tmp_path):
+    """No re-send on a whole-position port whose venue position holds foreign exposure."""
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=4, qty=4.0, pre_volume=10)
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0, venue_qty=15.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is True
+    assert port.closed == []
+    store.close()
+
+
+def __test_overlapping_restart_replays_never_spend_one_close_budget_twice__(tmp_path):
+    """A replay still running when the next starts cannot spend the symbol's budget again.
+
+    Two one-unit closes are owed against a book that is net long one unit:
+    only one may go out. The second replay overlaps the first while that one
+    waits for the venue's evidence of its first row.
+    """
+    class _SlowEvidencePort(_FakePort):
+        def __init__(self, legs):
+            super().__init__(legs)
+            self.gate: asyncio.Event | None = None
+
+        async def close_leg_executed(self, symbol, leg_id, coids, since_ms):
+            if self.gate is not None and leg_id == "10":
+                await self.gate.wait()
+            return await super().close_leg_executed(symbol, leg_id, coids, since_ms)
+
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=1, qty=1.0)
+    _pending_leg_row(ctx, leg_id="11", volume=1, qty=1.0)
+    port = _SlowEvidencePort([_leg("10", "buy", 1.0, open_time=0.0),
+                              _leg("11", "buy", 1.0, open_time=1.0),
+                              _leg("20", "sell", 1.0, open_time=2.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+
+    async def overlap():
+        port.gate = asyncio.Event()
+        first = asyncio.ensure_future(eng.restart_replay(port))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        second = await eng.restart_replay(port)
+        port.gate.set()
+        return await first, second
+
+    first, second = _run(overlap())
+    assert first is True and second is False
+    assert sum(volume for _leg_id, volume in _dispatched(port)) == 1
+    store.close()
+
+
+class _GatedClosePort(_FakePort):
+    """A port whose first ``close_leg`` after arming signals ``entered`` and waits on ``gate``."""
+
+    def __init__(self, legs):
+        super().__init__(legs)
+        self.gate: asyncio.Event | None = None
+        self.entered: asyncio.Event | None = None
+
+    async def close_leg(self, symbol, leg_id, volume, coid):
+        if (self.gate is not None and self.entered is not None
+                and not self.entered.is_set()):
+            self.entered.set()
+            await self.gate.wait()
+        await super().close_leg(symbol, leg_id, volume, coid)
+
+
+def __test_overlapping_closes_never_spend_one_net_budget_twice__(journal):
+    """A close still sending when the next one starts cannot spend the symbol's net again.
+
+    The book is long 3 against a short 1, net long 2. Each close asks for 2,
+    the net its own read shows. If the second planned from a read that does
+    not show the first one's send, the two would close 4 of the long side
+    and flip the net position short.
+    """
+    port = _GatedClosePort([_leg("10", "buy", 3.0, open_time=0.0),
+                            _leg("20", "sell", 1.0, open_time=1.0)])
+    eng = journal.emulator()
+
+    async def overlap():
+        port.gate = asyncio.Event()
+        port.entered = asyncio.Event()
+        first = asyncio.ensure_future(eng.run_close(_close_env("sell", 2.0), port))
+        await port.entered.wait()
+        fetches = port.fetch_calls
+        with pytest.raises(ExchangeConnectionError):
+            await eng.run_close(_close_env("sell", 2.0, pine_id="Other"), port)
+        assert port.fetch_calls == fetches
+        port.gate.set()
+        return await first
+
+    result = _run(overlap())
+    assert result.dispatched_qty == 2.0
+    assert _dispatched(port) == [("10", 2)]
+    # Released once the first close returned: the next one is planned again.
+    port.gate = None
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0), _leg("20", "sell", 1.0, open_time=1.0)])
+    again = _run(eng.run_close(_close_env("sell", 2.0, pine_id="Other"), port))
+    assert again.dispatched_qty == 0.0 and _dispatched(port) == [("10", 2)]
+
+
+def __test_a_reversal_never_plans_while_a_close_holds_the_symbol__(journal):
+    """A market reversal arriving while a close sends neither reads, closes nor opens."""
+    port = _GatedClosePort([_leg("10", "buy", 3.0, open_time=0.0),
+                            _leg("20", "sell", 1.0, open_time=1.0)])
+    eng = journal.emulator()
+
+    async def overlap():
+        port.gate = asyncio.Event()
+        port.entered = asyncio.Event()
+        first = asyncio.ensure_future(eng.run_close(_close_env("sell", 2.0), port))
+        await port.entered.wait()
+        with pytest.raises(ExchangeConnectionError):
+            await eng.run_reversal(_entry_env("sell", 4.0), port)
+        port.gate.set()
+        await first
+
+    _run(overlap())
+    assert _dispatched(port) == [("10", 2)]
+    assert port.placed == []
+    assert _live_residuals(eng) == []
+
+
+def __test_a_residual_drain_waits_while_a_close_holds_the_symbol__(journal):
+    """A drain never closes the opposing legs from a read another close pass is acting on."""
+    port = _GatedClosePort([_leg("20", "sell", 2.0, open_time=0.0),
+                            _leg("21", "sell", 1.0, open_time=1.0)])
+    eng = journal.emulator()
+    # The reversal's close of leg 20 and 21 was dispatched; the read still lists them.
+    _run(eng.run_reversal(_entry_env("buy", 4.0), port))
+    assert len(_live_residuals(eng)) == 1
+    sent = list(port.closed)
+
+    async def overlap():
+        port.gate = asyncio.Event()
+        port.entered = asyncio.Event()
+        close = CloseIntent(pine_id="Short", symbol="EURUSD", side="buy", qty=1.0)
+        first = asyncio.ensure_future(eng.run_close(
+            DispatchEnvelope(intent=close, run_tag="t000", bar_ts_ms=2000), port))
+        await port.entered.wait()
+        fetches = port.fetch_calls
+        await eng.drain_residual_opens(port)
+        assert port.fetch_calls == fetches
+        port.gate.set()
+        await first
+
+    _run(overlap())
+    assert port.closed[:len(sent)] == sent
+    # Only the close's own send went out; the drain sent nothing.
+    assert len(port.closed) == len(sent) + 1
+    assert port.placed == []
+    assert len(_live_residuals(eng)) == 1
+
+
+def __test_close_leg_attempt_ids_map_back_to_the_leg_close__():
+    """A replay re-send's id resolves to the leg close's own id; other ids pass through."""
+    leg_coid = close_leg_client_order_id("t000-x-y-c", "10")
+    attempt = close_leg_attempt_client_order_id(leg_coid, 2)
+    assert attempt != leg_coid
+    assert close_leg_row_client_order_id(attempt) == leg_coid
+    assert close_leg_row_client_order_id(leg_coid) == leg_coid
+
+
 # === run_reversal — decomposition =======================================
 
 def _entry_env(side, qty, *, symbol="EURUSD", pine_id="Long",
@@ -513,7 +1157,10 @@ def __test_run_reversal_pure_add_opens_only__():
 def __test_run_reversal_flip_closes_opposing_then_opens_residual__():
     """A flipping reversal closes the opposing legs, then opens the residual size."""
     # Short 2.0, buy 3.0 -> close the 2.0 sell leg, open the 1.0 long residual.
+    # The venue's read right after the close no longer lists the leg, so the
+    # residual opens within the same call.
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    port.closes_execute = True
     eng = OneWayEmulator(store_ctx=None)
     res = _run(eng.run_reversal(_entry_env("buy", 3.0), port))
     assert _dispatched(port) == [("20", 2)]
@@ -543,18 +1190,17 @@ def __test_run_reversal_below_min_residual_skips_whole_reversal__():
     assert port.closed == [] and port.placed == []
 
 
-def __test_run_reversal_partial_leg_unsupported_skips_atomically__():
-    """A reversal plan with a partial slice skips atomically on a no-partial port."""
+def __test_run_reversal_partial_leg_unsupported_closes_the_whole_leg__():
+    """An order smaller than the opposing leg closes that leg whole on a no-partial port."""
     # Broker holds a 3.0 sell leg while the combined order is only 2.0 —
     # the FIFO plan would reduce the leg partially, which the port cannot
-    # express. The pre-flight raises BEFORE any close or breadcrumb.
+    # express, so the leg is closed whole and nothing is opened.
     port = _FakePort([_leg("20", "sell", 3.0, open_time=0.0)])
     port.supports_partial_leg_close = False
     eng = OneWayEmulator(store_ctx=None)
-    with pytest.raises(OrderSkippedByPlugin) as exc:
-        _run(eng.run_reversal(_entry_env("buy", 2.0), port))
-    assert exc.value.reason == "partial_leg_close_unsupported"
-    assert port.closed == [] and port.placed == []
+    res = _run(eng.run_reversal(_entry_env("buy", 2.0), port))
+    assert _dispatched(port) == [("20", 3)]
+    assert res.open_qty == 0.0 and port.placed == []
 
 
 def __test_run_reversal_whole_leg_flip_passes_without_partial_support__():
@@ -571,6 +1217,7 @@ def __test_run_reversal_persists_close_leg_rows__(tmp_path):
     """A reversal persists its FIFO close-leg rows and finalises them on success."""
     store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    port.closes_execute = True
     eng = OneWayEmulator(store_ctx=ctx)
     _run(eng.run_reversal(_entry_env("buy", 3.0), port))
     assert _dispatched(port) == [("20", 2)]
@@ -832,70 +1479,112 @@ def __test_run_exit_bracket_ignores_resting_and_opposite_side_entries__(tmp_path
     store.close()
 
 
-def __test_clear_only_owns__(tmp_path):
+def __test_clear_only_owns__(journal):
     """Clearing one exit wipes only its own legs; a co-located exit's bracket survives."""
     # THE regression test: a TP-exit and an SL-exit on the SAME legs. Cancelling
     # TP must clear ONLY TP's legs; SL's bracket must survive (the plugin's
     # broadcast clear strips both).
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0),
                       _leg("11", "buy", 1.0, open_time=1.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
     _run(eng.run_exit_bracket(_exit_env("SL", "Long", sl=1.00), port))
-    assert len(list(iter_active_bracket_ownerships(ctx))) == 4  # 2 exits x 2 legs
+    assert len(list(journal.rows())) == 4  # 2 exits x 2 legs
     port.amended.clear()
     res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="Long"), port))
     assert set(res.legs) == {"10", "11"}
     # Each owned leg is re-amended to what its remaining owner (SL) asks for:
     # the TP is dropped, the stop stays.
     assert sorted(_amended_levels(port)) == [("10", None, 1.00), ("11", None, 1.00)]
-    surviving = list(iter_active_bracket_ownerships(ctx))
+    surviving = list(journal.rows())
     assert len(surviving) == 2
     assert all(row.intent_key == "SL\0Long" for row in surviving)
-    store.close()
 
 
-def __test_two_exits_distinct_ownership__(tmp_path):
+def __test_two_exits_distinct_ownership__(journal):
     """Two exits with different pine_ids get distinct intent_keys and attach coids."""
     # Different pine_ids -> different attach coids -> disjoint coid namespaces +
     # distinct intent_keys, which is what makes the scoped clear work.
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
     _run(eng.run_exit_bracket(_exit_env("SL", "Long", sl=1.00), port))
-    rows = list(iter_active_bracket_ownerships(ctx))
+    rows = list(journal.rows())
     assert {row.intent_key for row in rows} == {"TP\0Long", "SL\0Long"}
     assert len({row.client_order_id for row in rows}) == 2
-    store.close()
 
 
-def __test_clear_all_by_pine_id_when_from_entry_none__(tmp_path):
+def __test_clear_all_by_pine_id_when_from_entry_none__(journal):
     """A cancel with ``from_entry=None`` clears every exit sharing the pine_id, leaving others."""
     # A cancel-all (from_entry None) drops every exit sharing the pine_id, across
     # from_entry values, and leaves a different pine_id untouched.
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("TP", "L1", tp=1.20), port))
     _run(eng.run_exit_bracket(_exit_env("TP", "L2", tp=1.30), port))
     _run(eng.run_exit_bracket(_exit_env("RUN", "L1", sl=1.00), port))
     res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry=None), port))
     assert len(res.legs) == 2  # both TP rows (L1 + L2), not RUN
-    surviving = list(iter_active_bracket_ownerships(ctx))
+    surviving = list(journal.rows())
     assert all(row.intent_key == "RUN\0L1" for row in surviving)
-    store.close()
 
 
 def __test_clear_pure_path_is_noop__():
-    """The ownership-aware clear is a no-op without a persisted store (``store_ctx=None``)."""
-    # Ownership-aware clear needs the persisted index: store_ctx=None -> no-op.
+    """Clearing an exit that owns no leg is a no-op, without a store too (``store_ctx=None``)."""
     port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=None)
     res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="Long"), port))
     assert res == ClearFanResult(legs=())
     assert port.amended == []
+
+
+def __test_without_a_store_co_owners_are_merged_and_retired_like_with_one__():
+    """A library caller without a store keeps the owner merge of a shared leg.
+
+    The live defect (review F4): without a store no ownership was recorded, so
+    the SL exit's attach replaced the TP exit's take-profit on the leg, and
+    cancelling the TP exit retired nothing, leaving its level armed.
+    """
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = OneWayEmulator(store_ctx=None)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", qty=1.0, tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("SL", "Long", qty=1.0, sl=1.00), port))
+    assert _amended_levels(port) == [("10", 1.20, None), ("10", 1.20, 1.00)]
+    port.amended.clear()
+    res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="Long"), port))
+    assert res.legs == ("10",)
+    assert _amended_levels(port) == [("10", None, 1.00)]
+    port.amended.clear()
+    res = _run(eng.run_exit_bracket_clear(_cancel_env("SL", from_entry="Long"), port))
+    assert res.legs == ("10",)
+    assert _amended_levels(port) == [("10", None, None)]
+
+
+def __test_an_ambiguous_retirement_is_finished_by_the_drain_in_session__(journal):
+    """A retirement left ``clearing`` is finished by the per-sync drain, with or without a store.
+
+    The leg is re-amended to the remaining owner's levels under the persisted
+    clear coid, and only the retired exit's key is reported.
+    """
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("SL", "Long", sl=1.00), port))
+    cancel = _cancel_env("TP", from_entry="Long")
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket_clear(cancel, port))
+    port.fail_amend_unknown = False
+    assert _own_states(journal.rows()) == {
+        "TP\0Long": BRACKET_OWN_STATE_CLEARING, "SL\0Long": "active"}
+    # The leg takes no other write until the unsettled one is settled: once
+    # its window has passed.
+    _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    _run(eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S))
+    port.amended.clear()
+    assert _run(eng.drain_clearing_rows("EURUSD", port)) == {"TP\0Long"}
+    assert port.amended == [("10", "sell", None, 1.00, None, cancel.client_order_id(KIND_CANCEL))]
+    assert _own_states(journal.rows()) == {"SL\0Long": "active"}
 
 
 def __test_bracket_ownership_persist_and_replay__(tmp_path):
@@ -934,10 +1623,12 @@ def __test_clear_timeout_leaves_clearing_row_then_replay_reclears__(tmp_path):
     rows = list(iter_active_bracket_ownerships(ctx))
     assert len(rows) == 1
     assert rows[0].extras[EXTRAS_KEY_BRACKET_OWN_STATE] == BRACKET_OWN_STATE_CLEARING
-    # Restart with a healthy broker: the clearing row re-clears (amend to None,
+    # Restart (a fresh emulator: the process that sent the timed-out clear is
+    # gone) with a healthy broker: the clearing row re-clears (amend to None,
     # NOT the original 1.20/1.00) and is released — the cancel is honoured.
     port.fail_amend_unknown = False
     port.amended.clear()
+    eng = OneWayEmulator(store_ctx=ctx)
     _run(eng.restart_replay(port))
     assert _amended_levels(port) == [("10", None, None)]  # re-clear, not re-assert
     assert list(iter_active_bracket_ownerships(ctx)) == []  # released
@@ -1196,21 +1887,19 @@ def _capture_warnings(monkeypatch) -> list[str]:
     return warnings
 
 
-def __test_hedged_pyramid_each_leg_carries_its_own_entrys_bracket__(tmp_path):
+def __test_hedged_pyramid_each_leg_carries_its_own_entrys_bracket__(journal):
     """Three pyramided entries, one leg each: every leg carries its own exit's levels.
 
     The live defect: every exit was amended onto every leg, so the last
     writer (L3-X) won on all three legs and L1's and L2's own levels existed
     nowhere on the venue.
     """
-    store, ctx = _make_store(tmp_path)
     port = _FakePort(_pyramid_legs())
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _attach_pyramid_exits(eng, port)
     assert _venue_levels(port) == {"1": (1.30, 1.00), "2": (1.25, 1.05), "3": (1.20, 1.08)}
     assert [leg_id for leg_id, *_rest in port.amended] == ["1", "2", "3"]
-    assert len(list(iter_active_bracket_ownerships(ctx))) == 3  # one row per exit
-    store.close()
+    assert len(list(journal.rows())) == 3  # one row per exit
 
 
 def __test_hedged_pyramid_retiring_one_exit_touches_only_its_own_leg__(tmp_path):
@@ -1224,7 +1913,9 @@ def __test_hedged_pyramid_retiring_one_exit_touches_only_its_own_leg__(tmp_path)
     port.amended.clear()
     res = _run(eng.run_exit_bracket_clear(_cancel_env("L3-X", from_entry="L3"), port))
     assert res.legs == ("3",)
-    assert _amended_levels(port) == [("3", None, None)]  # no owner left on leg 3
+    # Leg 3 is closed: it carries no bracket, so its row is released without a
+    # venue call, and no other leg is written.
+    assert _amended_levels(port) == []
     assert {row.intent_key for row in iter_active_bracket_ownerships(ctx)} == {
         "L1-X\0L1", "L2-X\0L2"}
     # A restart re-asserts each remaining leg's own levels.
@@ -1234,11 +1925,10 @@ def __test_hedged_pyramid_retiring_one_exit_touches_only_its_own_leg__(tmp_path)
     store.close()
 
 
-def __test_tp_only_and_sl_only_exits_on_one_leg_union__(tmp_path):
+def __test_tp_only_and_sl_only_exits_on_one_leg_union__(journal):
     """A TP-only and an SL-only exit of one entry both stay on the leg; retiring one keeps the other."""
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("1", "buy", 1.0, entry_id="L1")])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("TP", "L1", qty=1.0, tp=1.20), port))
     _run(eng.run_exit_bracket(_exit_env("SL", "L1", qty=1.0, sl=1.00), port))
     assert _amended_levels(port) == [("1", 1.20, None), ("1", 1.20, 1.00)]
@@ -1251,24 +1941,21 @@ def __test_tp_only_and_sl_only_exits_on_one_leg_union__(tmp_path):
     port.amended.clear()
     _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="L1"), port))
     assert _amended_levels(port) == [("1", None, None)]
-    assert list(iter_active_bracket_ownerships(ctx)) == []
-    store.close()
+    assert list(journal.rows()) == []
 
 
-def __test_unattributed_legs_keep_the_single_exit_behaviour__(tmp_path):
+def __test_unattributed_legs_keep_the_single_exit_behaviour__(journal):
     """A plugin that never attributes legs gets every exit replicated onto every leg."""
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
                       _leg("11", "buy", 1.0, open_time=1.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     res = _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.20, sl=1.00), port))
     assert res.legs == ("10", "11")
     assert _amended_levels(port) == [("10", 1.20, 1.00), ("11", 1.20, 1.00)]
-    store.close()
 
 
 def __test_two_exits_on_unattributed_legs_merge_to_the_more_protective_levels__(
-        tmp_path, monkeypatch):
+        journal, monkeypatch):
     """Conflicting levels on one leg give the level the price reaches first, reported once.
 
     For a long the highest stop-loss and the lowest take-profit, independent
@@ -1276,9 +1963,8 @@ def __test_two_exits_on_unattributed_legs_merge_to_the_more_protective_levels__(
     leg back to the remaining one.
     """
     warnings = _capture_warnings(monkeypatch)
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 1.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.30, sl=1.00), port))
     _run(eng.run_exit_bracket(_exit_env("L2-X", "L2", qty=1.0, tp=1.25, sl=1.05), port))
     assert _venue_levels(port) == {"10": (1.25, 1.05)}
@@ -1288,24 +1974,21 @@ def __test_two_exits_on_unattributed_legs_merge_to_the_more_protective_levels__(
     assert len([w for w in warnings if "different levels" in w]) == 1
     _run(eng.run_exit_bracket_clear(_cancel_env("L2-X", from_entry="L2"), port))
     assert _venue_levels(port) == {"10": (1.30, 1.00)}
-    store.close()
 
 
-def __test_merge_mirrors_for_a_short_and_keeps_the_tightest_trail__(tmp_path):
+def __test_merge_mirrors_for_a_short_and_keeps_the_tightest_trail__(journal):
     """A short takes the lowest stop-loss and the highest take-profit; trailing takes the tightest."""
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("20", "sell", 1.0)])
-    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    eng = journal.emulator(mintick=0.01)
     _run(eng.run_exit_bracket(
         _exit_env("S1-X", "S1", side="buy", qty=1.0, tp=0.90, sl=1.20, trail=20.0), port))
     _run(eng.run_exit_bracket(
         _exit_env("S2-X", "S2", side="buy", qty=1.0, tp=0.95, sl=1.15, trail=10.0), port))
     leg_id, side, tp, sl, trail, _coid = port.amended[-1]
     assert (leg_id, side, tp, sl, trail) == ("20", "buy", 0.95, 1.15, 0.1)
-    store.close()
 
 
-def __test_an_entry_without_a_leg_never_covers_other_entries_legs__(tmp_path, monkeypatch):
+def __test_an_entry_without_a_leg_never_covers_other_entries_legs__(journal, monkeypatch):
     """An exit whose entry holds no leg skips instead of covering other entries' legs.
 
     Attribution comes only from the bot's own records and lost attribution
@@ -1318,12 +2001,11 @@ def __test_an_entry_without_a_leg_never_covers_other_entries_legs__(tmp_path, mo
     leg it no longer covers are retired.
     """
     warnings = _capture_warnings(monkeypatch)
-    store, ctx = _make_store(tmp_path)
     legs = [_leg("1", "buy", 1.0, open_time=1.0, entry_id="L1"),
             _leg("2", "buy", 1.0, open_time=2.0, entry_id="L2"),
             _leg("3", "buy", 1.0, open_time=3.0, entry_id="L3")]
     port = _FakePort(legs)
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.30, sl=1.00), port))
     _run(eng.run_exit_bracket(_exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
     assert _venue_levels(port) == {"1": (1.30, 1.00), "3": (1.20, 1.08)}
@@ -1338,23 +2020,21 @@ def __test_an_entry_without_a_leg_never_covers_other_entries_legs__(tmp_path, mo
         assert res.skipped and res.entry_without_leg and res.legs == ()
         assert "'L3' holds no open leg" in (res.skip_reason or "")
     # L1's and L2's legs are never touched; only L3-X's own row on the closed
-    # leg "3" is retired (once — the port treats the vanished leg as a no-op).
-    assert _amended_levels(port) == [("3", None, None)]
+    # leg "3" is retired, without a venue call (a closed leg carries no bracket).
+    assert _amended_levels(port) == []
     assert len([w for w in warnings if "attributed to an entry other than" in w]) == 1
-    assert {row.intent_key for row in iter_active_bracket_ownerships(ctx)} == {"L1-X\0L1"}
-    store.close()
+    assert {row.intent_key for row in journal.rows()} == {"L1-X\0L1"}
 
 
-def __test_an_entry_without_a_leg_retires_its_rows_from_legs_it_covered__(tmp_path):
+def __test_an_entry_without_a_leg_retires_its_rows_from_legs_it_covered__(journal):
     """The skip still retires the exit from a leg it covered before, keeping co-owners' levels.
 
     L3-X protected the unattributed leg "9" next to L1-X; once the plugin
     attributes "9" to L1, L3 holds no leg: L3-X's row comes off "9" and the
     leg is re-amended to L1-X's levels alone.
     """
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("9", "buy", 1.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.30, sl=1.00), port))
     _run(eng.run_exit_bracket(_exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
     assert _venue_levels(port) == {"9": (1.20, 1.08)}
@@ -1363,22 +2043,19 @@ def __test_an_entry_without_a_leg_retires_its_rows_from_legs_it_covered__(tmp_pa
     res = _run(eng.run_exit_bracket(_exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
     assert res.skipped and res.entry_without_leg
     assert _amended_levels(port) == [("9", 1.30, 1.00)]
-    assert {row.intent_key for row in iter_active_bracket_ownerships(ctx)} == {"L1-X\0L1"}
-    store.close()
+    assert {row.intent_key for row in journal.rows()} == {"L1-X\0L1"}
 
 
-def __test_an_entry_without_an_attributed_leg_covers_the_unattributed_legs__(tmp_path):
+def __test_an_entry_without_an_attributed_leg_covers_the_unattributed_legs__(journal):
     """With unattributed legs open, an exit without a leg of its own covers just those."""
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("1", "buy", 1.0, open_time=1.0, entry_id="L1"),
                       _leg("9", "buy", 1.0, open_time=2.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     res = _run(eng.run_exit_bracket(_exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
     assert res.legs == ("9",)
     # An exit without a from_entry covers every survivor leg.
     res = _run(eng.run_exit_bracket(_exit_env("ALL", "", qty=2.0, sl=1.00), port))
     assert res.legs == ("1", "9")
-    store.close()
 
 
 def __test_restart_replay_re_asserts_the_merged_levels_once_per_leg__(tmp_path):
@@ -1421,7 +2098,13 @@ def __test_a_retirement_left_clearing_re_asserts_the_remaining_owner__(tmp_path)
     assert port.amended == [("10", "sell", None, 1.00, None, cancel.client_order_id(KIND_CANCEL))]
     assert [row.intent_key for row in iter_active_bracket_ownerships(ctx)] == ["SL\0Long"]
 
+    # The first retirement's write never got a verdict, so the leg takes no
+    # different write until it is settled: once its window has passed.
+    _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    _run(eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S))
+
     # The per-sync drain does the same for a retirement left clearing in-session.
+    port.amended.clear()
     _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
     port.fail_amend_unknown = True
     with pytest.raises(OrderDispositionUnknownError):
@@ -1434,12 +2117,11 @@ def __test_a_retirement_left_clearing_re_asserts_the_remaining_owner__(tmp_path)
     store.close()
 
 
-def __test_a_dropped_leg_keeps_its_other_owners_levels__(tmp_path):
+def __test_a_dropped_leg_keeps_its_other_owners_levels__(journal):
     """A leg leaving one exit's covered set is handed back to the exits still owning it."""
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
                       _leg("11", "buy", 1.0, open_time=1.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
     _run(eng.run_exit_bracket(_exit_env("SL", "Long", sl=1.00), port))
     # An opposing leg nets "10" away; the TP exit re-attaches on "11" only.
@@ -1449,8 +2131,11 @@ def __test_a_dropped_leg_keeps_its_other_owners_levels__(tmp_path):
     port.amended.clear()
     res = _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.25), port))
     assert res.legs == ("11",)
-    assert _amended_levels(port) == [("10", None, 1.00), ("11", 1.25, 1.00)]
-    store.close()
+    # Leg "10" is offset whole by the opposing leg: nothing of it is net
+    # exposure, so it carries no bracket at all — the SL exit's stop left on it
+    # would close an offset leg and flip the net position. Leg "11" holds the
+    # merge of both owners.
+    assert _amended_levels(port) == [("10", None, None), ("11", 1.25, 1.00)]
 
 
 # === Venue rules on shared legs: unchanged amends, refused retirements ===
@@ -1474,7 +2159,7 @@ class _VenueRulesPort(_FakePort):
         self.calls = 0
 
     async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
-                            trail_offset, coid) -> None:
+                            trail_offset, qty, coid) -> None:
         self.calls += 1
         if self.rate_limited:
             raise ExchangeRateLimitError("too many requests", retry_after=1.0)
@@ -1488,49 +2173,44 @@ class _VenueRulesPort(_FakePort):
         self.current[leg_id] = levels
         await super().amend_bracket(
             symbol, leg_id, side=side, tp_price=tp_price, sl_price=sl_price,
-            trail_offset=trail_offset, coid=coid,
+            trail_offset=trail_offset, qty=qty, coid=coid,
         )
 
 
-def _own_states(ctx) -> dict[str, str]:
-    return {row.intent_key: row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]
-            for row in iter_active_bracket_ownerships(ctx)}
+def _own_states(rows: Iterable[OrderRow]) -> dict[str, str]:
+    return {row.intent_key: row.extras[EXTRAS_KEY_BRACKET_OWN_STATE] for row in rows}
 
 
-def __test_an_attach_dominated_by_a_co_owner_sends_no_amend__(tmp_path):
+def __test_an_attach_dominated_by_a_co_owner_sends_no_amend__(journal):
     """Attaching an exit whose levels a co-owner dominates changes nothing on the venue.
 
     The merge equals what the leg already holds, so no amend goes out (a
     venue refuses "nothing to amend", and a re-send resets a moved trailing
     stop); the attaching exit still owns the leg.
     """
-    store, ctx = _make_store(tmp_path)
     port = _VenueRulesPort([_leg("10", "buy", 1.0)], reject_identical=True)
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("A", "L", tp=1.15), port))
     res = _run(eng.run_exit_bracket(_exit_env("B", "L", tp=1.20), port))
     assert res.legs == ("10",) and not res.skipped
     assert _amended_levels(port) == [("10", 1.15, None)]
-    assert _own_states(ctx) == {"A\0L": "active", "B\0L": "active"}
+    assert _own_states(journal.rows()) == {"A\0L": "active", "B\0L": "active"}
     # Once A is retired, B's own level is what the leg must carry: sent.
     _run(eng.run_exit_bracket_clear(_cancel_env("A", from_entry="L"), port))
     assert _amended_levels(port) == [("10", 1.15, None), ("10", 1.20, None)]
-    store.close()
 
 
-def __test_retiring_a_dominated_owner_sends_no_amend__(tmp_path):
+def __test_retiring_a_dominated_owner_sends_no_amend__(journal):
     """Retiring an exit whose levels were all dominated leaves the leg as it is, row released."""
-    store, ctx = _make_store(tmp_path)
     port = _VenueRulesPort([_leg("10", "buy", 1.0)], reject_identical=True)
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("B", "L", tp=1.20), port))
     _run(eng.run_exit_bracket(_exit_env("A", "L", tp=1.15), port))
     port.amended.clear()
     res = _run(eng.run_exit_bracket_clear(_cancel_env("B", from_entry="L"), port))
     assert res.legs == ("10",)
     assert port.amended == []
-    assert _own_states(ctx) == {"A\0L": "active"}
-    store.close()
+    assert _own_states(journal.rows()) == {"A\0L": "active"}
 
 
 def __test_an_unconfirmed_amend_is_never_skipped_as_unchanged__(tmp_path):
@@ -1575,7 +2255,7 @@ def __test_a_refused_retirement_stays_clearing_and_never_raises__(tmp_path, monk
     port.mid = 1.093
     res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="L"), port))
     assert res.legs == ()
-    assert _own_states(ctx) == {"TP\0L": BRACKET_OWN_STATE_CLEARING, "SL\0L": "active"}
+    assert _own_states(iter_active_bracket_ownerships(ctx)) == {"TP\0L": BRACKET_OWN_STATE_CLEARING, "SL\0L": "active"}
     refusals = [w for w in warnings if "may still be armed" in w]
     assert len(refusals) == 1
     assert "TP" in refusals[0] and "stop distance too small" in refusals[0]
@@ -1584,24 +2264,23 @@ def __test_a_refused_retirement_stays_clearing_and_never_raises__(tmp_path, monk
     restarted = OneWayEmulator(store_ctx=ctx)
     assert _run(restarted.restart_replay(port)) is True
     assert _run(restarted.drain_clearing_rows("EURUSD", port)) == set()
-    assert _own_states(ctx) == {"TP\0L": BRACKET_OWN_STATE_CLEARING, "SL\0L": "active"}
+    assert _own_states(iter_active_bracket_ownerships(ctx)) == {"TP\0L": BRACKET_OWN_STATE_CLEARING, "SL\0L": "active"}
     assert len([w for w in warnings if "may still be armed" in w]) == 2  # once per instance
 
     port.mid = 1.12
     port.amended.clear()
     assert _run(restarted.drain_clearing_rows("EURUSD", port)) == {"TP\0L"}
     assert _amended_levels(port) == [("10", None, 1.09)]
-    assert _own_states(ctx) == {"SL\0L": "active"}
+    assert _own_states(iter_active_bracket_ownerships(ctx)) == {"SL\0L": "active"}
     store.close()
 
 
-def __test_a_refused_retirement_does_not_stop_the_other_legs__(tmp_path):
+def __test_a_refused_retirement_does_not_stop_the_other_legs__(journal):
     """A refusal on one leg keeps that leg clearing; the exit's other legs are still retired."""
-    store, ctx = _make_store(tmp_path)
     port = _VenueRulesPort([_leg("10", "buy", 1.0, entry_id="L1"),
                             _leg("11", "buy", 1.0, entry_id="L2")],
                            mid=1.10, min_dist=0.005)
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("TP", "", qty=2.0, tp=1.20), port))
     _run(eng.run_exit_bracket(_exit_env("SL1", "L1", qty=1.0, sl=1.09), port))
     port.mid = 1.093
@@ -1610,10 +2289,9 @@ def __test_a_refused_retirement_does_not_stop_the_other_legs__(tmp_path):
     assert _amended_levels(port)[-1] == ("11", None, None)
     states = {(row.intent_key, row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID]):
               row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]
-              for row in iter_active_bracket_ownerships(ctx)}
+              for row in journal.rows()}
     assert states == {("TP\0", "10"): BRACKET_OWN_STATE_CLEARING,
                       ("SL1\0L1", "10"): "active"}
-    store.close()
 
 
 def __test_a_throttled_retirement_stays_clearing_and_never_raises__(tmp_path):
@@ -1627,7 +2305,7 @@ def __test_a_throttled_retirement_stays_clearing_and_never_raises__(tmp_path):
     res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="L"), port))
     assert res.legs == ()
     assert port.calls == 1  # the second leg is not hammered
-    assert set(_own_states(ctx).values()) == {BRACKET_OWN_STATE_CLEARING}
+    assert set(_own_states(iter_active_bracket_ownerships(ctx)).values()) == {BRACKET_OWN_STATE_CLEARING}
     assert _run(eng.drain_clearing_rows("EURUSD", port)) == set()
     assert _run(OneWayEmulator(store_ctx=ctx).restart_replay(port)) is True
     port.rate_limited = False
@@ -1636,17 +2314,16 @@ def __test_a_throttled_retirement_stays_clearing_and_never_raises__(tmp_path):
     store.close()
 
 
-def __test_a_refused_retirement_of_a_dropped_leg_keeps_the_survivor_amend__(tmp_path):
+def __test_a_refused_retirement_of_a_dropped_leg_keeps_the_survivor_amend__(journal):
     """A refused retirement on a dropped leg stays clearing and never fails the exit's own fan.
 
     The retirement concerns a leg the exit no longer covers; raising it as
     the exit's refusal would send the engine into the refused-exit recovery
     of a bracket the venue accepted on every leg it does cover.
     """
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
                       _leg("11", "buy", 1.0, open_time=1.0)])
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
     # An opposing leg nets "10" away; the venue refuses any amend on "10".
     port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
@@ -1658,12 +2335,11 @@ def __test_a_refused_retirement_of_a_dropped_leg_keeps_the_survivor_amend__(tmp_
     assert res.legs == ("11",) and not res.skipped
     assert _amended_levels(port) == [("11", 1.25, None)]
     states = {row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID]: row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]
-              for row in iter_active_bracket_ownerships(ctx)}
+              for row in journal.rows()}
     assert states == {"10": BRACKET_OWN_STATE_CLEARING, "11": "active"}
-    store.close()
 
 
-def __test_a_co_owned_attach_refusal_is_not_an_after_fill_flatten__(tmp_path, monkeypatch):
+def __test_a_co_owned_attach_refusal_is_not_an_after_fill_flatten__(journal, monkeypatch):
     """A refused attach on a leg another exit protects is the exit's refusal, not a flatten.
 
     The SL exit's 1.09 sits on the leg; the price drifts to 1.093 and the TP
@@ -1674,76 +2350,66 @@ def __test_a_co_owned_attach_refusal_is_not_an_after_fill_flatten__(tmp_path, mo
     TP exit's row is released; SL's stays.
     """
     warnings = _capture_warnings(monkeypatch)
-    store, ctx = _make_store(tmp_path)
     port = _VenueRulesPort([_leg("10", "buy", 1.0)], mid=1.10, min_dist=0.005)
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("SL", "L", sl=1.09), port))
     port.mid = 1.093
     with pytest.raises(ExchangeOrderRejectedError) as raised:
         _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.20), port))
     assert not isinstance(raised.value, BracketAttachAfterFillRejectedError)
     assert "stop distance too small" in str(raised.value)
-    assert _own_states(ctx) == {"SL\0L": "active"}
+    assert _own_states(journal.rows()) == {"SL\0L": "active"}
     assert len([w for w in warnings if "other exits also protect" in w]) == 1
-    store.close()
 
 
-def __test_a_co_owned_modify_refusal_restores_the_previous_row__(tmp_path):
+def __test_a_co_owned_modify_refusal_restores_the_previous_row__(journal):
     """A refused modify on a co-owned leg keeps the exit's previous levels as its row.
 
     The venue still holds the merge with the exit's previous levels, so the
     row must keep them (a later retirement must take them off the leg).
     """
-    store, ctx = _make_store(tmp_path)
     port = _VenueRulesPort([_leg("10", "buy", 1.0)], mid=1.10, min_dist=0.005)
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.20), port))
     _run(eng.run_exit_bracket(_exit_env("SL", "L", sl=1.09), port))
     port.mid = 1.093
     with pytest.raises(ExchangeOrderRejectedError) as raised:
         _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.25), port))
     assert not isinstance(raised.value, BracketAttachAfterFillRejectedError)
-    rows = {row.intent_key: row for row in iter_active_bracket_ownerships(ctx)}
+    rows = {row.intent_key: row for row in journal.rows()}
     assert rows["TP\0L"].extras[EXTRAS_KEY_BRACKET_OWN_STATE] == "active"
     assert rows["TP\0L"].extras[EXTRAS_KEY_BRACKET_OWN_TP] == 1.20
-    store.close()
 
 
-def __test_a_sole_owner_attach_refusal_keeps_the_after_fill_flatten__(tmp_path):
+def __test_a_sole_owner_attach_refusal_keeps_the_after_fill_flatten__(journal):
     """With no co-owner the refused attach still means an unprotected position."""
-    store, ctx = _make_store(tmp_path)
     port = _VenueRulesPort([_leg("10", "buy", 1.0)], mid=1.093, min_dist=0.005)
-    eng = OneWayEmulator(store_ctx=ctx)
+    eng = journal.emulator()
     with pytest.raises(BracketAttachAfterFillRejectedError):
         _run(eng.run_exit_bracket(_exit_env("SL", "L", sl=1.09), port))
-    assert list(iter_active_bracket_ownerships(ctx)) == []
-    store.close()
+    assert list(journal.rows()) == []
 
 
-def __test_a_stop_and_a_trail_of_different_exits_are_reported_once__(tmp_path, monkeypatch):
+def __test_a_stop_and_a_trail_of_different_exits_are_reported_once__(journal, monkeypatch):
     """A fixed stop of one exit and a trail of another cannot be carried as asked; WARN once."""
     warnings = _capture_warnings(monkeypatch)
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 1.0)])
-    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    eng = journal.emulator(mintick=0.01)
     _run(eng.run_exit_bracket(_exit_env("ST", "L", sl=1.00), port))
     _run(eng.run_exit_bracket(_exit_env("TR", "L", trail=10.0), port))
     _run(eng.run_exit_bracket(_exit_env("TR", "L", trail=10.0), port))
     leg_id, _side, tp, sl, trail, _coid = port.amended[-1]
     assert (leg_id, tp, sl, trail) == ("10", None, 1.00, 0.1)
     assert len([w for w in warnings if "fixed stop-loss and a trailing stop" in w]) == 1
-    store.close()
 
 
-def __test_one_exit_asking_for_a_stop_and_a_trail_is_not_reported__(tmp_path, monkeypatch):
+def __test_one_exit_asking_for_a_stop_and_a_trail_is_not_reported__(journal, monkeypatch):
     warnings = _capture_warnings(monkeypatch)
-    store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("10", "buy", 1.0)])
-    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    eng = journal.emulator(mintick=0.01)
     _run(eng.run_exit_bracket(_exit_env("ST", "L", sl=1.00, trail=10.0), port))
     _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.20), port))
     assert [w for w in warnings if "fixed stop-loss and a trailing stop" in w] == []
-    store.close()
 
 
 # === Reversal residual-open replay (2.7) ================================
@@ -1763,6 +2429,7 @@ def __test_reversal_creates_then_clears_residual_breadcrumb__(tmp_path):
     # place_leg has persisted the residual entry row.
     store, ctx = _make_store(tmp_path)
     port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0)])
+    port.closes_execute = True
     eng = OneWayEmulator(store_ctx=ctx)
     _run(eng.run_reversal(_entry_env("buy", 3.0), port))
     assert _dispatched(port) == [("20", 1)]
@@ -1824,7 +2491,8 @@ def __test_replay_withholds_residual_reopen_under_quarantine__(tmp_path):
     live so the committed reversal finishes once the operator restart lifts
     the quarantine."""
     store, ctx = _make_store(tmp_path)
-    _seed_residual(ctx, entry_coid="entry-missing", qty=2.0)
+    # The breadcrumb carries the combined order: close the short 1, open 2.
+    _seed_residual(ctx, entry_coid="entry-missing", qty=3.0)
     # A still-live opposing leg: the crash hit before the FIFO closes landed.
     port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0)])
     quarantined = True
@@ -1874,6 +2542,7 @@ def __test_stop_fired_reversal_breadcrumb_anchors_on_entry_stop_coid__(tmp_path)
             "residual timed out", client_order_id="residual-coid",
         ),
     )
+    port.closes_execute = True
     eng = OneWayEmulator(store_ctx=ctx)
     with pytest.raises(OrderDispositionUnknownError):
         _run(eng.run_reversal(env, port))
@@ -1935,6 +2604,7 @@ def __test_reversal_clears_breadcrumb_on_definitive_entry_reject__(tmp_path):
         [_leg("20", "sell", 2.0, open_time=0.0)],
         fail_place_leg=ExchangeOrderRejectedError("insufficient margin"),
     )
+    port.closes_execute = True
     eng = OneWayEmulator(store_ctx=ctx)
     with pytest.raises(ExchangeOrderRejectedError):
         _run(eng.run_reversal(env, port))
@@ -1960,11 +2630,717 @@ def __test_reversal_keeps_breadcrumb_on_ambiguous_entry_failure__(tmp_path):
             "residual timed out", client_order_id="residual-coid",
         ),
     )
+    port.closes_execute = True
     eng = OneWayEmulator(store_ctx=ctx)
     with pytest.raises(OrderDispositionUnknownError):
         _run(eng.run_reversal(env, port))
     assert len(list(iter_active_residual_opens(ctx))) == 1
     store.close()
+
+
+def _live_residuals(eng: OneWayEmulator) -> list[OrderRow]:
+    """The live residual-open breadcrumbs, from the store or the in-memory journal."""
+    return list(iter_active_residual_opens(eng._close_journal))  # type: ignore[attr-defined]
+
+
+def __test_a_reversal_opens_its_residual_only_once_the_opposing_leg_is_gone__(journal):
+    """A dispatched close that the read still lists never has the residual opened beside it.
+
+    ``close_leg`` only dispatches: a reduce-only IOC close can fill in part
+    and be cancelled. The residual opens only on a pass whose fresh read shows
+    no opposing leg; meanwhile the unexecuted part of the close is re-sent from
+    the venue's evidence, in-session, with or without a store.
+    """
+    env = _entry_env("buy", 3.0)
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    eng = journal.emulator()
+    res = _run(eng.run_reversal(env, port))
+    assert _dispatched(port) == [("20", 2)]
+    # The read right after the close still lists the short leg: no open.
+    assert port.placed == []
+    assert res.open_qty == 1.0 and res.opened_orders == ()
+    assert len(_live_residuals(eng)) == 1
+    # The close was an IOC that filled 1 of 2 and was cancelled.
+    leg_coid = close_leg_client_order_id(env.client_order_id(KIND_CLOSE), "20")
+    port.executed_by_coid[leg_coid] = 1
+    port.set_legs([_leg("20", "sell", 1.0, open_time=0.0)])
+    _run(eng.drain_residual_opens(port))
+    assert eng.take_opened_residuals() == []
+    # Only the unexecuted part is re-sent, under a new attempt coid; still
+    # no residual beside the remaining short.
+    assert _dispatched(port) == [("20", 2), ("20", 1)]
+    assert port.closed[-1][3] == close_leg_attempt_client_order_id(leg_coid, 1)
+    assert port.placed == []
+    assert len(_live_residuals(eng)) == 1
+    # The book shows the short gone: the residual opens exactly once and the
+    # drain hands its orders back for the reversal's entry intent.
+    port.set_legs([])
+    _run(eng.drain_residual_opens(port))
+    assert eng.take_opened_residuals() == [(env.intent.intent_key, ("order",))]
+    assert port.placed == [("EURUSD", 1.0)]
+    assert _live_residuals(eng) == []
+    _run(eng.drain_residual_opens(port))
+    assert eng.take_opened_residuals() == []
+    assert port.placed == [("EURUSD", 1.0)]
+
+
+def __test_a_deferred_residual_waits_while_the_close_outcome_is_unknown__(journal):
+    """While the venue cannot say what the close executed, nothing is re-sent or opened."""
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    eng = journal.emulator()
+    _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    port.executed_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 2)]
+    assert port.placed == []
+    assert len(_live_residuals(eng)) == 1
+
+
+def __test_a_drained_residual_opens_under_the_reversals_own_envelope__():
+    """In the same process the drain opens the residual with the reversal's own envelope."""
+    class _CapturingPort(_FakePort):
+        def __init__(self, legs):
+            super().__init__(legs)
+            self.place_envelopes: list[DispatchEnvelope] = []
+
+        async def place_leg(self, envelope, qty):
+            self.place_envelopes.append(envelope)
+            return await super().place_leg(envelope, qty)
+
+    env = _entry_env("buy", 3.0, stop_fired=True)
+    port = _CapturingPort([_leg("20", "sell", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=None)
+    _run(eng.run_reversal(env, port))
+    port.set_legs([])
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    assert port.place_envelopes == [env]
+
+
+def __test_an_ambiguous_residual_open_without_a_store_is_never_reopened__():
+    """Without a store, a residual open of unknown outcome is discharged, not sent again.
+
+    The store's persist-first entry row proves an open went out; on a run
+    without one, the emulator records the entry coid before ``place_leg``, so
+    the drain discharges the breadcrumb instead of opening a second residual.
+    """
+    port = _FakePort(
+        [_leg("20", "sell", 2.0, open_time=0.0)],
+        fail_place_leg=OrderDispositionUnknownError(
+            "residual timed out", client_order_id="residual-coid",
+        ),
+    )
+    port.closes_execute = True
+    eng = OneWayEmulator(store_ctx=None)
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert len(_live_residuals(eng)) == 1
+    port._fail_place_leg = None
+    _run(eng.drain_residual_opens(port))
+    assert eng.take_opened_residuals() == []
+    assert port.placed == []
+    assert _live_residuals(eng) == []
+
+
+def __test_overlapping_drains_never_open_one_residual_twice__():
+    """A drain still running when the next starts cannot open the same residual again."""
+    class _SlowReadPort(_FakePort):
+        def __init__(self, legs):
+            super().__init__(legs)
+            self.gate: asyncio.Event | None = None
+
+        async def fetch_raw_positions(self, symbol):
+            if self.gate is not None:
+                await self.gate.wait()
+            return await super().fetch_raw_positions(symbol)
+
+    port = _SlowReadPort([_leg("20", "sell", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=None)
+    _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    port.set_legs([])
+
+    async def overlap():
+        port.gate = asyncio.Event()
+        first = asyncio.ensure_future(eng.drain_residual_opens(port))
+        await asyncio.sleep(0)
+        second = asyncio.ensure_future(eng.drain_residual_opens(port))
+        await asyncio.sleep(0)
+        port.gate.set()
+        await asyncio.gather(first, second)
+
+    _run(overlap())
+    assert port.placed == [("EURUSD", 1.0)]
+    assert _live_residuals(eng) == []
+
+
+def __test_an_unsent_residual_open_without_a_store_is_retried__():
+    """A residual open whose request never left the client stays owed and opens next sync."""
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=None)
+    _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    port.set_legs([])
+    port._fail_place_leg = ExchangeConnectionError("link down")
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == []
+    assert len(_live_residuals(eng)) == 1
+    port._fail_place_leg = None
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    assert _live_residuals(eng) == []
+
+
+class _RowLeavingPort(_FakePort):
+    """A port whose ``place_leg`` persists its entry row before it fails pre-send.
+
+    Models a plugin's persist-first ``submitted`` row left behind by an
+    :class:`ExchangeConnectionError` (the request never left the client).
+    """
+
+    def __init__(self, legs, ctx: RunContext | None) -> None:
+        super().__init__(legs)
+        self._ctx = ctx
+
+    async def place_leg(self, envelope, qty):
+        if self._fail_place_leg is not None and self._ctx is not None:
+            intent = envelope.intent
+            create_entry_order_row(
+                self._ctx, coid=envelope.client_order_id(KIND_ENTRY), symbol=intent.symbol,
+                side=intent.side, qty=qty, intent_key=intent.intent_key,
+                pine_entry_id=intent.pine_id, kind=ENTRY_KIND_POSITION, order_type="market",
+            )
+        return await super().place_leg(envelope, qty)
+
+
+def __test_an_unsent_in_session_residual_open_is_owned_by_the_breadcrumb__(journal):
+    """An in-session residual open that never left the client opens its residual next sync.
+
+    The closes already reduced the book: raising would let the dispatch path
+    re-plan the combined entry from the reduced book and open its whole size.
+    The breadcrumb keeps the residual's size, and the drain opens exactly it,
+    also where the plugin's ``submitted`` entry row was left behind.
+    """
+    port = _RowLeavingPort([_leg("20", "sell", 2.0, open_time=0.0)], journal._ctx)
+    port._fail_place_leg = ExchangeConnectionError("link down")
+    port.closes_execute = True
+    eng = journal.emulator()
+    env = _entry_env("buy", 3.0)
+    res = _run(eng.run_reversal(env, port))
+    assert res.opened_orders == () and res.open_qty == 1.0
+    assert port.placed == []
+    assert len(_live_residuals(eng)) == 1
+    port._fail_place_leg = None
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    assert eng.take_opened_residuals() == [(env.intent.intent_key, ("order",))]
+    assert _live_residuals(eng) == []
+
+
+def __test_an_unsent_read_after_the_closes_leaves_the_residual_to_the_drain__(journal):
+    """A read fault after the closes went out is absorbed; the drain opens the residual."""
+    class _ReadFailsAfterClosePort(_FakePort):
+        def __init__(self, legs):
+            super().__init__(legs)
+            self.read_ok = False
+
+        async def fetch_raw_positions(self, symbol):
+            if self.closed and not self.read_ok:
+                raise ConnectionError("read dropped")
+            return await super().fetch_raw_positions(symbol)
+
+    port = _ReadFailsAfterClosePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    port.closes_execute = True
+    eng = journal.emulator()
+    res = _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert res.opened_orders == () and port.placed == []
+    assert len(_live_residuals(eng)) == 1
+    port.read_ok = True
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+
+
+def __test_a_reversal_cut_short_after_a_close_went_out_is_finished_by_the_drain__(journal):
+    """A close that never left the client after another went out leaves the reversal committed.
+
+    The dispatch path would re-plan the combined three-unit buy from the book
+    the first close reduced (one short left) and open two; the drain closes
+    the remaining short and opens the one-unit residual instead.
+    """
+    port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0),
+                      _leg("21", "sell", 1.0, open_time=1.0)],
+                     fail_close_leg=ExchangeConnectionError("link down"),
+                     fail_close_leg_id="21")
+    port.closes_execute = True
+    eng = journal.emulator()
+    res = _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert res.opened_orders == () and res.closes == (("20", 1),)
+    assert len(_live_residuals(eng)) == 1
+    # The close that never went out leaves no pending row behind.
+    assert list(iter_active_close_legs(eng._close_journal)) == []  # type: ignore[attr-defined]
+    port._fail_close_leg = None
+    _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 1), ("21", 1)]
+    assert port.placed == []
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    assert _live_residuals(eng) == []
+
+
+def __test_a_flatten_cut_short_after_a_close_went_out_never_becomes_a_reversal__(journal):
+    """An exact flatten whose second close never left the client only finishes its closes."""
+    port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0),
+                      _leg("21", "sell", 1.0, open_time=1.0)],
+                     fail_close_leg=ExchangeConnectionError("link down"),
+                     fail_close_leg_id="21")
+    port.closes_execute = True
+    eng = journal.emulator()
+    res = _run(eng.run_reversal(_entry_env("buy", 2.0), port))
+    assert res.opened_orders == () and res.open_qty == 0.0
+    port._fail_close_leg = None
+    _run(eng.drain_residual_opens(port))
+    _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 1), ("21", 1)]
+    assert port.placed == []
+    assert _live_residuals(eng) == []
+
+
+def __test_a_restart_still_opens_a_residual_whose_open_never_left_the_client__(tmp_path):
+    """The unsent outcome of a residual open survives a restart.
+
+    The plugin's ``place_leg`` left its persist-first ``submitted`` entry row
+    behind before the request failed to leave the client. A restarted
+    emulator must not read that row as an open that went out.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _RowLeavingPort([_leg("20", "sell", 2.0, open_time=0.0)], ctx)
+    port._fail_place_leg = ExchangeConnectionError("link down")
+    port.closes_execute = True
+    res = _run(OneWayEmulator(store_ctx=ctx).run_reversal(_entry_env("buy", 3.0), port))
+    assert res.opened_orders == () and port.placed == []
+    port._fail_place_leg = None
+    restarted = OneWayEmulator(store_ctx=ctx)
+    assert _run(restarted.restart_replay(port)) is True
+    assert port.placed == [("EURUSD", 1.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_a_restart_during_a_residual_retry_still_opens_the_residual__(tmp_path):
+    """A process stop right before the retry's ``place_leg`` never retires the owed open.
+
+    The first attempt's ``place_leg`` left its ``submitted`` entry row
+    behind and never left the client. The process then stops inside the
+    retry, before the retry's own ``place_leg`` persisted anything: the
+    stale row of the first attempt is no evidence of the retry, so the
+    restarted emulator opens the residual, under the next attempt's coid.
+    """
+    class _ProcessStop(BaseException):
+        pass
+
+    class _StopBeforePlacePort(_RowLeavingPort):
+        def __init__(self, legs, ctx):
+            super().__init__(legs, ctx)
+            self.stop = False
+            self.place_envelopes: list[DispatchEnvelope] = []
+
+        async def place_leg(self, envelope, qty):
+            if self.stop:
+                raise _ProcessStop("process stopped")
+            self.place_envelopes.append(envelope)
+            return await super().place_leg(envelope, qty)
+
+    store, ctx = _make_store(tmp_path)
+    port = _StopBeforePlacePort([_leg("20", "sell", 2.0, open_time=0.0)], ctx)
+    port._fail_place_leg = ExchangeConnectionError("link down")
+    port.closes_execute = True
+    env = _entry_env("buy", 3.0)
+    eng = OneWayEmulator(store_ctx=ctx)
+    res = _run(eng.run_reversal(env, port))
+    assert res.opened_orders == () and port.placed == []
+    port._fail_place_leg = None
+    port.stop = True
+    with pytest.raises(_ProcessStop):
+        _run(eng.drain_residual_opens(port))
+    port.stop = False
+    restarted = OneWayEmulator(store_ctx=ctx)
+    assert _run(restarted.restart_replay(port)) is True
+    assert port.placed == [("EURUSD", 1.0)]
+    retry = port.place_envelopes[-1]
+    # The re-attempt takes the first value of the dispatch's own retry block.
+    assert retry.retry_seq == (env.retry_seq + 1) * 36 ** 3
+    assert retry.client_order_id(KIND_ENTRY) != env.client_order_id(KIND_ENTRY)
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_an_engine_bump_of_the_entry_never_reads_as_the_residual_open__(tmp_path):
+    """An engine dispatch under the entry's bumped id is no evidence of the residual's re-attempt.
+
+    The residual open's first attempt never left the client and left its
+    entry row behind. On the same bar the engine spends the entry's id and
+    dispatches it again under ``retry_seq + 1``, leaving an entry row under
+    that id. The breadcrumb's next attempt must not share that id: the drain
+    still opens the residual.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _RowLeavingPort([_leg("20", "sell", 2.0, open_time=0.0)], ctx)
+    port._fail_place_leg = ExchangeConnectionError("link down")
+    port.closes_execute = True
+    env = _entry_env("buy", 3.0)
+    eng = OneWayEmulator(store_ctx=ctx)
+    res = _run(eng.run_reversal(env, port))
+    assert res.opened_orders == () and port.placed == []
+    bumped = replace(env, retry_seq=env.retry_seq + 1)
+    intent = env.intent
+    create_entry_order_row(
+        ctx, coid=bumped.client_order_id(KIND_ENTRY), symbol=intent.symbol,
+        side=intent.side, qty=intent.qty, intent_key=intent.intent_key,
+        pine_entry_id=intent.pine_id, kind=ENTRY_KIND_POSITION, order_type="market",
+    )
+    port._fail_place_leg = None
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+def __test_a_reduction_cut_short_after_a_close_went_out_closes_only_its_plan__(journal):
+    """A reduction whose second close never left the client never flattens the opposing side.
+
+    A buy of 2 against shorts of 1, 1 and 3 reduces the two oldest. The drain
+    finishes that plan and leaves the third short open.
+    """
+    port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0),
+                      _leg("21", "sell", 1.0, open_time=1.0),
+                      _leg("22", "sell", 3.0, open_time=2.0)],
+                     fail_close_leg=ExchangeConnectionError("link down"),
+                     fail_close_leg_id="21")
+    port.closes_execute = True
+    eng = journal.emulator()
+    res = _run(eng.run_reversal(_entry_env("buy", 2.0), port))
+    assert res.opened_orders == () and res.open_qty == 0.0
+    port._fail_close_leg = None
+    _run(eng.drain_residual_opens(port))
+    _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 1), ("21", 1)]
+    assert port.placed == []
+    assert _live_residuals(eng) == []
+
+
+def __test_a_partial_slice_cut_short_is_discharged_once_the_venue_settles_it__(journal):
+    """A reduction slicing a leg leaves the rest of that leg open and its breadcrumb discharged."""
+    port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0),
+                      _leg("21", "sell", 3.0, open_time=1.0)],
+                     fail_close_leg=ExchangeConnectionError("link down"),
+                     fail_close_leg_id="21")
+    port.closes_execute = True
+    eng = journal.emulator()
+    _run(eng.run_reversal(_entry_env("buy", 2.0), port))
+    port._fail_close_leg = None
+    _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 1), ("21", 1)]
+    _run(eng.drain_residual_opens(port))
+    _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 1), ("21", 1)]
+    assert _live_residuals(eng) == []
+
+
+def __test_a_close_the_read_does_not_show_yet_is_not_spent_again__(journal):
+    """Consecutive closes never reuse net exposure an earlier close was sent against.
+
+    Long 3 against short 1 is net long 2. The first close of 2 is
+    dispatched, but the read still lists the long in full and the venue
+    cannot settle the send yet: the second close of 2 must not close more
+    of the long, or both executing would flip the book short.
+    """
+    port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
+                      _leg("20", "sell", 1.0, open_time=1.0)])
+    eng = journal.emulator()
+    _run(eng.run_close(_close_env("sell", 2.0), port))
+    assert _dispatched(port) == [("10", 2)]
+    port.executed_unknown = True
+    second = _run(eng.run_close(_close_env("sell", 2.0, pine_id="Other"), port))
+    assert _dispatched(port) == [("10", 2)]
+    assert second.dispatched_qty == 0.0 and second.legs == ()
+    # Once the venue's record settles the first send as executed, the read
+    # lagging behind it still does not free the exposure.
+    port.executed_unknown = False
+    port.executed_by_coid[port.closed[0][3]] = 2
+    _run(eng.run_close(_close_env("sell", 2.0, pine_id="Third"), port))
+    assert _dispatched(port) == [("10", 2)]
+    # The read catches up: the reservation is gone and the book is flat net.
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0), _leg("20", "sell", 1.0, open_time=1.0)])
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="Fourth"), port))
+    assert _dispatched(port) == [("10", 2)]
+
+
+def __test_one_shrink_never_frees_two_closes_of_the_same_leg__(journal):
+    """A leg losing one unit settles one of two one-unit closes sent against it, not both.
+
+    Long 3 against short 1 is net long 2. Two one-unit closes go out on the
+    long, both recording its size as 3, and the venue cannot settle either.
+    The read then shows the long at 2: that unit is the first close's, the
+    second is still outstanding, so the book is already flat net and a
+    third close must send nothing.
+    """
+    port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
+                      _leg("20", "sell", 1.0, open_time=1.0)])
+    port.executed_unknown = True
+    eng = journal.emulator()
+    _run(eng.run_close(_close_env("sell", 1.0), port))
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="Other"), port))
+    assert _dispatched(port) == [("10", 1), ("10", 1)]
+    port.set_legs([_leg("10", "buy", 2.0, open_time=0.0), _leg("20", "sell", 1.0, open_time=1.0)])
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="Third"), port))
+    assert _dispatched(port) == [("10", 1), ("10", 1)]
+    # The same shrink is not credited again on the next view either.
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="Fourth"), port))
+    assert _dispatched(port) == [("10", 1), ("10", 1)]
+    # The second close shows up as well: the book is flat net and stays so.
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0), _leg("20", "sell", 1.0, open_time=1.0)])
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="Fifth"), port))
+    assert _dispatched(port) == [("10", 1), ("10", 1)]
+
+
+def __test_a_restart_still_holds_back_a_close_the_read_does_not_show_yet__(tmp_path):
+    """A close sent before a restart still holds its exposure back after it.
+
+    Long 3 against short 1 is net long 2. The close of 2 is dispatched and
+    its row finished, the process restarts, and the read still lists the
+    long in full while the venue cannot settle the send: a second close of 2
+    must send nothing, or both executing would flip the book short.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
+                      _leg("20", "sell", 1.0, open_time=1.0)])
+    _run(OneWayEmulator(store_ctx=ctx).run_close(_close_env("sell", 2.0), port))
+    assert _dispatched(port) == [("10", 2)]
+    port.executed_unknown = True
+    restarted = OneWayEmulator(store_ctx=ctx)
+    assert _run(restarted.restart_replay(port)) is True
+    second = _run(restarted.run_close(_close_env("sell", 2.0, pine_id="Other"), port))
+    assert _dispatched(port) == [("10", 2)]
+    assert second.dispatched_qty == 0.0 and second.legs == ()
+    # The read catches up: the reservation ends and its row is closed.
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0), _leg("20", "sell", 1.0, open_time=1.0)])
+    _run(restarted.run_close(_close_env("sell", 1.0, pine_id="Third"), port))
+    assert _dispatched(port) == [("10", 2)]
+    row = ctx.get_order(port.closed[0][3])
+    assert row is not None and row.closed_ts_ms is not None
+    store.close()
+
+
+def __test_a_handed_down_shrink_is_not_credited_again_after_a_restart__(tmp_path):
+    """The shrink one close was credited with stays its own across a restart.
+
+    Two one-unit closes go out on a long of 3 against a short of 1. The read
+    shows the long at 2: the first close is settled and the second keeps
+    holding its unit. A restarted emulator must not credit that same unit
+    to the second close, so a further close sends nothing.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
+                      _leg("20", "sell", 1.0, open_time=1.0)])
+    port.executed_unknown = True
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_close(_close_env("sell", 1.0), port))
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="Other"), port))
+    port.set_legs([_leg("10", "buy", 2.0, open_time=0.0), _leg("20", "sell", 1.0, open_time=1.0)])
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="Third"), port))
+    assert _dispatched(port) == [("10", 1), ("10", 1)]
+    restarted = OneWayEmulator(store_ctx=ctx)
+    _run(restarted.run_close(_close_env("sell", 1.0, pine_id="Fourth"), port))
+    assert _dispatched(port) == [("10", 1), ("10", 1)]
+    store.close()
+
+
+def __test_a_stop_inside_the_credit_hand_down_never_frees_one_shrink_twice__(tmp_path, monkeypatch):
+    """A process stop between a reservation's release and its hand-down leaves both undone.
+
+    Two one-unit closes go out on a long of 3 against a short of 1, and the
+    read then shows the long at 2. The view settles the first close and hands
+    its unit down to the second; the process stops in between. A restarted
+    emulator must still hold the second close, so a further close sends
+    nothing.
+    """
+    class _ProcessStop(BaseException):
+        pass
+
+    def _stop(*_args, **_kwargs):
+        raise _ProcessStop("process stopped")
+
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0),
+                      _leg("20", "sell", 1.0, open_time=1.0)])
+    port.executed_unknown = True
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_close(_close_env("sell", 1.0), port))
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="Other"), port))
+    port.set_legs([_leg("10", "buy", 2.0, open_time=0.0), _leg("20", "sell", 1.0, open_time=1.0)])
+    monkeypatch.setattr(one_way_emulator_module, "lower_close_leg_send_pre_volume", _stop)
+    with pytest.raises(_ProcessStop):
+        _run(eng.run_close(_close_env("sell", 1.0, pine_id="Third"), port))
+    monkeypatch.undo()
+    restarted = OneWayEmulator(store_ctx=ctx)
+    _run(restarted.run_close(_close_env("sell", 1.0, pine_id="Fourth"), port))
+    assert _dispatched(port) == [("10", 1), ("10", 1)]
+    store.close()
+
+
+def __test_an_entry_never_opens_next_to_an_opposing_leg_a_close_still_holds__(journal):
+    """A buy whose opposing short is held by an unsettled close opens only once the short is gone.
+
+    A close of the whole short of 2 is dispatched; the read still lists the
+    short and the venue cannot settle the send. A buy of 3 must neither open
+    beside the short (a failed close would leave a hedge) nor close the short
+    again: it opens once the read shows the short gone.
+    """
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    eng = journal.emulator()
+    close = CloseIntent(pine_id="Short", symbol="EURUSD", side="buy", qty=2.0)
+    _run(eng.run_close(DispatchEnvelope(intent=close, run_tag="t000", bar_ts_ms=500), port))
+    port.executed_unknown = True
+    res = _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert res.opened_orders == () and port.placed == []
+    _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 2)] and port.placed == []
+    port.set_legs([])
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 3.0)]
+    assert _dispatched(port) == [("20", 2)]
+    assert _live_residuals(eng) == []
+
+
+def __test_a_close_the_drain_sends_itself_comes_off_the_reversal_open__(journal):
+    """A deferred reversal opens only what its combined order leaves after the closes it sends.
+
+    A close of the whole short of 2 is dispatched for another intent and a
+    buy of 3 waits behind it. The venue then proves that close executed
+    nothing: the drain closes the short itself under the reversal, so the
+    combined order of 3 is the close of 2 plus an open of 1, never an open of
+    3 on top of it.
+    """
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    eng = journal.emulator()
+    close = CloseIntent(pine_id="Short", symbol="EURUSD", side="buy", qty=2.0)
+    _run(eng.run_close(DispatchEnvelope(intent=close, run_tag="t000", bar_ts_ms=500), port))
+    port.executed_unknown = True
+    res = _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert res.opened_orders == () and port.placed == []
+    # The earlier close executed nothing: the short is the reversal's to close.
+    port.executed_unknown = False
+    _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 2), ("20", 2)] and port.placed == []
+    port.set_legs([])
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    assert _live_residuals(eng) == []
+
+
+def __test_consecutive_replay_passes_never_spend_one_net_budget_twice__(tmp_path):
+    """A replay pass leaves the net exposure an earlier pass already sent a close against.
+
+    Two longs of 1 against a short of 1 are net long 1, with a pending close
+    row on each long. The first pass re-sends the first row (the venue says
+    it executed nothing) and cannot decide the second. In the next pass the
+    first re-send is still outstanding and the read still lists its leg, so
+    the second row must not send another close: both executing would turn
+    the book short.
+    """
+    class _PerLegEvidencePort(_FakePort):
+        def __init__(self, legs):
+            super().__init__(legs)
+            self.unknown_legs: set[str] = set()
+
+        async def close_leg_executed(self, symbol, leg_id, coids, since_ms):
+            if leg_id in self.unknown_legs:
+                return None
+            return await super().close_leg_executed(symbol, leg_id, coids, since_ms)
+
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=1, qty=1.0)
+    _pending_leg_row(ctx, leg_id="11", volume=1, qty=1.0)
+    port = _PerLegEvidencePort([_leg("10", "buy", 1.0, open_time=0.0),
+                                _leg("11", "buy", 1.0, open_time=1.0),
+                                _leg("20", "sell", 1.0, open_time=2.0)])
+    port.unknown_legs = {"11"}
+    eng = OneWayEmulator(store_ctx=ctx)
+    assert _run(eng.restart_replay(port)) is False
+    assert _dispatched(port) == [("10", 1)]
+    port.unknown_legs = {"10"}
+    _run(eng.restart_replay(port))
+    assert _dispatched(port) == [("10", 1)]
+    store.close()
+
+
+def __test_a_close_the_venue_settles_as_unexecuted_frees_its_reservation__(journal):
+    """A send the venue records as not executed no longer holds exposure back."""
+    port = _FakePort([_leg("10", "buy", 3.0, open_time=0.0)])
+    eng = journal.emulator()
+    _run(eng.run_close(_close_env("sell", 2.0), port))
+    _run(eng.run_close(_close_env("sell", 2.0, pine_id="Other"), port))
+    assert _dispatched(port) == [("10", 2), ("10", 2)]
+
+
+def __test_a_reversal_closes_only_what_earlier_closes_left__(journal):
+    """A market reversal is planned on the book less what an earlier close was sent against."""
+    port = _FakePort([_leg("20", "sell", 3.0, open_time=0.0)])
+    eng = journal.emulator()
+    close = CloseIntent(pine_id="Short", symbol="EURUSD", side="buy", qty=2.0)
+    _run(eng.run_close(DispatchEnvelope(intent=close, run_tag="t000", bar_ts_ms=500), port))
+    port.executed_unknown = True
+    res = _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert _dispatched(port) == [("20", 2), ("20", 1)]
+    assert res.open_qty == 2.0
+
+
+def __test_a_reversal_whose_first_close_never_went_out_is_retried_whole__(journal):
+    """With no close on the wire the fault is raised and no breadcrumb or close row is left."""
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)],
+                     fail_close_leg=ExchangeConnectionError("link down"))
+    eng = journal.emulator()
+    with pytest.raises(ExchangeConnectionError):
+        _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert port.closed == [] and port.placed == []
+    assert _live_residuals(eng) == []
+    assert list(iter_active_close_legs(eng._close_journal)) == []  # type: ignore[attr-defined]
+
+
+def __test_residual_recovery_never_closes_another_owners_share_on_a_whole_leg_port__(journal):
+    """A new opposing position the run shares is not closed whole by the residual drain."""
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
+    port.supports_partial_leg_close = False
+    eng = journal.emulator()
+    _run(eng.run_reversal(_entry_env("buy", 3.0), port))
+    assert _dispatched(port) == [("20", 2)]
+    # The short is gone, but a five-unit venue position shows up on the short
+    # side of which the run owns one unit.
+    port.set_legs([_leg("30", "sell", 1.0, open_time=2.0, venue_qty=5.0)])
+    _run(eng.drain_residual_opens(port))
+    assert _dispatched(port) == [("20", 2)]
+    assert port.placed == []
+    assert len(_live_residuals(eng)) == 1
+
+
+def __test_an_opened_residual_is_handed_over_even_when_a_later_row_fails__():
+    """The orders of a residual the drain opened survive a later row's failure."""
+    port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0),
+                      _leg("30", "buy", 2.0, symbol="GBPUSD", open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=None)
+    first = _entry_env("buy", 3.0)
+    second = _entry_env("sell", 3.0, symbol="GBPUSD", pine_id="Short")
+    _run(eng.run_reversal(first, port))
+    _run(eng.run_reversal(second, port))
+    assert len(_live_residuals(eng)) == 2
+    # EURUSD is flat now; GBPUSD still lists its long and the venue cannot
+    # tell what its close executed, so that row raises.
+    port.set_legs([_leg("30", "buy", 2.0, symbol="GBPUSD", open_time=0.0)])
+    port.executed_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    assert eng.take_opened_residuals() == [(first.intent.intent_key, ("order",))]
+    assert eng.take_opened_residuals() == []
 
 
 def __test_reversal_clears_breadcrumb_on_definitive_close_reject__(tmp_path):
@@ -2144,12 +3520,19 @@ def __test_restart_replay_closes_opposing_legs_before_residual__(tmp_path):
     # the opposing legs are still live and no close-leg rows were persisted, so
     # _replay_close_legs has nothing to re-dispatch. Replaying the residual on top
     # of the still-open opposing legs would over-expose the book — the residual
-    # replay must FIFO-close every still-live opposing leg before the open.
+    # replay must FIFO-close every still-live opposing leg before the open. The
+    # close is only dispatched, so the open waits for a read that shows it.
     store, ctx = _make_store(tmp_path)
-    _seed_residual(ctx, entry_coid="entry-missing", qty=1.0, side="buy")
+    # The breadcrumb carries the combined order: close the short 2, open 1.
+    _seed_residual(ctx, entry_coid="entry-missing", qty=3.0, side="buy")
     port = _FakePort([_leg("20", "sell", 2.0, open_time=0.0)])
     eng = OneWayEmulator(store_ctx=ctx)
     _run(eng.restart_replay(port))
+    assert _dispatched(port) == [("20", 2)]
+    assert port.placed == []
+    assert len(list(iter_active_residual_opens(ctx))) == 1
+    port.set_legs([])
+    _run(eng.drain_residual_opens(port))
     assert _dispatched(port) == [("20", 2)]
     assert port.placed == [("EURUSD", 1.0)]
     assert list(iter_active_residual_opens(ctx)) == []
@@ -2352,3 +3735,1170 @@ def __test_permanent_port_read_fault_propagates_unchanged__():
     with pytest.raises(_PermanentProviderError):
         _run(OneWayEmulator(store_ctx=None).run_exit_bracket(
             _exit_env("TP", "Long", tp=1.20, sl=1.00), port))
+
+
+# === One write per leg: an unsettled write holds every different write ===
+
+class _GatedPort(_FakePort):
+    """A port whose amend of ``gated_leg`` blocks until ``release`` is set.
+
+    Models a venue call still in flight after the engine's bridge stopped
+    waiting for it: the write takes effect only when the call is released.
+    """
+
+    def __init__(self, legs) -> None:
+        super().__init__(legs)
+        self.gated_leg: str | None = None
+        self.release: asyncio.Event | None = None
+        self.entered: asyncio.Event | None = None
+
+    async def amend_bracket(self, symbol, leg_id, **kwargs) -> None:
+        if leg_id == self.gated_leg:
+            assert self.release is not None and self.entered is not None
+            self.entered.set()
+            await self.release.wait()
+        await super().amend_bracket(symbol, leg_id, **kwargs)
+
+
+def __test_a_write_still_in_flight_holds_a_newer_one_and_cannot_overwrite_it__(journal):
+    """A stop modify still in flight is not overtaken by a newer one that it would later undo.
+
+    The live defect: the bridge gave up on the first modify, the next sync sent
+    a newer stop, and the first one then reached the venue and put the older
+    stop back.
+    """
+    port = _GatedPort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+
+    async def scenario() -> None:
+        await eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port)
+        port.release = asyncio.Event()
+        port.entered = asyncio.Event()
+        port.gated_leg = "10"
+        older = asyncio.ensure_future(
+            eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.02), port))
+        await port.entered.wait()
+        # The newer modify meets the leg's unsettled write and is not sent.
+        with pytest.raises(OrderDispositionUnknownError):
+            await eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.05), port)
+        assert _amended_levels(port) == [("10", None, 1.00)]
+        # Nothing to settle while the call is running: no venue read at all.
+        reads = port.fetch_calls
+        await eng.settle_leg_writes("EURUSD", port, 0.0)
+        assert port.fetch_calls == reads
+        # The older write completes; the newest levels the exit asks for go out
+        # after it, never before.
+        port.release.set()
+        await older
+        port.gated_leg = None
+        await eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.05), port)
+
+    _run(scenario())
+    assert _amended_levels(port) == [("10", None, 1.00), ("10", None, 1.02), ("10", None, 1.05)]
+    assert port.venue["10"][1] == 1.05
+
+
+def __test_overlapping_settle_passes_judge_a_write_once__(journal):
+    """A settle pass still reading the venue when the next starts is the only one that judges.
+
+    The bridge can stop waiting for a slow pass while it keeps running. Two
+    passes would both judge the same write from their reads, and the later
+    one would remove a record the first already removed (or a newer one).
+    """
+    class _SlowMatchPort(_FakePort):
+        def __init__(self, legs) -> None:
+            super().__init__(legs)
+            self.gate: asyncio.Event | None = None
+
+        async def bracket_matches(self, symbol, leg_id, **kwargs):
+            if self.gate is not None:
+                await self.gate.wait()
+            return await super().bracket_matches(symbol, leg_id, **kwargs)
+
+    port = _SlowMatchPort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+
+    async def scenario() -> None:
+        port.fail_amend_unknown = True
+        port.unknown_amends_land = True
+        with pytest.raises(OrderDispositionUnknownError):
+            await eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port)
+        port.fail_amend_unknown = False
+        port.gate = asyncio.Event()
+        first = asyncio.ensure_future(eng.settle_leg_writes("EURUSD", port, 0.0))
+        await asyncio.sleep(0)
+        second = await eng.settle_leg_writes("EURUSD", port, 0.0)
+        assert second == LegSettleResult()
+        port.gate.set()
+        await first
+
+    _run(scenario())
+    assert port.match_calls == 1
+    assert not eng.needs_settling()
+
+
+def __test_a_settle_read_raced_by_a_repeat_of_the_write_judges_nothing__(journal):
+    """A repeat sent while the settle pass reads the venue voids that read.
+
+    The read judges the earlier send; the repeat is another send of the same
+    write, which ended without a verdict and restarted its settle window. The
+    pass must neither confirm the write from the stale read nor fail on the
+    reset window; the write stays unsettled for the next pass.
+    """
+    class _SlowMatchPort(_FakePort):
+        def __init__(self, legs) -> None:
+            super().__init__(legs)
+            self.gate: asyncio.Event | None = None
+            self.reading: asyncio.Event | None = None
+
+        async def bracket_matches(self, symbol, leg_id, **kwargs):
+            if self.gate is not None and self.reading is not None:
+                self.reading.set()
+                await self.gate.wait()
+            return await super().bracket_matches(symbol, leg_id, **kwargs)
+
+    port = _SlowMatchPort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+
+    async def scenario() -> LegSettleResult:
+        port.fail_amend_unknown = True
+        port.unknown_amends_land = True
+        with pytest.raises(OrderDispositionUnknownError):
+            await eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port)
+        port.gate = asyncio.Event()
+        port.reading = asyncio.Event()
+        pending = asyncio.ensure_future(eng.settle_leg_writes("EURUSD", port, 0.0))
+        await port.reading.wait()
+        # The identical repeat goes out and ends without a verdict too.
+        port.unknown_amends_land = False
+        with pytest.raises(OrderDispositionUnknownError):
+            await eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port)
+        port.gate.set()
+        return await pending
+
+    result = _run(scenario())
+    assert result.confirmed == frozenset()
+    assert eng.needs_settling()
+
+
+def __test_a_timed_out_modify_that_landed_is_settled_by_reading_the_leg__(journal):
+    """After a modify without a verdict the leg is written again only once its fate is read."""
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    port.fail_amend_unknown = True
+    port.unknown_amends_land = True  # the venue applied it, the answer was lost
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.02), port))
+    port.fail_amend_unknown = False
+    port.amended.clear()
+    # A different stop is held back: nothing reaches the venue.
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.05), port))
+    assert port.amended == []
+    assert eng.needs_settling()
+    # The leg shows the timed-out write, so it landed; the leg is then brought
+    # to what the exit asks for now.
+    result = _run(eng.settle_leg_writes("EURUSD", port, 100.0))
+    assert _amended_levels(port) == [("10", None, 1.05)]
+    assert result.confirmed == frozenset({"X\0Long"}) and result.refused == ()
+    assert not eng.needs_settling()
+
+
+def __test_a_timed_out_modify_the_leg_never_shows_is_lost_only_after_its_window__(journal):
+    """A write the leg does not show may still land: the leg stays held for the window."""
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.02), port))
+    port.fail_amend_unknown = False
+    port.amended.clear()
+    # The leg does not show the write. The settle pass repeats the identical
+    # stop at once (it cannot be undone by its own late arrival)...
+    _run(eng.settle_leg_writes("EURUSD", port, 100.0))
+    assert _amended_levels(port) == [("10", None, 1.02)]
+    _run(eng.settle_leg_writes("EURUSD", port, 100.0 + UNSETTLED_WRITE_WINDOW_S - 0.5))
+    assert _amended_levels(port) == [("10", None, 1.02)] and eng.needs_settling()
+    # ...but a different one stays held, even though the leg now shows 1.02:
+    # which of the two identical writes landed is not known.
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.05), port))
+    _run(eng.settle_leg_writes("EURUSD", port, 100.0 + UNSETTLED_WRITE_WINDOW_S - 0.1))
+    assert _amended_levels(port) == [("10", None, 1.02)]
+    # Once the window has passed the leg takes the levels the exit asks for.
+    _run(eng.settle_leg_writes("EURUSD", port, 100.0 + UNSETTLED_WRITE_WINDOW_S))
+    assert _amended_levels(port) == [("10", None, 1.02), ("10", None, 1.05)]
+    assert not eng.needs_settling()
+
+
+def __test_a_lost_first_attach_is_sent_again_by_the_settle_pass__(journal, monkeypatch):
+    """An attach that never reached the venue is repeated on the next sync, not at a restart."""
+    warnings = _capture_warnings(monkeypatch)
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    port.fail_amend_unknown = False
+    result = _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    assert _amended_levels(port) == [("10", None, 1.00)]
+    assert result.confirmed == frozenset()  # the first write may still land
+    result = _run(eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S))
+    assert _amended_levels(port) == [("10", None, 1.00)]
+    assert result.confirmed == frozenset({"X\0Long"}) and not eng.needs_settling()
+    assert warnings == []
+
+
+def __test_a_write_the_venue_cannot_read_back_is_re_sent_once_after_its_window__(journal, monkeypatch):
+    """A "cannot tell" answer neither confirms the write nor drops it: one re-send settles it.
+
+    The cTrader case: a trailing-to-trailing amend with the take-profit kept
+    whose answer was lost. The position shows a trailing stop either way and
+    does not report its distance, so the read cannot tell the new write from
+    the old protection. A confirmation would leave a lost amend in force
+    forever; a "lost" verdict inside the window would rewrite a moved trail
+    on every sync.
+    """
+    warnings = _capture_warnings(monkeypatch)
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, tp=1.20, sl=1.00), port))
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, tp=1.20, sl=1.02), port))
+    port.fail_amend_unknown = False
+    port.cannot_tell = True
+    port.amended.clear()
+    # Inside the window: held, not confirmed, and nothing is repeated.
+    result = _run(eng.settle_leg_writes("EURUSD", port, 100.0))
+    assert port.amended == [] and result.confirmed == frozenset() and eng.needs_settling()
+    _run(eng.settle_leg_writes("EURUSD", port, 100.0 + UNSETTLED_WRITE_WINDOW_S - 0.1))
+    assert port.amended == [] and eng.needs_settling()
+    assert warnings == []
+    # After the window the same write is sent once, and its confirmed return
+    # settles the leg.
+    result = _run(eng.settle_leg_writes("EURUSD", port, 100.0 + UNSETTLED_WRITE_WINDOW_S))
+    assert _amended_levels(port) == [("10", 1.20, 1.02)]
+    assert result.confirmed == frozenset({"X\0Long"}) and not eng.needs_settling()
+    assert len(warnings) == 1 and "does not show whether the leg holds it" in warnings[0]
+    # Settled: the confirmed levels are not written again.
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, tp=1.20, sl=1.02), port))
+    assert _amended_levels(port) == [("10", 1.20, 1.02)]
+
+
+def __test_a_cannot_tell_re_send_without_a_verdict_holds_the_leg_again__(journal):
+    """The re-send after the window is a write of its own: an unknown outcome holds the leg again."""
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    port.cannot_tell = True
+    _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    result = _run(eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S))
+    assert result.confirmed == frozenset() and eng.needs_settling()
+    port.fail_amend_unknown = False
+    # The re-send's own window: held again, then re-sent once more.
+    _run(eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S + 1.0))
+    assert port.amended == []
+    result = _run(eng.settle_leg_writes("EURUSD", port, 2 * UNSETTLED_WRITE_WINDOW_S + 1.0))
+    assert _amended_levels(port) == [("10", None, 1.00)]
+    assert result.confirmed == frozenset({"X\0Long"}) and not eng.needs_settling()
+
+
+def __test_a_cannot_tell_write_whose_repeat_was_confirmed_is_not_sent_again__(journal):
+    """An identical repeat the venue confirmed inside the window is the one re-assertion."""
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.02), port))
+    port.fail_amend_unknown = False
+    port.cannot_tell = True
+    port.amended.clear()
+    # The exit's own retry repeats the identical write; the venue confirms it.
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.02), port))
+    assert _amended_levels(port) == [("10", None, 1.02)]
+    _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    result = _run(eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S))
+    assert _amended_levels(port) == [("10", None, 1.02)]
+    assert result.confirmed == frozenset({"X\0Long"}) and not eng.needs_settling()
+
+
+def __test_a_refused_re_drive_is_handed_to_the_engine__(journal):
+    """The venue refusing the levels after an unsettled write is reported, never raised."""
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    refusing = _FakePort([_leg("10", "buy", 1.0)], fail_amend_leg="10")
+    _run(eng.settle_leg_writes("EURUSD", refusing, 0.0))
+    result = _run(eng.settle_leg_writes("EURUSD", refusing, UNSETTLED_WRITE_WINDOW_S))
+    assert [key for key, _error in result.refused] == ["X\0Long"]
+    assert result.confirmed == frozenset() and not eng.needs_settling()
+
+
+# === Protection covers the surviving quantity only ===
+
+def __test_a_partly_offset_leg_gets_no_whole_leg_bracket_but_a_software_guard__(
+        journal, monkeypatch):
+    """A whole-leg bracket on a partly offset leg would flip the net position.
+
+    Long 1.0 on leg "10", an opposing 0.4 on leg "20": the net position is
+    long 0.6. A venue bracket closes the whole 1.0 when it fires and leaves
+    the book short 0.4, so the leg is guarded in software for 0.6 instead.
+    """
+    warnings = _capture_warnings(monkeypatch)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("20", "sell", 0.4, open_time=1.0)])
+    eng = journal.emulator()
+    res = _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, tp=1.20, sl=1.00), port))
+    assert res.legs == ("10",) and not res.skipped
+    assert port.amended == []  # no venue bracket anywhere
+    assert eng.has_software_guards()
+    assert len([w for w in warnings if "guarded in software" in w]) == 1
+    # Inside the levels nothing fires.
+    assert eng.software_guard_triggers("EURUSD", 1.10) == []
+    (trigger,) = eng.software_guard_triggers("EURUSD", 0.99)
+    assert (trigger.leg_id, trigger.side, trigger.reason, trigger.level) == (
+        "10", "sell", "stop_loss", 1.00)
+    assert trigger.qty == pytest.approx(0.6)
+    assert trigger.from_entry == "Long" and trigger.exit_ids == ("X",)
+    # A firing guard is not evaluated again until the engine settles its close.
+    assert eng.software_guard_triggers("EURUSD", 0.98) == []
+    eng.software_guard_settled("EURUSD", "10", outcome="retry")
+    assert len(eng.software_guard_triggers("EURUSD", 0.98)) == 1
+    eng.software_guard_settled("EURUSD", "10", outcome="closed")
+    assert not eng.has_software_guards()
+
+
+def __test_a_venue_bracket_is_cleared_before_the_leg_goes_under_the_software_guard__(tmp_path):
+    """A leg bracketed whole and then partly offset loses the venue bracket first."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, tp=1.20, sl=1.00), port))
+    assert _amended_levels(port) == [("10", 1.20, 1.00)]
+    assert port.amended_qty == [("10", 1.0)]  # the whole venue position
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
+                   _leg("20", "sell", 0.4, open_time=1.0)])
+    port.amended.clear()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, tp=1.25, sl=1.00), port))
+    assert _amended_levels(port) == [("10", None, None)]
+    (trigger,) = eng.software_guard_triggers("EURUSD", 1.26)
+    assert (trigger.reason, trigger.level) == ("take_profit", 1.25)
+    assert trigger.qty == pytest.approx(0.6)
+    eng.software_guard_settled("EURUSD", "10", outcome="retry")
+
+    # A restart keeps the leg under the guard and writes no venue bracket: its
+    # rows record that the venue bracket is gone.
+    replay_port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                             _leg("20", "sell", 0.4, open_time=1.0)])
+    restarted = OneWayEmulator(store_ctx=ctx)
+    assert _run(restarted.restart_replay(replay_port)) is True
+    assert replay_port.amended == []
+    (trigger,) = restarted.software_guard_triggers("EURUSD", 0.99)
+    assert trigger.reason == "stop_loss" and trigger.qty == pytest.approx(0.6)
+
+    # The opposing leg closes: the leg is whole net exposure again and gets
+    # its venue bracket back, the guard is gone.
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0)])
+    port.amended.clear()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, tp=1.30, sl=1.00), port))
+    assert _amended_levels(port) == [("10", 1.30, 1.00)]
+    assert not eng.has_software_guards()
+    store.close()
+
+
+def __test_a_leg_sharing_its_venue_position_is_never_bracketed_whole__(journal):
+    """A venue position holding exposure the run does not own gets no position bracket.
+
+    The run owns 1.0 of a venue position of 3.0: a position-attribute stop
+    would close all 3.0. The leg is guarded for the run's 1.0, and a leg this
+    run never wrote is not sent a clear either (it would wipe a bracket of the
+    exposure's other owner).
+    """
+    port = _FakePort([_leg("1", "buy", 1.0, venue_qty=3.0)])
+    eng = journal.emulator()
+    res = _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    assert res.legs == ("1",)
+    assert port.amended == []
+    (trigger,) = eng.software_guard_triggers("EURUSD", 1.00)
+    assert trigger.qty == pytest.approx(1.0) and trigger.reason == "stop_loss"
+    eng.software_guard_settled("EURUSD", "1", outcome="retry")
+    # Retiring the exit drops the guard, again without a venue call.
+    _run(eng.run_exit_bracket_clear(_cancel_env("X", from_entry="Long"), port))
+    assert port.amended == [] and not eng.has_software_guards()
+    assert list(journal.rows()) == []
+
+
+def __test_a_leg_that_starts_sharing_its_venue_position_loses_its_whole_stop__(journal):
+    """Foreign exposure joining a whole-bracketed leg moves its stop to the software guard.
+
+    The run owned the whole venue position when its stop went on. Once the
+    venue position also holds exposure the run does not own, the stop would
+    close that too; the next settle pass clears it and guards the run's own
+    quantity instead, with no bracket operation of the strategy. When the
+    foreign exposure leaves, the venue stop comes back. Neither switch
+    confirms a parked exit.
+    """
+    port = _FakePort([_leg("1", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    assert _amended_levels(port) == [("1", None, 1.00)]
+    assert eng.watches_leg_shares() and not eng.needs_settling()
+    port.set_legs([_leg("1", "buy", 1.0, venue_qty=3.0)])
+    port.amended.clear()
+    result = _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    assert _amended_levels(port) == [("1", None, None)]
+    assert result.confirmed == frozenset() and result.refused == ()
+    (trigger,) = eng.software_guard_triggers("EURUSD", 1.00)
+    assert trigger.qty == pytest.approx(1.0) and trigger.reason == "stop_loss"
+    eng.software_guard_settled("EURUSD", "1", outcome="retry")
+    # An unchanged share is not re-driven: no venue write.
+    port.amended.clear()
+    _run(eng.settle_leg_writes("EURUSD", port, 1.0))
+    assert port.amended == []
+    # The foreign exposure leaves: the whole-position stop is written again.
+    port.set_legs([_leg("1", "buy", 1.0)])
+    result = _run(eng.settle_leg_writes("EURUSD", port, 2.0))
+    assert _amended_levels(port) == [("1", None, 1.00)]
+    assert result.confirmed == frozenset()
+    assert not eng.has_software_guards()
+    # Retired: nothing is watched any more.
+    _run(eng.run_exit_bracket_clear(_cancel_env("X", from_entry="Long"), port))
+    assert not eng.watches_leg_shares()
+
+
+def __test_a_share_switch_never_leaves_the_leg_without_either_protection__(journal):
+    """The guard is armed before the venue stop is cleared, and kept until it is replaced.
+
+    Both switch writes end without a verdict here: the venue may still hold
+    the old stop or may already hold the new one, so the guard stays armed
+    throughout.
+    """
+    port = _FakePort([_leg("1", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    port.set_legs([_leg("1", "buy", 1.0, venue_qty=3.0)])
+    port.fail_amend_unknown = True
+    _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    assert eng.has_software_guards() and eng.needs_settling()
+    # The clear's outcome becomes known (it landed), and the share goes back
+    # to whole while the venue stop is re-written without a verdict.
+    port.fail_amend_unknown = False
+    port.venue["1"] = (None, None, None, 3.0)
+    _run(eng.settle_leg_writes("EURUSD", port, 1.0))
+    assert eng.has_software_guards()
+    port.set_legs([_leg("1", "buy", 1.0)])
+    port.fail_amend_unknown = True
+    _run(eng.settle_leg_writes("EURUSD", port, 2.0))
+    assert eng.has_software_guards()
+    (trigger,) = eng.software_guard_triggers("EURUSD", 1.00)
+    assert trigger.qty == pytest.approx(1.0)
+
+
+def __test_a_share_switch_whose_clear_never_left_is_retried_on_the_next_sync__(journal):
+    """A dropped connection on the clear keeps the switch pending until the clear goes out.
+
+    The clear raised :class:`ExchangeConnectionError` (never sent): the
+    venue still holds the whole-position stop. The settle pass of the next
+    sync must clear it again, the guard protecting the run's share meanwhile.
+    """
+    port = _FakePort([_leg("1", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    port.set_legs([_leg("1", "buy", 1.0, venue_qty=3.0)])
+    amend = port.amend_bracket
+    drops = [ExchangeConnectionError("connection dropped")]
+
+    async def dropping_amend(*args, **kwargs) -> None:
+        if drops:
+            raise drops.pop()
+        await amend(*args, **kwargs)
+
+    port.amend_bracket = dropping_amend
+    port.amended.clear()
+    with pytest.raises(ExchangeConnectionError):
+        _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    assert port.amended == [] and eng.has_software_guards()
+    assert port.venue["1"][1] == 1.00
+    _run(eng.settle_leg_writes("EURUSD", port, 1.0))
+    assert _amended_levels(port) == [("1", None, None)]
+    assert eng.has_software_guards()
+    # Done: the next pass sends nothing more.
+    _run(eng.settle_leg_writes("EURUSD", port, 2.0))
+    assert _amended_levels(port) == [("1", None, None)]
+
+
+def __test_a_failed_share_switch_reverted_by_the_venue_drops_the_guard__(journal):
+    """A switch whose clear never left is reconciled even when the share goes back.
+
+    The clear raised :class:`ExchangeConnectionError` with the guard already
+    armed, and the foreign exposure left before the next sync: the leg is
+    whole again, its earlier mode. The settle pass must still reconcile it,
+    so the venue stop stays the leg's only protection and no software guard
+    races it with a second close.
+    """
+    port = _FakePort([_leg("1", "buy", 1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    port.set_legs([_leg("1", "buy", 1.0, venue_qty=3.0)])
+    amend = port.amend_bracket
+    drops = [ExchangeConnectionError("connection dropped")]
+
+    async def dropping_amend(*args, **kwargs) -> None:
+        if drops:
+            raise drops.pop()
+        await amend(*args, **kwargs)
+
+    port.amend_bracket = dropping_amend
+    port.amended.clear()
+    with pytest.raises(ExchangeConnectionError):
+        _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    assert eng.has_software_guards() and port.venue["1"][1] == 1.00
+    port.set_legs([_leg("1", "buy", 1.0)])
+    _run(eng.settle_leg_writes("EURUSD", port, 1.0))
+    assert not eng.has_software_guards()
+    assert eng.software_guard_triggers("EURUSD", 1.00) == []
+    assert port.venue["1"][1] == 1.00
+    assert all(sl == 1.00 for _leg_id, _tp, sl in _amended_levels(port))
+    # Reconciled: the next pass sends nothing more.
+    sent = list(port.amended)
+    _run(eng.settle_leg_writes("EURUSD", port, 2.0))
+    assert port.amended == sent and eng.watches_leg_shares()
+
+
+def __test_a_port_with_a_native_sized_bracket_receives_the_protected_quantity__(journal):
+    """Where the venue can size a leg bracket, the amend carries the surviving quantity."""
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("20", "sell", 0.4, open_time=1.0)])
+    eng = journal.emulator(sized_leg_bracket=CapabilityLevel.NATIVE)
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, sl=1.00), port))
+    assert _amended_levels(port) == [("10", None, 1.00)]
+    assert [(leg_id, pytest.approx(qty)) for leg_id, qty in port.amended_qty] == [("10", 0.6)]
+    assert not eng.has_software_guards()
+
+
+def __test_a_software_guard_trails_from_the_first_price_and_only_in_favour__():
+    """The guard's trailing stop arms at the first price and never moves back."""
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("20", "sell", 0.4, open_time=1.0)])
+    eng = OneWayEmulator(store_ctx=None, mintick=0.01)
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, trail=5.0), port))
+    assert eng.software_guard_triggers("EURUSD", 1.10) == []  # arms at 1.05
+    assert eng.software_guard_triggers("EURUSD", 1.20) == []  # trails to 1.15
+    assert eng.software_guard_triggers("EURUSD", 1.16) == []  # does not move back
+    (trigger,) = eng.software_guard_triggers("EURUSD", 1.15)
+    assert trigger.reason == "trailing_stop" and trigger.level == pytest.approx(1.15)
+
+
+def __test_a_partly_offset_leg_on_a_whole_leg_only_venue_is_reported_unprotectable__(
+        journal, monkeypatch):
+    """Neither a sized bracket nor a partial close: the leg gets no bracket, loudly."""
+    errors: list[str] = []
+    monkeypatch.setattr(
+        "pynecore.core.broker.one_way_emulator._blog_error",
+        lambda msg, *args, **_kw: errors.append(msg % args),
+    )
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("20", "sell", 0.4, open_time=1.0)])
+    port.supports_partial_leg_close = False
+    eng = journal.emulator()
+    for _ in range(2):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, sl=1.00), port))
+    assert port.amended == [] and not eng.has_software_guards()
+    assert len([e for e in errors if "cannot be protected" in e]) == 1
+    # With the opposing leg gone the leg is whole net exposure and is bracketed.
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0)])
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.00), port))
+    assert _amended_levels(port) == [("10", None, 1.00)]
+
+
+# === Review round: fan, guard, whole-leg and resend hardening ===
+
+def __test_an_unknown_first_leg_still_writes_and_records_the_other_legs__(journal):
+    """An attach of unknown outcome on one leg does not leave the later legs unowned.
+
+    The fan used to stop at the first unknown outcome: the second leg had no
+    ownership row, so the settle pass confirmed the exit while that leg carried
+    no stop.
+    """
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)],
+                     fail_amend_unknown_leg="10")
+    eng = journal.emulator()
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=2.0, sl=1.00), port))
+    assert _amended_levels(port) == [("11", None, 1.00)]
+    assert sorted((row.extras or {})[EXTRAS_KEY_BRACKET_OWN_LEG_ID]
+                  for row in journal.rows()) == ["10", "11"]
+    port.fail_amend_unknown_leg = None
+    _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    result = _run(eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S))
+    assert result.confirmed == frozenset({"X\0Long"})
+    assert port.venue["10"][1] == 1.00 and port.venue["11"][1] == 1.00
+
+
+def __test_a_software_guard_close_never_exceeds_what_survives_now__(journal):
+    """The guard closes at most the leg's current net share, never its armed quantity.
+
+    Long 10 against an opposing 4 arms a guard for 6. The opposing leg then
+    grows to 9: closing 6 would turn a net long of 1 into a net short of 5.
+    """
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0),
+                      _leg("20", "sell", 4.0, open_time=1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=6.0, sl=1.00), port))
+    (trigger,) = eng.software_guard_triggers("EURUSD", 0.99)
+    assert trigger.qty == pytest.approx(6.0)
+    port.set_legs([_leg("10", "buy", 10.0, open_time=0.0),
+                   _leg("20", "sell", 9.0, open_time=1.0)])
+
+    def guard_close() -> DispatchEnvelope:
+        intent = CloseIntent(
+            pine_id="__pyne_leg_guard__10", symbol="EURUSD", side="sell",
+            qty=trigger.qty, immediately=True, synthetic_kind="leg_guard",
+            target_leg_id="10", target_entry_id=trigger.from_entry,
+        )
+        return DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000)
+
+    res = _run(eng.run_close(guard_close(), port))
+    assert _dispatched(port) == [("10", 1)] and res.dispatched_qty == pytest.approx(1.0)
+    # Nothing of the leg survives any more: the guard close sends nothing.
+    port.closed.clear()
+    port.set_legs([_leg("10", "buy", 10.0, open_time=0.0),
+                   _leg("20", "sell", 10.0, open_time=1.0)])
+    res = _run(eng.run_close(guard_close(), port))
+    assert port.closed == [] and res.legs == () and not res.skipped
+
+
+def __test_a_whole_leg_close_that_would_flip_the_net_is_not_sent__(monkeypatch):
+    """On a whole-leg-only port a close is never widened past the net exposure."""
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        "pynecore.core.broker.one_way_emulator._blog_warning",
+        lambda msg, *args, **_kw: warnings.append(msg % args),
+    )
+    port = _FakePort([_leg("10", "buy", 10.0, open_time=0.0),
+                      _leg("20", "sell", 9.0, open_time=1.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=None)
+    with pytest.raises(OrderSkippedByPlugin):
+        _run(eng.run_close(_close_env("sell", 1.0), port))
+    assert port.closed == []
+    assert len([w for w in warnings if "would flip the net position" in w]) == 1
+    # The mirror through a reversal-shaped reduce: net short 1, a buy of 1.
+    port = _FakePort([_leg("20", "sell", 10.0, open_time=0.0),
+                      _leg("10", "buy", 9.0, open_time=1.0)])
+    port.supports_partial_leg_close = False
+    with pytest.raises(OrderSkippedByPlugin):
+        _run(eng.run_reversal(_entry_env("buy", 1.0), port))
+    assert port.closed == [] and port.placed == []
+
+
+def __test_a_close_larger_than_the_net_never_flips_it__():
+    """A close is capped at its side's net exposure, whole legs in the plan included.
+
+    Long legs of four and six against a short leg of nine net to one long. A
+    close of four would take the whole first leg and leave three short; it
+    closes the one unit of net exposure, the rest reported as a shortfall.
+    On a whole-leg-only port no leg fits inside that one unit, so nothing goes
+    out.
+    """
+    legs = [_leg("10", "buy", 4.0, open_time=0.0), _leg("11", "buy", 6.0, open_time=1.0),
+            _leg("20", "sell", 9.0, open_time=2.0)]
+    port = _FakePort(legs)
+    eng = OneWayEmulator(store_ctx=None)
+    res = _run(eng.run_close(_close_env("sell", 4.0), port))
+    assert _dispatched(port) == [("10", 1)]
+    assert res.shortfall == pytest.approx(3.0)
+    port = _FakePort(legs)
+    port.supports_partial_leg_close = False
+    with pytest.raises(OrderSkippedByPlugin):
+        _run(eng.run_close(_close_env("sell", 4.0), port))
+    assert port.closed == []
+
+
+def __test_a_whole_position_close_of_a_shared_venue_position_is_not_sent__():
+    """A whole-position-only port never closes a venue position the run only partly owns."""
+    port = _FakePort([_leg("1", "buy", 2.0, venue_qty=10.0)])
+    port.supports_partial_leg_close = False
+    eng = OneWayEmulator(store_ctx=None)
+    with pytest.raises(OrderSkippedByPlugin):
+        _run(eng.run_close(_close_env("sell", 2.0), port))
+    assert port.closed == []
+
+
+def __test_a_shared_venue_position_on_a_whole_position_venue_gets_no_guard__(
+        journal, monkeypatch):
+    """A guard there would close the whole venue position, the other owner's share too."""
+    errors: list[str] = []
+    monkeypatch.setattr(
+        "pynecore.core.broker.one_way_emulator._blog_error",
+        lambda msg, *args, **_kw: errors.append(msg % args),
+    )
+    port = _FakePort([_leg("1", "buy", 2.0, venue_qty=10.0)])
+    port.supports_partial_leg_close = False
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=2.0, sl=1.00), port))
+    assert port.amended == [] and not eng.has_software_guards()
+    assert len([e for e in errors if "cannot be protected" in e]) == 1
+
+
+def __test_a_repeat_still_in_flight_cannot_undo_a_newer_stop__(journal):
+    """The identical repeat of an unsettled write holds the leg until the repeat ends.
+
+    The repeat used to run under the original write's settle window: once that
+    expired a newer stop went out, and the repeat arriving late put the older
+    stop back.
+    """
+    port = _GatedPort([_leg("10", "buy", 1.0)])
+    eng = journal.emulator()
+
+    async def scenario() -> None:
+        port.fail_amend_unknown = True
+        with pytest.raises(OrderDispositionUnknownError):
+            await eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.01), port)
+        port.fail_amend_unknown = False
+        port.release = asyncio.Event()
+        port.entered = asyncio.Event()
+        port.gated_leg = "10"
+        # The settle pass repeats the identical stop; the repeat hangs.
+        repeat = asyncio.ensure_future(eng.settle_leg_writes("EURUSD", port, 0.0))
+        await port.entered.wait()
+        # The script moves the stop; the leg is held.
+        with pytest.raises(OrderDispositionUnknownError):
+            await eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, sl=1.05), port)
+        # The original write's window passes while the repeat is in flight:
+        # nothing else may go out.
+        await eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S + 1.0)
+        assert port.amended == []
+        port.release.set()
+        await repeat
+        port.gated_leg = None
+        assert _amended_levels(port) == [("10", None, 1.01)]
+        # Only now, with the repeat ended, does the newer stop go out.
+        await eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S + 2.0)
+
+    _run(scenario())
+    assert _amended_levels(port) == [("10", None, 1.01), ("10", None, 1.05)]
+    assert port.venue["10"][1] == 1.05
+    assert not eng.needs_settling()
+
+
+# === One write per close-leg / breadcrumb transition ======================
+
+class _WriteFault(Exception):
+    """The injected one-shot failure of a journal write."""
+
+
+def _fail_write_once(journal, method: str, when=lambda *args, **fields: True) -> None:
+    """Make the next ``method`` call of ``journal`` matching ``when`` raise once."""
+    real = getattr(journal, method)
+    state = {'armed': True}
+
+    def wrapper(*args, **fields):
+        if state['armed'] and when(*args, **fields):
+            state['armed'] = False
+            raise _WriteFault(method)
+        return real(*args, **fields)
+
+    setattr(journal, method, wrapper)
+
+
+def __test_a_failed_reservation_write_leaves_no_close_row_to_re_send__(tmp_path):
+    """A close row is never persisted without the reservation of its send."""
+    from pynecore.core.broker.store_helpers import EXTRAS_KEY_CLOSE_LEG_RESERVED
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _fail_write_once(
+        ctx, 'upsert_order',
+        when=lambda coid, **fields: ('symbol' not in fields
+                                     and EXTRAS_KEY_CLOSE_LEG_RESERVED
+                                     in (fields.get('extras') or {})),
+    )
+    with pytest.raises(_WriteFault):
+        _run(eng.run_close(_close_env("sell", 1.0), port))
+    assert port.closed == []
+    # A pending row without its reservation would be re-sent by the next
+    # settlement although nothing of it went out.
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+@pytest.mark.parametrize("mode", ["store", "memory"])
+def __test_a_failed_close_of_a_finished_close_row_never_leaks_it_live__(tmp_path, mode):
+    """Finishing a close row is one write: no live ``dispatched`` row without a send."""
+    from pynecore.core.broker.ownership_journal import MemoryOwnershipJournal
+    from pynecore.core.broker.store_helpers import finish_close_leg_row
+    store = None
+    if mode == "store":
+        store, journal = _make_store(tmp_path)
+    else:
+        journal = MemoryOwnershipJournal()
+    _pending_leg_row(journal, leg_id="10", volume=1, qty=1.0)
+    coid = "t000-x-y-c:10"
+    _fail_write_once(journal, 'close_order')
+    with pytest.raises(_WriteFault):
+        finish_close_leg_row(journal, coid)
+    row = journal.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    # Still pending, so a settlement pass reads and finishes it.
+    assert [r.client_order_id for r in iter_active_close_legs(journal)] == [coid]
+    finish_close_leg_row(journal, coid)
+    row = journal.get_order(coid)
+    assert row is not None and row.closed_ts_ms is not None
+    if store is not None:
+        store.close()
+
+
+def __test_a_failed_breadcrumb_rewrite_never_revives_the_earlier_one__(tmp_path):
+    """Re-persisting a breadcrumb under the same coid is one write with its reopen."""
+    from pynecore.core.broker.store_helpers import clear_residual_open_row
+    store, ctx = _make_store(tmp_path)
+    fields = dict(
+        coid="t000-x-y-c:residual", symbol="EURUSD", side="buy", qty=1.0,
+        intent_key="Long", pine_entry_id="Long", entry_coid="t000-x-y-e",
+        run_tag="t000", bar_ts_ms=1000, retry_seq=0,
+    )
+    create_residual_open_row(ctx, **fields, close_plan=[("20", 2.0)])
+    clear_residual_open_row(ctx, fields['coid'])
+    _fail_write_once(ctx, 'upsert_order')
+    with pytest.raises(_WriteFault):
+        create_residual_open_row(ctx, **{**fields, 'retry_seq': 1})
+    # A reopened breadcrumb still carrying the earlier close plan would be
+    # replayed: the earlier reversal closed and opened again.
+    assert list(iter_active_residual_opens(ctx)) == []
+    store.close()
+
+
+# === Storage failures on either side of a leg close ========================
+
+def _fail_storage_once(journal, method: str, when=lambda *args, **fields: True, *,
+                       times: int = 1) -> None:
+    """Make the next ``times`` matching ``method`` calls of ``journal`` raise a storage error."""
+    import sqlite3
+    real = getattr(journal, method)
+    state = {'left': times}
+
+    def wrapper(*args, **fields):
+        if state['left'] and when(*args, **fields):
+            state['left'] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **fields)
+
+    setattr(journal, method, wrapper)
+
+
+def __test_a_storage_failure_before_a_leg_close_sends_nothing__(tmp_path):
+    """A failed persist-first close-row write is a fault that never left the client."""
+    from pynecore.core.broker.exceptions import JournalWriteError
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _fail_storage_once(ctx, 'upsert_order')
+    with pytest.raises(JournalWriteError) as raised:
+        _run(eng.run_close(_close_env("sell", 1.0), port))
+    assert isinstance(raised.value, ExchangeConnectionError)
+    assert port.closed == []
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_a_storage_failure_after_a_leg_close_parks_it_for_settlement__(tmp_path):
+    """A failed write after the sent close is an unknown outcome its row still owns.
+
+    The store stays down for the ``dispatched`` mark and for its owed retry:
+    the row keeps its reservation. Once the store is back the owed mark lands,
+    so the running process, not only a restart, finishes the row.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    # The first writes once the close is on the wire: the row's ``dispatched`` mark.
+    _fail_storage_once(ctx, 'upsert_order', when=lambda *a, **f: bool(port.closed), times=2)
+    with pytest.raises(OrderDispositionUnknownError) as raised:
+        _run(eng.run_close(_close_env("sell", 1.0), port))
+    assert raised.value.client_order_id.endswith(":10")
+    assert len(port.closed) == 1
+    # The row keeps its reservation, so the settlement reads what it executed.
+    assert ([row.client_order_id for row in iter_active_close_legs(ctx)]
+            == [raised.value.client_order_id])
+
+    ctx.claim_owed_writes(lambda _label, write: write())
+    assert list(iter_active_close_legs(ctx)) == []
+    assert len(port.closed) == 1
+    store.close()
+
+
+def __test_a_store_still_down_after_a_sent_leg_close_parks_it_and_owes_the_finish__(tmp_path):
+    """A store that also fails the follow-up read still parks the close and owes its finish.
+
+    Nothing of the owed finish runs before it is queued, so the unknown
+    disposition is raised and the finish lands once the store is back.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    # The finish and its owed retry both fail on their first read.
+    _fail_storage_once(ctx, 'get_order', when=lambda *a, **f: bool(port.closed), times=2)
+    with pytest.raises(OrderDispositionUnknownError) as raised:
+        _run(eng.run_close(_close_env("sell", 1.0), port))
+    assert len(port.closed) == 1
+    assert ([row.client_order_id for row in iter_active_close_legs(ctx)]
+            == [raised.value.client_order_id])
+
+    ctx.claim_owed_writes(lambda _label, write: write())
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+# === Storage failures: a failed write leaves memory and journal as before ===
+
+
+def _fail_call(monkeypatch, target, name: str, *, when=None) -> list[int]:
+    """Make ``target.name`` raise a storage error once, on the first call ``when`` accepts."""
+    original = getattr(target, name)
+    failed = [0]
+
+    def failing(*args, **kwargs):
+        if not failed[0] and (when is None or when(*args, **kwargs)):
+            failed[0] += 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, failing)
+    return failed
+
+
+def __test_a_failed_release_in_the_drain_still_reports_the_keys_released__(journal, monkeypatch):
+    """Keys released before a failed release reach the engine; the rest is redone next sync."""
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0, entry_id="A"),
+                      _leg("11", "buy", 1.0, open_time=1.0, entry_id="B")])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("TP", "A", qty=1.0, tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("TP", "B", qty=1.0, tp=1.30), port))
+    port.fail_amend_unknown = True
+    for entry in ("A", "B"):
+        with pytest.raises(OrderDispositionUnknownError):
+            _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry=entry), port))
+    port.fail_amend_unknown = False
+    _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    _run(eng.settle_leg_writes("EURUSD", port, UNSETTLED_WRITE_WINDOW_S))
+    assert _own_states(journal.rows()) == {
+        "TP\0A": BRACKET_OWN_STATE_CLEARING, "TP\0B": BRACKET_OWN_STATE_CLEARING}
+    calls = [0]
+
+    def second_release(*_args, **_kwargs) -> bool:
+        calls[0] += 1
+        return calls[0] == 2
+
+    _fail_call(monkeypatch, one_way_emulator_module, "update_bracket_ownership_state",
+               when=second_release)
+    assert _run(eng.drain_clearing_rows("EURUSD", port)) == {"TP\0A"}
+    assert _own_states(journal.rows()) == {"TP\0B": BRACKET_OWN_STATE_CLEARING}
+    assert _run(eng.drain_clearing_rows("EURUSD", port)) == {"TP\0B"}
+    assert journal.rows() == []
+    assert _run(eng.drain_clearing_rows("EURUSD", port)) == set()
+
+
+def __test_a_failed_clearing_mark_leaves_every_row_active__(journal, monkeypatch):
+    """A clear whose persist-first marking fails marks no row and sends nothing; a retry clears."""
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", qty=2.0, tp=1.20), port))
+    port.amended.clear()
+    calls = [0]
+
+    def second_mark(*_args, **_kwargs) -> bool:
+        calls[0] += 1
+        return calls[0] == 2
+
+    _fail_call(monkeypatch, one_way_emulator_module, "update_bracket_ownership_state",
+               when=second_mark)
+    cancel = _cancel_env("TP", from_entry="Long")
+    with pytest.raises(sqlite3.OperationalError):
+        _run(eng.run_exit_bracket_clear(cancel, port))
+    assert sorted(row.extras[EXTRAS_KEY_BRACKET_OWN_STATE] for row in journal.rows()) == [
+        "active", "active"]
+    assert port.amended == []
+    res = _run(eng.run_exit_bracket_clear(cancel, port))
+    assert sorted(res.legs) == ["10", "11"]
+    assert journal.rows() == []
+
+
+def __test_a_failed_software_flag_write_flags_no_row__(tmp_path, monkeypatch):
+    """The software flag of a leg's rows flips in one write; a failed one is redone by the re-run."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=1.0, tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("Y", "Long", qty=1.0, sl=1.00), port))
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
+                   _leg("20", "sell", 0.4, open_time=1.0)])
+
+    def flags() -> dict[str, bool]:
+        return {row.intent_key: bool(row.extras.get(EXTRAS_KEY_BRACKET_OWN_SOFTWARE))
+                for row in iter_active_bracket_ownerships(ctx)}
+
+    def flagging_y(coid, **fields) -> bool:
+        return coid.startswith("bo:Y") and bool(
+            (fields.get('extras') or {}).get(EXTRAS_KEY_BRACKET_OWN_SOFTWARE))
+
+    _fail_call(monkeypatch, ctx, "upsert_order", when=flagging_y)
+    with pytest.raises(sqlite3.OperationalError):
+        _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, tp=1.25), port))
+    assert flags() == {"X\0Long": False, "Y\0Long": False}
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, tp=1.25), port))
+    assert flags() == {"X\0Long": True, "Y\0Long": True}
+    store.close()
+
+
+def __test_a_failed_attempt_move_is_written_by_the_next_pass__(tmp_path, monkeypatch):
+    """A residual open that never left the client opens once, even when its attempt move fails."""
+    store, ctx = _make_store(tmp_path)
+    port = _RowLeavingPort([_leg("20", "sell", 2.0, open_time=0.0)], ctx)
+    port._fail_place_leg = ExchangeConnectionError("link down")
+    port.closes_execute = True
+    eng = OneWayEmulator(store_ctx=ctx)
+    env = _entry_env("buy", 3.0)
+    _fail_call(monkeypatch, one_way_emulator_module, "advance_residual_open_attempt")
+    res = _run(eng.run_reversal(env, port))
+    assert res.opened_orders == () and port.placed == []
+    assert len(_live_residuals(eng)) == 1
+    port._fail_place_leg = None
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    assert eng.take_opened_residuals() == [(env.intent.intent_key, ("order",))]
+    assert _live_residuals(eng) == []
+    _run(eng.drain_residual_opens(port))
+    assert port.placed == [("EURUSD", 1.0)]
+    store.close()
+
+
+def __test_a_failed_record_of_a_cut_short_flatten_is_an_unknown_disposition__(
+        tmp_path, monkeypatch):
+    """A close went out, so a failed breadcrumb write never reads as "nothing sent"."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("20", "sell", 1.0, open_time=0.0),
+                      _leg("21", "sell", 1.0, open_time=1.0)],
+                     fail_close_leg=ExchangeConnectionError("link down"),
+                     fail_close_leg_id="21")
+    eng = OneWayEmulator(store_ctx=ctx)
+    _fail_call(monkeypatch, one_way_emulator_module, "create_residual_open_row")
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_reversal(_entry_env("buy", 2.0), port))
+    assert _dispatched(port) == [("20", 1)]
+    store.close()
+
+
+def __test_a_failed_discharge_of_an_unsent_close_is_settled_from_the_venue__(
+        tmp_path, monkeypatch):
+    """The row of a close that never left the client stays reserved when its discharge fails."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)],
+                     fail_close_leg=ExchangeConnectionError("link down"))
+    eng = OneWayEmulator(store_ctx=ctx)
+    _fail_call(monkeypatch, one_way_emulator_module, "release_close_leg_send")
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_close(_close_env("sell", 2.0), port))
+    assert [row.client_order_id for row in iter_active_close_legs(ctx)] == [
+        close_leg_client_order_id(_close_env("sell", 2.0).client_order_id(KIND_CLOSE), "10")]
+    port._fail_close_leg = None
+    assert _run(eng.restart_replay(port)) is True
+    assert len(port.closed) == 1 and port.closed[0][2] == 2
+    assert list(iter_active_close_legs(ctx)) == []
+    assert _run(eng.restart_replay(port)) is True
+    assert len(port.closed) == 1
+    store.close()
+
+
+def __test_a_failed_finish_after_a_re_send_never_sends_it_again__(tmp_path, monkeypatch):
+    """A re-send whose row write failed is settled from the venue's record, not sent twice."""
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=2, qty=2.0)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _fail_call(monkeypatch, one_way_emulator_module, "finish_close_leg_row")
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.restart_replay(port))
+    assert len(port.closed) == 1
+    _sym, _leg_id, volume, attempt = port.closed[0]
+    port.executed_by_coid[attempt] = volume
+    assert _run(eng.restart_replay(port)) is True
+    assert len(port.closed) == 1
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_a_failed_dropped_leg_mark_leaves_every_row_active__(journal, monkeypatch):
+    """A re-attach whose retirement marking fails marks no dropped row; the re-run retires them."""
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0, entry_id="A"),
+                      _leg("11", "buy", 1.0, open_time=1.0, entry_id="A")])
+    eng = journal.emulator()
+    _run(eng.run_exit_bracket(_exit_env("TP", "A", qty=2.0, tp=1.20), port))
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0, entry_id="B"),
+                   _leg("11", "buy", 1.0, open_time=1.0, entry_id="B"),
+                   _leg("12", "buy", 1.0, open_time=2.0, entry_id="A")])
+    calls = [0]
+
+    def second_mark(*_args, **kwargs) -> bool:
+        if kwargs.get('new_state') != BRACKET_OWN_STATE_CLEARING:
+            return False
+        calls[0] += 1
+        return calls[0] == 2
+
+    _fail_call(monkeypatch, one_way_emulator_module, "update_bracket_ownership_state",
+               when=second_mark)
+    with pytest.raises(sqlite3.OperationalError):
+        _run(eng.run_exit_bracket(_exit_env("TP", "A", qty=1.0, tp=1.20), port))
+    assert sorted((row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID],
+                   row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]) for row in journal.rows()) == [
+        ("10", "active"), ("11", "active")]
+    _run(eng.run_exit_bracket(_exit_env("TP", "A", qty=1.0, tp=1.20), port))
+    assert sorted((row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID],
+                   row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]) for row in journal.rows()) == [
+        ("12", "active")]
+
+
+def __test_a_failed_re_send_record_sends_nothing__(tmp_path, monkeypatch):
+    """A re-send whose attempt record fails is a journal fault before the send; a retry sends once."""
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=2, qty=2.0)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _fail_call(monkeypatch, one_way_emulator_module, "update_close_leg_state")
+    with pytest.raises(JournalWriteError):
+        _run(eng.restart_replay(port))
+    assert port.closed == []
+    assert _run(eng.restart_replay(port)) is True
+    assert _dispatched(port) == [("10", 2)]
+    assert list(iter_active_close_legs(ctx)) == []
+    store.close()
+
+
+def __test_a_failed_release_of_an_unsent_re_send_is_settled_from_the_venue__(
+        tmp_path, monkeypatch):
+    """An unsent re-send whose release fails stays reserved and is settled, never sent twice."""
+    store, ctx = _make_store(tmp_path)
+    _pending_leg_row(ctx, leg_id="10", volume=2, qty=2.0)
+    port = _FakePort([_leg("10", "buy", 2.0, open_time=0.0)],
+                     fail_close_leg=ExchangeConnectionError("link down"))
+    eng = OneWayEmulator(store_ctx=ctx)
+    _fail_call(monkeypatch, one_way_emulator_module, "release_close_leg_send")
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.restart_replay(port))
+    assert port.closed == []
+    port._fail_close_leg = None
+    assert _run(eng.restart_replay(port)) is True
+    assert _dispatched(port) == [("10", 2)]
+    assert _run(eng.restart_replay(port)) is True
+    assert _dispatched(port) == [("10", 2)]
+    store.close()

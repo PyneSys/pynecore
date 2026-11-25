@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 from pynecore.core.plugin.live_provider import LiveProviderConfig, LiveProviderPlugin
@@ -80,11 +80,9 @@ class PositionPort(Protocol):
 
     * ``supports_partial_leg_close`` — ``False`` when the venue cannot reduce
       a single leg by a partial volume (e.g. Capital.com, whose position
-      DELETE is full-row only). The emulator then pre-flights every close /
-      reversal plan and atomically skips
-      (:class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin`) any
-      plan containing a partial leg slice, before persisting or dispatching
-      anything.
+      DELETE is full-row only). The emulator then widens every partial leg
+      slice of a close / reversal plan to the whole leg, with a warning: a
+      close that cannot be met exactly is met in full, never dropped.
     """
 
     async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
@@ -97,6 +95,10 @@ class PositionPort(Protocol):
         is targeted with it: an exit bound to a ``from_entry`` covers that
         entry's legs plus every unattributed leg, an exit without one covers
         all net-survivor legs.
+
+        A leg living in a venue position that also holds exposure this run does
+        not own reports the run's share as ``qty`` and the venue position's
+        size as :attr:`~PositionLeg.venue_qty`.
         """
         ...
 
@@ -114,7 +116,59 @@ class PositionPort(Protocol):
     ) -> None:
         """Send ONE reduce/close of ``volume`` (broker-grid units) on broker
         leg ``leg_id`` under client-order-id ``coid``. The resulting fill
-        arrives on the regular order-event stream; this just dispatches."""
+        arrives on the regular order-event stream; this just dispatches.
+
+        A crash can leave a close's outcome unknown, so the restart replay
+        never re-sends one under a ``coid`` it already used: it asks
+        :meth:`close_leg_executed` what the earlier sends executed and sends
+        only the part still open, under a new ``coid``."""
+        ...
+
+    async def close_leg_executed(
+            self, symbol: str, leg_id: str, coids: Sequence[str], since_ms: int,
+    ) -> int | None:
+        """How much of leg ``leg_id`` the closes sent under ``coids`` executed.
+
+        The core asks this for a close whose outcome is unknown (a crash, a
+        timeout, a guard re-firing on the same close), while the leg is still
+        open, before it re-sends anything: ``coids`` are every client-order-id
+        the core recorded for that close, oldest first, and ``since_ms`` (epoch
+        ms, local clock) is when the first of them was about to be sent. A
+        ``coid`` is recorded BEFORE :meth:`close_leg` is called, so a crash can
+        leave one that never reached the plugin or the venue. The core re-sends
+        at most the requested volume minus the answer, so the answer must come
+        from venue evidence, never from an assumption. There are exactly three
+        answers:
+
+        * a positive ``int`` — the broker-grid volume (the unit of
+          :meth:`close_leg`'s ``volume``) these closes provably executed, once
+          none of them can execute any more.
+        * ``0`` — the venue proves none of them executed and none can execute
+          any more. A ``coid`` the venue provably never received (a crash
+          between recording the send and transmitting it) must become ``0``
+          once the venue's records are complete for ``since_ms``; answering
+          ``None`` for it forever leaves the close undecidable.
+        * ``None`` — cannot tell yet: a close still working, a read that
+          failed, timed out or came back incomplete, or an empty read made
+          before the venue's own indexing or publish delay for ``since_ms`` has
+          passed. The core sends nothing and asks again on its next sync; the
+          leg keeps its protection meanwhile.
+
+        Judge every ``coid`` by what the venue holds, never only by the
+        plugin's own records: the send may belong to an earlier run instance
+        of the bot, or the plugin's local row for it may already be gone to
+        retention, and neither makes it a send the venue never received. An
+        empty venue read is evidence of absence only once the venue's indexing
+        or publish delay has passed and the read covers ``since_ms``.
+
+        When the records cannot tell these closes' executions from another
+        reduction of the same leg after ``since_ms``, count that reduction as
+        theirs: an over-count leaves the leg less reduced than the script
+        asked, which the reconcile settles against the venue, while an
+        under-count would close the leg twice.
+
+        Called on the engine's async path; it may read the venue.
+        """
         ...
 
     async def reject_out_of_range(
@@ -145,6 +199,7 @@ class PositionPort(Protocol):
             tp_price: float | None,
             sl_price: float | None,
             trail_offset: float | None,
+            qty: float,
             coid: str,
     ) -> None:
         """Replicate (or clear) a protective bracket on ONE broker leg.
@@ -159,6 +214,15 @@ class PositionPort(Protocol):
         trailing anchor and a trailing flag).
         ``side`` is the exit side, supplied because a trail-only bracket needs it
         to place the initial anchor on the correct side.
+
+        ``qty`` (Pine units) is the quantity the bracket protects: what it may
+        close when it fires. It is the size of the leg's venue position unless
+        the plugin declares
+        :attr:`~ExchangeCapabilities.sized_leg_bracket` ``NATIVE``; only then can it be smaller (a leg an opposing leg partly
+        offsets, or a venue position shared with exposure the run does not
+        own), and the protection written must close at most ``qty``. A plugin
+        that does not declare ``NATIVE`` never receives a smaller ``qty``: the
+        core keeps the venue bracket off such a leg and guards it in software.
 
         Every call carries the WHOLE protection the leg must hold afterwards:
         several exits can own the same leg (a TP-only and an SL-only exit, or
@@ -200,6 +264,61 @@ class PositionPort(Protocol):
         response normalises to a benign return. A genuine rejection propagates
         as :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`
         for the caller to surface.
+
+        The outcome decides whether the core may write the leg again, so it
+        must be reported truthfully:
+
+        * a normal return — the venue confirmed the write;
+        * :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`
+          (or a subclass), :class:`~pynecore.core.broker.exceptions.ExchangeRateLimitError`
+          — the venue answered and did NOT apply the write;
+        * :class:`~pynecore.core.broker.exceptions.ExchangeConnectionError` —
+          the request never left the client;
+        * :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`
+          — the request may have reached the venue and no answer came back (a
+          timeout, a dropped link, a server-side failure with no verdict).
+          Never report this case as a rejection.
+
+        After an unknown outcome the write can still take effect later, and it
+        would then replace a newer protection. The core therefore sends the
+        leg nothing else until the write's fate is known, and settles it by
+        asking :meth:`bracket_matches` on its following syncs.
+        """
+        ...
+
+    async def bracket_matches(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            qty: float,
+    ) -> bool | None:
+        """Does broker leg ``leg_id`` hold exactly the protection this amend writes?
+
+        Reads the leg's protection from the venue (a fresh read, not a cache
+        the plugin's own writes feed) and compares it with what
+        :meth:`amend_bracket` would have written for the same arguments, after
+        the plugin's own conversion to the broker grid. The core calls it to
+        learn the fate of an :meth:`amend_bracket` whose outcome was unknown:
+
+        * ``True`` — that write (or an identical one) is in effect;
+        * ``False`` — the leg holds a different protection;
+        * ``None`` — the read cannot tell: the leg holds a protection the
+          write may or may not have produced, and the venue returns nothing
+          that tells them apart (a trailing stop whose distance the venue
+          does not report, with every level it does report equal). Answer
+          ``None`` only for that case, never to avoid a comparison the read
+          can make.
+
+        All-``None`` levels ask whether the leg carries no protection at all.
+        A trailing stop the venue has moved since it was written still
+        matches: compare what identifies the write (the trailing flag or
+        distance, the take-profit), not the stop price the venue trails. A leg
+        that is no longer open matches nothing — return ``False``.
+
+        A failed read raises like :meth:`fetch_raw_positions`; it must never
+        be answered with a guess.
         """
         ...
 
@@ -740,7 +859,7 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         ``reconcile()``'s idempotent cancel-retry loop forward without
         making broker-specific assumptions (e.g., what HTTP 404 means).
         Each plugin override classifies its exchange-side responses into
-        the five :class:`CancelDispositionOutcome` categories.
+        the six :class:`CancelDispositionOutcome` categories.
 
         The default implementation maps the existing :meth:`execute_cancel`
         contract conservatively to
@@ -774,12 +893,24 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         the next ``reconcile()`` (or resolves via a broker-pushed FILL /
         CANCEL event in the meantime), so progress still happens.
 
-        ``CANCEL_CONFIRMED``, ``ALREADY_FILLED``, ``TOO_LATE_TO_CANCEL`` and
-        ``STILL_OPEN`` outcomes are reachable ONLY via plugin override — the
-        default cannot disambiguate them from the bool-only contract.
-        Plugins that can read the exchange's post-cancel disposition
-        (activity history, position diff) SHOULD override and emit the more
-        precise outcome.
+        ``CANCEL_CONFIRMED``, ``ALREADY_FILLED``, ``TOO_LATE_TO_CANCEL``,
+        ``STILL_OPEN`` and ``FILLED_AND_CLOSED`` outcomes are reachable ONLY
+        via plugin override — the default cannot disambiguate them from the
+        bool-only contract. Plugins that can read the exchange's post-cancel
+        disposition (activity history, position diff) SHOULD override and
+        emit the more precise outcome.
+
+        :attr:`CancelDispositionOutcome.ALREADY_FILLED` tells the engine the
+        order filled into a position that is still open: it restores the
+        partial-bracket protection onto that position. An order that filled
+        and whose position has closed since — both the fill and the close
+        already booked, typically by an earlier process — has no open
+        position to protect: report
+        :attr:`CancelDispositionOutcome.FILLED_AND_CLOSED`, which the engine
+        resolves like a confirmed cancel (nothing restored, nothing booked,
+        no restart re-arm). Report it only when the plugin's own records
+        prove both the fill and the close; anything less stays
+        :attr:`CancelDispositionOutcome.UNKNOWN`.
 
         :param envelope: Dispatch envelope around the
             :class:`CancelIntent`; ``envelope.intent`` is the cancel

@@ -45,7 +45,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -71,6 +71,8 @@ __all__ = [
     'RETENTION_DAYS',
     'PURGE_INTERVAL_MS',
     'ENTRY_BOOK_EVENT_KIND',
+    'ENTRY_BOOK_CURSOR_EVENT_KIND',
+    'ENTRY_FILL_ORDER_EVENT_KIND',
 ]
 
 _log = logging.getLogger(__name__)
@@ -96,6 +98,25 @@ PURGE_INTERVAL_MS: Final[int] = 24 * 60 * 60 * 1000  # 1 day
 # what a restart resumes the book from, so the retention purge keeps it
 # however old it is (:meth:`BrokerStore.cleanup_old_data`).
 ENTRY_BOOK_EVENT_KIND: Final[str] = 'entry_book_snapshot'
+# Event kind of the binding book's fill cursors, one event per order id
+# (the event's ``client_order_id`` column holds the cursor key, a client or a
+# venue order id), written in the same transaction as the book they belong to
+# (:meth:`RunContext.replace_keyed_events`). A write replaces only the cursors
+# that changed, so the book event itself does not grow with the orders a
+# long-open position cycles through. They are kept however old they are.
+ENTRY_BOOK_CURSOR_EVENT_KIND: Final[str] = 'entry_book_fill_cursor'
+# Event kind of an entry order's place in the order the binding book opened
+# its bindings, one event per order id (the ``client_order_id`` column holds
+# the key, a client or a venue order id; payload ``{'seq': n}``), written by
+# the sync engine whenever a booked fill of the order opens a binding
+# (``OrderSyncEngine._persist_entry_fill_order``). A restart that cannot
+# resume the stored book rebuilds it in this order, the order the book
+# settles an unbound close in. Replaced in place and pruned to the orders
+# with a live journal row, they are kept however old they are.
+ENTRY_FILL_ORDER_EVENT_KIND: Final[str] = 'entry_fill_order'
+# Keys per statement of :meth:`RunContext.replace_keyed_events`'s delete, under
+# SQLite's bound-parameter limit.
+_KEYED_EVENT_BATCH: Final[int] = 500
 
 
 def _now_ms() -> int:
@@ -1434,16 +1455,20 @@ class BrokerStore:
 
         Four deletions in one transaction:
 
-        1. ``events`` older than the cutoff. Three rows are protected
+        1. ``events`` older than the cutoff. Five kinds of rows are protected
            regardless of age: events whose ``client_order_id`` matches a
            still-live order (the audit trail of an open position stays
            intact), events whose ``intent_key`` still has a live
            envelope for the same logical ``run_id`` — the engine's
            startup replay (:meth:`RunContext.find_event_by_intent_key`,
            :meth:`RunContext.iter_events_by_kind_for_run_id`) reads
-           those to dedup defensive-close FILLs across restarts — and the
+           those to dedup defensive-close FILLs across restarts — the
            newest :data:`ENTRY_BOOK_EVENT_KIND` event of each logical
-           ``run_id``, the binding book a restart resumes.
+           ``run_id``, the binding book a restart resumes, and every
+           :data:`ENTRY_BOOK_CURSOR_EVENT_KIND` event, its fill cursors
+           (one per order id, replaced in place, so they stay bounded), and
+           every :data:`ENTRY_FILL_ORDER_EVENT_KIND` event, the entry orders'
+           places in the fill order (bounded the same way).
         2. ``orders`` closed before the cutoff. Live rows are never
            touched.
         3. Orphan ``order_refs`` — rows whose order no longer exists.
@@ -1484,8 +1509,10 @@ class BrokerStore:
                 "      SELECT MAX(e.id) FROM events e "
                 "      JOIN runs r ON r.run_instance_id = e.run_instance_id "
                 "      JOIN runs own ON own.run_instance_id = events.run_instance_id "
-                "      WHERE r.run_id = own.run_id AND e.kind = events.kind))",
-                (cutoff, ENTRY_BOOK_EVENT_KIND),
+                "      WHERE r.run_id = own.run_id AND e.kind = events.kind)) "
+                "  AND events.kind NOT IN (?, ?)",
+                (cutoff, ENTRY_BOOK_EVENT_KIND, ENTRY_BOOK_CURSOR_EVENT_KIND,
+                 ENTRY_FILL_ORDER_EVENT_KIND),
             ).rowcount
             deleted_orders = self._conn.execute(
                 "DELETE FROM orders "
@@ -1616,6 +1643,55 @@ class RunContext:
     # Client order ids of the pending dispatches an earlier process left
     # (see :meth:`is_inherited_dispatch`).
     _inherited_dispatches: set[str] = field(default_factory=set, repr=False, compare=False)
+    # Parks the engine holds in memory whose row has not landed yet, with the
+    # plugin verdict recorded for each meanwhile (see :meth:`await_park_row`).
+    _verdicts_awaiting_park: dict[str, str | None] = field(
+        default_factory=dict, repr=False, compare=False)
+    # Where :meth:`owe_write` hands a failed follow-up write (the sync engine's
+    # owed-write queue), and the writes owed before anything claimed them.
+    _owed_write_sink: Callable[[str, Callable[[], None]], None] | None = field(
+        default=None, repr=False, compare=False)
+    _unclaimed_owed_writes: list[tuple[str, Callable[[], None]]] = field(
+        default_factory=list, repr=False, compare=False)
+
+    # --- Owed writes --------------------------------------------------------
+
+    def owe_write(self, label: str, write: Callable[[], None]) -> None:
+        """Run a follow-up write whose fact already stands, owing it when it fails.
+
+        For a Core component that holds only the run context (the dispatch
+        journal, the one-way emulator) and has to record what a venue write it
+        just made did: the write goes to the sync engine's owed-write queue
+        (:meth:`~OrderSyncEngine._owe_store_write`),
+        which runs it now, or queues it behind the writes already owed and
+        retries it at the top of the next sync. Before an engine claimed the
+        queue (:meth:`claim_owed_writes`) the write is run here and kept on a
+        failure, for the engine to take over.
+
+        :param label: What the write does, for the log.
+        :param write: The idempotent write; it re-reads what it changes.
+        """
+        if self._owed_write_sink is not None:
+            self._owed_write_sink(label, write)
+            return
+        try:
+            if not self._unclaimed_owed_writes:
+                write()
+                return
+        except sqlite3.Error as exc:
+            _log.warning("store write %s failed (%s: %s) — owed", label,
+                         type(exc).__name__, exc)
+        self._unclaimed_owed_writes.append((label, write))
+
+    def claim_owed_writes(self, sink: Callable[[str, Callable[[], None]], None]) -> None:
+        """Route every later :meth:`owe_write` to ``sink``, starting with the writes owed so far.
+
+        :param sink: The sync engine's owed-write queue.
+        """
+        self._owed_write_sink = sink
+        owed, self._unclaimed_owed_writes = self._unclaimed_owed_writes, []
+        for label, write in owed:
+            sink(label, write)
 
     # --- Inherited dispatches -----------------------------------------------
 
@@ -1791,20 +1867,44 @@ class RunContext:
             )
         now = _now_ms() if parked_ts_ms is None else parked_ts_ms
         ids_json = json.dumps(order_ids) if order_ids else '[]'
-        with self._store.transaction():
-            self._store._conn.execute(
-                "INSERT INTO pending_verifications ("
-                "  run_id, client_order_id, intent_key, parked_ts_ms, "
-                "  dispatch_kind, order_ids"
-                ") VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(run_id, client_order_id) DO UPDATE SET "
-                "  intent_key = excluded.intent_key, "
-                "  parked_ts_ms = excluded.parked_ts_ms, "
-                "  resolution = NULL, "
-                "  dispatch_kind = excluded.dispatch_kind, "
-                "  order_ids = excluded.order_ids",
-                (self.run_id, coid, key, now, kind, ids_json),
-            )
+        # The lock spans the commit and the marker's removal: a verdict
+        # recorded in between would go to the marker and be dropped with it.
+        # A failed commit keeps the marker for the owed retry.
+        with self._store._lock:
+            with self._store.transaction():
+                # A verdict recorded while this park's row was still owed
+                # (:meth:`await_park_row`) belongs to this park: it lands with it.
+                verdict = self._verdicts_awaiting_park.get(coid)
+                self._store._conn.execute(
+                    "INSERT INTO pending_verifications ("
+                    "  run_id, client_order_id, intent_key, parked_ts_ms, "
+                    "  dispatch_kind, order_ids, resolution"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(run_id, client_order_id) DO UPDATE SET "
+                    "  intent_key = excluded.intent_key, "
+                    "  parked_ts_ms = excluded.parked_ts_ms, "
+                    "  resolution = excluded.resolution, "
+                    "  dispatch_kind = excluded.dispatch_kind, "
+                    "  order_ids = excluded.order_ids",
+                    (self.run_id, coid, key, now, kind, ids_json, verdict),
+                )
+            self._verdicts_awaiting_park.pop(coid, None)
+
+    def await_park_row(self, coid: str) -> None:
+        """Keep the plugin verdicts for ``coid`` until its park row lands.
+
+        The engine holds a park in memory before its row is written when the
+        write failed and is owed, and a dispatch's command row turns
+        ``disposition_unknown`` (which a resolver may settle) before the engine
+        parks it at all. A plugin verdict
+        (:meth:`record_resolution`) arriving in that gap has no row to update;
+        it is kept here and written by the :meth:`record_park` that lands the
+        row, so neither the gap nor the late park drops it.
+
+        :param coid: The parked dispatch's ``client_order_id``.
+        """
+        with self._store._lock:
+            self._verdicts_awaiting_park.setdefault(coid, None)
 
     def record_unpark(self, coid: str) -> None:
         """Remove a parked dispatch (it has shown up at the broker)."""
@@ -1837,6 +1937,10 @@ class RunContext:
         idempotent (the already-attached leg is re-emitted with the
         same parameters and is a no-op at the broker).
 
+        A verdict for a park whose row has not landed yet
+        (:meth:`await_park_row`) is kept until that row lands, under the same
+        sticky rule; a row already there is updated too.
+
         :param coid: The parent ``client_order_id`` whose parked dispatch
             disposition is being recorded.
         :param resolution: ``'attached'`` if the dispatch landed at the
@@ -1851,6 +1955,9 @@ class RunContext:
                 f"expected 'attached' or 'rejected'"
             )
         with self._store.transaction():
+            if (coid in self._verdicts_awaiting_park
+                    and self._verdicts_awaiting_park[coid] != 'rejected'):
+                self._verdicts_awaiting_park[coid] = resolution
             if resolution == 'attached':
                 self._store._conn.execute(
                     "UPDATE pending_verifications "
@@ -2615,6 +2722,82 @@ class RunContext:
                 "      WHERE r.run_id = ? AND e.kind = ?)",
                 (kind, self.run_id, self.run_id, kind),
             ).rowcount
+
+    def keyed_events_for_run_id(self, kind: str) -> dict[str, dict]:
+        """The payload of every keyed event of ``kind`` of this logical run, by key.
+
+        Reads what :meth:`replace_keyed_events` wrote: the key is the event's
+        ``client_order_id`` column. Scoped to ``runs.run_id`` like
+        :meth:`latest_event_for_run_id`, so the events earlier process
+        instances of the run wrote count too. Should a key hold several
+        events, the newest one wins; a missing or malformed payload reads as
+        an empty dict.
+
+        :param kind: The event kind.
+        :return: Key -> payload.
+        """
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT e.client_order_id, e.payload "
+                "FROM events AS e "
+                "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
+                "WHERE r.run_id = ? AND e.kind = ? AND e.client_order_id IS NOT NULL "
+                "ORDER BY e.id",
+                (self.run_id, kind),
+            ).fetchall()
+        values: dict[str, dict] = {}
+        for row in rows:
+            payload: dict = {}
+            raw = row['payload']
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    payload = parsed
+            values[row['client_order_id']] = payload
+        return values
+
+    def replace_keyed_events(self, kind: str, values: Mapping[str, dict],
+                             removed: Iterable[str] = ()) -> None:
+        """Make the run hold one event of ``kind`` per key of ``values``, and none for ``removed``.
+
+        A keyed event stores its key in the ``client_order_id`` column. Each
+        key of ``values`` gets a fresh event with the given payload, the
+        run's older events of that key (any process instance of the logical
+        run) are deleted, and so are all events of the keys in ``removed``;
+        keys named in neither keep their events. One transaction: it nests
+        into the caller's (:meth:`transaction`), so the keyed events can land
+        together with another write or not at all.
+
+        :param kind: The event kind.
+        :param values: Key -> payload to store.
+        :param removed: Keys whose events are deleted.
+        """
+        doomed = [*values, *removed]
+        now = _now_ms()
+        with self._store.transaction() as conn:
+            for start in range(0, len(doomed), _KEYED_EVENT_BATCH):
+                batch = doomed[start:start + _KEYED_EVENT_BATCH]
+                placeholders = ', '.join('?' for _ in batch)
+                conn.execute(
+                    "DELETE FROM events "
+                    "WHERE kind = ? "
+                    "  AND run_instance_id IN ("
+                    "      SELECT run_instance_id FROM runs WHERE run_id = ?) "
+                    f"  AND client_order_id IN ({placeholders})",
+                    (kind, self.run_id, *batch),
+                )
+            conn.executemany(
+                "INSERT INTO events ("
+                "  run_instance_id, ts_ms, plugin_name, kind,"
+                "  client_order_id, exchange_order_id, intent_key, payload"
+                ") VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
+                [(self.run_instance_id, now, self._store._plugin_name, kind,
+                  key, json.dumps(payload))
+                 for key, payload in values.items()],
+            )
 
     # --- Spot inventory: execution ledger ----------------------------------
 

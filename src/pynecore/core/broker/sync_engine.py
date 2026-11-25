@@ -20,11 +20,64 @@ On each bar the engine:
 The engine is synchronous; the broker plugin is async. :meth:`OrderSyncEngine._run_async`
 bridges the two, using ``run_coroutine_threadsafe`` on a background event
 loop in live mode and ``asyncio.run`` for single-shot unit tests.
+
+Storage failure contract
+------------------------
+
+A failed store write never ends the run, so no write may leave memory ahead
+of what the store holds in a way the next sync cannot repair. Every engine
+write is one of three kinds:
+
+* **Before a venue write** (a dispatch's envelope, an adopted anchor, a
+  cancel-tentative park, the plugin journal's pending row): the write commits
+  before memory changes and before anything is sent. A failure raises
+  (:class:`~pynecore.core.broker.exceptions.JournalWriteError` or the raw
+  ``sqlite3.Error``), memory stays as it was, nothing goes out, and the next
+  sync redoes the step.
+* **After a venue write** (the plugin journal's confirm, a leg close's
+  finish): the order may be live, so a failure parks it as an unknown
+  disposition and the venue settles it. The row the failed write was to
+  advance is left in the state the running process resolves (a command row
+  ``disposition_unknown``, a sent leg close ``dispatched``), and that write
+  is owed too (:meth:`RunContext.owe_write`
+  hands it to this queue), so a park never waits for a restart's recovery.
+* **Retirement and follow-up writes** (an unpark, an envelope's ``complete``
+  marker, a park of an unknown disposition, a bumped anchor of a sent order,
+  a row's extras, a settle audit, a partial-bracket leg its close dispatch
+  settled, the promotion of legs a booked fill armed): these follow a step whose memory change
+  is already decided (a booked fill, a sent order, a retired intent), so the
+  memory change stands and the write is owed
+  (:meth:`OrderSyncEngine._owe_store_write`). An owed write is retried at the
+  top of the next sync, before the replay reads the store, and later writes
+  queue behind it so the store sees them in order. Each of these writes is
+  idempotent (a delete, an upsert, or a re-read-and-set), so landing it late
+  is the same as landing it on time.
+
+A fill whose routing a storage error ended before it was booked is routed
+again with the next drain, and its id leaves the duplicate gate
+(:meth:`OrderSyncEngine._keep_unbooked_fill_for_retry`). The binding book is
+written once per change, and a book write that failed is retried with the
+next change check.
+
+A restart settle a storage failure ended
+(:meth:`OrderSyncEngine.settle_restart_state`) leaves the restart unsettled:
+no sync reaches its diff, so nothing derived from the book that lacks the
+previous process's orders is sent, every sync retries the settle, and a script
+cancel issued meanwhile is applied to the rebuilt orders once it succeeds
+(:meth:`OrderSyncEngine._reconstruct_restart_book`).
+
+Every sync a storage failure ended, or that ends with an
+owed write or a failed book write, counts toward
+:data:`STORAGE_FAILURE_HALT_SYNCS`; at the bound the engine latches an
+``entry_block`` quarantine (:meth:`OrderSyncEngine.record_quarantine`): the
+process stays alive, no new exposure is opened, and the operator resumes it
+with ``pyne broker resume`` once the store is repaired.
 """
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import itertools
 import json
 import logging
@@ -34,6 +87,7 @@ import contextlib
 import queue
 import secrets
 import signal
+import sqlite3
 import threading
 import time
 from collections import OrderedDict
@@ -58,6 +112,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
+    JournalWriteError,
     MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -156,9 +211,11 @@ from pynecore.core.broker.software_stop_limit_engine import (
     StopLimitWatch,
 )
 from pynecore.core.broker.one_way_emulator import (
+    UNSETTLED_WRITE_WINDOW_S,
     BracketFanResult,
     CloseFanResult,
     OneWayEmulator,
+    SoftwareLegTrigger,
     close_leg_client_order_id,
 )
 from pynecore.core.broker.parked_dispatch import (
@@ -167,6 +224,8 @@ from pynecore.core.broker.parked_dispatch import (
     park_inherited_dispatches,
 )
 from pynecore.core.broker.storage import (
+    ENTRY_BOOK_CURSOR_EVENT_KIND,
+    ENTRY_FILL_ORDER_EVENT_KIND,
     ENTRY_BOOK_EVENT_KIND,
     EnvelopeRecord,
     OrderRow,
@@ -184,6 +243,7 @@ from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET,
     EXTRAS_KEY_BRACKET_OWN_OCA_NAME,
     EXTRAS_KEY_BRACKET_OWN_OCA_TYPE,
+    EXTRAS_KEY_CLOSE_PARENT_COID,
     BRACKET_OWN_STATE_ACTIVE,
     LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL,
@@ -195,7 +255,7 @@ from pynecore.core.broker.store_helpers import (
     LEGACY_OCO_STATE_MARKET_PENDING,
     STOP_LIMIT_STATE_ARMED,
     STOP_LIMIT_STATE_LIMIT_PENDING,
-    STOP_LIMIT_STATE_TRIGGERED,
+    STATE_CLOSE_LEG,
     STATE_REJECTED,
     STATE_SUBMITTED,
     create_engine_trigger_partial_leg_row,
@@ -214,7 +274,7 @@ if TYPE_CHECKING:
     from pynecore.core.plugin.broker import PositionPort
     from pynecore.lib.strategy import Order
 
-__all__ = ['OrderSyncEngine']
+__all__ = ['OrderSyncEngine', 'FILL_RECOVERY_HOLD_S']
 
 _log = logging.getLogger(__name__)
 
@@ -342,6 +402,15 @@ STOP_FATE_VERDICT_CEILING_S = 120.0
 #: keeps going: a venue outage is recoverable, and stopping the bot would only
 #: strand the user with the position it was managing.
 READ_STUCK_GRACE_S = 60.0
+#: Consecutive :meth:`OrderSyncEngine.sync` cycles a storage failure may end
+#: before the engine quarantines the bot. A failed journal write is retried on
+#: the next sync: the write paths roll back what they could not commit, a
+#: failure after an accepted venue write parks as an unknown disposition, and a
+#: retirement write is owed (:meth:`OrderSyncEngine._owe_store_write`). A store
+#: that keeps failing (a full disk, a lost volume) can no longer record what
+#: the bot does, so the engine latches an ``entry_block`` quarantine: the
+#: process stays alive and opens no new exposure until the operator resumes it.
+STORAGE_FAILURE_HALT_SYNCS = 5
 #: Minimum spacing (seconds) between the WARNING lines that report a read
 #: outage still inside the grace. ``calc_on_every_tick`` syncs on every market
 #: update, and a feed reconnect can replay a burst of ticks in well under a
@@ -427,6 +496,13 @@ class _CancelTentativeMeta:
     store-less runs. The ALREADY_FILLED resolution deletes the row via
     this handle (the envelope is retained, so ``record_complete``'s
     wholesale purge cannot be used there).
+
+    ``resolved`` is the verdict a resolution is applying (outcome, ``via``,
+    whether a partial fill triggered it). The entry stays in the map until
+    the resolution's store writes committed, so a storage failure midway
+    leaves it here and the next cancel-retry pass applies the same verdict
+    again instead of probing the venue anew
+    (:meth:`OrderSyncEngine._clear_intent_cancel_disposition_pending`).
     """
     since_ts_ms: int
     reason: str
@@ -434,6 +510,7 @@ class _CancelTentativeMeta:
     last_retry_ts_ms: int | None = None
     last_retry_outcome: CancelDispositionOutcome | None = None
     park_coid: str | None = None
+    resolved: tuple[CancelDispositionOutcome, str, bool] | None = None
 
 
 DEFENSIVE_CLOSE_RESOLUTION_GRACE_S = 30.0
@@ -682,6 +759,16 @@ def _is_triggerable_entry(intent: EntryIntent) -> bool:
     return intent.order_type is OrderType.LIMIT and intent.limit is not None
 
 
+def _partial_trigger_pine_id(leg: PartialBracketLeg) -> str:
+    """The synthetic Pine id of a partial-bracket leg's close.
+
+    ``__pyne_partial_trigger__{exit_pine_id}\\0{from_entry}\\0{leg_kind}``: the
+    NUL delimiter cannot occur in a Pine string literal, so the id never
+    collides with a script's own close.
+    """
+    return f"__pyne_partial_trigger__{leg.pine_id}\0{leg.from_entry}\0{leg.leg_kind}"
+
+
 def _sizes_match(actual: float, expected: float) -> bool:
     """Whether two signed position sizes are equal up to float noise.
 
@@ -690,6 +777,26 @@ def _sizes_match(actual: float, expected: float) -> bool:
     """
     scale = max(abs(expected), abs(actual), 1.0)
     return abs(actual - expected) <= scale * 1e-6 + 1e-9
+
+
+def _fill_slice(event: OrderEvent, qty: float) -> OrderEvent:
+    """A part of a fill event: ``qty`` of its ``fill_qty``, with its share of the rest.
+
+    The fee and the journal quantity
+    (:attr:`~OrderEvent.journal_fill_qty`) are
+    split in the same proportion, so the slices of one fill add up to it in
+    every unit.
+
+    :param event: A fill event with a positive ``fill_qty``.
+    :param qty: The part of ``fill_qty`` the slice carries.
+    """
+    whole = event.fill_qty or 0.0
+    share = qty / whole
+    journal_qty = event.journal_fill_qty
+    return dataclasses.replace(
+        event, fill_qty=qty, fee=event.fee * share,
+        journal_fill_qty=None if journal_qty is None else journal_qty * share,
+    )
 
 
 def _str_tuple_from_payload(data: dict, field: str) -> tuple[str, ...]:
@@ -1191,6 +1298,19 @@ class _NativeCancelAllExpected:
     symbol: str | None
 
 
+def _working_entry_levels(order: ExchangeOrder) -> tuple[float | None, float | None]:
+    """The ``(limit, stop)`` of a live working entry order as a Pine entry declares them.
+
+    A working entry order should be LIMIT or STOP; for any other type the
+    prices the venue reported are kept rather than a type guessed.
+    """
+    if order.order_type is OrderType.STOP:
+        return None, order.stop_price if order.stop_price is not None else order.price
+    if order.order_type is OrderType.LIMIT:
+        return order.price, None
+    return order.price, order.stop_price
+
+
 class OrderSyncEngine:
     """Translate Pine orders to broker calls and route fills back.
 
@@ -1366,6 +1486,13 @@ class OrderSyncEngine:
         # right now: its native stop stays as it is until the deal closes
         # (see :meth:`_dispatch_partial_bracket_close`).
         self._native_failsafe_closing_parent: str | None = None
+        # The partial-bracket leg whose close :meth:`_dispatch_partial_bracket_close`
+        # is dispatching right now: :meth:`_dispatch_new` records the close's
+        # client order id on it right before the venue call.
+        self._trigger_close_leg: tuple[str, str, str] | None = None
+        # Held partial-bracket closes already reported at ERROR, with the
+        # outcome reported (:meth:`_settle_held_partial_bracket_closes`).
+        self._held_trigger_close_reported: set[tuple[str, str]] = set()
         # Engine-trigger partial bracket state machine. The state
         # machine itself is cheap to keep around (empty ledger when the
         # mode is UNSUPPORTED), so it is constructed unconditionally —
@@ -1373,6 +1500,7 @@ class OrderSyncEngine:
         self._partial_bracket_engine = SoftwarePartialBracketEngine(
             store_ctx=store_ctx,
             state_change_listener=self._on_partial_bracket_leg_state_change,
+            owe_write=self._owe_store_write,
         )
         # Software stop-limit orders: a Pine order with both ``stop`` and
         # ``limit`` is one stop-limit order. On a venue without a native one
@@ -1391,12 +1519,16 @@ class OrderSyncEngine:
             store_ctx=store_ctx,
             mintick=mintick,
             block_exposure_reopens=lambda: self._quarantined,
+            sized_leg_bracket=caps.sized_leg_bracket,
         )
         # Set on the first ``sync`` (deferred like ``_restart_entry_scan_done``):
         # ``OneWayEmulator.restart_replay`` is async and needs live broker reads
         # via the port, so unlike the sync sibling replays it cannot run inline
         # in ``__init__``.
         self._one_way_replay_done: bool = False
+        #: Entries (intent keys) already told that their amend, replacement
+        #: or cancel waits for the residual open their reversal still owes.
+        self._residual_hold_logged: set[str] = set()
         # The plugin ports the contract probe has already seen
         # (``position_port``, ``spot_inventory_port``); see
         # :meth:`_check_plugin_ports`.
@@ -1408,6 +1540,13 @@ class OrderSyncEngine:
         # instead of tearing it down as an orphan. See
         # :meth:`_reconstruct_pine_bracket_state`.
         self._pine_bracket_reconstruct_done: bool = False
+        # Until then the book lacks the orders of the previous process, so a
+        # script cancel finds nothing to remove: the position records it and
+        # :meth:`_reconstruct_restart_book` applies it to the rebuilt orders.
+        position.restart_cancels = set()
+        #: The orders the restart rebuild put into ``exit_orders`` /
+        #: ``entry_orders``, across attempts a storage failure ended midway.
+        self._restart_rebuilt_orders: list[Order] = []
 
         self._active_intents: dict[str, Intent] = {}
         # Bounded-retry bookkeeping for entries the exchange rejects outright
@@ -1642,7 +1781,32 @@ class OrderSyncEngine:
         ] = queue.Queue()
         self._exchange_position: ExchangePosition | None = None
         self._interceptors: list[Callable[[Intent], InterceptorResult]] = []
+        # The interceptor verdicts the restart replay acted on
+        # (:meth:`_prepare_restart_replay_owners`), by input intent (``None``:
+        # rejected), until the next diff consumes them: the replay and the
+        # diff then carry the same decision, and an interceptor is called once
+        # per intent for both. They live for one attempt: each replay attempt
+        # judges afresh, and a :meth:`sync` that ends before its diff drops
+        # them, so a later sync never acts on a decision an interceptor may
+        # since have changed. A :meth:`settle_restart_state` that replayed
+        # hands them to the diff of the sync that follows it.
+        self._restart_interceptor_verdicts: dict[Intent, Intent | None] | None = None
         self._sync_count = 0
+        # Consecutive syncs a storage failure ended (:meth:`sync`).
+        self._storage_failed_syncs = 0
+        # The binding-book writes whose last attempt failed, by write
+        # (``'book'``, ``'fill_order'``): they are retried with the next change
+        # check, and a sync that ends with one still failed counts toward the
+        # storage quarantine (:meth:`sync`).
+        self._book_write_failures: dict[str, Exception] = {}
+        # Retirement and follow-up store writes whose attempt failed, in the
+        # order they were made, with the failure (:meth:`_owe_store_write`).
+        self._owed_store_writes: list[tuple[str, Callable[[], None]]] = []
+        self._owed_store_failure: Exception | None = None
+        if store_ctx is not None:
+            # The follow-up writes of the dispatch journal and the one-way
+            # emulator, which hold only the store, join the same queue.
+            store_ctx.claim_owed_writes(self._owe_store_write)
         self._current_bar_ts_ms: int = 0
         # Set during ``__init__`` when the persisted partial-bracket leg
         # ledger contains active rows: defers
@@ -1662,7 +1826,8 @@ class OrderSyncEngine:
         # the entry to either a confirmed cancel (legs flip to
         # ``aborted_parent_never_arrived``, mapping/envelope dropped)
         # or a late-fill restore (legs return to ``pending_entry`` or
-        # ``armed``). The diff-loop's adoption branch refuses to adopt
+        # ``armed``), or a fill whose position has closed since (legs flip
+        # to ``aborted_parent_gone``, mapping/envelope dropped). The diff-loop's adoption branch refuses to adopt
         # / dispatch any new intent whose key sits in this map — the
         # prior dispatch's broker state is still ambiguous, and a
         # parallel new dispatch would create a double-life. Stale-
@@ -1968,10 +2133,24 @@ class OrderSyncEngine:
         # has, the empty book of the fresh process must not overwrite it.
         self._entry_book_persisted: str | None = None
         self._entry_book_judged = False
+        # The fill cursors as the store holds them, one keyed event each
+        # (:data:`~pynecore.core.broker.storage.ENTRY_BOOK_CURSOR_EVENT_KIND`),
+        # so a book write stores only the cursors that changed; ``None`` until
+        # the first write reads them back.
+        self._entry_book_cursors_persisted: dict[str, float] | None = None
+        # The entry orders' places in the fill order as the store holds them,
+        # one keyed event each
+        # (:data:`~pynecore.core.broker.storage.ENTRY_FILL_ORDER_EVENT_KIND`),
+        # so a write stores only the places that changed
+        # (:meth:`_persist_entry_fill_order`).
+        self._entry_fill_places_persisted: dict[str, int] = {}
         # When each fill cursor's order was first seen without a live journal
         # row (wall-clock ms): past the restart check's close slack the cursor
         # is never consulted again and is dropped (:meth:`_prune_fill_cursors`).
         self._fill_cursor_unlive_since_ms: dict[str, int] = {}
+        # Orders (venue / client ids) already reported for a fill event without
+        # a journal quantity (:meth:`_check_journal_fill_qty`).
+        self._journal_qty_missing_reported: set[str] = set()
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -2161,6 +2340,17 @@ class OrderSyncEngine:
         # sync floods the cycle log for hours on an event-driven lane.
         self._partial_restore_logged: set[str] = set()
         self._whole_row_conflict_logged: set[str] = set()
+        #: The entry each dispatched software leg-guard close settles, by the
+        #: close's synthetic ``pine_id`` (``None``: the leg's exits protect
+        #: different entries, the fill walks the book unbound). The close's
+        #: envelope is retired at dispatch, so its fill is recognised by this
+        #: label alone; an entry stays until the leg's next guard close
+        #: replaces it.
+        self._leg_guard_close_entries: dict[str, str | None] = {}
+        #: Monotonic seconds at which a direct (non-emulated) exit write ended
+        #: with an unknown outcome, by intent key; see
+        #: :meth:`_exit_write_unsettled`.
+        self._unsettled_exit_writes: dict[str, float] = {}
 
         # Cross-restart recovery anchors. The state store persists envelope
         # identity and parked-verification entries; replay rebuilds these
@@ -2281,6 +2471,12 @@ class OrderSyncEngine:
         # diff could adopt them; keys the script kept (re-emitted or left
         # standing) are dropped from the set as the adoption branch pins them.
         self._restart_reconstructed_entry_keys: dict[str, EntryIntent] = {}
+        # The venue levels (tp, sl, trail price, trail offset) of each one-way
+        # bracket exit :meth:`_reconstruct_one_way_bracket_exits` rebuilt with
+        # its live mapping, until the first diff after the rebuild compares the
+        # script's exit of the key with them.
+        self._restart_reconstructed_exit_levels: dict[
+            str, tuple[float | None, float | None, float | None, float | None]] = {}
         self._restart_entry_scan_done: bool = False
         if store_ctx is not None:
             self._restore_quarantine(store_ctx)
@@ -2314,6 +2510,13 @@ class OrderSyncEngine:
             # verifies its earlier send before sending again, and a legacy
             # OCO row is retired (:meth:`_retire_legacy_oco_watches`).
             self._stop_limit_engine.restart_replay()
+            # The entry orders' places in the fill order an earlier process
+            # of the run recorded: the fills this process books get places
+            # after them, and a rejected stored book is rebuilt in this
+            # order (:meth:`_recover_adopted_parent_trades`).
+            stored_places = self._stored_fill_places()
+            self._position.seed_fill_places(stored_places)
+            self._entry_fill_places_persisted = stored_places
             # Rehydrate the broker-native fail-safe manager from the
             # replayed legs. ``NativeFailsafeManager`` was just
             # constructed empty, so without this call there is no
@@ -3351,9 +3554,20 @@ class OrderSyncEngine:
         :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` from
         ``run_event_stream``) so the bar loop exits via its ``finally`` block instead of running the
         script with stale state.
+
+        A storage failure while the events are booked does not stop the run:
+        the events not booked yet stay queued, and the :meth:`sync` of the bar
+        drains them again and counts a failure that persists toward its
+        storage quarantine.
         """
         self.raise_if_halted()
-        self._drain_events()
+        try:
+            self._drain_events()
+        except (sqlite3.Error, JournalWriteError) as exc:
+            _blog_warning(
+                "booking the queued broker events hit a storage failure (%s: %s) — "
+                "the rest is booked by the next drain", type(exc).__name__, exc,
+            )
 
     @critical_section
     def finalize_halt(self) -> None:
@@ -3385,7 +3599,7 @@ class OrderSyncEngine:
                 _blog_warning("further halt while booking the queued events: %s", error.reason)
 
     @critical_section
-    def settle_restart_state(self, bar_ts_ms: int) -> None:
+    def settle_restart_state(self, bar_ts_ms: int) -> bool:
         """Run the one-time restart settle BEFORE the first post-restart script.
 
         On a fresh process the Pine order dicts start empty, so a
@@ -3425,13 +3639,37 @@ class OrderSyncEngine:
             the value :meth:`sync` receives on the same bar (sourced from
             ``lib.last_bar_time`` at the call site). Anchors the stale-window
             timer for the native-failsafe rehydrate, exactly as in :meth:`sync`.
+
+        A storage failure is handled like a connection error and like one in
+        :meth:`sync`: the step it ended stays unlatched and is retried on the
+        next bar, and the failure counts toward
+        :data:`STORAGE_FAILURE_HALT_SYNCS` (:meth:`_note_storage_failure`).
+
+        Until a settle succeeds the restart is unsettled: the script runs
+        against a book without the previous process's orders, every
+        :meth:`sync` stops before its diff (each one-time step above returns
+        from it while unlatched), so nothing derived from that book is sent,
+        and each sync retries the settle. A script cancel of an order the
+        rebuild has not brought back yet is recorded and applied once it does
+        (:meth:`_reconstruct_restart_book`).
+
+        :return: Whether the restart is settled (the book is rebuilt).
         """
         if self.venue_writes_blocked:
             # External-intervention quarantine: observe only. The resume
             # restarts the run, which does this work on the startup path.
-            return
+            return self._pine_bracket_reconstruct_done
         if self._pine_bracket_reconstruct_done:
-            return
+            return True
+        try:
+            self._flush_owed_store_writes()
+            self._settle_restart_state_steps(bar_ts_ms)
+        except (sqlite3.Error, JournalWriteError) as exc:
+            self._note_storage_failure(exc)
+        return self._pine_bracket_reconstruct_done
+
+    def _settle_restart_state_steps(self, bar_ts_ms: int) -> None:
+        """The steps of :meth:`settle_restart_state`, without its storage handling."""
         self._current_bar_ts_ms = bar_ts_ms
         if self._pending_native_failsafe_rehydrate:
             self._pending_native_failsafe_rehydrate = False
@@ -3451,6 +3689,12 @@ class OrderSyncEngine:
             self._restart_entry_scan_done = True
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if not self._one_way_replay_done and one_way_port is not None:
+            # What the script cancelled or placed again meanwhile decides what
+            # the replay asserts
+            self._prepare_restart_replay_owners()
+            # A replayed write of unknown outcome holds its leg until it is
+            # settled; only the settlement can release it, so it runs first.
+            self._settle_one_way_leg_writes(one_way_port)
             try:
                 replayed = self._run_async_recovery(
                     self._one_way_emulator.restart_replay(one_way_port),
@@ -3464,8 +3708,9 @@ class OrderSyncEngine:
             if not replayed:
                 _blog_warning(
                     "restart settle skipped: one-way emulation replay could not "
-                    "complete (the exchange refused a replayed close, or the "
-                    "market is closed) — retrying next bar",
+                    "complete (the exchange refused a replayed close, the market "
+                    "is closed, or what a close executed before the restart is "
+                    "not established yet) — retrying next bar",
                 )
                 return
             self._one_way_replay_done = True
@@ -3479,14 +3724,13 @@ class OrderSyncEngine:
             )
             return
         if not self._pine_bracket_reconstruct_done:
-            self._reconstruct_pine_bracket_state()
-            self._pine_bracket_reconstruct_done = True
+            self._reconstruct_restart_book()
 
     def _check_plugin_ports(self) -> None:
         """Probe the plugin's ports the first time each one is seen.
 
-        A plugin sets :attr:`~pynecore.core.plugin.broker.BrokerPlugin.position_port`
-        and :attr:`~pynecore.core.plugin.broker.BrokerPlugin.spot_inventory_port`
+        A plugin sets :attr:`~BrokerPlugin.position_port`
+        and :attr:`~BrokerPlugin.spot_inventory_port`
         once it knows the account, which is after the startup contract probe
         ran, so the probe never saw them. A port that fails the check stops
         the bot before the engine drives anything through it. Only a real
@@ -3530,11 +3774,139 @@ class OrderSyncEngine:
 
         Whatever the cycle changed in the binding book is written to the
         store when it ends (:meth:`_persist_entry_book`), however it ends.
+
+        A storage failure ends the cycle without stopping the run: a raw
+        storage error, or a :class:`JournalWriteError` of a write that had to
+        precede its venue call, is reported and the cycle is retried on the
+        next sync, which re-diffs from what was committed. A binding-book
+        write still failed when the cycle ends (:meth:`_persist_entry_book`
+        keeps the run going and retries it) and a retirement write still owed
+        (:meth:`_owe_store_write`) count the same way. Only after
+        :data:`STORAGE_FAILURE_HALT_SYNCS` consecutive failed syncs does the
+        engine latch an ``entry_block`` quarantine (:meth:`_note_storage_failure`),
+        naming the cause once at ERROR; the process stays alive.
         """
         try:
-            self._sync_cycle(bar_ts_ms, last_price=last_price)
-        finally:
-            self._persist_entry_book()
+            try:
+                self._sync_cycle(bar_ts_ms, last_price=last_price)
+            finally:
+                # The diff consumed them, or this attempt ended before it.
+                self._restart_interceptor_verdicts = None
+                self._persist_entry_book()
+        except (sqlite3.Error, JournalWriteError) as exc:
+            self._note_storage_failure(exc)
+            return
+        if self._book_write_failures:
+            self._note_storage_failure(next(iter(self._book_write_failures.values())))
+            return
+        if self._owed_store_writes:
+            assert self._owed_store_failure is not None
+            self._note_storage_failure(self._owed_store_failure)
+            return
+        self._storage_failed_syncs = 0
+
+    def _note_storage_failure(self, exc: Exception) -> None:
+        """Report a sync a storage failure ended, and quarantine once it persists.
+
+        On the :data:`STORAGE_FAILURE_HALT_SYNCS`-th consecutive failed sync the
+        engine latches an ``entry_block`` quarantine: the process stays alive
+        and keeps ingesting, no new exposure is opened, and every write that
+        must precede its venue call keeps failing before anything is sent
+        while the store is down. The operator resumes the latch once the store
+        is repaired. Later failed syncs only keep the count.
+
+        :param exc: The storage failure that ended the sync.
+        """
+        self._storage_failed_syncs += 1
+        if self._storage_failed_syncs < STORAGE_FAILURE_HALT_SYNCS:
+            _blog_warning(
+                "sync ended by a storage failure (%s: %s) — nothing uncommitted "
+                "is kept, retried on the next sync (%d/%d)",
+                type(exc).__name__, exc, self._storage_failed_syncs,
+                STORAGE_FAILURE_HALT_SYNCS,
+            )
+            return
+        if self._quarantined:
+            _log.debug("storage failure under a held quarantine: %s", exc)
+            return
+        self.record_quarantine(
+            f"the broker store failed on {self._storage_failed_syncs} consecutive "
+            f"syncs ({type(exc).__name__}: {exc}); the bot can no longer record "
+            f"what it sends",
+            {'cause': f"{type(exc).__name__}: {exc}"},
+            kind=QuarantineKind.ENTRY_BLOCK,
+        )
+
+    def _owe_store_write(self, label: str, write: Callable[[], None]) -> None:
+        """Run a retirement or follow-up store write, owing it when it fails.
+
+        For writes whose memory change already stands (see the module's
+        storage failure contract). While an earlier write is owed this one
+        queues behind it unrun, so the store applies them in order. A failed
+        write is retried by :meth:`_flush_owed_store_writes` at the top of the
+        next sync, and a sync that ends with a write still owed counts toward
+        :data:`STORAGE_FAILURE_HALT_SYNCS`.
+
+        :param label: What the write does, for the log.
+        :param write: The idempotent write.
+        """
+        if not self._owed_store_writes:
+            try:
+                write()
+                return
+            except sqlite3.Error as exc:
+                self._owed_store_failure = exc
+                _blog_warning(
+                    "store write %s failed (%s: %s) — owed, retried at the next sync",
+                    label, type(exc).__name__, exc,
+                )
+        self._owed_store_writes.append((label, write))
+
+    def _flush_owed_store_writes(self) -> None:
+        """Land the owed store writes in order (:meth:`_owe_store_write`).
+
+        Runs at the top of every sync, before the replay reads the store, and
+        before a write that must precede its venue call, so it never lands
+        ahead of an older owed write on the same row.
+
+        :raises sqlite3.Error: When an owed write fails again; it and every
+            write behind it stay owed.
+        """
+        while self._owed_store_writes:
+            _label, write = self._owed_store_writes[0]
+            try:
+                write()
+            except sqlite3.Error as exc:
+                self._owed_store_failure = exc
+                raise
+            self._owed_store_writes.pop(0)
+        self._owed_store_failure = None
+
+    def _owe_unpark(self, coid: str) -> None:
+        """Retire the persisted park of ``coid`` (:meth:`_owe_store_write`)."""
+        store_ctx = self._store_ctx
+        assert store_ctx is not None
+        self._owe_store_write(f"unpark {coid}", functools.partial(store_ctx.record_unpark, coid))
+
+    def _owe_complete(self, key: str) -> None:
+        """Persist the ``complete`` marker of ``key`` (:meth:`_owe_store_write`)."""
+        store_ctx = self._store_ctx
+        assert store_ctx is not None
+        self._owe_store_write(f"complete {key}",
+                              functools.partial(store_ctx.record_complete, key))
+
+    def _log_store_event(self, kind: str, *args: Any, **fields: Any) -> None:
+        """Append an audit event to the store (:meth:`_owe_store_write`).
+
+        The arguments are those of
+        :meth:`~pynecore.core.broker.storage.RunContext.log_event`, taken as
+        they are now, so an owed event lands with the view it was logged with.
+        """
+        store_ctx = self._store_ctx
+        assert store_ctx is not None
+        self._owe_store_write(
+            f"event {kind}", functools.partial(store_ctx.log_event, kind, *args, **fields),
+        )
 
     def _sync_cycle(self, bar_ts_ms: int, *, last_price: float | None) -> None:
         """The diff/dispatch cycle of :meth:`sync`, without the book write."""
@@ -3545,6 +3917,8 @@ class OrderSyncEngine:
         # the engine silently keep iterating.
         self.raise_if_halted()
         self._check_plugin_ports()
+        # The store catches up first: the replay below reads it.
+        self._flush_owed_store_writes()
         # Re-replay persisted anchors at the start of every sync to keep
         # the in-memory caches aligned with the journal. The runner's
         # pre-sync refresh races with the broker plugin's ``connect()``
@@ -3605,7 +3979,7 @@ class OrderSyncEngine:
                     del self._reject_anchor_bars[key]
                     self._persisted_envelope_anchors.pop(key, None)
                     if self._store_ctx is not None:
-                        self._store_ctx.record_complete(key)
+                        self._owe_complete(key)
         # Restart-replay native fail-safe rehydrate: deferred from
         # ``__init__`` so the native bracket dispatcher the runner installs
         # after construction decides whether a parent awaits confirmation.
@@ -3687,6 +4061,14 @@ class OrderSyncEngine:
         # self-no-ops when ``store_ctx`` is None.
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
         if not self._one_way_replay_done and one_way_port is not None:
+            # A replayed write of unknown outcome holds its leg until it is
+            # settled, and the settlement pass of this sync lies past the
+            # replay: without this a replay that wants a different write on
+            # that leg could never complete.
+            self._settle_one_way_leg_writes(one_way_port)
+            # Neither may the replay re-assert an exit the script cancelled or
+            # placed again while the restart was unsettled.
+            self._prepare_restart_replay_owners()
             try:
                 replayed = self._run_async_recovery(
                     self._one_way_emulator.restart_replay(one_way_port),
@@ -3700,8 +4082,9 @@ class OrderSyncEngine:
             if not replayed:
                 _blog_warning(
                     "sync skipped: one-way emulation replay could not complete "
-                    "(the exchange refused a replayed close, or the market is "
-                    "closed) — retrying next sync",
+                    "(the exchange refused a replayed close, the market is "
+                    "closed, or what a close executed before the restart is not "
+                    "established yet) — retrying next sync",
                 )
                 return
             self._one_way_replay_done = True
@@ -3725,8 +4108,7 @@ class OrderSyncEngine:
         # state); reached only after ``_one_way_replay_done`` so it never runs
         # against an un-replayed ledger.
         if not self._pine_bracket_reconstruct_done:
-            self._reconstruct_pine_bracket_state()
-            self._pine_bracket_reconstruct_done = True
+            self._reconstruct_restart_book()
 
         raw = build_intents(
             self._position.entry_orders,
@@ -3735,7 +4117,8 @@ class OrderSyncEngine:
             self._position.bindings,
         )
         resolved = [self._resolve_ticks(i) for i in raw]
-        final = self._apply_interceptors(resolved)
+        verdicts, self._restart_interceptor_verdicts = self._restart_interceptor_verdicts, None
+        final = self._apply_interceptors(resolved, verdicts)
         final = self._clamp_close_intents(final)
         # Measured live (bybit-spot cycle 348, 2026-10-26): a bar-later
         # ``strategy.exit`` re-issue with new levels amended the fee-netted
@@ -3816,6 +4199,11 @@ class OrderSyncEngine:
         # otherwise the worst-SL recompute would still see the now-fired
         # leg as armed and emit a stale broker-native level for one bar.
         self._drive_partial_bracket_triggers(last_price=last_price)
+        # Software leg guards (one-way emulation): a leg whose venue bracket
+        # could not be limited to the protected quantity is closed here when
+        # the price reaches a level. Ungated like the partial-bracket driver:
+        # it only reduces existing exposure.
+        self._drive_software_leg_guards(last_price=last_price)
         # A legacy OCO watch row only reduces: its native LIMIT is cancelled
         # and the row closed, so it runs ungated.
         self._retire_legacy_oco_watches()
@@ -4020,7 +4408,7 @@ class OrderSyncEngine:
                     format_intent_key(key), mode, not_applied,
                 )
             if self._store_ctx is not None:
-                self._store_ctx.log_event(
+                self._log_store_event(
                     'resume_exit_reasserted', client_order_id=None, intent_key=key,
                     payload={'mode': mode, 'tp_price': intent.tp_price,
                              'sl_price': intent.sl_price},
@@ -4111,7 +4499,7 @@ class OrderSyncEngine:
                 refusal.error, single_line=True,
             )
             if self._store_ctx is not None:
-                self._store_ctx.log_event(
+                self._log_store_event(
                     'bracket_replay_refused', client_order_id=None,
                     intent_key=refusal.intent_key,
                     payload={'leg_id': refusal.leg_id, 'tp_price': refusal.tp_price,
@@ -4167,7 +4555,7 @@ class OrderSyncEngine:
             if order.id not in current:
                 current.append(order.id)
             if self._store_ctx is not None:
-                self._store_ctx.record_unpark(coid)
+                self._owe_unpark(coid)
             self._maybe_attach_defensive_close_ref(key, order.id)
             # The promoted order is proven LIVE at the venue. If its id sits
             # in the parked-modify cancel ring, the park was an atomic
@@ -4213,7 +4601,7 @@ class OrderSyncEngine:
             if order.id not in current:
                 current.append(order.id)
             if self._store_ctx is not None:
-                self._store_ctx.record_unpark(coid)
+                self._owe_unpark(coid)
             self._maybe_attach_defensive_close_ref(anchor.key, order.id)
             # Cross-restart sibling of the entry fill-ledger seed above: the
             # persisted anchor carries no intent, so the entry kind comes
@@ -4481,7 +4869,7 @@ class OrderSyncEngine:
             self._pending_verification.pop(close_coid, None)
             self._persisted_pending_anchors.pop(close_coid, None)
             if self._store_ctx is not None:
-                self._store_ctx.record_unpark(close_coid)
+                self._owe_unpark(close_coid)
         close_intent_key = marker.close_intent_key
         if close_intent_key:
             self._order_mapping.pop(close_intent_key, None)
@@ -4604,7 +4992,7 @@ class OrderSyncEngine:
             # with ``filled_qty=0`` would make the snapshot probe expect
             # the FULL correction qty to still be outstanding and
             # false-halt after the broker settled the remainder.
-            self._store_ctx.log_event(
+            self._log_store_event(
                 kind='flip_surplus_close_progress',
                 intent_key=close_key,
                 client_order_id=pending.position_coid or None,
@@ -4823,7 +5211,7 @@ class OrderSyncEngine:
         }
         if fill_exchange_order_id is not None:
             payload['fill_exchange_order_id'] = fill_exchange_order_id
-        self._store_ctx.log_event(
+        self._log_store_event(
             kind='flip_surplus_close_filled',
             intent_key=close_key,
             client_order_id=marker.position_coid or None,
@@ -5261,7 +5649,7 @@ class OrderSyncEngine:
         self._pending_verification.pop(close_coid, None)
         self._persisted_pending_anchors.pop(close_coid, None)
         if self._store_ctx is not None:
-            self._store_ctx.record_unpark(close_coid)
+            self._owe_unpark(close_coid)
         # The snapshot proved the correction executed, so its FILL is a
         # lost event that can still be redelivered (a reconnecting WS
         # replays its backlog, a polled broker rewinds its cursor). Cache
@@ -6568,7 +6956,7 @@ class OrderSyncEngine:
             event.leg_type, qty, event.pine_id, event.from_entry, self._position.size,
         )
         if self._store_ctx is not None:
-            self._store_ctx.log_event(
+            self._log_store_event(
                 'unbooked_exit_fill', client_order_id=event.order.client_order_id,
                 exchange_order_id=event.order.id, intent_key=None,
                 payload={'leg_type': str(event.leg_type), 'qty': qty,
@@ -6682,7 +7070,7 @@ class OrderSyncEngine:
                 entry_ids, venue, book, delta,
             )
         if self._store_ctx is not None:
-            self._store_ctx.log_event(
+            self._log_store_event(
                 'unbooked_exit_fill_settled', client_order_id=None, intent_key=None,
                 payload={'outcome': outcome, 'venue_size': venue, 'book_size': book,
                          'delta': delta, 'entry_ids': entry_ids,
@@ -6826,11 +7214,22 @@ class OrderSyncEngine:
         startup adoption ran before the first completed :meth:`sync`, the
         book is judged here (:meth:`_judge_entry_book_without_adoption`).
 
+        The fill cursors are not part of the book event: each is its own
+        keyed :data:`~pynecore.core.broker.storage.ENTRY_BOOK_CURSOR_EVENT_KIND`
+        event (:meth:`~pynecore.core.broker.storage.RunContext.replace_keyed_events`),
+        and a write replaces only the cursors that changed since the last one
+        and deletes the dropped ones, in the same transaction as the book
+        event. On spot the entry rows stay live until the position is flat,
+        so their cursors outlive many book writes; the book event itself
+        stays the size of the open bindings. Any cursor change writes the
+        book event too, so its ``written_ms`` dates the cursors' state.
+
         The write follows the plugin's own journal write of the fill, so a
         crash in between leaves the stored book behind the journal; the
         restart then finds a fill it did not take in and adopts the position
         FIFO (:meth:`_restore_entry_book`). A failed write is reported and
-        retried with the next change check.
+        retried with the next change check; while it stays failed, every sync
+        that ends counts toward the storage quarantine of :meth:`sync`.
 
         Only the newest book of the run is ever read, so a landed write then
         deletes the run's older ones
@@ -6842,6 +7241,7 @@ class OrderSyncEngine:
         """
         if self._store_ctx is None:
             return
+        self._persist_entry_fill_order()
         if not self._entry_book_judged:
             if self._sync_count == 0:
                 return
@@ -6855,9 +7255,12 @@ class OrderSyncEngine:
                 return
         if self._position.size == 0.0 and not self._position.bindings:
             self._position.forget_fill_cursors()
-        snapshot = self._position.entry_book_snapshot()
-        encoded = json.dumps(snapshot, sort_keys=True)
-        if encoded == self._entry_book_persisted:
+        book, cursors = self._entry_book_parts()
+        encoded = json.dumps(book, sort_keys=True)
+        if (encoded == self._entry_book_persisted
+                and cursors == self._entry_book_cursors_persisted):
+            # The stored book is the current one: nothing is owed any more.
+            self._book_write_failures.pop('book', None)
             return
         now_ms = int(time.time() * 1000)
         try:
@@ -6869,21 +7272,34 @@ class OrderSyncEngine:
             )
             pruned = False
         if pruned:
-            snapshot = self._position.entry_book_snapshot()
-            encoded = json.dumps(snapshot, sort_keys=True)
+            book, cursors = self._entry_book_parts()
+            encoded = json.dumps(book, sort_keys=True)
         try:
-            self._store_ctx.log_event(
-                ENTRY_BOOK_EVENT_KIND, client_order_id=None, intent_key=None,
-                payload={**snapshot, 'written_ms': now_ms},
-            )
+            with self._store_ctx.transaction():
+                persisted = self._entry_book_cursors_persisted
+                stored: dict[str, Any] = (
+                    persisted if persisted is not None else self._stored_fill_cursors())
+                self._store_ctx.log_event(
+                    ENTRY_BOOK_EVENT_KIND, client_order_id=None, intent_key=None,
+                    payload={**book, 'written_ms': now_ms},
+                )
+                changed = {key: {'qty': qty} for key, qty in cursors.items()
+                           if stored.get(key) != qty}
+                removed = [key for key in stored if key not in cursors]
+                if changed or removed:
+                    self._store_ctx.replace_keyed_events(
+                        ENTRY_BOOK_CURSOR_EVENT_KIND, changed, removed)
         except Exception as exc:  # noqa: BLE001 -- the book must not depend on the disk
             _blog_warning(
                 "binding book could not be written to the store (%s) — retried on "
                 "the next change check; a restart before it lands adopts the "
                 "position from the journal", exc,
             )
+            self._book_write_failures['book'] = exc
             return
+        self._book_write_failures.pop('book', None)
         self._entry_book_persisted = encoded
+        self._entry_book_cursors_persisted = cursors
         try:
             self._store_ctx.delete_superseded_events(ENTRY_BOOK_EVENT_KIND)
         except Exception as exc:  # noqa: BLE001 -- trimming is best effort
@@ -6891,6 +7307,139 @@ class OrderSyncEngine:
                 "superseded binding books could not be deleted from the store (%s) — "
                 "the new book is stored; they are deleted with the next write", exc,
             )
+
+    def _persist_entry_fill_order(self) -> None:
+        """Write the entry orders' places in the fill order that changed since the last write.
+
+        A booked fill that opens a binding gives its order the next place
+        (:meth:`~pynecore.core.broker.position.BrokerPosition.fill_places`);
+        each place is its own keyed
+        :data:`~pynecore.core.broker.storage.ENTRY_FILL_ORDER_EVENT_KIND`
+        event. Unlike the book this needs no startup judgement: a place
+        records only what this process booked, after the places of the
+        earlier processes, so it is written as soon as it is given. Before
+        a write, the places of orders without a live journal row are dropped
+        (only a live row is ever rebuilt from them,
+        :meth:`_recover_adopted_parent_trades`), so they stay as many as the
+        open entry rows. A failed write is reported and retried with the next
+        change check.
+        """
+        assert self._store_ctx is not None
+        places = self._position.fill_places()
+        if places == self._entry_fill_places_persisted:
+            self._book_write_failures.pop('fill_order', None)
+            return
+        try:
+            live: set[str] = set()
+            for row in self._store_ctx.iter_live_orders():
+                live.update(self._journal_row_keys(row))
+            gone = [key for key in places if key not in live]
+            if gone:
+                self._position.drop_fill_places(gone)
+                places = self._position.fill_places()
+            stored = self._entry_fill_places_persisted
+            changed = {key: {'seq': seq} for key, seq in places.items() if stored.get(key) != seq}
+            removed = [key for key in stored if key not in places]
+            if changed or removed:
+                self._store_ctx.replace_keyed_events(
+                    ENTRY_FILL_ORDER_EVENT_KIND, changed, removed)
+        except Exception as exc:  # noqa: BLE001 -- the book must not depend on the disk
+            _blog_warning(
+                "the entry fill order could not be written to the store (%s) — "
+                "retried on the next change check; a restart before it lands "
+                "rebuilds a rejected book with the orders it lacks in creation order",
+                exc,
+            )
+            self._book_write_failures['fill_order'] = exc
+            return
+        self._book_write_failures.pop('fill_order', None)
+        self._entry_fill_places_persisted = places
+
+    def _stored_fill_places(self) -> dict[str, int]:
+        """The entry orders' places in the fill order the store holds for the run.
+
+        Read from the keyed
+        :data:`~pynecore.core.broker.storage.ENTRY_FILL_ORDER_EVENT_KIND`
+        events; one whose ``seq`` is not a positive integer is skipped.
+        """
+        assert self._store_ctx is not None
+        places: dict[str, int] = {}
+        for key, payload in self._store_ctx.keyed_events_for_run_id(
+                ENTRY_FILL_ORDER_EVENT_KIND).items():
+            seq = payload.get('seq')
+            if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+                places[key] = seq
+        return places
+
+    def _entry_book_parts(self) -> tuple[dict[str, Any], dict[str, float]]:
+        """The binding book as stored: the book event's payload and the fill cursors apart.
+
+        :return: The book
+            (:meth:`~pynecore.core.broker.position.BrokerPosition.entry_book_snapshot`)
+            without its ``fill_cursors``, and the cursors.
+        """
+        book = self._position.entry_book_snapshot()
+        cursors: dict[str, float] = book.pop('fill_cursors')
+        return book, cursors
+
+    def _stored_fill_cursors(self) -> dict[str, Any]:
+        """The fill cursors the store holds for the run, by order id, as stored.
+
+        Read from the keyed
+        :data:`~pynecore.core.broker.storage.ENTRY_BOOK_CURSOR_EVENT_KIND`
+        events: each one's ``qty``, ``None`` when its payload has none. The
+        values are not validated here; the restart's parse is
+        (:meth:`~pynecore.core.broker.position.BrokerPosition.parse_entry_book_snapshot`).
+        """
+        assert self._store_ctx is not None
+        return {
+            key: payload.get('qty')
+            for key, payload in self._store_ctx.keyed_events_for_run_id(
+                ENTRY_BOOK_CURSOR_EVENT_KIND).items()
+        }
+
+    def _stored_entry_book_payload(self) -> dict | None:
+        """The latest stored binding book of the run with its fill cursors, as written.
+
+        The book event's payload, its ``fill_cursors`` read from the keyed
+        cursor events (:meth:`_stored_fill_cursors`); a cursor that is not a
+        number makes the book malformed.
+
+        :return: ``None`` when the run never wrote a book.
+        """
+        assert self._store_ctx is not None
+        latest = self._store_ctx.latest_event_for_run_id((ENTRY_BOOK_EVENT_KIND,))
+        if latest is None:
+            return None
+        return {**latest[1], 'fill_cursors': self._stored_fill_cursors()}
+
+    def _check_journal_fill_qty(self, event: OrderEvent) -> None:
+        """Report a fill event that carries no journal quantity, once per order.
+
+        A plugin sets :attr:`~OrderEvent.journal_fill_qty`
+        on every fill; without it the booked fill does not move its order's
+        fill cursor (:meth:`~BrokerPosition.fill_cursor`), so a restart finds
+        the journal ahead of the book and adopts the position FIFO rather
+        than resume the book. Only a run with a store has a journal to
+        compare with.
+
+        :param event: A routed order event.
+        """
+        if (self._store_ctx is None or event.journal_fill_qty is not None
+                or not (event.fill_qty or 0.0) > 0.0):
+            return
+        order = event.order
+        keys = {key for key in (order.client_order_id, order.id) if key}
+        if not keys or keys & self._journal_qty_missing_reported:
+            return
+        self._journal_qty_missing_reported.update(keys)
+        _blog_error(
+            "fill of order %s (pine=%r) carries no journal quantity — a plugin "
+            "contract violation (OrderEvent.journal_fill_qty); the fill is booked, "
+            "but a restart cannot resume the binding book over it and adopts the "
+            "position from the journal",
+            order.client_order_id or order.id, event.pine_id,
+        )
 
     def _prune_fill_cursors(self, now_ms: int) -> bool:
         """Drop the fill cursors no restart check can consult any more.
@@ -7000,10 +7549,10 @@ class OrderSyncEngine:
         """The latest binding book of the run in the store, ``None`` when none or malformed."""
         if self._store_ctx is None:
             return None
-        latest = self._store_ctx.latest_event_for_run_id((ENTRY_BOOK_EVENT_KIND,))
-        if latest is None:
+        payload = self._stored_entry_book_payload()
+        if payload is None:
             return None
-        return self._position.parse_entry_book_snapshot(latest[1])
+        return self._position.parse_entry_book_snapshot(payload)
 
     @staticmethod
     def _journal_row_keys(row: OrderRow) -> tuple[str, ...]:
@@ -7044,7 +7593,11 @@ class OrderSyncEngine:
         what the book took in of its order
         (the ``fill_cursors`` of
         :class:`~pynecore.core.broker.position.EntryBookSnapshot`)
-        holds a fill the book never saw.
+        holds a fill the book never saw. Both are in the journal's unit: the
+        cursors sum the fills' journal quantities
+        (:attr:`~OrderEvent.journal_fill_qty`),
+        not the position quantities, which differ on a fee-net spot fill and
+        on an inverse contract fill.
 
         :param snapshot: The stored book.
         :return: ``None`` when the book saw every fill the journal shows.
@@ -7089,15 +7642,15 @@ class OrderSyncEngine:
         size = self._position.size
         if self._store_ctx is None or size == 0.0:
             return
-        latest = self._store_ctx.latest_event_for_run_id((ENTRY_BOOK_EVENT_KIND,))
-        if latest is None:
+        payload = self._stored_entry_book_payload()
+        if payload is None:
             _blog_info(
                 "startup: no stored binding book for the adopted position (%s) — the "
                 "book is attributed FIFO from the journal and is not faithful",
                 size,
             )
             return
-        snapshot = self._position.parse_entry_book_snapshot(latest[1])
+        snapshot = self._position.parse_entry_book_snapshot(payload)
         reason: str | None
         if snapshot is None:
             reason = "it is malformed"
@@ -7119,8 +7672,9 @@ class OrderSyncEngine:
             )
             return
         self._position.restore_entry_book(snapshot)
-        self._entry_book_persisted = json.dumps(
-            self._position.entry_book_snapshot(), sort_keys=True)
+        book, cursors = self._entry_book_parts()
+        self._entry_book_persisted = json.dumps(book, sort_keys=True)
+        self._entry_book_cursors_persisted = cursors
         _blog_info(
             "startup: resumed the binding book of the previous process (%s)%s",
             ", ".join(f"{binding.entry_id}={binding.bound}"
@@ -7580,7 +8134,7 @@ class OrderSyncEngine:
             self._adopted_reduction_qty,
         )
         if self._store_ctx is not None:
-            self._store_ctx.log_event(
+            self._log_store_event(
                 'adopted_reduction_fill_held',
                 client_order_id=event.order.client_order_id,
                 exchange_order_id=event.order.id, intent_key=None,
@@ -7717,8 +8271,7 @@ class OrderSyncEngine:
                     part = qty if qty <= remaining or _sizes_match(qty, remaining) else remaining
                     remaining = round(remaining - part, 12)
                 if part > 0.0:
-                    slice_event = event if part == qty else dataclasses.replace(
-                        event, fill_qty=part, fee=event.fee * part / qty)
+                    slice_event = event if part == qty else _fill_slice(event, part)
                     self._position.record_fill(
                         slice_event,
                         close_entry_id=self._close_fill_entry_id(slice_event),
@@ -7763,7 +8316,7 @@ class OrderSyncEngine:
                 "venue size the split is measured on)" if unverified_shared else "",
             )
         if self._store_ctx is not None:
-            self._store_ctx.log_event(
+            self._log_store_event(
                 'adopted_reduction_fill_settled', client_order_id=None, intent_key=None,
                 payload={'outcome': outcome, 'venue_size': venue, 'book_size': book,
                          'held_qty': held_qty, 'adopted_reduction': expected,
@@ -7778,7 +8331,7 @@ class OrderSyncEngine:
         """Split held fills, oldest first, into the first ``qty`` and the rest.
 
         A fill straddling the bound is sliced into two events, each with its
-        share of the fill's fee.
+        share of the fill's fee and journal quantity (:func:`_fill_slice`).
 
         :param held: The held fills, oldest first.
         :param qty: The quantity the first part takes.
@@ -7797,10 +8350,8 @@ class OrderSyncEngine:
                 remaining = round(remaining - fill_qty, 12)
                 continue
             rest = round(fill_qty - remaining, 12)
-            within.append(dataclasses.replace(
-                event, fill_qty=remaining, fee=event.fee * remaining / fill_qty))
-            beyond.append(dataclasses.replace(
-                event, fill_qty=rest, fee=event.fee * rest / fill_qty))
+            within.append(_fill_slice(event, remaining))
+            beyond.append(_fill_slice(event, rest))
             remaining = 0.0
         return within, beyond
 
@@ -8135,7 +8686,7 @@ class OrderSyncEngine:
                     )
                     self._cancel_and_retire_exit_leg(key, intent)
                     if self._store_ctx is not None:
-                        self._store_ctx.log_event(
+                        self._log_store_event(
                             'reduce_coverage_stale_exit_cancelled',
                             client_order_id=None, intent_key=key,
                             payload={'coverage': coverage, 'held': held_abs,
@@ -8207,7 +8758,7 @@ class OrderSyncEngine:
             if not self._retire_exit_for_rearm(key, intent):
                 continue
             if self._store_ctx is not None:
-                self._store_ctx.log_event(
+                self._log_store_event(
                     'stop_coverage_rearm',
                     client_order_id=None, intent_key=key,
                     payload={'held': held_abs, 'parent_held': parent_held},
@@ -8296,7 +8847,7 @@ class OrderSyncEngine:
             )
             _blog_error("stop-coverage invariant: %s", reason)
             if self._store_ctx is not None:
-                self._store_ctx.log_event(
+                self._log_store_event(
                     'stop_coverage_rearm_unverified',
                     client_order_id=None, intent_key=key,
                     payload={'held': held_abs, 'parent_held': parent_held,
@@ -8386,11 +8937,20 @@ class OrderSyncEngine:
             )
             return False
         if self._store_ctx is not None and coid is not None:
-            self._store_ctx.close_order(coid)
-            self._store_ctx.log_event(
-                event_kind, client_order_id=coid, intent_key=None,
-                payload={**payload, 'exchange_order_id': order.id},
-            )
+            # The cancel landed: the venue no longer shows the order, so a
+            # failed row close is owed rather than retried by a later pass.
+            store_ctx = self._store_ctx
+            event_payload = {**payload, 'exchange_order_id': order.id}
+
+            def _close_row() -> None:
+                with store_ctx.transaction():
+                    store_ctx.close_order(coid)
+                    store_ctx.log_event(
+                        event_kind, client_order_id=coid, intent_key=None,
+                        payload=event_payload,
+                    )
+
+            self._owe_store_write(f"close {coid}", _close_row)
         return True
 
     def _warn_reduce_coverage_once(
@@ -8710,8 +9270,12 @@ class OrderSyncEngine:
                         drained_any = True
                         continue
                     own_marker = self._match_pending_defensive_close(event)
+                    book_mark = self._fill_book_mark(event)
                     try:
                         self._route_event(event)
+                    except sqlite3.Error:
+                        self._keep_unbooked_fill_for_retry(event, pos, book_mark)
+                        raise
                     except VenueWritesQuarantinedError:
                         # A follow-up write that ends the event's routing (its
                         # bookkeeping is done) is deferred to the post-resume
@@ -8746,6 +9310,55 @@ class OrderSyncEngine:
             self._retry_forced_cancels()
             self._reconcile_short_gate_after_fill()
 
+    def _fill_book_mark(
+            self, event: 'OrderEvent | _NativeCancelAllExpected',
+    ) -> tuple[bool, float, int, int, int] | None:
+        """What a fill's booking would change, taken before the fill is routed.
+
+        ``None`` for an event that carries no fill. Otherwise whether the
+        fill's id was already seen, and the position size, its open and
+        closed trade counts and the held reduction fills: booking a fill
+        changes one of them (:meth:`_keep_unbooked_fill_for_retry`).
+
+        :param event: The event about to be routed.
+        """
+        if not isinstance(event, OrderEvent) or (event.fill_qty or 0.0) <= 0.0:
+            return None
+        seen = event.fill_id is not None and event.fill_id in self._seen_fill_ids
+        return (seen, self._position.size, len(self._position.open_trades),
+                len(self._position.closed_trades), len(self._held_reduction_fills))
+
+    def _keep_unbooked_fill_for_retry(
+            self, event: OrderEvent, pos: int,
+            mark: tuple[bool, float, int, int, int] | None,
+    ) -> None:
+        """Keep a fill whose routing a storage error ended before it was booked.
+
+        The fill is routed again with the next drain: it stays in the batch
+        carry, and an id the duplicate gate recorded for it is forgotten, so
+        the retry is not dropped as a redelivery. A fill booked before the
+        error is not routed again, so it can never be applied twice.
+
+        :param event: The event whose routing raised.
+        :param pos: The event's index in the drain batch.
+        :param mark: :meth:`_fill_book_mark` taken before the routing.
+        """
+        if mark is None:
+            return
+        seen, size, open_count, closed_count, held_count = mark
+        if (self._position.size != size
+                or len(self._position.open_trades) != open_count
+                or len(self._position.closed_trades) != closed_count
+                or len(self._held_reduction_fills) != held_count):
+            return
+        if not seen and event.fill_id is not None:
+            self._seen_fill_ids.discard(event.fill_id)
+        self._drain_batch_pos = pos
+        _blog_warning(
+            "fill %s (order %s) not booked: a storage write failed while it was "
+            "routed — routed again with the next drain", event.fill_id, event.order.id,
+        )
+
     def _unpark_filled_entry(self, event: OrderEvent) -> None:
         """Retire the park of an entry dispatch the venue reports fully filled.
 
@@ -8768,14 +9381,19 @@ class OrderSyncEngine:
         if envelope is not None:
             if not isinstance(envelope.intent, EntryIntent):
                 return
-            del self._pending_verification[coid]
         else:
             record = self._persisted_pending_anchors.get(coid)
             if record is None or record.dispatch_kind != 'new':
                 return
-            del self._persisted_pending_anchors[coid]
+        # The park leaves memory only once its row is gone: a failed write
+        # keeps both, so the retried fill retires it.
         if self._store_ctx is not None:
+            self._flush_owed_store_writes()
             self._store_ctx.record_unpark(coid)
+        if envelope is not None:
+            del self._pending_verification[coid]
+        else:
+            del self._persisted_pending_anchors[coid]
         _log.info("parked entry dispatch %s filled at the venue; park retired", coid)
 
     def _route_event(self, event: OrderEvent) -> None:
@@ -9450,6 +10068,7 @@ class OrderSyncEngine:
             # LongA (older) and LongB (newer) open, LongB's exit or a
             # defensive close of LongB consumes LongA's rows FIFO while LongA
             # keeps its binding and its bracket, and LongB's binding is spent.
+            self._check_journal_fill_qty(event)
             if not self._hold_fill_against_adopted_reduction(event):
                 if ((event.fill_qty or 0.0) > 0.0 and (event.fill_price or 0.0) > 0.0
                         and self._position.is_non_reducing_exit(event)):
@@ -9966,7 +10585,7 @@ class OrderSyncEngine:
                     )
                 self._trim_cancelled_bracket_leg(event, key)
                 if self._store_ctx is not None:
-                    self._store_ctx.log_event(
+                    self._log_store_event(
                         'venue_driven_cancel',
                         client_order_id=event.order.client_order_id,
                         intent_key=key,
@@ -9990,7 +10609,7 @@ class OrderSyncEngine:
                 )
                 self._trim_cancelled_bracket_leg(event, key)
                 if self._store_ctx is not None:
-                    self._store_ctx.log_event(
+                    self._log_store_event(
                         'oca_sibling_cancel',
                         client_order_id=event.order.client_order_id,
                         intent_key=key,
@@ -10017,7 +10636,7 @@ class OrderSyncEngine:
                         format_intent_key(key), event,
                     )
                     if self._store_ctx is not None:
-                        self._store_ctx.log_event(
+                        self._log_store_event(
                             'cancel_after_full_fill_ignored',
                             client_order_id=event.order.client_order_id,
                             intent_key=key,
@@ -10083,7 +10702,7 @@ class OrderSyncEngine:
                 self._drop_envelope(key)
                 if venue_driven:
                     if self._store_ctx is not None:
-                        self._store_ctx.log_event(
+                        self._log_store_event(
                             'venue_driven_cancel',
                             client_order_id=event.order.client_order_id,
                             intent_key=key,
@@ -10222,7 +10841,7 @@ class OrderSyncEngine:
                  "changes or re-issues it)") if count >= _ENTRY_REJECT_RETRY_CAP else "",
             )
         if self._store_ctx is not None:
-            self._store_ctx.log_event(
+            self._log_store_event(
                 'venue_driven_cancel',
                 client_order_id=event.order.client_order_id,
                 intent_key=key,
@@ -10649,7 +11268,7 @@ class OrderSyncEngine:
             )
             self._trim_cancelled_bracket_leg(event, key)
             if self._store_ctx is not None:
-                self._store_ctx.log_event(
+                self._log_store_event(
                     'expected_bracket_close_cancel',
                     client_order_id=event.order.client_order_id,
                     intent_key=key,
@@ -10669,7 +11288,7 @@ class OrderSyncEngine:
             if isinstance(sib, ExitIntent) and sib.from_entry == from_entry:
                 self._cancel_and_retire_exit_leg(sib_key, sib)
         if self._store_ctx is not None:
-            self._store_ctx.log_event(
+            self._log_store_event(
                 'expected_bracket_close_cancel',
                 client_order_id=event.order.client_order_id,
                 intent_key=key,
@@ -10826,7 +11445,7 @@ class OrderSyncEngine:
         # envelope dying means the correction is no longer in flight.
         self._pending_flip_surplus_closes.pop(key, None)
         if self._store_ctx is not None:
-            self._store_ctx.record_complete(key)
+            self._owe_complete(key)
 
     def _reanchor_envelope_after_reject(self, key: str) -> None:
         """Retire a rejected dispatch but keep a bumped retry anchor.
@@ -10935,7 +11554,9 @@ class OrderSyncEngine:
         (:meth:`BrokerPosition.record_fill`): a script ``strategy.close(id)``
         settles ``id``'s, an engine-made close aimed at one entry
         (``partial_trigger``, ``marketable_exit``) its ``target_entry_id``'s, a
-        defensive close the parent entry it protects. A ``strategy.close_all``
+        fired software leg guard the entry its leg's exits protect
+        (:attr:`~OrderSyncEngine._leg_guard_close_entries`), a defensive close
+        the parent entry it protects. A ``strategy.close_all``
         and a reversal's close are unbound and walk the whole book. A fill whose
         close the engine cannot identify takes the entry id its labels carry:
         the ``from_entry`` of a venue's per-position protective close (cTrader
@@ -10963,10 +11584,13 @@ class OrderSyncEngine:
         if intent is not None:
             if intent.synthetic_kind is None:
                 return intent.pine_id or None
-            if intent.synthetic_kind in ('partial_trigger', 'marketable_exit'):
+            if intent.synthetic_kind in ('partial_trigger', 'marketable_exit', 'leg_guard'):
                 return intent.target_entry_id
             if intent.synthetic_kind == 'reversal_close':
                 return None
+        for label in (event.pine_id, event.from_entry):
+            if label in self._leg_guard_close_entries:
+                return self._leg_guard_close_entries[label]
         defensive_entry_id = self._match_pending_defensive_close(event)
         if defensive_entry_id is not None:
             return defensive_entry_id
@@ -12048,7 +12672,7 @@ class OrderSyncEngine:
             if (fill_order_id is not None
                     and fill_order_id != marker.close_order_ref):
                 payload['fill_exchange_order_id'] = fill_order_id
-            self._store_ctx.log_event(
+            self._log_store_event(
                 kind='defensive_close_filled',
                 intent_key=marker.close_intent_key,
                 client_order_id=marker.reject_context.position_coid,
@@ -12114,7 +12738,7 @@ class OrderSyncEngine:
             self._pending_verification.pop(close_coid, None)
             self._persisted_pending_anchors.pop(close_coid, None)
             if self._store_ctx is not None:
-                self._store_ctx.record_unpark(close_coid)
+                self._owe_unpark(close_coid)
         # Drop the synthetic close intent's ``_order_mapping`` slot and
         # envelope state. ``_cleanup_position_tracking`` above only
         # cleans entries keyed by ``marker.entry_id`` (the parent
@@ -12953,14 +13577,21 @@ class OrderSyncEngine:
             # the recovery; meanwhile the WATCH phase keeps the legs
             # ``pending_entry`` rather than firing against a missing price.
             return
-        resolver = TickOffsetResolver(self._mintick)
-        self._partial_bracket_engine.on_parent_entry_filled(
-            symbol=self._symbol,
-            from_entry=pine_id,
-            fill_price=float(fill_price),
-            parent_side=parent_side,
-            parent_qty=float(parent_trade.size if parent_trade.size >= 0.0 else -parent_trade.size),
-            resolver=resolver,
+        # The fill is booked, so the promotion it decides stands: a leg write
+        # that fails is owed, and the owed promotion arms the legs still
+        # ``pending_entry`` (the routing is not repeated for a booked fill).
+        self._owe_store_write(
+            f"promote the partial-bracket legs of {pine_id!r}",
+            functools.partial(
+                self._partial_bracket_engine.on_parent_entry_filled,
+                symbol=self._symbol,
+                from_entry=pine_id,
+                fill_price=float(fill_price),
+                parent_side=parent_side,
+                parent_qty=float(
+                    parent_trade.size if parent_trade.size >= 0.0 else -parent_trade.size),
+                resolver=TickOffsetResolver(self._mintick),
+            ),
         )
         # Restart-orphan guard. When the process restarted while this parent's
         # entry was still pending, every leg was ``pending_entry`` so the
@@ -13265,15 +13896,17 @@ class OrderSyncEngine:
             state = manager.get_state(ref)
             if state is None:
                 continue
+            # The observation is judged in memory already, so its record is
+            # owed when the write fails (:meth:`_owe_store_write`).
             if (verdict is FailsafeObservation.CONFIRMED
                     and state.owner is FailsafeOwner.ENGINE_FAILSAFE):
-                self._persist_native_failsafe_levels(ref, confirmed=True)
+                self._owe_native_failsafe_levels(ref, confirmed=True)
             elif verdict is FailsafeObservation.ACCEPTED_BASELINE:
                 self._note_native_failsafe_level_accepted(ref, stop_level, state.desired_level)
-                self._persist_native_failsafe_levels(ref)
+                self._owe_native_failsafe_levels(ref)
             elif accepting and not state.accept_first_observation:
                 # An own level explained the first observation: it is judged.
-                self._persist_native_failsafe_levels(ref)
+                self._owe_native_failsafe_levels(ref)
 
     def _note_native_failsafe_level_accepted(
             self, ref: str, observed: float | None, desired: float | None,
@@ -13303,10 +13936,26 @@ class OrderSyncEngine:
                 "its worst-SL %s", ref, observed, desired, single_line=True,
             )
         if self._store_ctx is not None:
-            self._store_ctx.log_event(
+            self._log_store_event(
                 kind, client_order_id=ref, intent_key=None,
                 payload={'observed_stop': observed, 'desired_stop': desired},
             )
+
+    def _owe_native_failsafe_levels(self, ref: str, *, confirmed: bool = False) -> None:
+        """Record ``ref``'s bracket triples as a follow-up write (:meth:`_owe_store_write`).
+
+        The confirmed triple is taken now, so a record that lands late never
+        claims a level dispatched after this confirmation.
+        """
+        state = self._native_failsafe_manager.get_state(ref)
+        if self._store_ctx is None or state is None:
+            return
+        confirmed_triple = ([state.desired_level, state.desired_profit_level,
+                             state.desired_trailing_stop] if confirmed else None)
+        self._owe_store_write(
+            f"native fail-safe levels {ref}",
+            lambda: self._write_native_failsafe_levels(ref, confirmed_triple),
+        )
 
     def _persist_native_failsafe_levels(self, ref: str, *, confirmed: bool = False) -> None:
         """Record the bracket triples the broker may carry for ``ref`` on its parent row.
@@ -13327,6 +13976,20 @@ class OrderSyncEngine:
         state = self._native_failsafe_manager.get_state(ref)
         if self._store_ctx is None or state is None:
             return
+        self._flush_owed_store_writes()
+        self._write_native_failsafe_levels(
+            ref,
+            [state.desired_level, state.desired_profit_level, state.desired_trailing_stop]
+            if confirmed else None,
+        )
+
+    def _write_native_failsafe_levels(
+            self, ref: str, confirmed: list[float | None] | None,
+    ) -> None:
+        """Write ``ref``'s outstanding triples, and ``confirmed`` when given, to its row."""
+        state = self._native_failsafe_manager.get_state(ref)
+        if self._store_ctx is None or state is None:
+            return
         with self._store_ctx.transaction():
             row = self._store_ctx.get_order(ref)
             if row is None or row.closed_ts_ms is not None:
@@ -13336,9 +13999,8 @@ class OrderSyncEngine:
             saved['levels'] = [
                 [o.sl, o.profit_level, o.trailing_stop] for o in state.outstanding
             ][-NATIVE_FAILSAFE_LEVELS_PERSISTED_CAP:]
-            if confirmed:
-                saved['confirmed'] = [state.desired_level, state.desired_profit_level,
-                                      state.desired_trailing_stop]
+            if confirmed is not None:
+                saved['confirmed'] = confirmed
             if self._operator_resume_ts_ms is not None and not state.accept_first_observation:
                 saved[_NATIVE_FAILSAFE_RESUME_EXTRA_KEY] = self._operator_resume_ts_ms
             if saved == extras.get(NATIVE_FAILSAFE_LEVELS_EXTRA):
@@ -13716,6 +14378,7 @@ class OrderSyncEngine:
         audit / observability.
         """
         if intent_key in self._cancel_disposition_pending:
+            self._forced_cancel_pending.pop(intent_key, None)
             return
         park_coid: str | None = None
         if self._store_ctx is not None:
@@ -13726,34 +14389,48 @@ class OrderSyncEngine:
                     pine_id=intent_key, symbol=self._symbol,
                 ))
                 row_coid = cancel_envelope.client_order_id(KIND_CANCEL)
-            self._store_ctx.record_park(
+            park = functools.partial(
+                self._store_ctx.record_park,
                 coid=row_coid,
                 key=intent_key,
                 kind='cancel_tentative',
-                order_ids=self._order_mapping.get(intent_key, []),
+                order_ids=list(self._order_mapping.get(intent_key, [])),
                 parked_ts_ms=now_ms,
             )
+            if parked_coid is not None:
+                # The speculative ``'cancel_probe'`` pre-park already holds the
+                # obligation durably, and a restart re-arms this same state
+                # from it; converting its kind is a follow-up write.
+                self._owe_store_write(f"cancel-tentative park {row_coid}", park)
+            else:
+                self._flush_owed_store_writes()
+                park()
             park_coid = row_coid
         self._cancel_disposition_pending[intent_key] = _CancelTentativeMeta(
             since_ts_ms=now_ms,
             reason=reason,
             park_coid=park_coid,
         )
+        # Cancel-tentative owns the cancel from here: the forced-cancel retry
+        # must not drive it as well.
+        self._forced_cancel_pending.pop(intent_key, None)
+        self._emit_broker_event(PartialBracketCancelTentativeStartedEvent(
+            intent_key=intent_key,
+            reason=reason,
+            since_ts_ms=now_ms,
+        ))
         # ``intent_key`` here is the parent ``EntryIntent.intent_key``,
         # which equals ``leg.from_entry`` on every child partial bracket
         # leg — so the engine API's parent-scoped flip uses the same
         # value as the shadow-map key. The leg flip is a no-op when no
         # partial bracket exists for the parent (entry without partial
         # exits), which is the structural case where the shadow-map
-        # entry alone provides the refuse-and-defer guard.
+        # entry alone provides the refuse-and-defer guard. A leg write that
+        # fails here raises; the resolution flips the rest first
+        # (:meth:`_clear_intent_cancel_disposition_pending`).
         self._partial_bracket_engine.mark_legs_cancel_tentative(
             intent_key, reason=reason, now_ms=now_ms,
         )
-        self._emit_broker_event(PartialBracketCancelTentativeStartedEvent(
-            intent_key=intent_key,
-            reason=reason,
-            since_ts_ms=now_ms,
-        ))
 
     def _clear_intent_cancel_disposition_pending(
             self,
@@ -13781,6 +14458,12 @@ class OrderSyncEngine:
           :attr:`CancelDispositionOutcome.STILL_OPEN`:
           confirm-cancel (legs → ``aborted_parent_never_arrived``;
           mapping, envelope, active_intents dropped).
+        - :attr:`CancelDispositionOutcome.FILLED_AND_CLOSED`: the same
+          cleanup with the legs → ``aborted_parent_gone``. The order filled
+          and its position has closed since, both booked already, so nothing
+          is restored (no armed leg, no failsafe registration), no fill is
+          booked and no OCA cascade fires; the envelope drop retires the
+          durable ``'cancel_tentative'`` row, so a restart does not re-arm.
         - :attr:`CancelDispositionOutcome.ALREADY_FILLED`:
           restore (legs → ``armed``; parent re-registered with
           ``NativeFailsafeManager`` ``pending_confirmation=True``;
@@ -13790,10 +14473,23 @@ class OrderSyncEngine:
         :attr:`CancelDispositionOutcome.UNKNOWN` is NOT a resolution —
         the caller handles it by bumping the retry counter and
         returning without invoking this method.
+
+        The entry leaves :attr:`~OrderSyncEngine._cancel_disposition_pending`
+        only once the resolution is applied, its leg writes committed. A
+        storage failure midway raises with the entry still there, holding the
+        verdict (:attr:`_CancelTentativeMeta.resolved`), so the next
+        :meth:`_drive_cancel_tentative` pass (or a re-routed event) applies the
+        same verdict again; every step is idempotent.
         """
-        meta = self._cancel_disposition_pending.pop(intent_key, None)
+        meta = self._cancel_disposition_pending.get(intent_key)
         if meta is None:
             return
+        meta.resolved = (outcome, via, is_partial_fill)
+        # A storage failure can end the mark before every leg flipped; the
+        # resolution acts on ``cancel_tentative`` legs only, so flip the rest.
+        self._partial_bracket_engine.mark_legs_cancel_tentative(
+            intent_key, reason=meta.reason, now_ms=meta.since_ts_ms,
+        )
         duration_ms = max(0, now_ms - meta.since_ts_ms)
         if outcome is CancelDispositionOutcome.ALREADY_FILLED:
             # Retire the durable ``'cancel_tentative'`` journal row. This
@@ -13804,7 +14500,7 @@ class OrderSyncEngine:
             # resolved disposition on the next restart
             # (:meth:`_absorb_journal_retry_rows`).
             if meta.park_coid is not None and self._store_ctx is not None:
-                self._store_ctx.record_unpark(meta.park_coid)
+                self._owe_unpark(meta.park_coid)
             # Restore to ``pending_entry`` rather than ``armed``: tentative
             # legs born from a pending-parent dispatch carry only
             # ``trigger_offset`` (tick distance), never an absolute
@@ -13948,6 +14644,7 @@ class OrderSyncEngine:
             self._partial_bracket_engine.confirm_cancel_tentative(
                 intent_key,
                 reason=f'cancel_tentative_resolved_{outcome.value}',
+                parent_gone=outcome is CancelDispositionOutcome.FILLED_AND_CLOSED,
             )
             self._order_mapping.pop(intent_key, None)
             self._drop_envelope(intent_key)
@@ -13971,6 +14668,7 @@ class OrderSyncEngine:
                 self._active_intents.pop(exit_key, None)
                 self._order_mapping.pop(exit_key, None)
                 self._drop_envelope(exit_key)
+        self._cancel_disposition_pending.pop(intent_key, None)
         self._emit_broker_event(PartialBracketCancelTentativeResolvedEvent(
             intent_key=intent_key,
             outcome=outcome,
@@ -14026,6 +14724,15 @@ class OrderSyncEngine:
         for intent_key in list(self._cancel_disposition_pending):
             meta = self._cancel_disposition_pending.get(intent_key)
             if meta is None:
+                continue
+            if meta.resolved is not None:
+                # A resolution a storage failure ended midway: finish it with
+                # the verdict it already has.
+                outcome, via, is_partial_fill = meta.resolved
+                self._clear_intent_cancel_disposition_pending(
+                    intent_key, outcome=outcome, via=via, now_ms=now_ms,
+                    is_partial_fill=is_partial_fill,
+                )
                 continue
             reads_confirmed = self._read_view_confirmed
             if (now_ms - meta.since_ts_ms >= stale_grace_ms
@@ -14375,12 +15082,14 @@ class OrderSyncEngine:
         if dispatcher is None:
             return  # Slice A without plugin opt-in: state-only run
         for snapshot in manager.pending_dispatch():
+            # Recorded BEFORE the PUT, and before the snapshot leaves the
+            # queue: a crash before its answer still leaves every level the
+            # broker may carry on record for the restart, and a failed write
+            # keeps the snapshot queued for the next sync.
+            self._persist_native_failsafe_levels(snapshot.parent_entry_dispatch_ref)
             manager.mark_dispatch_in_flight(
                 snapshot.parent_entry_dispatch_ref, now_ms=now_ms,
             )
-            # Recorded BEFORE the PUT: a crash before its answer still leaves
-            # every level the broker may carry on record for the restart.
-            self._persist_native_failsafe_levels(snapshot.parent_entry_dispatch_ref)
             try:
                 dispatcher(snapshot)
             except BrokerManualInterventionError as halt:
@@ -14503,7 +15212,7 @@ class OrderSyncEngine:
                 format_intent_key(pine_id), event.order.id, event.fill_qty,
             )
             if self._store_ctx is not None:
-                self._store_ctx.log_event(
+                self._log_store_event(
                     'stop_limit_fill_while_armed',
                     payload={'pine_id': pine_id, 'order_id': event.order.id,
                              'fill_qty': event.fill_qty, 'stop': watch.stop,
@@ -14734,7 +15443,8 @@ class OrderSyncEngine:
                     "retrying next sync", format_intent_key(pine_id),
                 )
                 continue
-            filled = outcome is CancelDispositionOutcome.ALREADY_FILLED
+            filled = outcome in (CancelDispositionOutcome.ALREADY_FILLED,
+                                 CancelDispositionOutcome.FILLED_AND_CLOSED)
             self._stop_limit_engine.retire_legacy(
                 pine_id, reason='legacy_oco_limit_filled' if filled else 'legacy_oco_limit_cancelled',
             )
@@ -14831,6 +15541,177 @@ class OrderSyncEngine:
                    format_intent_key(key), new.limit, new.qty)
         return True
 
+    def _settle_one_way_leg_writes(self, port: 'PositionPort') -> None:
+        """Settle the one-way legs whose protection write has no known outcome.
+
+        Runs once per sync before the clearing-row drain, while the emulator
+        reports work (:meth:`OneWayEmulator.needs_settling`) or holds a
+        protected leg whose share of its venue position it re-checks
+        (:meth:`OneWayEmulator.watches_leg_shares`). The emulator
+        learns each write's fate from the venue and brings the leg to the
+        protection its ownership rows ask for
+        (:meth:`OneWayEmulator.settle_leg_writes`); here the engine's own
+        state follows:
+
+        * An exit whose every leg is now confirmed has its parked dispatches
+          retired (the bracket is a position attribute, so the open-orders
+          verification would never find it) and gets the per-leg mapping a
+          confirmed attach records.
+        * An exit whose leg the venue refused to bring to its levels is taken
+          out of the active intents with its mapping and envelope, so the diff
+          of this same sync dispatches it afresh and a refusal there has the
+          regular refused-exit recovery.
+
+        A pass that does not complete (a read fault, an expired bridge wait)
+        is retried on the next sync.
+        """
+        if (not self._one_way_emulator.needs_settling()
+                and not self._one_way_emulator.watches_leg_shares()):
+            return
+        try:
+            result = self._run_async_recovery(
+                self._one_way_emulator.settle_leg_writes(
+                    self._symbol, port, time.monotonic()),
+            )
+        except BrokerManualInterventionError as e:
+            self._record_halt(e)
+            raise
+        except (OrderDispositionUnknownError, ExchangeConnectionError) as e:
+            _blog_warning(
+                "settling one-way leg writes did not complete (%s) — "
+                "retrying next sync", e,
+            )
+            return
+        for key in result.confirmed:
+            parked = [
+                coid for coid, envelope in self._pending_verification.items()
+                if envelope.intent.intent_key == key
+                and isinstance(envelope.intent, ExitIntent)
+            ]
+            for coid in parked:
+                del self._pending_verification[coid]
+                if self._store_ctx is not None:
+                    self._owe_unpark(coid)
+            if key in self._active_intents:
+                self._order_mapping[key] = [
+                    f"bracket:{(row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)}"
+                    for row in self._one_way_emulator.iter_bracket_ownerships()
+                    if row.intent_key == key
+                ]
+            _blog_info(
+                "one-way bracket of %s confirmed on its legs after an "
+                "unsettled write", format_intent_key(key),
+            )
+        for key, error in result.refused:
+            _blog_warning(
+                "one-way bracket of %s: the venue refused to bring a leg to "
+                "the exit's levels after an unsettled write (%s: %s) — the "
+                "exit is dispatched afresh",
+                format_intent_key(key), type(error).__name__, error,
+            )
+            self._active_intents.pop(key, None)
+            self._order_mapping.pop(key, None)
+            self._drop_envelope(key)
+
+    def _drive_software_leg_guards(self, *, last_price: float | None) -> None:
+        """Fire the one-way software leg guards the price reached.
+
+        A leg whose protection must close less than its venue position (an
+        opposing leg partly offsets it, or the venue position also holds
+        exposure the run does not own) carries no venue bracket when the venue
+        cannot size one; the emulator guards it instead
+        (:meth:`OneWayEmulator.software_guard_triggers`). Each trigger is
+        dispatched as an immediate close of exactly the protected quantity of
+        that one leg (:meth:`_dispatch_leg_guard_close`).
+
+        Skipped without a price, and while venue writes are forbidden: a
+        trigger consumed then could not be dispatched.
+        """
+        if (last_price is None or self.venue_writes_blocked
+                or not self._one_way_emulator.has_software_guards()):
+            return
+        for trigger in self._one_way_emulator.software_guard_triggers(
+                self._symbol, last_price):
+            outcome = 'unknown'
+            try:
+                outcome = self._dispatch_leg_guard_close(trigger, last_price)
+            finally:
+                self._one_way_emulator.software_guard_settled(
+                    trigger.symbol, trigger.leg_id, outcome=outcome,
+                )
+
+    def _dispatch_leg_guard_close(
+            self, trigger: SoftwareLegTrigger, last_price: float,
+    ) -> str:
+        """Dispatch the close of one triggered software leg guard.
+
+        The close is a :class:`CloseIntent` of kind ``leg_guard`` under the
+        synthetic ``pine_id`` ``__pyne_leg_guard__{leg_id}``, aimed at the
+        guarded leg alone and sized to the protected quantity, so it can
+        neither reduce another leg nor close the part of the leg that is
+        offset or not the run's own. Its fill is recognised by its label
+        (:attr:`~OrderSyncEngine._leg_guard_close_entries`).
+
+        The envelope and mapping of a settled dispatch are retired, like an
+        engine-trigger partial close's, so the next close of the leg gets a
+        fresh client order id. A dispatch of unknown outcome keeps its
+        envelope and its park: the close may have landed, so a repeated
+        trigger re-sends the SAME client order id, and the emulator
+        re-derives the guard's quantity from the venue before arming it again.
+
+        :return: The verdict for
+            :meth:`OneWayEmulator.software_guard_settled`: ``'closed'`` when
+            the close went on the wire or the leg held nothing left to close,
+            ``'retry'`` when nothing went out (the plugin skipped it, the
+            venue refused it, the link was down), ``'unknown'`` when the
+            dispatch ended without a verdict.
+        """
+        synth_pine_id = f"__pyne_leg_guard__{trigger.leg_id}"
+        close_intent = CloseIntent(
+            pine_id=synth_pine_id,
+            symbol=trigger.symbol,
+            side=trigger.side,
+            qty=trigger.qty,
+            immediately=True,
+            synthetic_kind='leg_guard',
+            target_leg_id=trigger.leg_id,
+            target_entry_id=trigger.from_entry,
+            comment=(
+                f"software leg guard ({trigger.reason} of "
+                f"{', '.join(repr(exit_id) for exit_id in trigger.exit_ids)})"
+            ),
+        )
+        _blog_warning(
+            "software leg guard of leg %s fired: %s %s reached at price %s — "
+            "closing %s of the leg (exits %s)",
+            trigger.leg_id, trigger.reason, trigger.level, last_price,
+            trigger.qty, ", ".join(repr(exit_id) for exit_id in trigger.exit_ids),
+        )
+        self._leg_guard_close_entries[synth_pine_id] = trigger.from_entry
+        outcome = 'unknown'
+        try:
+            self._dispatch_new(close_intent)
+            if synth_pine_id in self._order_mapping:
+                outcome = 'closed'
+        except OrderSkippedByPlugin as e:
+            outcome = 'retry'
+            _blog_warning(
+                "software leg guard close of leg %s skipped (%s) — the guard "
+                "stays armed", trigger.leg_id, e,
+            )
+        except BrokerManualInterventionError:
+            raise
+        except (ExchangeOrderRejectedError, ExchangeConnectionError) as e:
+            outcome = 'retry'
+            _blog_warning(
+                "software leg guard close of leg %s did not go out (%s: %s) — "
+                "the guard stays armed", trigger.leg_id, type(e).__name__, e,
+            )
+        if outcome != 'unknown':
+            self._order_mapping.pop(synth_pine_id, None)
+            self._drop_envelope(synth_pine_id)
+        return outcome
+
     def _drive_partial_bracket_triggers(
             self, *, last_price: float | None,
     ) -> None:
@@ -14857,7 +15738,11 @@ class OrderSyncEngine:
         already short-circuits to an empty result when the snapshot
         comes back ``None`` so a transient connection blip surfaces
         as "no triggers this tick" rather than a halt.
+
+        First the legs an earlier process left with a possibly sent close are
+        settled from the venue evidence (:meth:`_settle_held_partial_bracket_closes`).
         """
+        self._settle_held_partial_bracket_closes()
         if last_price is None:
             return
         if not any(True for _ in self._partial_bracket_engine.iter_legs()):
@@ -14981,6 +15866,145 @@ class OrderSyncEngine:
         for leg in triggering:
             self._dispatch_partial_bracket_close(leg)
 
+    def _settle_held_partial_bracket_closes(self) -> None:
+        """Settle the partial-bracket legs held on a close whose outcome is unknown.
+
+        A leg left ``triggering`` with its close's client order id recorded, by
+        an earlier process or by a dispatch of this one whose outcome is unknown
+        (:meth:`SoftwarePartialBracketEngine.iter_held_trigger_legs`) may have
+        sent that close, and the venue may have executed it, so it is never
+        sent again blind. Like any venue write whose outcome is unknown, it
+        waits for the evidence of that client order id
+        (:meth:`_held_trigger_close_outcome`):
+
+        * ``'sent'`` — the venue executed the close: the leg settles as the
+          dispatch owed it (``triggered``, OCA cascade, exit retired); the fill
+          books through the regular fill path;
+        * ``'refused'`` — the venue refused it with nothing filled: the leg
+          re-arms, and the spent client order id is not reused;
+        * ``'pending'`` — the plugin's journal row is still live (an answer the
+          plugin's resolver owns, or an order still working): the leg stays
+          held;
+        * ``'unknown'`` — no record shows whether the close executed, and none
+          will: the leg stays held and the bot is quarantined (new
+          entries blocked, exits and closes keep running) for the operator.
+
+        A held leg's OCA siblings do not trigger meanwhile. The first hold of
+        each close is reported at ERROR with what still protects the position.
+        """
+        engine = self._partial_bracket_engine
+        for leg in engine.iter_held_trigger_legs():
+            if leg.symbol != self._symbol:
+                continue
+            close_coid = leg.close_attempt_coid
+            assert close_coid is not None
+            outcome = self._held_trigger_close_outcome(close_coid)
+            if outcome == 'sent':
+                _blog_warning(
+                    "partial-bracket leg %s (%s of %r from %r): its held close %s "
+                    "executed on the venue; settled without a second close",
+                    leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid,
+                )
+                self._settle_sent_partial_bracket_close(leg, _partial_trigger_pine_id(leg))
+                continue
+            if outcome == 'refused':
+                _blog_warning(
+                    "partial-bracket leg %s (%s of %r from %r): its held close %s "
+                    "was refused by the venue; the leg re-arms",
+                    leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid,
+                )
+                engine.release_held_trigger(leg.key, reason='held_close_refused')
+                self._reanchor_envelope_after_reject(_partial_trigger_pine_id(leg))
+                continue
+            if (close_coid, outcome) in self._held_trigger_close_reported:
+                continue
+            self._held_trigger_close_reported.add((close_coid, outcome))
+            if self._native_bracket_dispatcher is not None:
+                cover = "the native fail-safe stop keeps covering the position"
+            else:
+                cover = ("nothing on the venue covers the position for this leg and "
+                         "its OCA siblings")
+            why = ("the venue's answer for it is still open in the plugin's journal"
+                   if outcome == 'pending' else
+                   "no venue record shows whether it executed, and none will")
+            _blog_error(
+                "partial-bracket leg %s (%s of %r from %r) held: its close %s may "
+                "have executed and is not sent again; %s. Until "
+                "it is settled its OCA siblings do not trigger and %s",
+                leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid,
+                why, cover,
+            )
+            if outcome == 'unknown':
+                self.record_quarantine(
+                    f"partial-bracket close {close_coid} of leg {leg.coid} has no "
+                    f"venue record of whether it executed: it is not sent again, and "
+                    f"the bot cannot tell whether the position was reduced",
+                    {'leg_coid': leg.coid, 'close_coid': close_coid,
+                     'pine_id': leg.pine_id, 'from_entry': leg.from_entry},
+                    intent_key=leg.intent_key,
+                    kind=QuarantineKind.ENTRY_BLOCK,
+                )
+
+    def _held_trigger_close_outcome(self, close_coid: str) -> str:
+        """What the venue evidence says about a held partial-bracket close.
+
+        Only an execution settles a close as ``'sent'``: the venue acknowledging
+        it does not, since an acknowledged order can still end unfilled. The
+        plugin's journal row of the close decides, over every process of the
+        run:
+
+        * a filled quantity, or the journal's ``confirmed`` completion event
+          under the client order id (the close dispatch journal writes it once
+          the venue reported the close executed) — ``'sent'``;
+        * a refused row with nothing filled — ``'refused'``;
+        * a live row (a pending dispatch whose answer the plugin's resolver
+          owns, or an acknowledged order still working) — ``'pending'``: its
+          fill or its end updates the row;
+        * an ended row with nothing filled and no completion event, or no row
+          and no completion event at all — ``'unknown'``: a zero-fill
+          cancellation and a fill not recorded look the same there, and nothing
+          will tell them apart.
+
+        :param close_coid: The close's client order id.
+        :return: ``'sent'``, ``'refused'``, ``'pending'`` or ``'unknown'``.
+        """
+        store_ctx = self._store_ctx
+        if store_ctx is None:
+            return 'unknown'
+        row = store_ctx.get_order_for_run_id(close_coid)
+        if row is not None and row.filled_qty > 0.0:
+            return 'sent'
+        for _key, coid, _xid, _payload in store_ctx.iter_events_by_kind_for_run_id('confirmed'):
+            if coid == close_coid:
+                return 'sent'
+        if row is None:
+            return 'unknown'
+        if row.state == STATE_REJECTED:
+            return 'refused'
+        if row.closed_ts_ms is None:
+            return 'pending'
+        return 'unknown'
+
+    def _close_attempt_left_no_record(self, close_coid: str) -> bool:
+        """Whether the store holds no row of a close sent under ``close_coid``.
+
+        A plugin's persist-first row is written under the close's client order
+        id, and a hedging fan-out writes one row per leg under
+        ``f"{close_coid}:{leg_id}"`` before sending that leg. Without a store
+        nothing can be ruled out.
+
+        :param close_coid: The close's client order id.
+        :return: ``True`` when a store is open and it has neither row.
+        """
+        store_ctx = self._store_ctx
+        if store_ctx is None:
+            return False
+        if store_ctx.get_order_for_run_id(close_coid) is not None:
+            return False
+        return not any(
+            (row.extras or {}).get(EXTRAS_KEY_CLOSE_PARENT_COID) == close_coid
+            for row in store_ctx.iter_orders_in_state_for_run_id(STATE_CLOSE_LEG))
+
     def _dispatch_partial_bracket_close(self, leg) -> None:
         """Synthesise + dispatch one partial-bracket :class:`CloseIntent`.
 
@@ -15025,10 +16049,7 @@ class OrderSyncEngine:
         * :class:`BrokerManualInterventionError` propagates after
           marking the leg failed — the engine is going to halt.
         """
-        synth_pine_id = (
-            f"__pyne_partial_trigger__{leg.pine_id}\0"
-            f"{leg.from_entry}\0{leg.leg_kind}"
-        )
+        synth_pine_id = _partial_trigger_pine_id(leg)
         close_intent = CloseIntent(
             pine_id=synth_pine_id,
             symbol=leg.symbol,
@@ -15043,6 +16064,7 @@ class OrderSyncEngine:
                 f"from_entry={leg.from_entry!r})"
             ),
         )
+        self._trigger_close_leg = leg.key
         try:
             self._dispatch_new(close_intent)
         except OrderSkippedByPlugin as e:
@@ -15079,44 +16101,63 @@ class OrderSyncEngine:
             # would stay in :data:`LEG_STATE_TRIGGERING` and OCA siblings
             # would remain reserved while the current sync aborts. Settle
             # the leg as failed and let the next price tick re-arm against
-            # a fresh parent snapshot. Drop the synth envelope for the same
-            # reason as the ``OrderSkippedByPlugin`` branch — the broker
-            # rejected the dispatch, so no live order owns the COID anchor;
-            # a later re-trigger must mint a fresh one instead of reusing
-            # the stale persisted anchor (and surviving a restart with it).
+            # a fresh parent snapshot. The venue saw and refused the COID, so
+            # the synth envelope retires with a bumped anchor: a re-trigger on
+            # the same bar mints a fresh COID instead of one an
+            # idempotency-caching venue dedupes into the refused order, and
+            # no stale anchor survives a restart.
             _blog_warning(
                 "partial-trigger close for %r rejected by broker (%s: %s) — "
                 "the leg re-arms on the next price tick",
                 leg.key, type(e).__name__, e,
             )
             self._order_mapping.pop(synth_pine_id, None)
-            self._drop_envelope(synth_pine_id)
+            self._reanchor_envelope_after_reject(synth_pine_id)
             self._partial_bracket_engine.mark_trigger_dispatch_failed(
                 leg.key, reason=f'broker_rejected:{type(e).__name__}',
             )
             return
         except Exception as e:
+            if (isinstance(e, (sqlite3.Error, JournalWriteError))
+                    and leg.close_attempt_coid is None):
+                # The store failed before the close's client order id was
+                # recorded, so nothing was sent: the leg and the envelope stay
+                # as they are. The next tick re-arms the undispatched leg, and
+                # its next send reuses the unsent id rather than the one a
+                # refusal spent before it.
+                raise
+            if (isinstance(e, JournalWriteError) and leg.close_attempt_coid is not None
+                    and self._close_attempt_left_no_record(leg.close_attempt_coid)):
+                # The plugin's persist-first write failed before its venue
+                # call, and no row of the close exists, so nothing was sent:
+                # the leg re-arms with its unused id kept on the envelope for
+                # the next send. A row would mean a send may be on the venue (a
+                # fan-out whose earlier legs went out), and the leg is held.
+                self._order_mapping.pop(synth_pine_id, None)
+                self._partial_bracket_engine.mark_trigger_dispatch_failed(
+                    leg.key, reason='close_journal_write_failed',
+                )
+                raise
             # Any other dispatch-side failure (e.g.
             # :class:`ExchangeConnectionError` raised by the broker plugin and
             # re-raised through ``_dispatch_new``'s generic ``Exception``
-            # path) leaves the leg stuck in :data:`LEG_STATE_TRIGGERING` and
-            # reserves its OCA group as in-flight. Subsequent ticks then skip
-            # this leg and its siblings, so the bracket never retries until a
-            # restart replays the state machine. Settle the leg as unknown
-            # (the order may or may not have reached the exchange — the same
-            # semantics as :class:`OrderDispositionUnknownError`) so the next
-            # price tick re-evaluates against a fresh parent snapshot; the
-            # leg's :meth:`_safety_check` caps against the live parent size
-            # and prevents over-closing if the failed dispatch had in fact
-            # landed. Drop the synth envelope so a re-trigger mints a fresh
-            # idempotency anchor instead of reusing the stale one (and
-            # surviving a restart with it).
+            # path) has an unknown outcome: the order may or may not have
+            # reached the exchange, the same semantics as
+            # :class:`OrderDispositionUnknownError`. A leg that recorded its
+            # close's client order id is held on it and settled from the venue
+            # evidence (:meth:`_settle_held_partial_bracket_closes`), which
+            # also retires the synth envelope then. A leg that failed before
+            # the record sent nothing: it re-arms, and its synth envelope is
+            # dropped so a re-trigger mints a fresh idempotency anchor.
             self._order_mapping.pop(synth_pine_id, None)
-            self._drop_envelope(synth_pine_id)
+            if leg.close_attempt_coid is None:
+                self._drop_envelope(synth_pine_id)
             self._partial_bracket_engine.mark_trigger_dispatch_unknown(
                 leg.key, reason=f'dispatch_failed:{type(e).__name__}',
             )
             raise
+        finally:
+            self._trigger_close_leg = None
         # ``_dispatch_new`` catches :class:`OrderDispositionUnknownError`
         # internally and routes it to :meth:`_park_pending` without
         # re-raising. On the clean-return path the dispatch can therefore
@@ -15126,14 +16167,28 @@ class OrderSyncEngine:
         # parked path would evict the leg + OCA-cancel siblings even
         # though the close was never acknowledged, leaving the parent
         # unprotected if the parked close eventually resolves
-        # ``'rejected'``. Detect the park and re-arm the leg instead so
-        # the next price tick re-evaluates and ``_verify_pending_dispatches``
-        # can still reconcile the in-flight order if it did land.
+        # ``'rejected'``. Re-arming it would send a second close while the
+        # first may have executed. The leg is held on the parked close's
+        # client order id instead, until the venue evidence settles it
+        # (:meth:`_settle_held_partial_bracket_closes`).
         if synth_pine_id not in self._order_mapping:
             self._partial_bracket_engine.mark_trigger_dispatch_unknown(
                 leg.key, reason='dispatch_parked',
             )
             return
+        self._settle_sent_partial_bracket_close(leg, synth_pine_id)
+
+    def _settle_sent_partial_bracket_close(self, leg, synth_pine_id: str) -> None:
+        """Settle a ``triggering`` leg whose close the venue took.
+
+        The leg becomes ``triggered``, its OCA siblings cascade, the synthetic
+        close identity retires, and so does the partial exit once no leg of it
+        is left. The close's fill books through the regular fill path.
+
+        :param leg: The ``triggering`` leg.
+        :param synth_pine_id: The close's synthetic Pine id
+            (:func:`_partial_trigger_pine_id`).
+        """
         # A close for the parent's whole position leaves nothing for the
         # native stop to protect once it fills, and the venue drops the stop
         # with the deal. Re-pointing it as the sibling legs cascade only races
@@ -15285,26 +16340,43 @@ class OrderSyncEngine:
 
     # === Interceptor chain ===
 
-    def _apply_interceptors(self, intents: list[Intent]) -> list[Intent]:
+    def _apply_interceptors(
+            self, intents: list[Intent],
+            verdicts: dict[Intent, Intent | None] | None = None,
+    ) -> list[Intent]:
+        """Run the interceptor chain over ``intents``; the rejected ones are left out.
+
+        :param verdicts: Verdicts already given, by input intent (``None``:
+            rejected). An intent found here is not judged again; every other
+            intent's verdict is added to it.
+        """
         if not self._interceptors:
             return intents
         out: list[Intent] = []
         for intent in intents:
-            current = intent
-            rejected = False
-            for fn in self._interceptors:
-                result = fn(current)
-                if result.rejected:
-                    rejected = True
-                    _log.info(
-                        "intent %s rejected by interceptor: %s",
-                        format_intent_key(current.intent_key), result.reject_reason,
-                    )
-                    break
-                current = self._apply_modifications(current, result)
-            if not rejected:
-                out.append(current)
+            if verdicts is not None and intent in verdicts:
+                verdict = verdicts[intent]
+            else:
+                verdict = self._intercept(intent)
+                if verdicts is not None:
+                    verdicts[intent] = verdict
+            if verdict is not None:
+                out.append(verdict)
         return out
+
+    def _intercept(self, intent: Intent) -> Intent | None:
+        """The intent the interceptor chain leaves of ``intent``; ``None`` when rejected."""
+        current = intent
+        for fn in self._interceptors:
+            result = fn(current)
+            if result.rejected:
+                _log.info(
+                    "intent %s rejected by interceptor: %s",
+                    format_intent_key(current.intent_key), result.reject_reason,
+                )
+                return None
+            current = self._apply_modifications(current, result)
+        return current
 
     @staticmethod
     def _apply_modifications(
@@ -15776,20 +16848,30 @@ class OrderSyncEngine:
         entry row carries a durable ``filled_qty`` cursor and its
         ``pine_entry_id``, so the run-owned exposure is the signed sum of those
         cursors grouped by entry id. Returns one ``(entry_id, signed_size)`` pair
-        per distinct real entry id, insertion-ordered, so
+        per distinct real entry id, in fill order, so
         :meth:`~pynecore.core.broker.position.BrokerPosition.reconstruct_parent_trade`
         (which de-dups by entry id) seeds each exactly once — pyramided rows
         sharing one id collapse to a single summed trade, distinct ids stay
         separate.
 
+        Fill order is the order the binding book opened its bindings in, which
+        the engine records per entry order as it books the fills
+        (:meth:`~pynecore.core.broker.position.BrokerPosition.fill_places`,
+        kept across restarts by :meth:`_persist_entry_fill_order`): the order
+        in which both the binding book and a plugin's journal settle a close
+        that names no entry. A row whose fill this run never booked (it filled
+        while no process ran) has no place; such rows follow the placed ones,
+        in creation order.
+
         With ``fifo_trim`` (startup adoption) the adopted net may sit BELOW the
         durable sum on the same side: someone reduced the position while the
         bot was down or quarantined, and no plugin attributed the reduction to
         journal rows yet. Nothing names the entries it closed, so the excess
-        is trimmed from the oldest rows, Pine's FIFO for a close that names no
-        entry (in memory only: the journal stays the plugin's to net), and the
-        surviving entries keep their own ids. Without it (a settlement whose
-        fills name their entries) such a sum falls back like any mismatch.
+        is trimmed from the rows that filled first, Pine's FIFO for a close
+        that names no entry (in memory only: the journal stays the plugin's to
+        net), and the surviving entries keep their own ids. Without it (a
+        settlement whose fills name their entries) such a sum falls back like
+        any mismatch.
 
         Returns an EMPTY list (caller falls back to the single synthetic-parent
         seed) whenever the ledger cannot faithfully account for the adopted net:
@@ -15817,7 +16899,14 @@ class OrderSyncEngine:
         want_buy = broker_signed > 0.0
         owned: list[tuple[str, float]] = []
         total = 0.0
-        rows = sorted(self._store_ctx.iter_live_orders(), key=lambda r: r.created_ts_ms)
+        places = self._position.fill_places()
+
+        def fill_order(entry_row: OrderRow) -> tuple[bool, int, int]:
+            place = max((places[key] for key in self._journal_row_keys(entry_row)
+                         if key in places), default=None)
+            return place is None, place or 0, entry_row.created_ts_ms
+
+        rows = sorted(self._store_ctx.iter_live_orders(), key=fill_order)
         for row in rows:
             filled = row.filled_qty
             if filled <= 0.0:
@@ -15938,6 +17027,113 @@ class OrderSyncEngine:
             return next(iter(parents))
         return None
 
+    def _prepare_restart_replay_owners(self) -> None:
+        """Bring the ownership rows in line with the script's book before the restart replay.
+
+        While the restart is unsettled
+        (:attr:`~BrokerPosition.restart_cancels` is recording) the script runs
+        against a book that holds only its own orders, and the one-way replay
+        that follows re-asserts every ownership row the previous process
+        persisted. The script's exits are judged as the diff judges them (ticks
+        resolved, interceptors applied), and two kinds of rows must not be
+        re-asserted as persisted:
+
+        * An exit the script placed again replaced the persisted one: its rows
+          get the levels of the script's exit
+          (:meth:`~pynecore.core.broker.one_way_emulator.OneWayEmulator.retarget_replaced_owners`),
+          so the replay asserts those, never the replaced ones.
+        * An exit the script cancelled (a ``strategy.cancel`` /
+          ``strategy.cancel_all`` naming it, and not placed again for the same
+          entry) or placed again only for an interceptor to reject it: its rows
+          are marked ``clearing``
+          (:meth:`~pynecore.core.broker.one_way_emulator.OneWayEmulator.retire_cancelled_owners`),
+          so the replay clears them under a cancel coid and leaves every other
+          owner of the leg in place. A re-placed exit id for another entry
+          spares nothing.
+
+        A settle that reaches the replay before the script has an empty book,
+        so neither applies.
+        """
+        self._restart_interceptor_verdicts = None
+        cancels = self._position.restart_cancels
+        if cancels is None:
+            return
+        held = [self._resolve_ticks(intent) for intent in build_intents(
+            {}, self._position.exit_orders, self._symbol, self._position.bindings)]
+        held_exits = {intent.intent_key for intent in held if isinstance(intent, ExitIntent)}
+        self._restart_interceptor_verdicts = {}
+        accepted = [intent for intent in self._apply_interceptors(
+            held, self._restart_interceptor_verdicts) if isinstance(intent, ExitIntent)]
+        rejected = held_exits - {intent.intent_key for intent in accepted}
+        retargeted = self._one_way_emulator.retarget_replaced_owners({
+            intent.intent_key: intent for intent in accepted
+            if not intent.has_unresolved_ticks
+        })
+        if retargeted:
+            _blog_info("restart: %d bracket ownership row(s) of exits the script placed again "
+                       "are re-asserted with the script's levels", retargeted)
+        if not cancels and not rejected:
+            return
+        placed = {(intent.pine_id, intent.from_entry) for intent in accepted}
+        cancel_all = None in cancels
+
+        def cancelled(intent_key: str) -> bool:
+            if intent_key in rejected:
+                return True
+            exit_id, _sep, rest = intent_key.partition(INTENT_KEY_SEP)
+            from_entry = rest.partition(INTENT_KEY_SEP)[0]
+            return ((exit_id, from_entry) not in placed
+                    and (cancel_all or exit_id in cancels))
+
+        def clear_coid(intent_key: str) -> str:
+            return encode_wire_client_order_id(
+                build_client_order_id(
+                    run_tag=self._run_tag, pine_id=intent_key,
+                    bar_ts_ms=self._current_bar_ts_ms, kind=KIND_CANCEL,
+                ),
+                self._coid_max_len,
+            )
+
+        marked = self._one_way_emulator.retire_cancelled_owners(cancelled, clear_coid)
+        if marked:
+            _blog_info("restart: %d bracket ownership row(s) of exits the script cancelled "
+                       "are retired by the replay instead of re-asserted", marked)
+
+    def _reconstruct_restart_book(self) -> None:
+        """Rebuild the restart book once, then apply the script cancels it missed.
+
+        Runs :meth:`_reconstruct_pine_bracket_state` and latches
+        :attr:`~OrderSyncEngine._pine_bracket_reconstruct_done`. While the
+        restart settle could not reach the rebuild, the script ran against a
+        book without the previous process's orders, so a ``strategy.cancel`` /
+        ``strategy.cancel_all`` of one of them removed nothing; the position
+        recorded it (:attr:`~BrokerPosition.restart_cancels`). Each recorded
+        cancel is applied here to the orders the rebuild put into the book, and
+        only to those: an order the script placed itself is in the book already
+        and the rebuild leaves its key alone, so a later re-place of a cancelled
+        id survives. The diff then cancels the venue order of a removed one,
+        exactly as when the settle succeeded before the script.
+
+        A storage failure can end the rebuild midway: the keys it added so far
+        are kept, the latch stays off, and the next attempt completes the rest.
+        """
+        position = self._position
+        exits_before = set(position.exit_orders)
+        entries_before = set(position.entry_orders)
+        try:
+            self._reconstruct_pine_bracket_state()
+        finally:
+            self._restart_rebuilt_orders.extend(
+                order for key, order in position.exit_orders.items() if key not in exits_before)
+            self._restart_rebuilt_orders.extend(
+                order for key, order in position.entry_orders.items()
+                if key not in entries_before)
+        self._pine_bracket_reconstruct_done = True
+        for order in position.apply_restart_cancels(self._restart_rebuilt_orders):
+            _blog_info("restart: applied the script's cancel of %s to the rebuilt order",
+                       order.exit_id if order.exit_id is not None else order.order_id)
+        self._restart_rebuilt_orders.clear()
+
     def _reconstruct_pine_bracket_state(self) -> None:
         """Rebuild the persistent Pine-side exit brackets the previous run armed.
 
@@ -16052,20 +17248,7 @@ class OrderSyncEngine:
                     or pine_id in self._order_mapping
                     or pine_id in self._position.entry_orders):
                 continue
-            if ex_order.order_type is OrderType.STOP:
-                limit_price = None
-                stop_price = (
-                    ex_order.stop_price if ex_order.stop_price is not None
-                    else ex_order.price
-                )
-            elif ex_order.order_type is OrderType.LIMIT:
-                limit_price = ex_order.price
-                stop_price = None
-            else:
-                # A working entry order should be LIMIT or STOP; preserve
-                # whatever prices the venue reported rather than guess a type.
-                limit_price = ex_order.price
-                stop_price = ex_order.stop_price
+            limit_price, stop_price = _working_entry_levels(ex_order)
             self._position.reconstruct_entry_order(
                 pine_id=pine_id,
                 side=ex_order.side,
@@ -16443,6 +17626,8 @@ class OrderSyncEngine:
                 )
                 continue
             self._order_mapping[ikey] = [f"bracket:{lid}" for lid in leg_ids]
+            self._restart_reconstructed_exit_levels[ikey] = (
+                tp_price, sl_price, trail_price, trail_offset)
             _blog_info(
                 "reconstructed one-way bracket exit %r after restart "
                 "(%d leg(s)) — adopting live broker protection",
@@ -16899,7 +18084,15 @@ class OrderSyncEngine:
             for key in list(self._restart_reconstructed_entry_keys):
                 desired = new_map.get(key)
                 if isinstance(desired, EntryIntent) or key in self._active_intents:
-                    self._restart_reconstructed_entry_keys.pop(key, None)
+                    old = self._restart_reconstructed_entry_keys.pop(key)
+                    if (isinstance(desired, EntryIntent) and desired != old
+                            and key not in self._active_intents
+                            and key in self._order_mapping):
+                        # Re-declared at other parameters: the venue order
+                        # still has the rebuilt ones, so the diff modifies it
+                        # from them instead of adopting the new declaration.
+                        self._build_envelope(old)
+                        self._active_intents[key] = old
                     continue
                 old = self._restart_reconstructed_entry_keys.pop(key)
                 if key not in self._order_mapping:
@@ -16920,6 +18113,27 @@ class OrderSyncEngine:
                 )
                 self._dispatch_cancel(old)
                 self._forget_restart_live_entry(old.pine_id)
+
+        # A rebuilt one-way bracket exit the script placed again with other
+        # levels: the venue holds the rebuilt levels, so the diff starts from
+        # them and amends the bracket to the script's exit. Adopting the
+        # script's exit as it is would leave the venue on the old levels until
+        # the script changes them again.
+        if self._restart_reconstructed_exit_levels:
+            for key, (tp_price, sl_price, trail_price, trail_offset) in (
+                    self._restart_reconstructed_exit_levels.items()):
+                desired = new_map.get(key)
+                if (not isinstance(desired, ExitIntent) or key in self._active_intents
+                        or key not in self._order_mapping):
+                    continue
+                held = dataclasses.replace(
+                    desired, tp_price=tp_price, sl_price=sl_price,
+                    trail_price=trail_price, trail_offset=trail_offset,
+                )
+                if held != desired:
+                    self._build_envelope(held)
+                    self._active_intents[key] = held
+            self._restart_reconstructed_exit_levels.clear()
 
         # Pine semantic: when an entry intent fails to dispatch in this same
         # sync (e.g. plugin reports qty below venue minimum), a bracket exit
@@ -17139,9 +18353,9 @@ class OrderSyncEngine:
         # live leg; (2) a ``clearing`` row is never reconstructed (the rebuild only
         # restores ACTIVE rows), so its re-clear retry lives here too.
         one_way_port: PositionPort | None = getattr(self._broker, 'position_port', None)
-        if one_way_port is not None and self._store_ctx is not None:
+        if one_way_port is not None:
             orphan_cancels: dict[str, CancelIntent] = {}
-            for row in iter_active_bracket_ownerships(self._store_ctx):
+            for row in self._one_way_emulator.iter_bracket_ownerships():
                 ikey = row.intent_key
                 if (ikey is None or ikey in orphan_cancels
                         or ikey in self._active_intents or ikey in new_map
@@ -17191,6 +18405,7 @@ class OrderSyncEngine:
             # ``clearing`` row is marked-for-removal, never wanted protection, so
             # re-clearing it (idempotent amend-to-None) cannot tear down a live
             # survivor bracket (those rows are ``active``, untouched).
+            self._settle_one_way_leg_writes(one_way_port)
             try:
                 drained_keys = self._run_async_recovery(
                     self._one_way_emulator.drain_clearing_rows(
@@ -17225,15 +18440,17 @@ class OrderSyncEngine:
                     self._order_mapping.pop(key, None)
                     self._drop_envelope(key)
 
-            # Reconcile any reversal residual-open breadcrumb a crash or an
-            # ambiguous round-trip left live. ``restart_replay`` discharges these
-            # once at startup, but it is one-shot (latched above), so a breadcrumb
-            # stranded mid-session — ``run_reversal``'s residual ``place_leg`` or the
-            # replay's own re-dispatch returning ``OrderDispositionUnknownError`` —
-            # would otherwise wait for the next restart. Drain it per-sync, exactly
-            # like the clearing-row drain: the re-open is idempotent on its
-            # deterministic entry coid, so a re-dispatch cannot double-open, and an
-            # ambiguous retry leaves the row live rather than halting the bot.
+            # Reconcile any live reversal residual-open breadcrumb. ``run_reversal``
+            # leaves one live while its fresh read after the closes still lists an
+            # opposing leg (a dispatched close may still fill in part), and a
+            # crash or an ambiguous round-trip leaves one too. ``restart_replay``
+            # discharges these once at startup, but it is one-shot (latched
+            # above), so drain them per-sync, exactly like the clearing-row
+            # drain: the closes are settled from the venue's evidence, the
+            # residual opens once the book shows them gone, and an ambiguous
+            # retry leaves the row live rather than halting the bot. A residual
+            # opened here belongs to its reversal's entry intent: its order ids
+            # are mapped to it, as ``run_reversal``'s own open would have been.
             try:
                 self._run_async_recovery(
                     self._one_way_emulator.drain_residual_opens(one_way_port),
@@ -17247,6 +18464,19 @@ class OrderSyncEngine:
                     "draining one-way residual opens did not confirm (%s) — "
                     "retrying next sync", e,
                 )
+            finally:
+                # Taken even when a later row raised: the orders of a residual
+                # that did open are never lost with its discharged breadcrumb.
+                for residual_key, residual_orders in (
+                        self._one_way_emulator.take_opened_residuals()):
+                    # Mapped even while the entry has no active intent (a
+                    # fresh engine after a restart has none yet): the residual
+                    # finishes a reversal the previous process committed, and
+                    # the mapping is what makes Pine's re-emission of the
+                    # entry adopt it (the cross-restart adoption of the diff)
+                    # instead of dispatching the whole entry again.
+                    self._order_mapping.setdefault(residual_key, []).extend(
+                        o.id for o in residual_orders)
 
         for key in list(self._active_intents):
             if key not in new_map:
@@ -17276,6 +18506,14 @@ class OrderSyncEngine:
                     # (:meth:`_route_defensive_close_fill` →
                     # :meth:`_cleanup_position_tracking`) is the only
                     # legitimate remover while the marker is armed.
+                    continue
+                if self._one_way_emulator.owes_residual_open(key):
+                    # The entry's market reversal still owes its residual
+                    # open and has no venue order to cancel: dropping the
+                    # intent would leave the residual's orders unowned when
+                    # the breadcrumb opens them. Keep it until the residual
+                    # opened or the breadcrumb was discharged.
+                    self._log_residual_hold(key)
                     continue
                 old = self._active_intents[key]
                 if (isinstance(old, EntryIntent)
@@ -18112,6 +19350,16 @@ class OrderSyncEngine:
                     # the close FILL settles the marker, the next
                     # bar re-evaluates from a clean slate.
                     continue
+                if (isinstance(intent, EntryIntent)
+                        and self._one_way_emulator.owes_residual_open(key)):
+                    # A market reversal of this entry still owes its residual
+                    # open: the breadcrumb opens it under the reversal's own
+                    # envelope. Amending or re-dispatching the entry now would
+                    # open a second order next to it, so the active intent
+                    # stays until the residual opened (its orders are mapped
+                    # to the key) or the breadcrumb was discharged.
+                    self._log_residual_hold(key)
+                    continue
                 if (isinstance(intent, ExitIntent)
                         and intent.from_entry is not None
                         and intent.from_entry
@@ -18601,9 +19849,10 @@ class OrderSyncEngine:
             # a current-bar COID with ``retry_seq=0``. Without this the build
             # would stamp the new bar's order with the rejected bar's
             # ``bar_ts_ms`` and ``retry_seq=1``.
-            self._reject_anchor_bars.pop(intent.intent_key, None)
             if self._store_ctx is not None:
+                self._flush_owed_store_writes()
                 self._store_ctx.record_complete(intent.intent_key)
+            self._reject_anchor_bars.pop(intent.intent_key, None)
             anchor = None
         if anchor is not None:
             self._reject_anchor_bars.pop(intent.intent_key, None)
@@ -18646,14 +19895,17 @@ class OrderSyncEngine:
             retry_seq=0,
             coid_max_len=self._coid_max_len,
         )
-        self._envelopes[intent.intent_key] = envelope
+        # The envelope is journaled before it is taken: its COID must survive a
+        # restart before anything is sent under it.
         if self._store_ctx is not None:
+            self._flush_owed_store_writes()
             self._store_ctx.record_envelope(
                 key=intent.intent_key,
                 bar_ts_ms=envelope.bar_ts_ms,
                 retry_seq=envelope.retry_seq,
                 run_tag=envelope.run_tag,
             )
+        self._envelopes[intent.intent_key] = envelope
         return envelope
 
     def _persisted_entry_anchor_is_spent(
@@ -18806,11 +20058,14 @@ class OrderSyncEngine:
         """
         if self._store_ctx is None or envelope.retry_seq == 0:
             return
-        self._store_ctx.record_envelope(
-            key=envelope.intent.intent_key,
-            bar_ts_ms=envelope.bar_ts_ms,
-            retry_seq=envelope.retry_seq,
-            run_tag=envelope.run_tag,
+        store_ctx = self._store_ctx
+        key = envelope.intent.intent_key
+        bar_ts_ms, retry_seq, run_tag = envelope.bar_ts_ms, envelope.retry_seq, envelope.run_tag
+        self._owe_store_write(
+            f"bumped anchor {key}",
+            lambda: store_ctx.record_envelope(
+                key=key, bar_ts_ms=bar_ts_ms, retry_seq=retry_seq, run_tag=run_tag,
+            ),
         )
 
     def _scan_live_entry_anchors_for_restart(self) -> None:
@@ -19061,6 +20316,21 @@ class OrderSyncEngine:
                 "(adopting instead of re-dispatching)",
                 len(self._order_mapping[key]), format_intent_key(key),
             )
+            live_orders = [self._restart_live_entry_orders_by_id.get(order_id)
+                           for order_id in self._order_mapping[key]]
+            live = live_orders[0] if len(live_orders) == 1 else None
+            if live is not None:
+                # The live order as the rebuild reads it: its quantity (of the
+                # whole order, filled part included) and its levels
+                limit_price, stop_price = _working_entry_levels(live)
+                held = dataclasses.replace(intent, qty=abs(live.qty),
+                                           limit=limit_price, stop=stop_price)
+                if held != intent:
+                    # Re-declared with another quantity or level: the diff
+                    # modifies the live order from what it holds instead of
+                    # adopting the declaration over it.
+                    self._build_envelope(held)
+                    self._active_intents[key] = held
 
     def _maybe_adopt_restart_entry_anchor(
             self, intent: Intent, current: EnvelopeRecord | None,
@@ -19122,6 +20392,7 @@ class OrderSyncEngine:
                 bar_ts_ms == current.bar_ts_ms and retry_seq > current.retry_seq):
             return None
         if self._store_ctx is not None:
+            self._flush_owed_store_writes()
             self._store_ctx.record_envelope(
                 key=intent.intent_key,
                 bar_ts_ms=bar_ts_ms,
@@ -19216,6 +20487,36 @@ class OrderSyncEngine:
                 return coid
         return None
 
+    def _exit_write_unsettled(self, key: str) -> bool:
+        """Is a direct exit write of ``key`` still without a known outcome?
+
+        The non-emulated counterpart of the one-way emulator's per-leg write
+        serialization (:meth:`OneWayEmulator.settle_leg_writes`): an exit
+        dispatch or modify that ended with
+        :class:`OrderDispositionUnknownError` may still reach the venue, and
+        arriving after a newer modify it would put the older levels back. So
+        no further modify of the exit goes out while one is unsettled.
+
+        A write is settled once its park is gone (the open-orders verification
+        found it, the plugin recorded a resolution, or the key was retired),
+        or once :data:`~pynecore.core.broker.one_way_emulator.UNSETTLED_WRITE_WINDOW_S`
+        has passed since it was parked: a request the venue has not applied by
+        then counts as lost.
+
+        :param key: The exit's intent key.
+        """
+        since = self._unsettled_exit_writes.get(key)
+        if since is None:
+            return False
+        parked = any(
+            envelope.intent.intent_key == key
+            for envelope in self._pending_verification.values()
+        )
+        if parked and time.monotonic() - since < UNSETTLED_WRITE_WINDOW_S:
+            return True
+        del self._unsettled_exit_writes[key]
+        return False
+
     def _park_pending(
             self, envelope: DispatchEnvelope, error: OrderDispositionUnknownError,
             *, kind: str = 'new', old_intent: Intent | None = None,
@@ -19242,6 +20543,9 @@ class OrderSyncEngine:
         """
         coid = error.client_order_id
         self._pending_verification[coid] = envelope
+        if (isinstance(envelope.intent, ExitIntent)
+                and getattr(self._broker, 'position_port', None) is None):
+            self._unsettled_exit_writes[envelope.intent.intent_key] = time.monotonic()
         # Re-parking the same coid in this engine instance must reset
         # the in-memory ``_consumed_attached_coids`` dedup. Without
         # this, if an earlier 'attached' resolution already marked the
@@ -19266,12 +20570,18 @@ class OrderSyncEngine:
                 envelope.intent.intent_key, old_intent,
             )
         if self._store_ctx is not None:
-            self._store_ctx.record_park(
-                coid=coid,
-                key=envelope.intent.intent_key,
-                kind=kind,
-                order_ids=self._order_mapping.get(
-                    envelope.intent.intent_key, [],
+            # The park holds in memory either way: the order may be live, so
+            # the row is owed rather than the park dropped.
+            store_ctx = self._store_ctx
+            park_key = envelope.intent.intent_key
+            park_order_ids = list(self._order_mapping.get(park_key, []))
+            # A plugin verdict can arrive before an owed row lands; the store
+            # keeps it for the row (:meth:`RunContext.await_park_row`).
+            store_ctx.await_park_row(coid)
+            self._owe_store_write(
+                f"park {coid}",
+                lambda: store_ctx.record_park(
+                    coid=coid, key=park_key, kind=kind, order_ids=park_order_ids,
                 ),
             )
         # A parked dispatch may be live at the broker. If this envelope carries
@@ -19756,12 +21066,14 @@ class OrderSyncEngine:
             pine_id=old.pine_id, symbol=self._symbol, from_entry=from_entry,
         ))
         coid = cancel_envelope.client_order_id(KIND_CANCEL)
-        self._store_ctx.record_park(
-            coid=coid,
-            key=key,
-            kind=kind,
-            order_ids=self._order_mapping.get(key, []),
-            parked_ts_ms=parked_ts_ms,
+        store_ctx = self._store_ctx
+        order_ids = list(self._order_mapping.get(key, []))
+        self._owe_store_write(
+            f"forced-cancel park {coid}",
+            lambda: store_ctx.record_park(
+                coid=coid, key=key, kind=kind, order_ids=order_ids,
+                parked_ts_ms=parked_ts_ms,
+            ),
         )
         return coid
 
@@ -20414,7 +21726,8 @@ class OrderSyncEngine:
 
         A native leg is cancelled through
         :meth:`BrokerPlugin.execute_cancel_with_outcome`. Any outcome other
-        than a definitive one (``ALREADY_FILLED`` or a confirmed cancel) falls
+        than a definitive one (``ALREADY_FILLED``, ``FILLED_AND_CLOSED``, whose
+        fill is booked already, or a confirmed cancel) falls
         back to :meth:`_dispatch_cancel`, whose journaled cancel obligation
         covers an ambiguous disposition; a repeated cancel of a gone order is
         a benign no-op. Engine-trigger partial-bracket legs have no venue
@@ -20458,7 +21771,8 @@ class OrderSyncEngine:
             return outcome
         if outcome in (CancelDispositionOutcome.CANCEL_CONFIRMED,
                        CancelDispositionOutcome.TOO_LATE_TO_CANCEL,
-                       CancelDispositionOutcome.STILL_OPEN):
+                       CancelDispositionOutcome.STILL_OPEN,
+                       CancelDispositionOutcome.FILLED_AND_CLOSED):
             return outcome
         # noinspection PyBroadException
         try:
@@ -20902,7 +22216,10 @@ class OrderSyncEngine:
                         # LIMIT/STOP rests full-size (no close at placement).
                         # run_reversal reads the legs and plans internally, so the
                         # engine needs no net-position tracking; it returns the
-                        # opened order(s) — register their real ids.
+                        # order(s) it opened — register their real ids. A
+                        # reversal whose closes are not yet seen executed opens
+                        # nothing here: the per-sync residual drain opens it and
+                        # maps its ids to this intent then.
                         reversal = self._run_async_write(
                             self._one_way_emulator.run_reversal(envelope, port),
                         )
@@ -21146,6 +22463,7 @@ class OrderSyncEngine:
                         reason="pre_clear_leg_filled",
                         context={'symbol': intent.symbol, 'pine_id': intent.pine_id},
                     )
+                self._record_trigger_close_attempt(intent, envelope)
                 if port is not None:
                     # Hedging-mode emulation: fan the close out FIFO across the
                     # position-side legs (persist-first close-leg ledger). The
@@ -21333,6 +22651,24 @@ class OrderSyncEngine:
             self._log_dispatch_failure(intent, e)
             raise
 
+    def _record_trigger_close_attempt(
+            self, intent: CloseIntent, envelope: DispatchEnvelope,
+    ) -> None:
+        """Record a partial-bracket close's client order id on its leg before the send.
+
+        Runs right before the venue call of every send of the close, a re-send
+        under a re-anchored id included, so the leg always names the send that
+        may be on the venue: a restart holds the leg on it instead of sending a
+        second close (:meth:`_settle_held_partial_bracket_closes`). The write
+        commits first; a failure raises before anything is sent.
+        """
+        leg_key = self._trigger_close_leg
+        if intent.synthetic_kind != 'partial_trigger' or leg_key is None:
+            return
+        self._partial_bracket_engine.record_trigger_close_attempt(
+            leg_key, close_coid=envelope.client_order_id(KIND_CLOSE),
+        )
+
     def _dispatch_crossed_entry(
             self, intent: EntryIntent, error: ExchangeOrderRejectedError,
     ) -> None:
@@ -21424,12 +22760,19 @@ class OrderSyncEngine:
         A transport loss is a WARNING: nothing was booked and the sync loop
         retries the whole diff on the next pass, so an ERROR would flag a
         self-healing outage as a failure (measured: cTrader cycle 249, a wire
-        stall; the close dispatched cleanly one bar later).
+        stall; the close dispatched cleanly one bar later). A storage error is
+        a WARNING too: :meth:`sync` retries it and halts only once it persists.
         """
         if isinstance(exc, ExchangeConnectionError):
             _blog_warning(
                 "dispatch of %s interrupted by a connection loss (%s); "
                 "retried on the next sync", intent, exc,
+            )
+            return
+        if isinstance(exc, sqlite3.Error):
+            _blog_warning(
+                "dispatch of %s interrupted by a storage failure (%s: %s); "
+                "retried on the next sync", intent, type(exc).__name__, exc,
             )
             return
         _blog_error(
@@ -22344,14 +23687,7 @@ class OrderSyncEngine:
             # missing-pending accounting: the position vanishes from
             # the broker snapshot through the sibling's fill, an order
             # this engine never registered as a dispatch of its own.
-            if self._store_ctx is not None:
-                row = self._store_ctx.get_order(e.position_coid)
-                if row is not None:
-                    extras = dict(row.extras or {})
-                    extras['natural_close_at'] = time.time()
-                    self._store_ctx.upsert_order(
-                        e.position_coid, extras=extras,
-                    )
+            self._stamp_natural_close_at(e.position_coid)
             if entry_id:
                 self._cascade_oca_cancel_for_key(entry_id)
                 self._cancel_bracket_reject_residuals(context)
@@ -22541,14 +23877,7 @@ class OrderSyncEngine:
         # history stream).
         dispatch_succeeded = close_intent.intent_key in self._order_mapping
         if dispatch_succeeded:
-            if self._store_ctx is not None:
-                row = self._store_ctx.get_order(e.position_coid)
-                if row is not None:
-                    extras = dict(row.extras or {})
-                    extras['natural_close_at'] = time.time()
-                    self._store_ctx.upsert_order(
-                        e.position_coid, extras=extras,
-                    )
+            self._stamp_natural_close_at(e.position_coid)
             # Capture the broker-side close ref so the FILL handler
             # (and a possible startup replay) can match the close
             # event back to its marker even when the FILL routes
@@ -22895,6 +24224,11 @@ class OrderSyncEngine:
         key) are written atomically from the engine's point of view —
         the store layer's UPSERT runs under its own transaction.
 
+        The marker holds in memory either way and its row is owed
+        (:meth:`_owe_store_write`): the close it guards goes out right after
+        (its own journal row is written before it is sent), and a marker
+        missing from memory would leave that close unmatched.
+
         Pyramiding can fill multiple positions under the same Pine entry
         id, each with its own ``position_coid``. The in-memory map is
         keyed by ``entry_id`` only, so a second simultaneous bracket-
@@ -22936,16 +24270,23 @@ class OrderSyncEngine:
             )
             self._record_halt(halt)
             raise halt
-        self._pending_defensive_close[entry_id] = marker
         if self._store_ctx is None:
+            self._pending_defensive_close[entry_id] = marker
             return
+        store_ctx = self._store_ctx
         position_coid = marker.reject_context.position_coid
-        row = self._store_ctx.get_order(position_coid)
-        if row is None:
-            return
-        extras = dict(row.extras or {})
-        extras['defensive_close_pending'] = marker.to_extras_dict()
-        self._store_ctx.upsert_order(position_coid, extras=extras)
+        marker_extras = marker.to_extras_dict()
+
+        def _write_marker() -> None:
+            row = store_ctx.get_order(position_coid)
+            if row is None:
+                return
+            extras = dict(row.extras or {})
+            extras['defensive_close_pending'] = marker_extras
+            store_ctx.upsert_order(position_coid, extras=extras)
+
+        self._pending_defensive_close[entry_id] = marker
+        self._owe_store_write(f"defensive-close marker of {position_coid}", _write_marker)
 
     def _replay_pending_defensive_closes(self) -> None:
         """Re-arm or drop persisted defensive-close markers across restart.
@@ -23155,7 +24496,7 @@ class OrderSyncEngine:
                 if close_coid is not None:
                     self._pending_verification.pop(close_coid, None)
                     self._persisted_pending_anchors.pop(close_coid, None)
-                    self._store_ctx.record_unpark(close_coid)
+                    self._owe_unpark(close_coid)
                 # Finish the idempotency-anchor cleanup the prior instance
                 # may have crashed before completing. Mirror the in-flight
                 # FILL settlement path (see ``_route_defensive_close_fill``):
@@ -23569,7 +24910,7 @@ class OrderSyncEngine:
                     payload['fill_exchange_order_id'] = (
                         marker.fill_exchange_order_id
                     )
-                self._store_ctx.log_event(
+                self._log_store_event(
                     kind='defensive_close_filled',
                     intent_key=marker.close_intent_key,
                     client_order_id=marker.reject_context.position_coid,
@@ -23601,7 +24942,7 @@ class OrderSyncEngine:
                 self._pending_verification.pop(close_coid, None)
                 self._persisted_pending_anchors.pop(close_coid, None)
                 if self._store_ctx is not None:
-                    self._store_ctx.record_unpark(close_coid)
+                    self._owe_unpark(close_coid)
             # Mirror the synthetic-close mapping cleanup the in-flight
             # FILL settlement path runs (see ``_route_defensive_close_fill``):
             # without dropping the close intent's ``_order_mapping`` slot
@@ -24135,7 +25476,7 @@ class OrderSyncEngine:
     def _read_leg_quantities(self, port: PositionPort) -> dict[str, float]:
         """The venue's open size per leg id for the engine's symbol.
 
-        Rows sharing a :attr:`~pynecore.core.broker.models.PositionLeg.leg_id`
+        Rows sharing a :attr:`~PositionLeg.leg_id`
         are summed: a defensive close addresses the leg by that id.
 
         :param port: The plugin's position port.
@@ -24168,7 +25509,7 @@ class OrderSyncEngine:
 
         :param context: The reject context of the close about to dispatch.
         :return: The context, with
-            :attr:`~pynecore.core.broker.models.BracketAttachRejectContext.position_leg_qty`
+            :attr:`~BracketAttachRejectContext.position_leg_qty`
             set when the leg was read.
         """
         port: PositionPort | None = getattr(self._broker, 'position_port', None)
@@ -24194,7 +25535,7 @@ class OrderSyncEngine:
     def _void_leg_baselines_on_book_move(self, own_entry_id: str | None = None) -> None:
         """Drop the target-leg baselines the book has moved past.
 
-        A baseline (:attr:`~pynecore.core.broker.models.BracketAttachRejectContext.position_leg_qty`)
+        A baseline (:attr:`~BracketAttachRejectContext.position_leg_qty`)
         is the leg's size before the marker's close. The grace probe
         (:meth:`_defensive_target_legs_verdict`) credits the leg's shrink from
         it to the pending closes aimed at the leg, which is sound only while
@@ -24231,12 +25572,12 @@ class OrderSyncEngine:
         """Judge, leg by leg, whether the venue shows the markers' closes on their target legs.
 
         Read only for a plugin with one-way emulation
-        (:attr:`~pynecore.core.plugin.broker.BrokerPlugin.position_port`) and
+        (:attr:`~BrokerPlugin.position_port`) and
         only for markers that name their target leg
-        (:attr:`~pynecore.core.broker.models.BracketAttachRejectContext.position_deal_id`).
+        (:attr:`~BracketAttachRejectContext.position_deal_id`).
         A leg is matched by its
-        :attr:`~pynecore.core.broker.models.PositionLeg.leg_id` alone, whatever
-        its :attr:`~pynecore.core.broker.models.PositionLeg.entry_id`: a missing
+        :attr:`~PositionLeg.leg_id` alone, whatever
+        its :attr:`~PositionLeg.entry_id`: a missing
         attribution only means the plugin cannot name the entry, not that the
         leg holds another one. A defensive close takes its quantity off its one
         target leg (``target_leg_id``), so every leg is judged by one rule over
@@ -24245,7 +25586,7 @@ class OrderSyncEngine:
         - an unlisted leg is closed, whatever it held;
         - a listed leg is closed only when it holds no more than its size
           before the first of these closes (the largest
-          :attr:`~pynecore.core.broker.models.BracketAttachRejectContext.position_leg_qty`
+          :attr:`~BracketAttachRejectContext.position_leg_qty`
           among them; the leg only shrinks while they are pending) minus all
           of their closes. A partial exit's close legitimately leaves the rest
           listed; a listed leg any of whose markers lacks the baseline proves
@@ -24332,7 +25673,7 @@ class OrderSyncEngine:
             self._pending_verification.pop(close_coid, None)
             self._persisted_pending_anchors.pop(close_coid, None)
             if self._store_ctx is not None:
-                self._store_ctx.record_unpark(close_coid)
+                self._owe_unpark(close_coid)
         if self._store_ctx is not None:
             # Stamp the parent row's ``natural_close_at`` BEFORE writing
             # the durable audit. Mirrors the synchronous-success /
@@ -24394,7 +25735,7 @@ class OrderSyncEngine:
                 payload['fill_exchange_order_id'] = (
                     marker.fill_exchange_order_id
                 )
-            self._store_ctx.log_event(
+            self._log_store_event(
                 kind='defensive_close_filled',
                 intent_key=marker.close_intent_key,
                 client_order_id=marker.reject_context.position_coid,
@@ -24665,14 +26006,20 @@ class OrderSyncEngine:
         """
         if self._store_ctx is None:
             return
-        row = self._store_ctx.get_order(position_coid)
-        if row is None:
-            return
-        extras = dict(row.extras or {})
-        if 'natural_close_at' in extras:
-            return
-        extras['natural_close_at'] = time.time()
-        self._store_ctx.upsert_order(position_coid, extras=extras)
+        store_ctx = self._store_ctx
+        stamped_at = time.time()
+
+        def _stamp() -> None:
+            row = store_ctx.get_order(position_coid)
+            if row is None:
+                return
+            extras = dict(row.extras or {})
+            if 'natural_close_at' in extras:
+                return
+            extras['natural_close_at'] = stamped_at
+            store_ctx.upsert_order(position_coid, extras=extras)
+
+        self._owe_store_write(f"natural close of {position_coid}", _stamp)
 
     def _clear_pending_defensive_close(self, entry_id: str) -> None:
         """Drop a defensive-close pending marker from memory + extras.
@@ -24687,14 +26034,30 @@ class OrderSyncEngine:
         self._replayed_defensive_close_entry_ids.discard(entry_id)
         if marker is None or self._store_ctx is None:
             return
+        store_ctx = self._store_ctx
         position_coid = marker.reject_context.position_coid
-        row = self._store_ctx.get_order(position_coid)
-        if row is None:
+
+        def _clear_marker() -> None:
+            row = store_ctx.get_order(position_coid)
+            if row is None:
+                return
+            extras = dict(row.extras or {})
+            if 'defensive_close_pending' in extras:
+                extras.pop('defensive_close_pending')
+                store_ctx.upsert_order(position_coid, extras=extras)
+
+        self._owe_store_write(f"defensive-close marker clear of {position_coid}", _clear_marker)
+
+    def _log_residual_hold(self, key: str) -> None:
+        """Report once that ``key`` waits for the residual open its reversal owes."""
+        if key in self._residual_hold_logged:
             return
-        extras = dict(row.extras or {})
-        if 'defensive_close_pending' in extras:
-            extras.pop('defensive_close_pending')
-            self._store_ctx.upsert_order(position_coid, extras=extras)
+        self._residual_hold_logged.add(key)
+        _blog_info(
+            "entry %s: its market reversal still owes the residual open; the "
+            "entry is not amended, replaced or cancelled until that open is "
+            "settled", format_intent_key(key),
+        )
 
     def _dispatch_modify(self, old: Intent, new: Intent) -> None:
         # Quarantine gate for entry amends: ``modify_entry`` goes straight
@@ -25050,6 +26413,16 @@ class OrderSyncEngine:
                         f"bracket:{leg_id}" for leg_id in bracket.legs
                     ]
                 else:
+                    if self._exit_write_unsettled(new.intent_key):
+                        _blog_warning(
+                            "modify %s -> %s deferred — an earlier write of "
+                            "this exit ended without a verdict and could still "
+                            "replace a newer one; retrying each sync until it "
+                            "is settled", old, new,
+                        )
+                        raise _PartialBracketModifyDeferred(
+                            "exit modify deferred — earlier exit write unsettled"
+                        )
                     orders = self._run_async_write(self._broker.modify_exit(old_env, new_env))
                     self._order_mapping[new.intent_key] = [o.id for o in orders]
             else:
@@ -25355,13 +26728,14 @@ class OrderSyncEngine:
             isinstance(old, EntryIntent)
             and self._partial_qty_bracket_exit_mode is CapabilityLevel.SOFTWARE
         )
+        # One anchor for the probe row and the cancel-tentative state it may
+        # become: the in-memory stale grace and the one a restart rebuilds
+        # from the row start at the same instant.
+        probe_ts_ms = self._cancel_tentative_now_ms() if is_software_parent_entry else None
         parked_coid = self._park_forced_cancel(
             old.intent_key, old,
             kind='cancel_probe' if is_software_parent_entry else 'forced_cancel',
-            parked_ts_ms=(
-                self._cancel_tentative_now_ms()
-                if is_software_parent_entry else None
-            ),
+            parked_ts_ms=probe_ts_ms,
         )
         try:
             landed = self._dispatch_cancel_strict(old)
@@ -25383,9 +26757,7 @@ class OrderSyncEngine:
             # parent until ``_clear_intent_cancel_disposition_pending``
             # runs (or stale-grace promotes the parent to DEGRADED_HALT).
             # See the cancel-tentative state design dossier.
-            if (isinstance(old, EntryIntent)
-                    and self._partial_qty_bracket_exit_mode
-                    is CapabilityLevel.SOFTWARE):
+            if probe_ts_ms is not None:
                 # Keep the original EntryIntent envelope in ``_envelopes``.
                 # A later ALREADY_FILLED resolution restores the parent and
                 # downstream code (e.g.
@@ -25411,11 +26783,10 @@ class OrderSyncEngine:
                 # which neither row exists. Leg-less parents depend on this:
                 # the leg flip inside the mark is a no-op for them, leaving
                 # the converted row as the only durable trace.
-                self._forced_cancel_pending.pop(old.intent_key, None)
                 self._mark_intent_cancel_disposition_pending(
                     old.intent_key,
                     reason='parent_cancel_disposition_unknown',
-                    now_ms=self._cancel_tentative_now_ms(),
+                    now_ms=probe_ts_ms,
                     parked_coid=parked_coid,
                 )
                 return True
@@ -25437,7 +26808,7 @@ class OrderSyncEngine:
             )
             return True
         if not landed:
-            if is_software_parent_entry:
+            if probe_ts_ms is not None:
                 # A SOFTWARE partial-bracket parent entry whose cancel did NOT
                 # land must resolve through the OUTCOME-based cancel-tentative
                 # machine, exactly like the unknown-disposition timeout above —
@@ -25462,11 +26833,10 @@ class OrderSyncEngine:
                     "the parent filled) or the stale grace expires",
                     format_intent_key(old.intent_key),
                 )
-                self._forced_cancel_pending.pop(old.intent_key, None)
                 self._mark_intent_cancel_disposition_pending(
                     old.intent_key,
                     reason='parent_cancel_did_not_land',
-                    now_ms=self._cancel_tentative_now_ms(),
+                    now_ms=probe_ts_ms,
                     parked_coid=parked_coid,
                 )
                 return True

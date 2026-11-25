@@ -140,7 +140,8 @@ def park_inherited_dispatches(store_ctx: 'RunContext') -> list[str]:
     already has a park keeps it untouched, resolution included.
 
     Only entry rows (``extras['kind']`` a position or a working order) are
-    parked; the park is dated at the row's own dispatch.
+    parked; the park is dated at the row's own dispatch. The parks are one
+    write: a failure parks none, and the next call parks them all.
 
     :param store_ctx: The run's store.
     :return: The client order ids parked.
@@ -150,14 +151,15 @@ def park_inherited_dispatches(store_ctx: 'RunContext') -> list[str]:
         return []
     _envelopes, parks = store_ctx.replay()
     parked: list[str] = []
-    for row in find_pending_dispatch(store_ctx):
-        coid = row.client_order_id
-        if (coid not in inherited or coid in parks or not row.intent_key
-                or (row.extras or {}).get('kind') not in (ENTRY_KIND_POSITION,
-                                                          ENTRY_KIND_WORKING)):
-            continue
-        store_ctx.record_park(coid, row.intent_key, parked_ts_ms=row.created_ts_ms)
-        parked.append(coid)
+    with store_ctx.transaction():
+        for row in find_pending_dispatch(store_ctx):
+            coid = row.client_order_id
+            if (coid not in inherited or coid in parks or not row.intent_key
+                    or (row.extras or {}).get('kind') not in (ENTRY_KIND_POSITION,
+                                                              ENTRY_KIND_WORKING)):
+                continue
+            store_ctx.record_park(coid, row.intent_key, parked_ts_ms=row.created_ts_ms)
+            parked.append(coid)
     return parked
 
 

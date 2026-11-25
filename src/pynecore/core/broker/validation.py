@@ -30,9 +30,11 @@ _POSITION_PORT_METHODS = (
     'fetch_raw_positions',
     'get_volume_quantizer',
     'close_leg',
+    'close_leg_executed',
     'reject_out_of_range',
     'place_leg',
     'amend_bracket',
+    'bracket_matches',
 )
 
 #: Surface a :class:`~pynecore.core.broker.spot_inventory.SpotInventoryPort`

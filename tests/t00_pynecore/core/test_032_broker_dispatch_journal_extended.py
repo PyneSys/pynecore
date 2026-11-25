@@ -1004,3 +1004,531 @@ def __test_pending_dispatch_states_excludes_new_states__(tmp_path: Path) -> None
     )
     assert STATE_CLOSING not in PENDING_DISPATCH_STATES
     assert STATE_CANCEL_PENDING not in PENDING_DISPATCH_STATES
+
+
+# === One transaction per terminal transition ==============================
+
+class _WriteFault(Exception):
+    """The injected one-shot failure of a store write."""
+
+
+def _fail_close_order_once(ctx: RunContext) -> None:
+    """Make the next ``close_order`` of ``ctx`` raise once, then behave normally."""
+    real = ctx.close_order
+    state = {'armed': True}
+
+    def close_order(client_order_id: str) -> None:
+        if state['armed']:
+            state['armed'] = False
+            raise _WriteFault(client_order_id)
+        real(client_order_id)
+
+    ctx.close_order = close_order  # type: ignore[method-assign]
+
+
+def _assert_still_pending(ctx: RunContext, coid: str) -> None:
+    """The row is still owned by the recovery pass, not left live as terminal."""
+    from pynecore.core.broker.store_helpers import find_pending_dispatch
+    row = ctx.get_order(coid)
+    assert row is not None
+    assert row.closed_ts_ms is None
+    assert row.state != STATE_CONFIRMED and row.state != STATE_REJECTED
+    assert coid in {r.client_order_id for r in find_pending_dispatch(ctx)}
+    kinds = [k for k, _ in _read_events(ctx, coid)]
+    assert 'confirmed' not in kinds
+
+
+def __test_a_failed_close_of_a_partial_close_row_leaves_it_to_recovery__(
+        tmp_path: Path) -> None:
+    """Partial close: a failed ``close_order`` must not leave a live confirmed row."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            from pynecore.core.broker.journal import ResumeOutcome
+            coid = _coid(ctx, "Long")
+            hooks = _FakePartialCloseHooks(
+                partial_outcome=CloseOutcome(
+                    mode='partial', applied_targets=['DEAL-NEW'],
+                    deal_reference='REF-PARTIAL', exchange_id='DEAL-NEW',
+                    filled_qty=0.5, fill_price=1.105, raw={},
+                ),
+            )
+            _fail_close_order_once(ctx)
+            try:
+                _run(DispatchJournal(ctx).run_close(
+                    coid=coid, intent=_make_close_intent(qty=0.5),
+                    kind=KIND_PARTIAL_CLOSE, targets=[], hooks=hooks,
+                ))
+            except _WriteFault:
+                pass
+            else:
+                raise AssertionError("expected the injected write fault")
+            _assert_still_pending(ctx, coid)
+            assert ctx.get_order(coid).state == STATE_SERVER_REF_SEEN  # type: ignore[union-attr]
+
+            @dataclass
+            class _Resume:
+                async def resume_pending_dispatch(self, *, row, refs) -> ResumeOutcome:
+                    return ResumeOutcome(status='confirmed', exchange_id='DEAL-NEW')
+
+            _run(DispatchJournal(ctx).recover_pending(lambda row: _Resume()))
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.state == STATE_CONFIRMED
+            assert row.closed_ts_ms is not None
+        finally:
+            ctx.close()
+
+
+def __test_a_failed_close_of_a_cancel_row_leaves_it_to_recovery__(tmp_path: Path) -> None:
+    """Cancel: a failed ``close_order`` must not leave a live confirmed row."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            t1_coid = _coid(ctx, "T1", kind_char='w')
+            t1_row = _seed_target_row(ctx, coid=t1_coid, kind_extra='working')
+            coid = _coid(ctx, "Long")
+            hooks = _FakeCancelHooks(outcome=CancelOutcome(
+                succeeded=True, reason_path='deleted', cleared_legs=1,
+                applied_target_coids=[t1_coid],
+            ))
+            _fail_close_order_once(ctx)
+            try:
+                _run(DispatchJournal(ctx).run_cancel(
+                    coid=coid, intent=_make_cancel_intent(), targets=[t1_row],
+                    hooks=hooks,
+                ))
+            except _WriteFault:
+                pass
+            else:
+                raise AssertionError("expected the injected write fault")
+            _assert_still_pending(ctx, coid)
+        finally:
+            ctx.close()
+
+
+def __test_a_failed_close_of_a_modify_entry_row_leaves_it_to_recovery__(
+        tmp_path: Path) -> None:
+    """Modify entry: a failed ``close_order`` must not leave a live confirmed row."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            target_coid = _coid(ctx, "T1", kind_char='e')
+            _seed_target_row(ctx, coid=target_coid, kind_extra='working')
+            coid = _coid(ctx, "Long-mod")
+            hooks = _FakeModifyEntryHooks(outcome=ModifyEntryOutcome(
+                server_ref='REF-AMEND-1', new_level=1.12, raw={},
+            ))
+            _fail_close_order_once(ctx)
+            try:
+                _run(DispatchJournal(ctx).run_modify_entry(
+                    coid=coid, target_coid=target_coid,
+                    old_intent=_make_entry_intent(limit=1.10),
+                    new_intent=_make_entry_intent(limit=1.12),
+                    qty=1.0, hooks=hooks,
+                ))
+            except _WriteFault:
+                pass
+            else:
+                raise AssertionError("expected the injected write fault")
+            _assert_still_pending(ctx, coid)
+        finally:
+            ctx.close()
+
+
+def __test_a_failed_close_of_a_modify_exit_row_leaves_it_to_recovery__(
+        tmp_path: Path) -> None:
+    """Modify exit: a failed ``close_order`` must not leave a live confirmed row."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            target_coid = _coid(ctx, "T1", kind_char='e')
+            target_row = _seed_target_row(ctx, coid=target_coid)
+            coid = _coid(ctx, "TPSL-mod")
+            hooks = _FakeModifyExitHooks(outcome=ModifyExitOutcome(
+                server_ref='REF-MEX-1', deal_status='ACCEPTED', rejected_reason=None,
+                post_put_state={'profit_level': 1.18, 'stop_level': 1.04}, raw={},
+            ))
+            _fail_close_order_once(ctx)
+            try:
+                _run(DispatchJournal(ctx).run_modify_exit(
+                    coid=coid, target_coid=target_coid, target_row=target_row,
+                    old_intent=_make_exit_intent(tp=1.15, sl=1.05),
+                    new_intent=_make_exit_intent(tp=1.18, sl=1.04),
+                    qty=1.0, hooks=hooks,
+                ))
+            except _WriteFault:
+                pass
+            else:
+                raise AssertionError("expected the injected write fault")
+            _assert_still_pending(ctx, coid)
+        finally:
+            ctx.close()
+
+
+def __test_a_failed_close_of_a_rejected_row_never_leaves_it_live_as_rejected__(
+        tmp_path: Path) -> None:
+    """``mark_rejected``: a failed ``close_order`` keeps the row pending, not live-rejected."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            coid = _coid(ctx, "Long")
+            hooks = _FakePartialCloseHooks(
+                partial_exc=ExchangeOrderRejectedError("dealStatus=REJECTED"),
+            )
+            _fail_close_order_once(ctx)
+            try:
+                _run(DispatchJournal(ctx).run_close(
+                    coid=coid, intent=_make_close_intent(qty=0.5),
+                    kind=KIND_PARTIAL_CLOSE, targets=[], hooks=hooks,
+                ))
+            except _WriteFault:
+                pass
+            else:
+                raise AssertionError("expected the injected write fault")
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.state == STATE_SUBMITTED
+            assert row.closed_ts_ms is None
+        finally:
+            ctx.close()
+
+
+def __test_a_failed_close_inside_a_recovery_verdict_leaves_the_row_pending__(
+        tmp_path: Path) -> None:
+    """Recovery: a confirmed partial-close verdict whose close fails stays recoverable."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            from pynecore.core.broker.journal import ResumeOutcome
+            from pynecore.core.broker.store_helpers import create_close_target_row
+            coid = _coid(ctx, "Long")
+            create_close_target_row(
+                ctx, coid=coid, symbol='EURUSD', side='sell', qty=0.5,
+                intent_key='Long', kind=KIND_PARTIAL_CLOSE,
+            )
+
+            @dataclass
+            class _Resume:
+                async def resume_pending_dispatch(self, *, row, refs) -> ResumeOutcome:
+                    return ResumeOutcome(status='confirmed', exchange_id='DEAL-NEW')
+
+            _fail_close_order_once(ctx)
+            try:
+                _run(DispatchJournal(ctx).recover_pending(lambda row: _Resume()))
+            except _WriteFault:
+                pass
+            else:
+                raise AssertionError("expected the injected write fault")
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.state == STATE_SUBMITTED
+            assert row.closed_ts_ms is None
+            _run(DispatchJournal(ctx).recover_pending(lambda row: _Resume()))
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.state == STATE_CONFIRMED
+            assert row.closed_ts_ms is not None
+        finally:
+            ctx.close()
+
+
+# === Storage failures on either side of the venue call =====================
+
+def _fail_event_once(ctx: RunContext, event_kind: str, *, times: int = 1) -> None:
+    """Make the next ``times`` ``log_event`` calls of ``event_kind`` raise a storage error."""
+    import sqlite3
+    real = ctx.log_event
+    state = {'left': times}
+
+    def log_event(kind: str, *args: Any, **fields: Any) -> Any:
+        if state['left'] and kind == event_kind:
+            state['left'] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(kind, *args, **fields)
+
+    ctx.log_event = log_event  # type: ignore[method-assign]
+
+
+@dataclass
+class _FakeEntryHooks:
+    """Entry hooks of a venue that accepts and confirms every submission."""
+    submits: list[str] = field(default_factory=list)
+
+    async def submit(self, *, coid: str, intent: EntryIntent, qty: float) -> Any:
+        from pynecore.core.broker.journal import SubmitOutcome
+        self.submits.append(coid)
+        return SubmitOutcome(server_ref='REF-1')
+
+    async def confirm_submission(
+            self, *, coid: str, intent: EntryIntent, server_ref: str,
+    ) -> Any:
+        from pynecore.core.broker.journal import ConfirmOutcome
+        return ConfirmOutcome(exchange_id='ORD-1', is_filled=False)
+
+    def exchange_order_from_state(self, *, row: OrderRow, intent: EntryIntent) -> ExchangeOrder:
+        raise AssertionError("the dispatch must not complete")
+
+
+def _expect(exc_type: type[BaseException], coro: Awaitable[Any]) -> BaseException:
+    try:
+        _run(coro)
+    except exc_type as exc:
+        return exc
+    raise AssertionError(f"expected {exc_type.__name__}")
+
+
+def __test_a_storage_failure_before_the_entry_submit_sends_nothing__(tmp_path: Path) -> None:
+    """Entry: a failed persist-first write leaves no row and never reaches the venue."""
+    from pynecore.core.broker.exceptions import ExchangeConnectionError, JournalWriteError
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            coid = _coid(ctx, "Long", kind_char='e')
+            hooks = _FakeEntryHooks()
+            _fail_event_once(ctx, 'dispatch_submitted')
+            exc = _expect(JournalWriteError, DispatchJournal(ctx).run_entry(
+                coid=coid, intent=_make_entry_intent(), qty=1.0, kind='working',
+                hooks=hooks,
+            ))
+            # Retried by the sync loop like a request that never left the client.
+            assert isinstance(exc, ExchangeConnectionError)
+            assert hooks.submits == []
+            assert ctx.get_order(coid) is None
+        finally:
+            ctx.close()
+
+
+def __test_a_storage_failure_after_the_entry_submit_parks_it__(tmp_path: Path) -> None:
+    """Entry: a failed write after the accepted submit is an unknown disposition."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            coid = _coid(ctx, "Long", kind_char='e')
+            hooks = _FakeEntryHooks()
+            _fail_event_once(ctx, 'deal_reference_seen')
+            exc = _expect(OrderDispositionUnknownError, DispatchJournal(ctx).run_entry(
+                coid=coid, intent=_make_entry_intent(), qty=1.0, kind='working',
+                hooks=hooks,
+            ))
+            assert isinstance(exc, OrderDispositionUnknownError)
+            assert exc.client_order_id == coid
+            assert hooks.submits == [coid]
+            # The row stays pending for the venue-data resolution.
+            from pynecore.core.broker.store_helpers import find_pending_dispatch
+            assert coid in {r.client_order_id for r in find_pending_dispatch(ctx)}
+        finally:
+            ctx.close()
+
+
+def _modify_exit_outcome() -> ModifyExitOutcome:
+    return ModifyExitOutcome(
+        server_ref='REF-AMEND', deal_status='ACCEPTED',
+        post_put_state={'tp': 1.16, 'sl': 1.04},
+    )
+
+
+def __test_a_storage_failure_before_the_modify_exit_put_sends_nothing__(tmp_path: Path) -> None:
+    """Modify exit: a failed persist-first write leaves no row and sends no amend."""
+    from pynecore.core.broker.exceptions import JournalWriteError
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            target_coid = _coid(ctx, "Long", kind_char='e')
+            target_row = _seed_target_row(ctx, coid=target_coid)
+            coid = _coid(ctx, "TP_SL", kind_char='m')
+            hooks = _FakeModifyExitHooks(outcome=_modify_exit_outcome())
+            _fail_event_once(ctx, 'dispatch_submitted')
+            _expect(JournalWriteError, DispatchJournal(ctx).run_modify_exit(
+                coid=coid, target_coid=target_coid, target_row=target_row,
+                old_intent=_make_exit_intent(), new_intent=_make_exit_intent(tp=1.16, sl=1.04),
+                qty=1.0, hooks=hooks,
+            ))
+            assert hooks.calls == []
+            assert ctx.get_order(coid) is None
+        finally:
+            ctx.close()
+
+
+def __test_a_storage_failure_after_the_modify_exit_put_parks_it__(tmp_path: Path) -> None:
+    """Modify exit: a failed write after the accepted amend is an unknown disposition."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            target_coid = _coid(ctx, "Long", kind_char='e')
+            target_row = _seed_target_row(ctx, coid=target_coid)
+            coid = _coid(ctx, "TP_SL", kind_char='m')
+            hooks = _FakeModifyExitHooks(outcome=_modify_exit_outcome())
+            _fail_event_once(ctx, 'deal_reference_seen')
+            exc = _expect(OrderDispositionUnknownError, DispatchJournal(ctx).run_modify_exit(
+                coid=coid, target_coid=target_coid, target_row=target_row,
+                old_intent=_make_exit_intent(), new_intent=_make_exit_intent(tp=1.16, sl=1.04),
+                qty=1.0, hooks=hooks,
+            ))
+            assert isinstance(exc, OrderDispositionUnknownError)
+            assert exc.client_order_id == coid
+            assert len(hooks.calls) == 1
+            _assert_still_pending(ctx, coid)
+        finally:
+            ctx.close()
+
+
+def __test_a_storage_failure_before_the_close_sends_nothing__(tmp_path: Path) -> None:
+    """Full close: a failed persist-first write leaves no row and closes nothing."""
+    from pynecore.core.broker.exceptions import JournalWriteError
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            target_row = _seed_target_row(ctx, coid=_coid(ctx, "T1", kind_char='e'))
+            coid = _coid(ctx, "Long")
+            hooks = _FakeFullCloseHooks(full_outcome=CloseOutcome(
+                mode='full', applied_targets=['DEAL-1'], deal_reference=None,
+                exchange_id='DEAL-1', filled_qty=1.0, fill_price=1.10, raw={},
+            ))
+            _fail_event_once(ctx, 'dispatch_submitted')
+            _expect(JournalWriteError, DispatchJournal(ctx).run_close(
+                coid=coid, intent=_make_close_intent(), kind=KIND_FULL_CLOSE,
+                targets=[target_row], hooks=hooks,
+            ))
+            assert hooks.calls == []
+            assert ctx.get_order(coid) is None
+        finally:
+            ctx.close()
+
+
+def __test_a_storage_failure_after_the_close_parks_it__(tmp_path: Path) -> None:
+    """Full close: a failed write after the executed close is an unknown disposition."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            target_row = _seed_target_row(ctx, coid=_coid(ctx, "T1", kind_char='e'))
+            coid = _coid(ctx, "Long")
+            hooks = _FakeFullCloseHooks(full_outcome=CloseOutcome(
+                mode='full', applied_targets=['DEAL-1'], deal_reference=None,
+                exchange_id='DEAL-1', filled_qty=1.0, fill_price=1.10, raw={},
+            ))
+            _fail_event_once(ctx, 'close_dispatched')
+            exc = _expect(OrderDispositionUnknownError, DispatchJournal(ctx).run_close(
+                coid=coid, intent=_make_close_intent(), kind=KIND_FULL_CLOSE,
+                targets=[target_row], hooks=hooks,
+            ))
+            assert isinstance(exc, OrderDispositionUnknownError)
+            assert exc.client_order_id == coid
+            assert len(hooks.calls) == 1
+            # The closing transition rolled back: the row stays pending.
+            from pynecore.core.broker.store_helpers import find_pending_dispatch
+            assert coid in {r.client_order_id for r in find_pending_dispatch(ctx)}
+        finally:
+            ctx.close()
+
+
+def __test_a_storage_failure_while_booking_a_reject_keeps_the_reject__(tmp_path: Path) -> None:
+    """A venue reject stays a reject when the write that books it fails."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            target_row = _seed_target_row(ctx, coid=_coid(ctx, "T1", kind_char='e'))
+            coid = _coid(ctx, "Long")
+            hooks = _FakeFullCloseHooks(full_exc=ExchangeOrderRejectedError("refused"))
+            _fail_event_once(ctx, 'rejected')
+            _expect(ExchangeOrderRejectedError, DispatchJournal(ctx).run_close(
+                coid=coid, intent=_make_close_intent(), kind=KIND_FULL_CLOSE,
+                targets=[target_row], hooks=hooks,
+            ))
+        finally:
+            ctx.close()
+
+
+class _RejectingEntryHooks(_FakeEntryHooks):
+    """Entry hooks of a venue that definitively refuses the submission."""
+
+    async def submit(self, *, coid: str, intent: EntryIntent, qty: float) -> Any:
+        self.submits.append(coid)
+        raise ExchangeOrderRejectedError("insufficient margin")
+
+
+def __test_a_failed_reject_event_leaves_the_entry_row_pending__(tmp_path: Path) -> None:
+    """Entry: the reject and its audit event are one write; a failed one books neither.
+
+    The store stays down for the journal's own booking and for the owed
+    retry of it, so the row is still pending; once the store is back the
+    owed booking lands both together, once.
+    """
+    from pynecore.core.broker.store_helpers import find_pending_dispatch
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            coid = _coid(ctx, "Long", kind_char='e')
+            hooks = _RejectingEntryHooks()
+            _fail_event_once(ctx, 'rejected', times=2)
+            _expect(ExchangeOrderRejectedError, DispatchJournal(ctx).run_entry(
+                coid=coid, intent=_make_entry_intent(), qty=1.0, kind='working',
+                hooks=hooks,
+            ))
+            row = ctx.get_order(coid)
+            assert row is not None and row.state == STATE_SUBMITTED
+            assert coid in {r.client_order_id for r in find_pending_dispatch(ctx)}
+            assert 'rejected' not in [k for k, _ in _read_events(ctx, coid)]
+
+            ctx.claim_owed_writes(lambda _label, write: write())
+            row = ctx.get_order(coid)
+            assert row is not None and row.state == STATE_REJECTED
+            assert row.closed_ts_ms is not None
+            assert [k for k, _ in _read_events(ctx, coid)].count('rejected') == 1
+        finally:
+            ctx.close()
+
+
+def __test_a_failed_confirm_event_leaves_the_entry_row_pending__(tmp_path: Path) -> None:
+    """Entry: the confirmation and its audit event are one write; a failed one parks."""
+    from pynecore.core.broker.store_helpers import find_pending_dispatch
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            coid = _coid(ctx, "Long", kind_char='e')
+            hooks = _FakeEntryHooks()
+            _fail_event_once(ctx, 'confirmed')
+            exc = _expect(OrderDispositionUnknownError, DispatchJournal(ctx).run_entry(
+                coid=coid, intent=_make_entry_intent(), qty=1.0, kind='working',
+                hooks=hooks,
+            ))
+            assert isinstance(exc, OrderDispositionUnknownError)
+            row = ctx.get_order(coid)
+            assert row is not None and row.state != STATE_CONFIRMED
+            assert row.exchange_order_id is None
+            assert coid in {r.client_order_id for r in find_pending_dispatch(ctx)}
+        finally:
+            ctx.close()
+
+
+def __test_a_failed_reconcile_event_leaves_the_row_as_it_was__(tmp_path: Path) -> None:
+    """Reconcile: the state transition and its audit event commit together, or neither does."""
+    import sqlite3
+    from pynecore.core.broker.journal import ReconcileOutcome
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        try:
+            coid = _coid(ctx, "Long", kind_char='e')
+            _seed_target_row(ctx, coid=coid)
+            outcome = ReconcileOutcome(
+                kind='terminal_close', reason='test', new_state=STATE_REJECTED,
+                audit_event='reconcile_test', close_row=True,
+            )
+            _fail_event_once(ctx, 'reconcile_test')
+            try:
+                DispatchJournal(ctx).apply_reconcile_outcome(coid, outcome)
+            except sqlite3.OperationalError:
+                pass
+            else:
+                raise AssertionError("expected the injected write fault")
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.state == STATE_CONFIRMED and row.closed_ts_ms is None
+
+            DispatchJournal(ctx).apply_reconcile_outcome(coid, outcome)
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.state == STATE_REJECTED and row.closed_ts_ms is not None
+            assert [k for k, _ in _read_events(ctx, coid)].count('reconcile_test') == 1
+        finally:
+            ctx.close()

@@ -5,6 +5,7 @@ Covers entry accounting (open, add), exit accounting (full close, partial
 close, FIFO close across multiple entries), side flip in a single fill,
 mark-to-market, and liquidation.
 """
+import dataclasses
 import logging
 from types import SimpleNamespace
 
@@ -512,6 +513,7 @@ def _bfill(side: str, qty: float, price: float, *, pine_id: str | None,
     return OrderEvent(
         order=order, event_type="filled", fill_price=price, fill_qty=qty,
         timestamp=0.0, pine_id=pine_id, from_entry=from_entry, leg_type=leg,
+        journal_fill_qty=qty,
     )
 
 
@@ -531,6 +533,30 @@ def _pyramid(*legs: tuple[str, float]) -> BrokerPosition:
     for i, (entry_id, qty) in enumerate(legs):
         p.record_fill(_bfill("buy", qty, 100.0, pine_id=entry_id, order_id=f"e{i}"))
     return p
+
+
+def __test_an_order_gets_a_fill_place_each_time_it_opens_a_binding__():
+    """The fill order follows the bindings: a growing slice keeps its place, a refill gets a new one.
+
+    A further slice of an order whose binding is open grows that binding and
+    keeps the order's place; once a close spent the binding, the order's next
+    fill opens a binding at the end of the book and the order goes last. A
+    seeded place from an earlier process comes before every new one.
+    """
+    p = BrokerPosition()
+    p.seed_fill_places({"old": 7})
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="A", order_id="a"))
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="B", order_id="b"))
+    p.record_fill(_bfill("buy", 0.5, 100.0, pine_id="A", order_id="a"))
+    assert p.fill_places() == {"old": 7, "a": 8, "b": 9}
+    # A close naming no entry settles the oldest binding: A's 1.5 is spent.
+    p.record_fill(_bfill("sell", 1.5, 110.0, pine_id="C", order_id="c", leg=LegType.CLOSE))
+    assert _book(p) == [("B", 1.0)]
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="A", order_id="a"))
+    assert _book(p) == [("B", 1.0), ("A", 1.0)]
+    assert p.fill_places() == {"old": 7, "a": 10, "b": 9}
+    p.drop_fill_places(["old", "unknown"])
+    assert p.fill_places() == {"a": 10, "b": 9}
 
 
 def __test_exit_legs_settle_their_own_bindings_while_rows_drain_fifo__():
@@ -886,3 +912,21 @@ def __test_the_fill_cursor_counts_only_the_booked_slices__():
     second = _bfill("buy", 1.0, 100.0, pine_id="L1", order_id="e1")
     p.record_fill(second)
     assert p.fill_cursor(["coid-e1", "e1"]) == 2.0
+
+
+def __test_the_fill_cursor_counts_the_journal_quantity_of_each_fill__():
+    """The cursor is in the journal's unit, not the position's.
+
+    A fee-net spot buy moves the position by 0.999 while the plugin journals
+    the gross 1.0; the cursor takes the journal quantity. A fill that carries
+    none leaves the cursor where it was, so a restart never vouches for it.
+    """
+    p = BrokerPosition()
+    event = dataclasses.replace(_bfill("buy", 0.999, 100.0, pine_id="L1", order_id="e1"),
+                                journal_fill_qty=1.0)
+    p.record_fill(event)
+    assert p.size == pytest.approx(0.999)
+    assert p.fill_cursor(["e1"]) == 1.0
+    p.record_fill(dataclasses.replace(event, journal_fill_qty=None))
+    assert p.size == pytest.approx(1.998)
+    assert p.fill_cursor(["e1"]) == 1.0

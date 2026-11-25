@@ -37,6 +37,7 @@ __all__ = [
     'plan_leg_close_volumes',
     'legs_on_position_side',
     'net_survivor_legs',
+    'net_survivor_exposure',
 ]
 
 # Quantities are in Pine units (fractional lots possible). Anything below this
@@ -343,6 +344,27 @@ def net_survivor_legs(
     reversal; there the gross majority legs exceed the net, and protecting all of
     them would close more than the position and flip it to the minority side.
     """
+    side, exposure = net_survivor_exposure(legs)
+    return side, [leg for leg, _remaining in exposure]
+
+
+def net_survivor_exposure(
+        legs: list[PositionLeg],
+) -> tuple[str, list[tuple[PositionLeg, float]]]:
+    """Return the one-way side and each net-survivor leg with its surviving quantity.
+
+    The legs are those of :func:`net_survivor_legs`, in the same FIFO order;
+    the quantity paired with each is the part of the leg the opposing legs do
+    NOT virtually FIFO-close — the leg's share of the net one-way position.
+    On a clean one-way book it is the leg's whole ``qty``; on a mixed book the
+    oldest surviving leg can carry less than its ``qty``, and the surviving
+    quantities sum to the net position. A net-flat book returns
+    ``('flat', [])``.
+
+    A protective order of one leg must close its surviving quantity and no
+    more: the rest of the leg is offset by an opposing leg, so closing it too
+    would flip the net position to the minority side.
+    """
     net = net_signed_qty(legs)
     if abs(net) <= _QTY_EPS:
         return 'flat', []
@@ -352,7 +374,7 @@ def net_survivor_legs(
         key=lambda leg: (leg.open_time, leg.leg_id),
     )
     offset = sum(leg.qty for leg in legs if leg.side != side)
-    kept: list[PositionLeg] = []
+    kept: list[tuple[PositionLeg, float]] = []
     for leg in survivors:
         remaining = leg.qty
         if offset > 0.0:
@@ -360,5 +382,5 @@ def net_survivor_legs(
             offset -= consumed
             remaining -= consumed
         if remaining > _QTY_EPS:
-            kept.append(leg)
+            kept.append((leg, remaining))
     return side, kept

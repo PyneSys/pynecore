@@ -571,8 +571,10 @@ class DisappearanceTracker:
         ``OrderType.MARKET``); a non-entry row MUST supply a custom factory.
     :param fill_event_factory: Overrides the recovered-fill event
         construction. Receives ``(row, confirmation, cumulative,
-        fill_qty, now_ts)``. The default builder is entry-shaped as
-        above; a non-entry row MUST supply a custom factory.
+        fill_qty, now_ts)``; ``fill_qty`` is the rise of the row's
+        ``filled_qty``, in the journal's unit, and is what the event's
+        ``journal_fill_qty`` must carry. The default builder is entry-shaped
+        as above; a non-entry row MUST supply a custom factory.
     :param retire_cancelled_row: Retires the row of a confirmed
         :data:`MissingResolution.CANCELLED` in place of the default
         terminal close, inside the same store transaction. For a venue
@@ -1312,4 +1314,6 @@ class DisappearanceTracker:
             pine_id=row.pine_entry_id, from_entry=row.from_entry,
             leg_type=LegType.ENTRY, fee=confirmation.fill_fee,
             fill_id=fill_id,
+            # The slice is the rise of the row's own ``filled_qty``.
+            journal_fill_qty=fill_qty,
         )

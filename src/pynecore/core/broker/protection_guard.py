@@ -35,6 +35,13 @@ venue and judges every venue observation against them:
   plugin names, so a restart restores them (on first use) and a crash in the
   middle of a write leaves both the old and the new levels acceptable. A
   confirmed post-resume re-assert no view showed yet stays unseen across it.
+  A row holds one record of each scope: an order's own levels
+  (:data:`PROTECTION_LEVELS_EXTRA`) and a position-scoped protection
+  (:data:`POSITION_PROTECTION_LEVELS_EXTRA`, the keys the plugin names
+  ``position_scoped``). A position protection is homed on a row that lives as
+  long as the run's exposure, an entry row; that row may still rest as an
+  order with its own guarded limit or trigger, and neither record evicts the
+  other.
 - **Rebaselined on an operator resume.** :func:`rebaseline_after_resume`
   voids every level written before the resume: the operator accepted the
   venue as it stands. The first judged observation after it becomes the
@@ -57,17 +64,20 @@ venue and judges every venue observation against them:
   the trailing switched — calls the ``report`` hook once per key, normally
   :meth:`~pynecore.core.plugin.broker.BrokerPlugin.report_external_intervention`.
 """
+import contextlib
 import logging
 import math
+import sqlite3
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import RunContext
 
 __all__ = [
+    'POSITION_PROTECTION_LEVELS_EXTRA',
     'PROTECTION_LEVELS_EXTRA',
     'ProtectionLevels',
     'ProtectionLevelGuard',
@@ -78,6 +88,13 @@ logger = logging.getLogger(__name__)
 
 #: Journal-row extras key holding a protection key's accepted levels.
 PROTECTION_LEVELS_EXTRA = 'protection_levels'
+
+#: Journal-row extras key holding the accepted levels of a position-scoped
+#: protection key (see ``position_scoped`` of :class:`ProtectionLevelGuard`).
+POSITION_PROTECTION_LEVELS_EXTRA = 'position_protection_levels'
+
+#: Every extras key a guard record may live under.
+_RECORD_EXTRAS = (PROTECTION_LEVELS_EXTRA, POSITION_PROTECTION_LEVELS_EXTRA)
 
 #: Consecutive mismatching observations a polled verdict needs.
 _CONFIRMATIONS = 2
@@ -143,6 +160,8 @@ class _Write:
 @dataclass
 class _Entry:
     row_coid: str | None
+    extra: str = PROTECTION_LEVELS_EXTRA
+    """The extras key of :attr:`row_coid` the record persists under."""
     writes: list[_Write] = field(default_factory=list)
     """The acceptable own writes, oldest first."""
     confirmed: int | None = None
@@ -202,6 +221,11 @@ class ProtectionLevelGuard:
     :param store_ctx: The run's journal; ``None`` keeps the levels in memory only.
     :param clock: Wall clock in seconds, comparable with the ``read_started_at``
         the plugin passes to :meth:`observe`.
+    :param position_scoped: Whether a key is a position protection (a
+        position-level TP/SL or trailing stop) rather than an order's own
+        levels. Its record persists under :data:`POSITION_PROTECTION_LEVELS_EXTRA`,
+        so it may share a row with an order record. ``None``: every key is an
+        order's.
     """
 
     def __init__(
@@ -210,46 +234,124 @@ class ProtectionLevelGuard:
             *,
             store_ctx: 'RunContext | None' = None,
             clock: Callable[[], float] = time.time,
+            position_scoped: Callable[[str], bool] | None = None,
     ) -> None:
         self._report = report
         self._store = store_ctx
         self._clock = clock
+        self._position_scoped = position_scoped
         self._entries: dict[str, _Entry] = {}
         self._restored = False
+        # Records whose write failed after the venue answered (:meth:`settle`),
+        # by key, with the row and extras key they live on: rewritten from the
+        # key's current state on the next use (:meth:`_flush_owed`).
+        self._owed: dict[str, tuple[str | None, str]] = {}
 
     def _restore(self) -> None:
         """Reload the accepted levels persisted on the live journal rows, once.
 
         Runs on first use rather than at construction, so an operator resume
-        the engine applies at startup has already re-flagged the rows.
+        the engine applies at startup has already re-flagged the rows. Every
+        later use lands the records still owed first (:meth:`_flush_owed`).
         """
         if self._restored:
+            self._flush_owed()
             return
-        self._restored = True
         if self._store is None:
+            self._restored = True
             return
+        restored: dict[str, _Entry] = {}
         for row in self._store.iter_live_orders():
-            saved = (row.extras or {}).get(PROTECTION_LEVELS_EXTRA)
-            if not isinstance(saved, dict) or not isinstance(saved.get('key'), str):
-                continue
-            try:
-                writes = [_Write(int(gen), ProtectionLevels.from_list(levels))
-                          for gen, levels in saved.get('writes') or []]
-                confirmed_raw = saved.get('confirmed')
-                confirmed = int(confirmed_raw) if confirmed_raw is not None else None
-                unresolved = [int(gen) for gen in saved.get('unresolved') or []]
-                next_gen = int(saved.get('next_gen') or 0)
-            except (TypeError, ValueError):
-                logger.warning("unreadable protection levels on row %r", row.client_order_id)
-                continue
-            self._entries.setdefault(saved['key'], _Entry(
-                row_coid=row.client_order_id, writes=writes, confirmed=confirmed,
-                unresolved=unresolved,
-                next_gen=max([next_gen, *(w.gen + 1 for w in writes)]),
-                written_at=float(saved.get('written_at') or 0.0),
-                rebaseline=bool(saved.get('rebaseline')),
-                unseen_reassert=bool(saved.get('unseen_reassert')),
-            ))
+            for extra in _RECORD_EXTRAS:
+                saved = (row.extras or {}).get(extra)
+                if not isinstance(saved, dict) or not isinstance(saved.get('key'), str):
+                    continue
+                try:
+                    writes = [_Write(int(gen), ProtectionLevels.from_list(levels))
+                              for gen, levels in saved.get('writes') or []]
+                    confirmed_raw = saved.get('confirmed')
+                    confirmed = int(confirmed_raw) if confirmed_raw is not None else None
+                    unresolved = [int(gen) for gen in saved.get('unresolved') or []]
+                    next_gen = int(saved.get('next_gen') or 0)
+                except (TypeError, ValueError):
+                    logger.warning("unreadable protection levels on row %r",
+                                   row.client_order_id)
+                    continue
+                restored.setdefault(saved['key'], _Entry(
+                    row_coid=row.client_order_id, extra=extra, writes=writes,
+                    confirmed=confirmed, unresolved=unresolved,
+                    next_gen=max([next_gen, *(w.gen + 1 for w in writes)]),
+                    written_at=float(saved.get('written_at') or 0.0),
+                    rebaseline=bool(saved.get('rebaseline')),
+                    unseen_reassert=bool(saved.get('unseen_reassert')),
+                ))
+        # Taken over only once the whole read succeeded: a failed read leaves
+        # the guard unrestored, and the next use reads the rows again.
+        for key, entry in restored.items():
+            self._entries.setdefault(key, entry)
+        self._restored = True
+
+    @contextlib.contextmanager
+    def _atomic(self, key: str) -> Iterator[None]:
+        """One state transition of ``key``: its journal writes and its in-memory record.
+
+        The writes made inside share one store transaction. When anything
+        inside raises (a failed journal write above all), the key's record is
+        put back exactly as it was before, so the next call redoes the
+        transition once instead of finding it half applied.
+        """
+        before = self._entries.get(key)
+        saved = _copy_entry(before) if before is not None else None
+        try:
+            if self._store is None:
+                yield
+            else:
+                with self._store.transaction():
+                    yield
+        except BaseException:
+            if before is None or saved is None:
+                self._entries.pop(key, None)
+            else:
+                before.__dict__.update(saved.__dict__)
+                self._entries[key] = before
+            raise
+
+    def _land_or_owe(self, key: str, row_coid: str | None, extra: str) -> bool:
+        """Write ``key``'s current record, or owe it when the write fails.
+
+        For a transition whose memory change stands whatever the journal does:
+        the venue already answered. The record written is the key's state at
+        the time of the write, so a late write is the same as a timely one;
+        a key no longer guarded clears its record from ``row_coid``.
+
+        :return: Whether the record landed.
+        """
+        if self._store is None:
+            return True
+        try:
+            with self._store.transaction():
+                entry = self._entries.get(key)
+                if entry is not None:
+                    self._persist(key, entry)
+                    if entry.row_coid != row_coid and row_coid is not None:
+                        self._write_extra(row_coid, extra, None)
+                elif row_coid is not None:
+                    self._write_extra(row_coid, extra, None)
+        except sqlite3.Error as exc:
+            self._owed[key] = (row_coid, extra)
+            logger.warning(
+                "protection levels of %r could not be persisted (%s) — the venue "
+                "answer holds in memory; retried on the next use", key, exc,
+            )
+            return False
+        return True
+
+    def _flush_owed(self) -> None:
+        """Land the records :meth:`_land_or_owe` owes, oldest first; stop at a failure."""
+        for key in list(self._owed):
+            row_coid, extra = self._owed.pop(key)
+            if not self._land_or_owe(key, row_coid, extra):
+                return
 
     def known(self, key: str) -> bool:
         """Whether the guard holds levels for ``key``."""
@@ -269,15 +371,16 @@ class ProtectionLevelGuard:
         :return: The write's id, for :meth:`settle`'s ``write``.
         """
         self._restore()
-        entry = self._entry_on_row(key, row_coid)
-        gen = entry.add(levels)
-        entry.unresolved.append(gen)
-        entry.resolve_count = 0
-        entry.in_flight += 1
-        entry.written_at = self._clock()
-        entry.mismatch = None
-        entry.mismatch_count = 0
-        self._persist(key, entry)
+        with self._atomic(key):
+            entry = self._entry_on_row(key, row_coid)
+            gen = entry.add(levels)
+            entry.unresolved.append(gen)
+            entry.resolve_count = 0
+            entry.in_flight += 1
+            entry.written_at = self._clock()
+            entry.mismatch = None
+            entry.mismatch_count = 0
+            self._persist(key, entry)
         return gen
 
     def adopt(self, key: str, levels: ProtectionLevels, *, row_coid: str | None = None) -> None:
@@ -292,16 +395,17 @@ class ProtectionLevelGuard:
         :param row_coid: As for :meth:`expect`.
         """
         self._restore()
-        entry = self._entry_on_row(key, row_coid)
-        entry.writes = []
-        entry.confirmed = entry.add(levels)
-        entry.unresolved = []
-        entry.resolve_count = 0
-        entry.rebaseline = False
-        entry.unseen_reassert = False
-        entry.mismatch = None
-        entry.mismatch_count = 0
-        self._persist(key, entry)
+        with self._atomic(key):
+            entry = self._entry_on_row(key, row_coid)
+            entry.writes = []
+            entry.confirmed = entry.add(levels)
+            entry.unresolved = []
+            entry.resolve_count = 0
+            entry.rebaseline = False
+            entry.unseen_reassert = False
+            entry.mismatch = None
+            entry.mismatch_count = 0
+            self._persist(key, entry)
 
     def precede(self, key: str, levels: ProtectionLevels, *, tick: float) -> bool:
         """Accept ``levels`` as what the venue carried before every recorded write.
@@ -326,10 +430,11 @@ class ProtectionLevelGuard:
         tolerance = self._tolerance(levels, tick)
         if any(w.levels.matches(levels, tolerance) for w in entry.writes):
             return False
-        self._adopt_baseline(entry, levels)
-        entry.mismatch = None
-        entry.mismatch_count = 0
-        self._persist(key, entry)
+        with self._atomic(key):
+            self._adopt_baseline(entry, levels)
+            entry.mismatch = None
+            entry.mismatch_count = 0
+            self._persist(key, entry)
         return True
 
     def settle(
@@ -353,11 +458,16 @@ class ProtectionLevelGuard:
             it the answer closes the one unresolved write of those levels; when
             several are unresolved, which one it answers is unknown, so all of
             them stay unresolved until a venue observation decides.
+
+        The venue answered, so the answer holds in memory even when its
+        journal write fails: the write is no longer in flight, and the record
+        is owed and rewritten on the next use (:meth:`_land_or_owe`).
         """
         self._restore()
         entry = self._entries.get(key)
         if entry is None:
             return
+        row_coid, extra = entry.row_coid, entry.extra
         entry.in_flight = max(0, entry.in_flight - 1)
         entry.written_at = self._clock()
         if confirmed is not None:
@@ -390,16 +500,16 @@ class ProtectionLevelGuard:
                 # protection of the bot's on the venue. After a resume the
                 # venue still carries the operator's accepted protection, which
                 # the next observation adopts as the baseline.
-                self.forget(key)
-                return
-        self._persist(key, entry)
+                self._entries.pop(key, None)
+        self._land_or_owe(key, row_coid, extra)
 
     def forget(self, key: str) -> None:
         """Stop guarding ``key``: its protection or position is gone."""
         self._restore()
-        entry = self._entries.pop(key, None)
-        if entry is not None and entry.row_coid is not None and self._store is not None:
-            self._write_extra(entry.row_coid, None)
+        with self._atomic(key):
+            entry = self._entries.pop(key, None)
+            if entry is not None and entry.row_coid is not None and self._store is not None:
+                self._write_extra(entry.row_coid, entry.extra, None)
 
     def observe(
             self,
@@ -435,23 +545,25 @@ class ProtectionLevelGuard:
             # A view one of the bot's post-resume writes explains resolves that
             # write as usual; any other view is the operator's accepted
             # protection and becomes the baseline, older than those writes.
-            entry.rebaseline = False
-            entry.mismatch = None
-            entry.mismatch_count = 0
-            if matching:
-                self._resolve(entry, matching, snapshot=read_started_at is not None)
-            else:
-                self._adopt_baseline(entry, venue)
-            self._persist(key, entry)
+            with self._atomic(key):
+                entry.rebaseline = False
+                entry.mismatch = None
+                entry.mismatch_count = 0
+                if matching:
+                    self._resolve(entry, matching, snapshot=read_started_at is not None)
+                else:
+                    self._adopt_baseline(entry, venue)
+                self._persist(key, entry)
             return False
         if matching:
-            seen_reassert = entry.unseen_reassert
-            entry.unseen_reassert = False
-            entry.mismatch = None
-            entry.mismatch_count = 0
-            if self._resolve(entry, matching, snapshot=read_started_at is not None) \
-                    or seen_reassert:
-                self._persist(key, entry)
+            with self._atomic(key):
+                seen_reassert = entry.unseen_reassert
+                entry.unseen_reassert = False
+                entry.mismatch = None
+                entry.mismatch_count = 0
+                if self._resolve(entry, matching, snapshot=read_started_at is not None) \
+                        or seen_reassert:
+                    self._persist(key, entry)
             return False
         if entry.unseen_reassert and read_started_at is None:
             # A push of the levels the operator left may still arrive after the
@@ -566,18 +678,21 @@ class ProtectionLevelGuard:
         """The key's entry, created or moved onto ``row_coid`` when one is named."""
         entry = self._entries.get(key)
         if entry is None:
-            entry = _Entry(row_coid=row_coid)
+            position = self._position_scoped is not None and self._position_scoped(key)
+            entry = _Entry(row_coid=row_coid,
+                           extra=POSITION_PROTECTION_LEVELS_EXTRA if position
+                           else PROTECTION_LEVELS_EXTRA)
             self._entries[key] = entry
         elif row_coid is not None and row_coid != entry.row_coid:
             if entry.row_coid is not None and self._store is not None:
-                self._write_extra(entry.row_coid, None)
+                self._write_extra(entry.row_coid, entry.extra, None)
             entry.row_coid = row_coid
         return entry
 
     def _persist(self, key: str, entry: _Entry) -> None:
         if entry.row_coid is None or self._store is None:
             return
-        self._write_extra(entry.row_coid, {
+        self._write_extra(entry.row_coid, entry.extra, {
             'key': key,
             'writes': [[w.gen, w.levels.as_list()] for w in entry.writes],
             'confirmed': entry.confirmed,
@@ -588,7 +703,7 @@ class ProtectionLevelGuard:
             'unseen_reassert': entry.unseen_reassert,
         })
 
-    def _write_extra(self, coid: str, value: dict | None) -> None:
+    def _write_extra(self, coid: str, extra: str, value: dict | None) -> None:
         assert self._store is not None
         with self._store.transaction():
             row = self._store.get_order(coid)
@@ -596,12 +711,17 @@ class ProtectionLevelGuard:
                 return
             extras = dict(row.extras or {})
             if value is None:
-                if PROTECTION_LEVELS_EXTRA not in extras:
+                if extra not in extras:
                     return
-                del extras[PROTECTION_LEVELS_EXTRA]
+                del extras[extra]
             else:
-                extras[PROTECTION_LEVELS_EXTRA] = value
+                extras[extra] = value
             self._store.upsert_order(coid, extras=extras)
+
+
+def _copy_entry(entry: _Entry) -> _Entry:
+    """A copy of ``entry`` that later changes to ``entry`` leave untouched."""
+    return replace(entry, writes=list(entry.writes), unresolved=list(entry.unresolved))
 
 
 def rebaseline_after_resume(store_ctx: 'RunContext') -> None:
@@ -622,15 +742,19 @@ def rebaseline_after_resume(store_ctx: 'RunContext') -> None:
     """
     with store_ctx.transaction():
         for row in store_ctx.iter_live_orders():
-            saved = (row.extras or {}).get(PROTECTION_LEVELS_EXTRA)
-            if not isinstance(saved, dict):
-                continue
             extras = dict(row.extras or {})
-            extras[PROTECTION_LEVELS_EXTRA] = {
-                **saved, 'writes': [], 'confirmed': None, 'unresolved': [],
-                'rebaseline': True,
-            }
-            store_ctx.upsert_order(row.client_order_id, extras=extras)
+            flagged = False
+            for extra in _RECORD_EXTRAS:
+                saved = extras.get(extra)
+                if not isinstance(saved, dict):
+                    continue
+                extras[extra] = {
+                    **saved, 'writes': [], 'confirmed': None, 'unresolved': [],
+                    'rebaseline': True,
+                }
+                flagged = True
+            if flagged:
+                store_ctx.upsert_order(row.client_order_id, extras=extras)
 
 
 def _describe(levels: ProtectionLevels) -> str:

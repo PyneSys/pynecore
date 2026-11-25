@@ -13,6 +13,7 @@ engine or broker. Sync-engine integration tests (8-12) wire a minimal
 :class:`_MockBroker` that controls the cancel-pathway return values
 deterministically.
 """
+import sqlite3
 import time
 from dataclasses import dataclass, field
 
@@ -40,6 +41,7 @@ from pynecore.core.broker.models import (
     PartialBracketCancelTentativeStartedEvent,
 )
 from pynecore.core.broker.native_failsafe_manager import FailsafeHealth
+from pynecore.core.broker import software_partial_bracket_engine as spbe_mod
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.software_partial_bracket_engine import (
     PartialBracketLeg,
@@ -59,6 +61,7 @@ from pynecore.core.broker.store_helpers import (
     LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL,
     LEG_KIND_TRAIL_PARTIAL,
+    LEG_STATE_ABORTED_PARENT_GONE,
     LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED,
     LEG_STATE_ARMED,
     LEG_STATE_CANCEL_TENTATIVE,
@@ -1088,6 +1091,173 @@ def __test_cancel_tentative_already_filled_purges_journal_row__(tmp_path):
         engine2 = _mk_engine(_MockBroker(), store_ctx=ctx2)
         assert engine2._cancel_disposition_pending == {}
         assert engine2._forced_cancel_pending == {}
+
+
+def __test_filled_and_closed_resolves_without_restore_booking_or_halt__():
+    """FILLED_AND_CLOSED resolves the tentative like a confirmed cancel.
+
+    The order filled before the cancel and its position has closed since,
+    both booked already: the resolution restores nothing (no pending or
+    armed leg, no fail-safe registration), books no fill, fires no OCA
+    cascade, retires the parent's and its partial exits' state, and the
+    expired stale grace never halts the bot.
+    """
+    events: list[BrokerEvent] = []
+    broker = _MockBroker(
+        raise_on_cancel=[OrderDispositionUnknownError(
+            "cancel timed out", client_order_id='xchg-parent',
+        )],
+        cancel_outcomes=[CancelDispositionOutcome.FILLED_AND_CLOSED],
+    )
+    engine = _mk_engine(broker, events=events, cancel_tentative_stale_grace_s=1.0)
+    intent = _seed_parent_intent_and_leg(engine)
+    child = ExitIntent(
+        pine_id='exit_tp', from_entry=intent.intent_key, symbol=SYMBOL,
+        side='sell', qty=0.5, tp_price=110.0, is_partial_qty_bracket=True,
+    )
+    engine._active_intents[child.intent_key] = child
+    engine._order_mapping[child.intent_key] = ['xchg-child']
+    cascades: list[str] = []
+    engine._cascade_oca_cancel_for_key = cascades.append  # type: ignore[method-assign]
+    closed_before = len(engine._position.closed_trades)
+    engine._dispatch_cancel(intent)
+    meta = engine._cancel_disposition_pending[intent.intent_key]
+    legs = list(engine._partial_bracket_engine.iter_legs())
+    assert [leg.leg_state for leg in legs] == [LEG_STATE_CANCEL_TENTATIVE]
+
+    engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 5_000)
+    engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 6_000)
+
+    assert engine.halted is False
+    assert len(broker.cancel_with_outcome_calls) == 1
+    assert engine._cancel_disposition_pending == {}
+    assert [leg.leg_state for leg in legs] == [LEG_STATE_ABORTED_PARENT_GONE]
+    assert list(engine._partial_bracket_engine.iter_legs()) == []
+    assert engine._native_failsafe_manager.get_state(legs[0].parent_entry_dispatch_ref) is None
+    for key in (intent.intent_key, child.intent_key):
+        assert key not in engine._order_mapping
+        assert key not in engine._envelopes
+        assert key not in engine._active_intents
+    assert engine._position.open_trades == []
+    assert len(engine._position.closed_trades) == closed_before
+    assert cascades == []
+    resolved = [e for e in events
+                if isinstance(e, PartialBracketCancelTentativeResolvedEvent)]
+    assert [(e.outcome, e.via) for e in resolved] == [
+        (CancelDispositionOutcome.FILLED_AND_CLOSED, 'reconcile_retry'),
+    ]
+    assert not [e for e in events
+                if isinstance(e, PartialBracketCancelTentativeDegradedEvent)]
+
+
+@pytest.mark.parametrize('outcome,leg_state', [
+    (CancelDispositionOutcome.CANCEL_CONFIRMED, LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED),
+    (CancelDispositionOutcome.FILLED_AND_CLOSED, LEG_STATE_ABORTED_PARENT_GONE),
+    (CancelDispositionOutcome.ALREADY_FILLED, LEG_STATE_PENDING_ENTRY),
+])
+def __test_a_resolution_a_leg_write_failure_ended_is_finished_with_its_verdict__(
+        monkeypatch, outcome, leg_state):
+    """A storage failure while a resolution writes its legs never strands the parent.
+
+    The parent stays pending with the verdict it got, its leg as the store
+    holds it, and the next cancel-retry pass finishes the same resolution
+    without probing the venue again.
+    """
+    events: list[BrokerEvent] = []
+    broker = _MockBroker(
+        raise_on_cancel=[OrderDispositionUnknownError(
+            "cancel timed out", client_order_id='xchg-parent',
+        )],
+        cancel_outcomes=[outcome],
+    )
+    engine = _mk_engine(broker, events=events)
+    intent = _seed_parent_intent_and_leg(engine)
+    engine._dispatch_cancel(intent)
+    meta = engine._cancel_disposition_pending[intent.intent_key]
+    (leg,) = list(engine._partial_bracket_engine.iter_legs())
+    written: list[str] = []
+    failures = [sqlite3.OperationalError("disk I/O error")]
+
+    def _write(_store_ctx, *, new_leg_state, **_kwargs):
+        if failures:
+            raise failures.pop()
+        written.append(new_leg_state)
+
+    engine._partial_bracket_engine._store_ctx = object()  # type: ignore[assignment]
+    monkeypatch.setattr(spbe_mod, 'update_engine_trigger_partial_leg_state', _write)
+
+    with pytest.raises(sqlite3.OperationalError):
+        engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_000)
+    assert engine._cancel_disposition_pending[intent.intent_key] is meta
+    assert leg.leg_state == LEG_STATE_CANCEL_TENTATIVE
+    assert written == []
+
+    engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 2_000)
+    assert len(broker.cancel_with_outcome_calls) == 1
+    assert engine._cancel_disposition_pending == {}
+    assert written == [leg_state]
+    assert leg.leg_state == leg_state
+    assert (intent.intent_key in engine._envelopes) is (
+        outcome is CancelDispositionOutcome.ALREADY_FILLED)
+    resolved = [e for e in events
+                if isinstance(e, PartialBracketCancelTentativeResolvedEvent)]
+    assert [e.outcome for e in resolved] == [outcome]
+
+
+def __test_filled_and_closed_after_a_restart_is_not_re_armed__(tmp_path):
+    """A restart resolving FILLED_AND_CLOSED retires the durable row for good.
+
+    The cancel was left unsettled by the earlier process, which also booked
+    the order's fill and its close. The restarted run probes once with the
+    stale grace long expired, resolves without a halt and drops the
+    ``cancel_tentative`` row, so a further restart re-arms nothing and
+    probes nothing.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            _run_identity(), script_source="src", script_path="t027.py",
+        )
+        broker = _MockBroker(
+            raise_on_cancel=[OrderDispositionUnknownError(
+                "cancel timed out", client_order_id='xchg-parent',
+            )],
+        )
+        engine = _mk_engine(broker, store_ctx=ctx)
+        intent = _seed_parent_intent_and_leg(engine, with_leg=False)
+        engine._dispatch_cancel(intent)
+        meta = engine._cancel_disposition_pending[intent.intent_key]
+        ctx.close()
+
+        ctx2 = store.open_run(
+            _run_identity(), script_source="src", script_path="t027.py",
+        )
+        broker2 = _MockBroker(
+            cancel_outcomes=[CancelDispositionOutcome.FILLED_AND_CLOSED],
+        )
+        engine2 = _mk_engine(broker2, store_ctx=ctx2, cancel_tentative_stale_grace_s=1.0)
+        assert intent.intent_key in engine2._cancel_disposition_pending
+        engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_200_000)
+        engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_201_000)
+        assert engine2.halted is False
+        assert engine2._cancel_disposition_pending == {}
+        assert intent.intent_key not in engine2._order_mapping
+        assert intent.intent_key not in engine2._envelopes
+        assert len(broker2.cancel_with_outcome_calls) == 1
+        _, pending2 = ctx2.replay()
+        assert pending2 == {}
+        ctx2.close()
+
+        ctx3 = store.open_run(
+            _run_identity(), script_source="src", script_path="t027.py",
+        )
+        broker3 = _MockBroker()
+        engine3 = _mk_engine(broker3, store_ctx=ctx3, cancel_tentative_stale_grace_s=1.0)
+        assert engine3._cancel_disposition_pending == {}
+        assert engine3._forced_cancel_pending == {}
+        assert intent.intent_key not in engine3._order_mapping
+        engine3._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_300_000)
+        assert broker3.cancel_with_outcome_calls == []
+        assert engine3.halted is False
 
 
 def __test_cancel_tentative_stale_grace_rehalts_after_restart__(tmp_path):

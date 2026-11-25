@@ -135,11 +135,14 @@ class BrokerPosition(PositionBase):
         'entry_orders', 'exit_orders',
         # The binding book (see :class:`~pynecore.lib.strategy._EntryBinding`):
         '_entry_book', '_entry_seq', '_order_bindings', 'last_spent_entry_ids',
-        'book_faithful', '_fill_cursors', 'book_moves',
+        'book_faithful', '_fill_cursors', '_fill_places', '_fill_place_seq', 'book_moves',
         # Per-evaluation set of close keys already seen this script run, so a
         # second same-key ``strategy.close()`` THIS evaluation nets onto the
         # first while a next-tick re-issue (calc_on_every_tick) replaces it.
         '_closes_this_eval',
+        # Script cancels recorded while a restart has not rebuilt the book yet
+        # (see :attr:`~BrokerPosition.restart_cancels`).
+        'restart_cancels',
         # === Risk management state (mirrors SimPosition) ===
         # Configuration set by ``strategy.risk.*`` setters:
         'risk_allowed_direction',
@@ -211,6 +214,12 @@ class BrokerPosition(PositionBase):
         # :meth:`~BrokerPosition.fill_cursor`): what a restart compares the
         # journal's fill cursors with to prove the stored book saw every fill.
         self._fill_cursors: dict[str, float] = {}
+        # Client order id / venue order id -> the order's place in the order
+        # the book opened its bindings in (see :meth:`~BrokerPosition.fill_places`),
+        # and the last place given. Unlike the binding sequence it counts on
+        # across processes of a run: the engine seeds it from the store.
+        self._fill_places: dict[str, int] = {}
+        self._fill_place_seq: int = 0
         # How many times a booked fill or an unbooked reduction moved the
         # book in this process: a reading of the venue taken at one count is
         # comparable with the book only while the count stays the same.
@@ -230,6 +239,13 @@ class BrokerPosition(PositionBase):
         # script evaluation; reset by :meth:`begin_evaluation`. See
         # :meth:`_add_order` for the same-eval netting it drives.
         self._closes_this_eval: set['_ExitOrderKey'] = set()
+        # The ids a script cancelled (``None`` for ``strategy.cancel_all``)
+        # while a restart has not rebuilt the persistent orders of the previous
+        # process into this book yet, so the cancel finds nothing to remove.
+        # ``None`` when nothing is recorded: the sync engine switches recording
+        # on for a fresh process and, once it rebuilds the book, applies the
+        # recorded cancels to the rebuilt orders and switches it off.
+        self.restart_cancels: set[str | None] | None = None
 
         # === Risk management state ===
         # Configuration (filled by the ``strategy.risk.*`` setters via
@@ -383,6 +399,8 @@ class BrokerPosition(PositionBase):
     def _remove_order_by_id(self, order_id: str) -> None:
         # TV-verified semantics: ``strategy.cancel(id)`` matches an exit by
         # its ``exit_id`` and an entry by its entry id; no cross-matching.
+        if self.restart_cancels is not None:
+            self.restart_cancels.add(order_id)
         for exit_order in list(self.exit_orders.values()):
             if exit_order.exit_id == order_id:
                 self._remove_order(exit_order)
@@ -390,12 +408,43 @@ class BrokerPosition(PositionBase):
         if entry is not None:
             self._remove_order(entry)
 
+    def apply_restart_cancels(self, rebuilt: 'Iterable[Order]') -> list['Order']:
+        """Apply the recorded restart cancels to the orders a restart rebuilt.
+
+        Removes each of ``rebuilt`` that is still in the book (the same object,
+        so an order the script placed later under the same key is spared) and
+        that a recorded cancel names (:attr:`~BrokerPosition.restart_cancels`):
+        an exit by its exit id, an entry by its entry id, every order for a
+        ``strategy.cancel_all``. Recording stops here.
+
+        :param rebuilt: The orders the restart rebuild put into the book.
+        :return: The removed orders.
+        """
+        cancels = self.restart_cancels or set()
+        self.restart_cancels = None
+        removed: list['Order'] = []
+        if not cancels:
+            return removed
+        for order in rebuilt:
+            if any(held is order for held in self.exit_orders.values()):
+                order_id = order.exit_id
+            elif any(held is order for held in self.entry_orders.values()):
+                order_id = order.order_id
+            else:
+                continue
+            if None in cancels or order_id in cancels:
+                self._remove_order(order)
+                removed.append(order)
+        return removed
+
     def _cancel_all_orders(self) -> None:
         # No ``orderbook`` attribute — that lives on ``SimPosition`` and drives
         # the simulator's price-keyed fill loop, which has no analog in live
         # trading. Clearing the two Pine-side dicts is enough; the next
         # ``OrderSyncEngine.sync()`` diffs against ``_active_intents`` and
         # dispatches a per-id cancel for every previously tracked intent.
+        if self.restart_cancels is not None:
+            self.restart_cancels.add(None)
         self.entry_orders.clear()
         self.exit_orders.clear()
 
@@ -638,7 +687,7 @@ class BrokerPosition(PositionBase):
         # order. The sync engine settles such a fill against the venue position.
         if self.is_non_reducing_exit(event):
             return False
-        self._advance_fill_cursor(event, fill_qty)
+        self._advance_fill_cursor(event)
         self.book_moves += 1
 
         # Commission bookkeeping — realized fee becomes part of net P&L at close
@@ -676,7 +725,8 @@ class BrokerPosition(PositionBase):
                 entry_equity=self.equity,
             )
             self.open_trades.append(trade)
-            self._bind_fill(event.pine_id, event.order.id, signed_delta, fill_price)
+            if self._bind_fill(event.pine_id, event.order.id, signed_delta, fill_price):
+                self._place_fill(event)
             self.open_commission += fee
             # The entry Order stays in ``entry_orders`` for intent stability, but
             # its filled slice now lives in ``open_trades``. Record how much of it
@@ -820,7 +870,8 @@ class BrokerPosition(PositionBase):
                 # Every trade row is closed, so the flipped trade is the whole
                 # position and its binding the whole book.
                 self.clear_entry_book()
-                self._bind_fill(event.pine_id, event.order.id, new_size, fill_price)
+                if self._bind_fill(event.pine_id, event.order.id, new_size, fill_price):
+                    self._place_fill(event)
 
         if self.size == 0.0:
             self.clear_entry_book()
@@ -966,7 +1017,7 @@ class BrokerPosition(PositionBase):
             ))
 
     def _bind_fill(self, entry_id: str | None, order_id: str | None,
-                   size: float, price: float) -> None:
+                   size: float, price: float) -> bool:
         """Book an entry fill in the binding book.
 
         A further slice of an entry order whose binding is still open grows
@@ -978,6 +1029,7 @@ class BrokerPosition(PositionBase):
             has none (an adopted parent).
         :param size: The signed quantity the fill opened.
         :param price: The fill price.
+        :return: Whether the fill opened a new binding.
         """
         binding = self._order_bindings.get(order_id) if order_id is not None else None
         if (binding is not None and binding in self._entry_book
@@ -987,12 +1039,26 @@ class BrokerPosition(PositionBase):
                                    / (binding.init_size + qty))
             binding.init_size += qty
             binding.bound += qty
-            return
+            return False
         self._entry_seq += 1
         binding = _EntryBinding(self._entry_seq, entry_id, size, price)
         self._entry_book.append(binding)
         if order_id is not None:
             self._order_bindings[order_id] = binding
+        return True
+
+    def _place_fill(self, event: 'OrderEvent') -> None:
+        """Give the order of a fill that opened a binding the next place in the fill order.
+
+        :param event: The booked entry fill.
+        """
+        order = event.order
+        keys = [key for key in (order.client_order_id, order.id) if key]
+        if not keys:
+            return
+        self._fill_place_seq += 1
+        for key in keys:
+            self._fill_places[key] = self._fill_place_seq
 
     def _settle_bindings(self, entry_id: str | None, qty: float, price: float) -> None:
         """Settle a closing fill's quantity against the binding book.
@@ -1099,23 +1165,32 @@ class BrokerPosition(PositionBase):
             self._settle_bindings(entry_id, qty, price)
         return list(self.last_spent_entry_ids)
 
-    def _advance_fill_cursor(self, event: 'OrderEvent', fill_qty: float) -> None:
+    def _advance_fill_cursor(self, event: 'OrderEvent') -> None:
         """Note how much of the fill's order the book has now taken in.
 
         Kept under the order's client order id and its venue order id: the
-        sum of the fills booked for it, whichever of its ids each one carried.
-        Only the slices the book applied count, never the cumulative filled
-        quantity the plugin reports on the order: that snapshot can already
-        include a slice whose own event is not booked yet, and a cursor
-        credited with it would let a restart judge a book that missed the
-        slice as complete.
+        sum of the booked fills' :attr:`~OrderEvent.journal_fill_qty`,
+        whichever of its ids each one carried. That is the quantity in the
+        unit the plugin journals the order's ``filled_qty`` in, so a restart
+        compares the cursor with the journal like with like even where the
+        position moves by a different figure (a fee-net spot fill, a
+        contract-quantity inverse fill). Only the slices the book applied
+        count, never the cumulative filled quantity the plugin reports on the
+        order: that snapshot can already include a slice whose own event is
+        not booked yet, and a cursor credited with it would let a restart
+        judge a book that missed the slice as complete. A fill without a
+        journal quantity leaves the cursor where it was: the book cannot say
+        how much of the journal row it covers.
 
         :param event: The fill being booked.
-        :param fill_qty: Its booked quantity.
         """
+        journal_qty = event.journal_fill_qty
+        if journal_qty is None:
+            return
         order = event.order
         keys = [key for key in (order.client_order_id, order.id) if key]
-        booked = max((self._fill_cursors.get(key, 0.0) for key in keys), default=0.0) + fill_qty
+        booked = max((self._fill_cursors.get(key, 0.0) for key in keys),
+                     default=0.0) + journal_qty
         for key in keys:
             self._fill_cursors[key] = booked
 
@@ -1155,6 +1230,40 @@ class BrokerPosition(PositionBase):
         """
         for key in keys:
             self._fill_cursors.pop(key, None)
+
+    def fill_places(self) -> dict[str, int]:
+        """Every entry order's place in the order the book opened its bindings, by order id.
+
+        A booked fill that opens a binding (an order's first fill, or a fill
+        after a close spent its binding) gives its order the next place, under
+        its client order id and its venue order id; a further slice that grows
+        the open binding keeps it. The binding book settles a close that names
+        no entry oldest binding first, so this is the order such a close
+        settles the entries in. The places count on across the processes of a
+        run (:meth:`seed_fill_places`); the binding sequence numbers do not.
+
+        :return: A copy: client / venue order id -> place, larger is later.
+        """
+        return dict(self._fill_places)
+
+    def seed_fill_places(self, places: dict[str, int]) -> None:
+        """Take over places an earlier process of the run gave; later ones go after them.
+
+        A place this process already gave wins over a seeded one.
+
+        :param places: Client / venue order id -> place.
+        """
+        for key, place in places.items():
+            self._fill_places.setdefault(key, place)
+        self._fill_place_seq = max([self._fill_place_seq, *places.values()])
+
+    def drop_fill_places(self, keys: Iterable[str]) -> None:
+        """Drop the places of the given order ids; unknown ids are ignored.
+
+        :param keys: Client / venue order ids.
+        """
+        for key in keys:
+            self._fill_places.pop(key, None)
 
     def entry_book_snapshot(self) -> dict[str, Any]:
         """The whole binding book as a JSON-serializable dict.

@@ -602,6 +602,7 @@ def _legacy_row(ctx: RunContext, *, state: str | None = None,
 @pytest.mark.parametrize("outcome,closed", [
     (CancelDispositionOutcome.CANCEL_CONFIRMED, True),
     (CancelDispositionOutcome.ALREADY_FILLED, True),
+    (CancelDispositionOutcome.FILLED_AND_CLOSED, True),
     (CancelDispositionOutcome.UNKNOWN, False),
 ])
 def __test_a_legacy_oco_row_cancels_its_resting_limit_and_closes__(
@@ -626,7 +627,8 @@ def __test_a_legacy_oco_row_cancels_its_resting_limit_and_closes__(
         assert (eng._stop_limit_engine.get_watch("Long") is None) is closed
         assert broker.entries == []
         # A cancelled LIMIT releases the order for a stop-limit watch; a filled
-        # one stays mapped, its fill is the order's fill.
+        # one stays mapped, its fill is the order's fill, also when its position
+        # has closed since.
         released = outcome is CancelDispositionOutcome.CANCEL_CONFIRMED
         assert ("Long" not in eng.order_mapping) is released
         if not closed:

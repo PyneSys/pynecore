@@ -3,6 +3,8 @@ Behavior tests for the protection level guard
 (:mod:`pynecore.core.broker.protection_guard`) and the plugin-side
 :meth:`BrokerPlugin.report_external_intervention` it reports through.
 """
+import dataclasses
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +13,7 @@ import pytest
 from pynecore.core.broker.exceptions import UnexpectedCancelError
 from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.protection_guard import (
+    POSITION_PROTECTION_LEVELS_EXTRA,
     PROTECTION_LEVELS_EXTRA,
     ProtectionLevelGuard,
     ProtectionLevels,
@@ -431,6 +434,57 @@ def __test_moving_a_key_to_another_row_drops_the_old_copy__(tmp_path: Path):
         assert new is not None and new.extras[PROTECTION_LEVELS_EXTRA]['key'] == "p1"
 
 
+def __test_an_order_record_and_a_position_record_share_a_row__(tmp_path: Path):
+    """A resting entry keeps its own levels beside the position protection homed on it."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "entry-1")
+
+        def position_scoped(key: str) -> bool:
+            return key.startswith("position:")
+
+        def scoped_guard():
+            reports: list[tuple[str, dict]] = []
+            guard = ProtectionLevelGuard(
+                lambda reason, context: reports.append((reason, context)),
+                store_ctx=ctx, clock=_Clock(), position_scoped=position_scoped,
+            )
+            return guard, reports
+
+        guard, _reports = scoped_guard()
+        limit = ProtectionLevels(limit=99.0)
+        _place(guard, "entry-1", limit, row_coid="entry-1")
+        _place(guard, "position:1", BRACKET, row_coid="entry-1")
+        row = ctx.get_order("entry-1")
+        assert row is not None
+        assert row.extras[PROTECTION_LEVELS_EXTRA]['key'] == "entry-1"
+        assert row.extras[POSITION_PROTECTION_LEVELS_EXTRA]['key'] == "position:1"
+
+        # Both survive a restart, each judged against its own levels.
+        restarted, reports = scoped_guard()
+        assert restarted.known("entry-1") and restarted.known("position:1")
+        assert restarted.observe("position:1", ProtectionLevels(stop=97.0, limit=110.0),
+                                 tick=TICK, immediate=True)
+        assert restarted.observe("entry-1", ProtectionLevels(limit=98.0),
+                                 tick=TICK, immediate=True)
+        assert [context['protection_key'] for _, context in reports] == [
+            "position:1", "entry-1"]
+
+        # Forgetting the order's record leaves the position's in place.
+        restarted.forget("entry-1")
+        row = ctx.get_order("entry-1")
+        assert row is not None and PROTECTION_LEVELS_EXTRA not in row.extras
+        assert row.extras[POSITION_PROTECTION_LEVELS_EXTRA]['key'] == "position:1"
+        assert scoped_guard()[0].known("position:1")
+
+        # A resume voids the position record too.
+        rebaseline_after_resume(ctx)
+        row = ctx.get_order("entry-1")
+        assert row is not None
+        saved = row.extras[POSITION_PROTECTION_LEVELS_EXTRA]
+        assert saved['writes'] == [] and saved['rebaseline'] is True
+
+
 def __test_adopt_replaces_the_accepted_levels__():
     guard, reports, _clock = _guard()
     _place(guard, "p1", BRACKET)
@@ -727,3 +781,143 @@ def __test_the_engine_exposes_the_resume_it_applied__(tmp_path: Path):
             'quarantine_resumed'))
         assert payload['resume_ts_ms'] == engine.operator_resume_ts_ms
         resumed.close()
+
+
+def _fail_once(monkeypatch, target, name: str) -> list[int]:
+    """Make ``target.name`` raise a storage error on its next call only."""
+    original = getattr(target, name)
+    calls = [0]
+
+    def failing(*args, **kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, failing)
+    return calls
+
+
+def _record(guard, key: str) -> dict | None:
+    entry = guard._entries.get(key)
+    return dataclasses.asdict(entry) if entry is not None else None
+
+
+def __test_a_failed_expect_write_leaves_the_guard_unchanged__(tmp_path: Path, monkeypatch):
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "leg-1")
+        guard, _reports, _clock = _guard(ctx)
+        _place(guard, "p1", BRACKET, row_coid="leg-1")
+        before = _record(guard, "p1")
+        persisted = ctx.get_order("leg-1").extras[PROTECTION_LEVELS_EXTRA]
+        _fail_once(monkeypatch, ctx, "upsert_order")
+        moved = ProtectionLevels(stop=97.0, limit=110.0)
+        with pytest.raises(sqlite3.OperationalError):
+            guard.expect("p1", moved)
+        assert _record(guard, "p1") == before
+        assert ctx.get_order("leg-1").extras[PROTECTION_LEVELS_EXTRA] == persisted
+
+        gen = guard.expect("p1", moved)
+        guard.settle("p1", moved, write=gen)
+        assert not guard.observe("p1", moved, tick=TICK, immediate=True)
+        restarted, reports, _clock = _guard(ctx)
+        assert not restarted.observe("p1", moved, tick=TICK, immediate=True)
+        assert reports == []
+
+
+def __test_a_failed_first_expect_write_leaves_the_key_unknown__(tmp_path: Path, monkeypatch):
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "leg-1")
+        guard, _reports, _clock = _guard(ctx)
+        _fail_once(monkeypatch, ctx, "upsert_order")
+        with pytest.raises(sqlite3.OperationalError):
+            guard.expect("p1", BRACKET, row_coid="leg-1")
+        assert not guard.known("p1")
+        _place(guard, "p1", BRACKET, row_coid="leg-1")
+        assert ctx.get_order("leg-1").extras[PROTECTION_LEVELS_EXTRA]['key'] == "p1"
+
+
+def __test_a_failed_settle_write_holds_the_answer_and_lands_on_the_next_use__(
+        tmp_path: Path, monkeypatch):
+    """A settle whose write fails still closes the write: observations resume at once."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "leg-1")
+        guard, reports, clock = _guard(ctx)
+        _place(guard, "p1", BRACKET, row_coid="leg-1")
+        moved = ProtectionLevels(stop=97.0, limit=110.0)
+        gen = guard.expect("p1", moved)
+        _fail_once(monkeypatch, ctx, "upsert_order")
+        guard.settle("p1", moved, write=gen)
+        assert guard._entries["p1"].in_flight == 0
+        assert guard._entries["p1"].confirmed == gen
+        assert ctx.get_order("leg-1").extras[PROTECTION_LEVELS_EXTRA]['confirmed'] != gen
+
+        # The next use lands the owed record, and a newer write settles as usual.
+        newer = ProtectionLevels(stop=96.0, limit=110.0)
+        newer_gen = guard.expect("p1", newer)
+        assert ctx.get_order("leg-1").extras[PROTECTION_LEVELS_EXTRA]['unresolved'] == [newer_gen]
+        guard.settle("p1", newer, write=newer_gen)
+        assert guard._entries["p1"].in_flight == 0
+        assert ctx.get_order("leg-1").extras[PROTECTION_LEVELS_EXTRA]['confirmed'] == newer_gen
+        # Observations are judged again: a changed stop is reported.
+        clock.now += 5.0
+        assert guard.observe("p1", ProtectionLevels(stop=50.0, limit=110.0), tick=TICK,
+                             immediate=True)
+        assert len(reports) == 1
+
+
+def __test_a_failed_forget_write_keeps_the_key_guarded__(tmp_path: Path, monkeypatch):
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "leg-1")
+        guard, _reports, _clock = _guard(ctx)
+        _place(guard, "p1", BRACKET, row_coid="leg-1")
+        before = _record(guard, "p1")
+        _fail_once(monkeypatch, ctx, "upsert_order")
+        with pytest.raises(sqlite3.OperationalError):
+            guard.forget("p1")
+        assert _record(guard, "p1") == before
+        assert PROTECTION_LEVELS_EXTRA in ctx.get_order("leg-1").extras
+
+        guard.forget("p1")
+        assert not guard.known("p1")
+        assert PROTECTION_LEVELS_EXTRA not in ctx.get_order("leg-1").extras
+
+
+def __test_a_failed_resolve_write_leaves_the_unknown_write_open__(tmp_path: Path, monkeypatch):
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "leg-1")
+        guard, reports, clock = _guard(ctx)
+        _place(guard, "p1", BRACKET, row_coid="leg-1")
+        unknown = ProtectionLevels(stop=97.0, limit=110.0)
+        guard.expect("p1", unknown)
+        guard.settle("p1", None)
+        before = _record(guard, "p1")
+        _fail_once(monkeypatch, ctx, "upsert_order")
+        with pytest.raises(sqlite3.OperationalError):
+            guard.observe("p1", unknown, tick=TICK, immediate=True)
+        assert _record(guard, "p1") == before
+
+        assert not guard.observe("p1", unknown, tick=TICK, immediate=True)
+        assert ctx.get_order("leg-1").extras[PROTECTION_LEVELS_EXTRA]['unresolved'] == []
+        clock.now += 5.0
+        assert guard.observe("p1", BRACKET, tick=TICK, immediate=True)
+        assert len(reports) == 1
+
+
+def __test_a_failed_restore_read_is_retried_on_next_use__(tmp_path: Path, monkeypatch):
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "leg-1")
+        guard, _reports, _clock = _guard(ctx)
+        _place(guard, "p1", BRACKET, row_coid="leg-1")
+
+        restarted, _reports, _clock = _guard(ctx)
+        _fail_once(monkeypatch, ctx, "iter_live_orders")
+        with pytest.raises(sqlite3.OperationalError):
+            restarted.known("p1")
+        assert restarted.known("p1")

@@ -3309,3 +3309,611 @@ def __test_a_late_write_of_an_older_latch_does_not_mark_the_escalation_persisted
         assert not engine._quarantine_persisted, (  # noqa
             "the resume watch must still re-assert the escalation"
         )
+
+
+# === Storage failures while a fill is booked ==============================
+
+def _entry_fill_event(coid: str, fill_id: str) -> OrderEvent:
+    return OrderEvent(
+        order=ExchangeOrder(
+            id="xchg-filled", symbol=SYMBOL, side="buy", order_type=OrderType.LIMIT,
+            qty=1.0, filled_qty=1.0, remaining_qty=0.0, price=50_000.0,
+            stop_price=None, average_fill_price=50_000.0, status=OrderStatus.FILLED,
+            timestamp=time.time(), fee=0.0, fee_currency="", client_order_id=coid,
+        ),
+        event_type='filled', fill_price=50_000.0, fill_qty=1.0,
+        timestamp=time.time(), pine_id="L", leg_type=LegType.ENTRY, fill_id=fill_id,
+    )
+
+
+def __test_a_storage_failure_before_a_fill_is_booked_keeps_the_fill__(
+        tmp_path: Path,
+) -> None:
+    """A fill whose routing a failed write ended is booked on the retry, once."""
+    import sqlite3
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, pos, coid = _park_entry(_MockBroker(), ctx)
+        real_unpark = ctx.record_unpark
+        failed: list[str] = []
+
+        def record_unpark(c: str) -> None:
+            if not failed:
+                failed.append(c)
+                raise sqlite3.OperationalError("disk I/O error")
+            real_unpark(c)
+
+        ctx.record_unpark = record_unpark  # type: ignore[method-assign]
+        engine.on_order_event(_entry_fill_event(coid, "EXEC-1"))
+        engine.sync(BAR_TS + 60_000)
+        assert failed == [coid]
+        assert pos.size == 0.0
+        assert not engine.halted
+
+        engine.sync(BAR_TS + 120_000)
+        assert pos.size == 1.0
+        assert coid not in engine.pending_verification
+        assert coid not in ctx.replay()[1]
+        # The broker's redelivery of the same execution is still a duplicate.
+        engine.on_order_event(_entry_fill_event(coid, "EXEC-1"))
+        engine.sync(BAR_TS + 180_000)
+        assert pos.size == 1.0
+        ctx.close()
+
+
+def __test_a_binding_book_that_keeps_failing_quarantines_after_the_bounded_retry__(
+        tmp_path: Path,
+) -> None:
+    """A book write that never lands counts toward the storage quarantine of every sync."""
+    from pynecore.core.broker.storage import ENTRY_BOOK_EVENT_KIND
+    from pynecore.core.broker.sync_engine import STORAGE_FAILURE_HALT_SYNCS
+    import sqlite3
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, pos, coid = _park_entry(_MockBroker(), ctx)
+        real_log_event = ctx.log_event
+
+        def log_event(kind, *args, **fields):
+            if kind == ENTRY_BOOK_EVENT_KIND:
+                raise sqlite3.OperationalError("database or disk is full")
+            return real_log_event(kind, *args, **fields)
+
+        ctx.log_event = log_event  # type: ignore[method-assign]
+        engine.on_order_event(_entry_fill_event(coid, "EXEC-1"))
+        ts = BAR_TS
+        for _ in range(STORAGE_FAILURE_HALT_SYNCS - 1):
+            ts += 60_000
+            engine.sync(ts)
+            assert not engine.quarantined
+        assert pos.size == 1.0
+        engine.sync(ts + 60_000)
+        assert engine.quarantined
+        assert not engine.halted
+        ctx.log_event = real_log_event  # type: ignore[method-assign]
+        ctx.close()
+
+
+def __test_a_binding_book_that_lands_again_resets_the_storage_count__(
+        tmp_path: Path,
+) -> None:
+    """Once the owed book lands, the failed syncs before it no longer count."""
+    from pynecore.core.broker.storage import ENTRY_BOOK_EVENT_KIND
+    from pynecore.core.broker.sync_engine import STORAGE_FAILURE_HALT_SYNCS
+    import sqlite3
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos, coid = _park_entry(_MockBroker(), ctx)
+        real_log_event = ctx.log_event
+        failing = {'on': True}
+
+        def log_event(kind, *args, **fields):
+            if failing['on'] and kind == ENTRY_BOOK_EVENT_KIND:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_log_event(kind, *args, **fields)
+
+        ctx.log_event = log_event  # type: ignore[method-assign]
+        engine.on_order_event(_entry_fill_event(coid, "EXEC-1"))
+        ts = BAR_TS
+        for _ in range(STORAGE_FAILURE_HALT_SYNCS - 1):
+            ts += 60_000
+            engine.sync(ts)
+        failing['on'] = False
+        engine.sync(ts + 60_000)
+        failing['on'] = True
+        for _ in range(STORAGE_FAILURE_HALT_SYNCS - 1):
+            ts += 60_000
+            engine.sync(ts + 60_000)
+        assert not engine.halted
+        ctx.log_event = real_log_event  # type: ignore[method-assign]
+        ctx.close()
+
+
+def _fail_once(obj: object, name: str) -> list[tuple]:
+    """Make ``obj.name`` raise a storage error on its first call; return the calls."""
+    import sqlite3
+    real = getattr(obj, name)
+    calls: list[tuple] = []
+
+    def _call(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    setattr(obj, name, _call)
+    return calls
+
+
+def __test_a_failed_envelope_write_takes_no_envelope_and_sends_nothing__(
+        tmp_path: Path,
+) -> None:
+    """An envelope whose journal write fails is not taken, and nothing is sent under it."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _MockBroker()
+        engine, pos = _mk_engine(broker, ctx)
+        calls = _fail_once(ctx, 'record_envelope')
+        pos.entry_orders["L"] = Order("L", 1.0, order_type=_order_type_entry, limit=50_000.0)
+        engine.sync(BAR_TS)
+        assert len(calls) == 1
+        assert broker.entry_calls == []
+        assert "L" not in engine._envelopes
+        assert not engine.halted
+
+        engine.sync(BAR_TS)
+        assert len(broker.entry_calls) == 1
+        envelopes, _pending = ctx.replay()
+        assert "L" in envelopes
+        assert (broker.entry_calls[0].client_order_id('e')
+                == engine._envelopes["L"].client_order_id('e'))
+        ctx.close()
+
+
+def __test_a_failed_park_write_keeps_the_park_and_lands_it_next_sync__(
+        tmp_path: Path,
+) -> None:
+    """The park of an unknown disposition holds when its row fails, and the row is owed."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _MockBroker()
+        calls = _fail_once(ctx, 'record_park')
+        engine, _pos, coid = _park_entry(broker, ctx)
+        assert len(calls) == 1
+        assert coid in engine.pending_verification
+        assert coid not in ctx.replay()[1]
+        assert not engine.halted
+
+        engine.sync(BAR_TS + 60_000)
+        assert coid in ctx.replay()[1]
+        assert coid in engine.pending_verification
+        # The parked entry is not sent again.
+        assert len(broker.entry_calls) == 1
+        assert engine._owed_store_writes == []
+        ctx.close()
+
+
+def __test_a_failed_unpark_of_a_recovered_park_is_owed_and_lands_before_the_next_send__(
+        tmp_path: Path,
+) -> None:
+    """A recovered park's failed unpark keeps the adoption and lands before the next send."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _MockBroker()
+        engine, pos, coid = _park_entry(broker, ctx)
+        live = broker._mk_order(engine.pending_verification[coid])
+        broker.open_orders = [live]
+        calls = _fail_once(ctx, 'record_unpark')
+        pos.entry_orders["S"] = Order("S", 1.0, order_type=_order_type_entry, limit=49_000.0)
+        engine.sync(BAR_TS + 60_000)
+        assert calls[0] == (coid,)
+        assert live.id in engine.order_mapping["L"]
+        assert coid not in engine.pending_verification
+        # The failed retirement did not end the cycle: the rest of it ran,
+        # and the owed unpark landed before the new entry's envelope.
+        assert "S" in engine.active_intents
+        assert len(broker.entry_calls) == 2
+        assert coid not in ctx.replay()[1]
+        assert engine._owed_store_writes == []
+
+        engine.sync(BAR_TS + 120_000)
+        assert coid not in ctx.replay()[1]
+        assert len(broker.entry_calls) == 2
+        ctx.close()
+
+
+def __test_a_failed_complete_marker_never_resurrects_the_retired_anchor__(
+        tmp_path: Path,
+) -> None:
+    """A retired envelope whose ``complete`` write failed is not replayed back by the next sync."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _MockBroker()
+        engine, pos = _mk_engine(broker, ctx)
+        pos.entry_orders["L"] = Order("L", 1.0, order_type=_order_type_entry, limit=50_000.0)
+        engine.sync(BAR_TS)
+        assert "L" in ctx.replay()[0]
+        calls = _fail_once(ctx, 'record_complete')
+        del pos.entry_orders["L"]
+        engine.sync(BAR_TS + 60_000)
+        assert len(broker.cancel_calls) == 1
+        assert calls and calls[0] == ("L",)
+        assert "L" not in engine._envelopes
+        assert not engine.halted
+
+        engine.sync(BAR_TS + 120_000)
+        assert "L" not in ctx.replay()[0]
+        assert "L" not in engine._persisted_envelope_anchors
+        assert engine._owed_store_writes == []
+        ctx.close()
+
+
+def __test_an_owed_write_that_keeps_failing_quarantines_after_the_bounded_retry__(
+        tmp_path: Path,
+) -> None:
+    """An owed write counts toward the storage bound until it lands."""
+    import sqlite3
+    from pynecore.core.broker.sync_engine import STORAGE_FAILURE_HALT_SYNCS
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _MockBroker()
+        real_park = ctx.record_park
+
+        def record_park(*args, **kwargs):
+            raise sqlite3.OperationalError("database or disk is full")
+
+        ctx.record_park = record_park  # type: ignore[method-assign]
+        engine, _pos, coid = _park_entry(broker, ctx)
+        ts = BAR_TS
+        for _ in range(STORAGE_FAILURE_HALT_SYNCS - 2):
+            ts += 60_000
+            engine.sync(ts)
+            assert not engine.quarantined
+        ts += 60_000
+        engine.sync(ts)
+        assert engine.quarantined
+        assert not engine.halted
+        ctx.record_park = real_park  # type: ignore[method-assign]
+        engine.sync(ts + 60_000)
+        assert coid in ctx.replay()[1]
+        assert engine._owed_store_writes == []
+        ctx.close()
+
+
+def __test_a_failed_row_close_after_a_landed_stray_cancel_is_owed_not_sent_again__(
+        tmp_path: Path,
+) -> None:
+    """The row close of a cancelled stray is owed: the cancel goes out once, the row closes."""
+    broker = _MockBroker()
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(broker, ctx)
+        engine.sync(BAR_TS)
+        coid = "prior-run-resting-entry"
+        ctx.upsert_order(
+            coid, symbol=SYMBOL, side="buy", qty=1.0, state="live",
+            intent_key="Z", exchange_order_id="xchg-stray", pine_entry_id="Z",
+        )
+        broker.open_orders = [ExchangeOrder(
+            id="xchg-stray", symbol=SYMBOL, side="buy",
+            order_type=OrderType.LIMIT, qty=1.0, filled_qty=0.0,
+            remaining_qty=1.0, price=49_000.0, stop_price=None,
+            average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=0.0, fee=0.0, fee_currency="", client_order_id=coid,
+        )]
+        broker.position = None
+        calls = _fail_once(ctx, 'close_order')
+
+        engine.reconcile()
+        assert broker.cancel_broker_order_calls == ["xchg-stray"]
+        assert calls == [(coid,)]
+        assert [row.client_order_id for row in ctx.iter_live_orders()] == [coid]
+
+        # The venue no longer shows the cancelled order; the row lands with
+        # the next sync and the cancel is not sent again.
+        broker.open_orders = []
+        engine.sync(BAR_TS + 60_000)
+        assert broker.cancel_broker_order_calls == ["xchg-stray"]
+        assert not [row for row in ctx.iter_live_orders() if row.client_order_id == coid]
+        assert engine._owed_store_writes == []
+        ctx.close()
+
+
+def __test_a_plugin_verdict_before_an_owed_park_row_lands_with_the_row__(
+        tmp_path: Path,
+) -> None:
+    """A verdict the plugin records while the park row is owed is not lost."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _MockBroker()
+        _fail_once(ctx, 'record_park')
+        engine, _pos, coid = _park_entry(broker, ctx)
+        assert coid not in ctx.replay()[1]
+
+        ctx.record_resolution(coid, 'rejected')
+        # A later 'attached' for another leg never overrides the rejection.
+        ctx.record_resolution(coid, 'attached')
+        engine.sync(BAR_TS + 60_000)
+        engine.sync(BAR_TS + 120_000)
+        assert coid not in engine.pending_verification
+        assert len(broker.entry_calls) == 2, "the rejected entry is sent again"
+        assert "L" in engine.order_mapping
+        ctx.close()
+
+
+def __test_a_park_row_that_lands_on_time_keeps_no_stale_verdict__(
+        tmp_path: Path,
+) -> None:
+    """Once the park row landed, a later re-park of the same id starts unresolved."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.await_park_row("c-1")
+        ctx.record_resolution("c-1", 'attached')
+        ctx.record_park("c-1", "L")
+        assert ctx.replay()[1]["c-1"].resolution == 'attached'
+        ctx.record_park("c-1", "L")
+        assert ctx.replay()[1]["c-1"].resolution is None
+        ctx.close()
+
+
+# === Journal writes that fail after the venue call ========================
+
+
+@dataclass
+class _JournalEntryHooks:
+    """Entry hooks of a venue that answers every submit with a reference."""
+    reject_on_confirm: bool = False
+
+    async def submit(self, *, coid, intent, qty):
+        from pynecore.core.broker.journal import SubmitOutcome
+        return SubmitOutcome(server_ref=f"ref-{coid}")
+
+    async def confirm_submission(self, *, coid, intent, server_ref):
+        from pynecore.core.broker.exceptions import ExchangeOrderRejectedError
+        from pynecore.core.broker.journal import ConfirmOutcome
+        if self.reject_on_confirm:
+            raise ExchangeOrderRejectedError("refused on confirm")
+        return ConfirmOutcome(exchange_id=f"venue-{coid}", is_filled=False)
+
+    def exchange_order_from_state(self, *, row, intent):
+        return ExchangeOrder(
+            id=row.exchange_order_id or "", symbol=row.symbol, side=row.side,
+            order_type=OrderType.LIMIT, qty=row.qty, filled_qty=0.0,
+            remaining_qty=row.qty, price=intent.limit, stop_price=None,
+            average_fill_price=None, status=OrderStatus.OPEN, timestamp=0.0,
+            fee=0.0, fee_currency="", client_order_id=row.client_order_id,
+        )
+
+    async def resume_pending_dispatch(self, *, row, refs):  # pragma: no cover — unused
+        raise NotImplementedError
+
+
+@dataclass
+class _JournalingBroker(_MockBroker):
+    """A broker whose entries run through the Core's dispatch journal."""
+    store_ctx: RunContext | None = None
+    hooks: _JournalEntryHooks = field(default_factory=_JournalEntryHooks)
+
+    async def execute_entry(self, envelope):
+        from pynecore.core.broker.journal import DispatchJournal
+        from pynecore.core.broker.store_helpers import ENTRY_KIND_WORKING
+        self.entry_calls.append(envelope)
+        assert self.store_ctx is not None
+        intent = envelope.intent
+        return await DispatchJournal(self.store_ctx).run_entry(
+            coid=envelope.client_order_id('e'), intent=intent, qty=intent.qty,
+            kind=ENTRY_KIND_WORKING, hooks=self.hooks,
+        )
+
+
+def _journal_entry(ctx: RunContext, broker: _JournalingBroker) -> tuple[
+        OrderSyncEngine, BrokerPosition]:
+    broker.store_ctx = ctx
+    engine, pos = _mk_engine(broker, ctx)
+    pos.entry_orders["L"] = Order("L", 1.0, order_type=_order_type_entry, limit=50_000.0)
+    engine.sync(BAR_TS)
+    return engine, pos
+
+
+def _fail_times(obj: object, name: str, times: int) -> list[tuple]:
+    """Make ``obj.name`` raise a storage error on its first ``times`` calls."""
+    import sqlite3
+    real = getattr(obj, name)
+    calls: list[tuple] = []
+
+    def _call(*args, **kwargs):
+        calls.append(args)
+        if len(calls) <= times:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    setattr(obj, name, _call)
+    return calls
+
+
+def __test_a_failed_journal_write_after_the_venue_call_leaves_a_row_the_run_resolves__(
+        tmp_path: Path,
+) -> None:
+    """The command row of a parked journal failure is the running resolver's to settle.
+
+    The venue took the submit and returned its reference, then the journal
+    write of that reference failed. The dispatch parks, and its row is
+    ``disposition_unknown`` with the reference, so this process's resolver
+    looks it up; a ``submitted`` row would wait for a restart.
+    """
+    from pynecore.core.broker.parked_dispatch import awaits_venue_answer
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _JournalingBroker()
+        calls = _fail_times(ctx, 'add_ref', 1)
+        engine, _pos = _journal_entry(ctx, broker)
+        coid = broker.entry_calls[0].client_order_id('e')
+        assert len(calls) == 2
+        assert coid in engine.pending_verification
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == STATE_DISPOSITION_UNKNOWN
+        assert dict(ctx.iter_refs_for_coid(coid)) == {'deal_reference': f"ref-{coid}"}
+        assert awaits_venue_answer(ctx, row)
+        assert engine._owed_store_writes == []
+
+        rejected = asyncio.run(ParkedDispatchResolver(
+            venue='Test', log=logging.getLogger(__name__), grace_s=0.0,
+            misses_to_reject=1, clock=lambda: 4_000_000_000.0,
+        ).resolve(ctx, _absent))
+        assert rejected == [coid]
+        engine.sync(BAR_TS + 60_000)
+        assert coid not in engine.pending_verification
+        assert len(broker.entry_calls) == 2, "the refused entry is sent again"
+        ctx.close()
+
+
+async def _absent(_row: OrderRow) -> ParkedVerdict:
+    return ParkedVerdict(ParkedOutcome.ABSENT)
+
+
+def __test_a_failed_disposition_mark_after_the_venue_call_is_owed__(
+        tmp_path: Path,
+) -> None:
+    """When marking the row fails too, the mark is owed and lands with the next sync."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _JournalingBroker()
+        _fail_times(ctx, 'add_ref', 2)
+        engine, _pos = _journal_entry(ctx, broker)
+        coid = broker.entry_calls[0].client_order_id('e')
+        assert coid in engine.pending_verification
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'submitted'
+        # The park queues behind the owed mark, so the store sees them in order.
+        assert [label for label, _write in engine._owed_store_writes] == [
+            f"disposition_unknown {coid}", f"park {coid}"]
+
+        engine.sync(BAR_TS + 60_000)
+        assert engine._owed_store_writes == []
+        assert coid in ctx.replay()[1]
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == STATE_DISPOSITION_UNKNOWN
+        assert dict(ctx.iter_refs_for_coid(coid)) == {'deal_reference': f"ref-{coid}"}
+        assert len(broker.entry_calls) == 1
+        ctx.close()
+
+
+def __test_a_venue_reject_whose_booking_failed_closes_the_row__(
+        tmp_path: Path,
+) -> None:
+    """A confirm reject whose journal booking failed still retires the command row.
+
+    The engine gets the reject; a row left ``server_ref_seen`` and live would
+    read as an order the run still owns.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _JournalingBroker(hooks=_JournalEntryHooks(reject_on_confirm=True))
+        _fail_times(ctx, 'close_order', 1)
+        engine, _pos = _journal_entry(ctx, broker)
+        coid = broker.entry_calls[0].client_order_id('e')
+        row = ctx.get_order(coid)
+        assert row is not None
+        assert row.state == 'rejected' and row.closed_ts_ms is not None
+        assert coid not in engine.pending_verification
+        assert engine._owed_store_writes == []
+        ctx.close()
+
+
+
+def __test_a_resolver_verdict_before_the_engine_parks_the_dispatch_is_kept__(
+        tmp_path: Path,
+) -> None:
+    """A resolver that settles the command row before the engine's park still reaches the park.
+
+    The journal turns the row ``disposition_unknown`` and raises; before the
+    engine parks the dispatch, this process's resolver finds the order absent
+    and rejects it. The verdict lands with the park row, so the next sync
+    drops the park and sends the entry again.
+    """
+    from pynecore.core.broker.exceptions import OrderDispositionUnknownError
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        broker = _JournalingBroker()
+        _fail_times(ctx, 'add_ref', 1)
+        resolved: list[list[str]] = []
+        journaled_entry = broker.execute_entry
+
+        async def execute_entry(envelope):
+            try:
+                return await journaled_entry(envelope)
+            except OrderDispositionUnknownError:
+                resolved.append(await ParkedDispatchResolver(
+                    venue='Test', log=logging.getLogger(__name__), grace_s=0.0,
+                    misses_to_reject=1, clock=lambda: 4_000_000_000.0,
+                ).resolve(ctx, _absent))
+                raise
+
+        broker.execute_entry = execute_entry  # type: ignore[method-assign]
+        engine, _pos = _journal_entry(ctx, broker)
+        coid = broker.entry_calls[0].client_order_id('e')
+        assert resolved == [[coid]]
+        assert coid in engine.pending_verification
+        assert {rec.coid: rec.resolution for rec in ctx.iter_pending_resolutions()} == {
+            coid: 'rejected'}
+
+        engine.sync(BAR_TS + 60_000)
+        assert coid not in engine.pending_verification
+        assert len(broker.entry_calls) == 2, "the refused entry is sent again"
+        ctx.close()
+
+
+
+def __test_a_verdict_slot_never_hides_a_verdict_from_a_landed_park_row__(
+        tmp_path: Path,
+) -> None:
+    """A verdict slot opened for a coid whose park row exists still updates that row."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.record_park("c-1", "L")
+        ctx.await_park_row("c-1")  # e.g. the journal marks the row again
+        ctx.record_resolution("c-1", 'rejected')
+        assert {rec.coid: rec.resolution for rec in ctx.iter_pending_resolutions()} == {
+            "c-1": 'rejected'}
+        ctx.close()
+
+
+class _VerdictAtParkCommit(dict):
+    """A verdict marker map whose removal lets a plugin thread record a verdict first.
+
+    The plugin's ``record_resolution`` runs on another thread right as the
+    park's commit gives the marker up; ``joined`` tells whether it could
+    finish before the removal.
+    """
+
+    def __init__(self, ctx: RunContext, coid: str) -> None:
+        super().__init__()
+        self._ctx = ctx
+        self._coid = coid
+        self.joined: bool | None = None
+
+    def pop(self, key, *default):
+        import threading
+        if key == self._coid and self.joined is None:
+            plugin = threading.Thread(
+                target=self._ctx.record_resolution, args=(self._coid, 'rejected'))
+            plugin.start()
+            plugin.join(timeout=0.5)
+            self.joined = not plugin.is_alive()
+            self._plugin = plugin
+        return super().pop(key, *default)
+
+
+def __test_a_plugin_verdict_at_the_park_commit_is_kept__(tmp_path: Path) -> None:
+    """A verdict the plugin records as the owed park row commits is not dropped with its marker."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        marker = _VerdictAtParkCommit(ctx, "c-1")
+        ctx._verdicts_awaiting_park = marker  # type: ignore[assignment]
+        ctx.await_park_row("c-1")
+        ctx.record_park("c-1", "L")
+        # The plugin waited for the park's commit and its marker removal.
+        assert marker.joined is False
+        marker._plugin.join()
+        resolutions = {rec.coid: rec.resolution for rec in ctx.iter_pending_resolutions()}
+        assert resolutions == {"c-1": 'rejected'}
+        ctx.close()

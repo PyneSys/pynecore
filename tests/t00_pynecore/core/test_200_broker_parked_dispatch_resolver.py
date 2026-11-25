@@ -7,6 +7,7 @@ writes that must land together, or a dispatch stays parked for the run.
 """
 import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -264,3 +265,32 @@ def __test_an_inherited_dispatch_that_landed_is_no_longer_in_flight__(tmp_path: 
                          filled_qty=1.0)
 
         assert inherited_dispatch_in_flight(ctx, KEY) is None
+
+
+def __test_a_failed_inherited_park_parks_none_and_the_next_call_parks_all__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inherited parks are one write: none is left parked but unreported."""
+    second = 'coid-inherited-2'
+    with BrokerStore(tmp_path / 'broker.sqlite', plugin_name='Test') as store:
+        earlier = _open_ctx(store)
+        _write_entry(earlier, INHERITED)
+        _write_entry(earlier, second, key='second')
+        earlier.close()
+        ctx = _open_ctx(store)
+        original = ctx.record_park
+        calls = [0]
+
+        def failing(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise sqlite3.OperationalError('disk I/O error')
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ctx, 'record_park', failing)
+        with pytest.raises(sqlite3.OperationalError):
+            park_inherited_dispatches(ctx)
+        assert ctx.replay()[1] == {}
+
+        assert sorted(park_inherited_dispatches(ctx)) == sorted([INHERITED, second])
+        assert park_inherited_dispatches(ctx) == []

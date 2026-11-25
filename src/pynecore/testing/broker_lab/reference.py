@@ -366,6 +366,7 @@ class ReferenceVenueProfile:
             event_type="filled" if remaining == 0.0 else "partial",
             fill_price=price,
             fill_qty=qty,
+            journal_fill_qty=qty,
             timestamp=runner.now_ms / 1000.0,
             pine_id=record.pine_id,
             leg_type=record.leg_type,

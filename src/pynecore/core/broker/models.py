@@ -316,6 +316,21 @@ class OrderEvent:
     its persisted ``filled_qty`` cursor that no other path re-emits the same
     execution. A ``None`` ``fill_id`` is a no-op for the gate (applied as-is),
     so it must never be used for a path that a duplicate could also reach.
+
+    **journal_fill_qty is the same slice in the journal's own unit.** The
+    quantity this execution adds to the ``filled_qty`` of its order's row in
+    the plugin's journal (:class:`~pynecore.core.broker.storage.OrderRow`),
+    measured the way the plugin journals it: gross of a base-coin fee where
+    ``fill_qty`` is fee-net, in contracts where ``fill_qty`` is converted to
+    base units. The engine sums it per order (the binding book's fill cursor,
+    :meth:`~BrokerPosition.fill_cursor`), and a restart resumes the stored
+    book only when no journal row shows more ``filled_qty`` than that sum,
+    so both sides of the comparison are in one unit on every venue. A plugin
+    sets it on every fill event (``fill_qty`` set), whether or not the order
+    has a journal row; where the journal unit is the position unit it equals
+    ``fill_qty``. ``None`` on a fill is a contract violation: the fill is
+    booked, but its order's cursor does not move, so a restart cannot vouch
+    for the book and adopts the position from the journal.
     """
     order: ExchangeOrder
     event_type: str  # "created" | "amended" | "filled" | "partial" | "cancelled" | "rejected"
@@ -332,6 +347,9 @@ class OrderEvent:
     # across every path that can surface the same execution; the sync engine's
     # duplicate-fill gate keys on it. ``None`` => no-op for the gate.
     fill_id: str | None = None
+    # This fill's quantity in the unit of its order's journal row
+    # ``filled_qty`` (see class docstring). Set on every fill event.
+    journal_fill_qty: float | None = None
     # Set only on ``cancelled`` events synthesised by the
     # :class:`~pynecore.core.broker.disappearance.DisappearanceTracker` after
     # it has already applied the ``on_unexpected_cancel`` policy for the
@@ -442,6 +460,16 @@ class PositionLeg:
         mapping is uncertain. A ``None`` leg is covered by every exit of its
         side, with the levels merged; a wrong id makes an exit protect the
         wrong leg.
+    :ivar venue_qty: The size of the venue position this leg lives in, when
+        that is larger than ``qty``: the venue holds exposure on the same
+        position that this run does not own (another run or a manual trade
+        sharing a one-leg-per-side position), and ``qty`` is this run's share
+        only. ``None`` when the venue position is exactly ``qty``. A
+        position-attribute bracket fires on the whole venue position, so the
+        core never lets one stand in for a protection of ``qty`` alone: it
+        asks for a sized bracket where the venue has one
+        (:attr:`ExchangeCapabilities.sized_leg_bracket`), and guards the leg
+        in software otherwise.
     """
     leg_id: str
     symbol: str
@@ -451,6 +479,7 @@ class PositionLeg:
     open_time: float
     unrealized_pnl: float = 0.0
     entry_id: str | None = None
+    venue_qty: float | None = None
 
 
 @dataclass
@@ -610,6 +639,25 @@ class ExchangeCapabilities:
     # skip). Mutually exclusive with a declared spot inventory port — the
     # spot ledger models long-only exposure.
     short_selling: CapabilityLevel = CapabilityLevel.UNSUPPORTED
+
+    # === Sized leg bracket (one-way emulation) ===
+    # Read only for a plugin that exposes a ``position_port``: can the
+    # protective bracket of ONE leg (``PositionPort.amend_bracket``) be limited
+    # to a quantity below the size of the venue position it is written on?
+    # The core needs that for a leg an opposing leg partly offsets (a bracket
+    # on the whole leg would flip the net position when it fires) and for a
+    # leg whose venue position also holds exposure the run does not own
+    # (``PositionLeg.venue_qty``).
+    # NATIVE = ``amend_bracket`` honours a ``qty`` below the venue position
+    # size: the protection it writes closes at most ``qty`` when it fires.
+    # SOFTWARE / UNSUPPORTED = the venue bracket always covers the whole
+    # position. The core then never writes a venue bracket on such a leg: its
+    # software leg guard watches the price and closes exactly the protected
+    # quantity with ``PositionPort.close_leg``. That protection lives only
+    # while the bot runs. A plugin whose venue cannot size the bracket declares
+    # SOFTWARE; the default UNSUPPORTED is handled the same way, so a port
+    # that never declares the field is still safe.
+    sized_leg_bracket: CapabilityLevel = CapabilityLevel.UNSUPPORTED
 
 
 # === Pine Script intents ===
@@ -795,9 +843,10 @@ class CloseIntent:
     target_entry_id: str | None = None
     target_position_coid: str | None = None
     target_exchange_id: str | None = None
-    # A defensive close of one hedge leg (the leg the venue refused to
-    # protect): the one-way emulator reduces this leg and no other, so a leg
-    # that already closed or shrank never makes it liquidate a sibling leg.
+    # A close of one hedge leg — a defensive close (the leg the venue refused
+    # to protect) or a fired software leg guard (``leg_guard``): the one-way
+    # emulator reduces this leg and no other, so a leg that already closed or
+    # shrank never makes it liquidate a sibling leg.
     target_leg_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -816,7 +865,7 @@ class CloseIntent:
             return
         if self.synthetic_kind not in {
             'partial_trigger', 'marketable_exit', 'defensive_close',
-            'reversal_close',
+            'reversal_close', 'leg_guard',
         }:
             raise ValueError(
                 f"CloseIntent.synthetic_kind is invalid: {self.synthetic_kind!r}"
@@ -835,6 +884,19 @@ class CloseIntent:
                     or self.target_leg_id is not None):
                 raise ValueError(
                     "CloseIntent reversal_close is symbol-wide and takes no targets."
+                )
+            return
+        if self.synthetic_kind == 'leg_guard':
+            # A fired software leg guard closes the protected quantity of ONE
+            # leg. The fill settles ``target_entry_id`` when every exit that
+            # owned the leg protects the same entry, and walks the book
+            # unbound otherwise.
+            if (not self.target_leg_id
+                    or self.target_position_coid is not None
+                    or self.target_exchange_id is not None):
+                raise ValueError(
+                    "CloseIntent leg_guard requires target_leg_id and takes no "
+                    "position COID or exchange id."
                 )
             return
         if self.synthetic_kind in {'partial_trigger', 'marketable_exit'}:
@@ -1938,7 +2000,7 @@ class CancelDispositionOutcome(StrEnum):
 
     Returned by :meth:`BrokerPlugin.execute_cancel_with_outcome` and used by
     the sync engine's ``reconcile()`` cancel-retry-loop to drive the
-    cancel-tentative state machine forward. The five outcomes encode the
+    cancel-tentative state machine forward. The six outcomes encode the
     only decision-relevant disposition categories — broker-specific status
     strings, HTTP codes, and exception types are normalized into these by
     each plugin's override.
@@ -1965,6 +2027,14 @@ class CancelDispositionOutcome(StrEnum):
     # was unknown; this one is unambiguous). Treated as
     # ``CANCEL_CONFIRMED`` by the sync engine.
     STILL_OPEN = 'still_open'
+    # Broker journal proves that the order filled before the cancel AND
+    # that the position it opened has closed since (a fill and its close
+    # both booked by an earlier process or session). Sync engine:
+    # resolution, never a restore: legs flip to ``aborted_parent_gone``;
+    # mapping, envelope, active_intents and the durable cancel-tentative
+    # row are dropped like on a confirmed cancel; no fill is booked and no
+    # OCA cascade fires (the book already holds the fill and its close).
+    FILLED_AND_CLOSED = 'filled_and_closed'
     # Plugin could not disambiguate (404 / not-found / timeout /
     # ambiguous response). Sync engine: leg stays
     # ``cancel_tentative``, retry on next reconcile until stale-grace.

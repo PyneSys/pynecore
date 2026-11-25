@@ -333,6 +333,38 @@ def __test_every_fail_safe_put_is_recorded_before_it_is_sent__(tmp_path: Path) -
         ctx.close()
 
 
+def __test_a_failed_fail_safe_record_keeps_the_put_queued_for_the_next_sync__(
+        tmp_path: Path,
+) -> None:
+    """A record that fails before its PUT sends nothing and keeps the snapshot queued."""
+    import sqlite3
+
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        _seed_parent(ctx, None)
+        engine = _engine(ctx)
+        puts: list[NativeBracketSnapshot] = []
+        _rehydrate(engine, puts)
+        real_upsert = ctx.upsert_order
+        failures = [sqlite3.OperationalError("disk I/O error")]
+
+        def _upsert(*args, **kwargs):
+            if failures:
+                raise failures.pop()
+            return real_upsert(*args, **kwargs)
+
+        ctx.upsert_order = _upsert  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.OperationalError):
+            engine.drive_native_failsafe(now_ms=float(BAR_TS))
+        assert puts == []
+        engine.drive_native_failsafe(now_ms=float(BAR_TS) + 1_000.0)
+        assert len(puts) == 1
+        row = ctx.get_order(PARENT)
+        assert row is not None and row.extras[NATIVE_FAILSAFE_LEVELS_EXTRA]['levels']
+        ctx.upsert_order = real_upsert  # type: ignore[method-assign]
+        ctx.close()
+
+
 # --- re-assert of the strategy's persistent exits after a resume --------------------
 
 

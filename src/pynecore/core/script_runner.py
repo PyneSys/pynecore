@@ -7,6 +7,7 @@ import importlib.util
 import itertools
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -109,6 +110,14 @@ STARTUP_RECONCILE_RETRY_BASE_S = 2.0
 
 STARTUP_RECONCILE_RETRY_MAX_S = 60.0
 """Cap of the startup reconcile's doubling retry wait."""
+
+RESTART_SETTLE_RETRIES = 3
+"""Retries of a failed restart settle before the first fresh bar's script runs.
+
+They wait like the startup reconcile (:data:`STARTUP_RECONCILE_RETRY_BASE_S`,
+doubling). A settle still failing after them leaves the restart unsettled, which
+every later sync retries; nothing derived from the unrebuilt book is sent.
+"""
 
 STARTUP_RECONCILE_QUIET_S = 60.0
 """Outage length the startup reconcile rides out at INFO before it warns.
@@ -1270,6 +1279,7 @@ class ScriptRunner:
                  '_signal_rate_sources_fn', '_sec_begin_bar_fn', '_sec_end_bar_fn',
                  '_broker_plugin', '_order_sync_engine', '_broker_event_loop',
                  '_engine_event_stream_future', '_quarantine_resume_watch_future',
+                 '_restart_settle_waited',
                  '_broker_stop_settle_s', 'broker_stop_settled', '_broker_stop_settle_ran',
                  '_broker_store_ctx', '_log_ohlcv', '_price_decimals',
                  '_config_dir', '_symbol_map', '_script_timeframe',
@@ -1533,6 +1543,9 @@ class ScriptRunner:
         self._broker_event_loop: 'asyncio.AbstractEventLoop | None' = broker_event_loop
         self._broker_store_ctx: 'RunContext | None' = broker_store_ctx
         self._order_sync_engine: 'OrderSyncEngine | None' = None
+        # Whether the restart settle already rode out its pre-script retries
+        # (:meth:`_settle_restart_before_script`).
+        self._restart_settle_waited = False
         self._engine_event_stream_future: Any = None
         self._quarantine_resume_watch_future: Any = None
         self._broker_stop_settle_s = broker_stop_settle_s
@@ -1895,8 +1908,52 @@ class ScriptRunner:
                        else broker_info)
                 log("startup reconcile could not read the venue yet (%s) — "
                     "retry #%d in %.0fs before the first bar", e, attempt, delay)
-                threading.Event().wait(timeout=delay)
-                delay = min(delay * 2.0, STARTUP_RECONCILE_RETRY_MAX_S)
+                delay = ScriptRunner._wait_before_retry(delay)
+
+    @staticmethod
+    def _wait_before_retry(delay: float) -> float:
+        """Wait ``delay`` seconds before a venue retry of the startup path.
+
+        The startup reconcile and the restart settle share this doubling wait.
+
+        :param delay: The wait before this retry, in seconds.
+        :return: The wait before the next retry, doubled and capped at
+            :data:`STARTUP_RECONCILE_RETRY_MAX_S`.
+        """
+        threading.Event().wait(timeout=delay)
+        return min(delay * 2.0, STARTUP_RECONCILE_RETRY_MAX_S)
+
+    def _settle_restart_before_script(self, engine: 'OrderSyncEngine', bar_ts_ms: int) -> None:
+        """Settle the restart before a fresh bar's script, riding out a short outage.
+
+        The script must see the orders the previous process left in the book
+        (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.settle_restart_state`).
+        On the first fresh bar a failed settle is retried
+        :data:`RESTART_SETTLE_RETRIES` times with the startup reconcile's
+        doubling wait. A settle that still fails, or fails on a later bar, leaves
+        the restart unsettled: the script runs, the sync sends nothing derived
+        from the unrebuilt book and retries the settle, and a cancel the script
+        issues meanwhile is applied once the book is rebuilt. Under a venue
+        write quarantine the settle does not run, so there is nothing to wait for.
+
+        :param engine: The run's sync engine.
+        :param bar_ts_ms: The bar's timestamp, as the post-script sync receives it.
+        """
+        if engine.settle_restart_state(bar_ts_ms) or self._restart_settle_waited:
+            return
+        self._restart_settle_waited = True
+        delay = STARTUP_RECONCILE_RETRY_BASE_S
+        for attempt in range(1, RESTART_SETTLE_RETRIES + 1):
+            if engine.venue_writes_blocked:
+                return
+            broker_info("restart settle could not complete yet — retry #%d in %.0fs "
+                        "before the first bar's script", attempt, delay)
+            delay = ScriptRunner._wait_before_retry(delay)
+            if engine.settle_restart_state(bar_ts_ms):
+                return
+        broker_warning("restart settle still incomplete after %d retries — the script runs "
+                       "without the previous process's orders; nothing derived from them is "
+                       "sent, and every sync retries the settle", RESTART_SETTLE_RETRIES)
 
     # === Order-processing dispatch =========================================
 
@@ -1946,7 +2003,12 @@ class ScriptRunner:
         # most once per minute regardless of sync frequency. SIGKILL / OOM then
         # gets cleaned on the next open_run() via the stale-run threshold.
         if self._broker_store_ctx is not None:
-            self._broker_store_ctx.heartbeat()
+            try:
+                self._broker_store_ctx.heartbeat()
+            except sqlite3.Error as e:
+                # The engine bounds a failing store itself (it quarantines once
+                # the failure persists); a missed heartbeat is caught up next sync.
+                broker_warning("broker store heartbeat failed: %s — retried next sync", e)
 
     def _bar_open_at_download(self, candle: OHLCV) -> bool:
         """Whether the chart bar opened at ``candle`` was still forming when the history was
@@ -4405,8 +4467,9 @@ class ScriptRunner:
                             # has latched, so steady-state bars pay nothing.
                             if is_strat and position and not suppressed \
                                     and self._order_sync_engine is not None:
-                                cast('OrderSyncEngine', self._order_sync_engine) \
-                                    .settle_restart_state(int(lib.last_bar_time))
+                                self._settle_restart_before_script(
+                                    cast('OrderSyncEngine', self._order_sync_engine),
+                                    int(lib.last_bar_time))
                             _run_libs_and_main()
                             if is_strat and position and not suppressed:
                                 # noinspection PyProtectedMember
