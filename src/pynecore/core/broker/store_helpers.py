@@ -619,12 +619,13 @@ EXTRAS_KEY_BRACKET_OWN_LEG_ID = 'bracket_own_leg_id'
 EXTRAS_KEY_BRACKET_OWN_ATTACH_COID = 'bracket_own_attach_coid'
 # The amend-to-clear dispatch coid (``KIND_CANCEL``) recorded PERSIST-FIRST when a
 # row enters ``clearing``, so a restart re-CLEARS under the SAME clear coid instead
-# of the attach coid. ``amend_bracket`` is idempotent on ``coid`` (the contract
-# permits a plugin to dedup a repeated coid), so replaying a clear under the attach
-# coid could be swallowed as a duplicate attach, leaving the bracket armed while the
-# row is released.
+# of the attach coid, so the venue call correlates with the retirement. The coid is
+# a correlation id only: a retry may carry other levels than the first call under
+# it, and ``PositionPort.amend_bracket`` must never dedup an amend by coid.
 EXTRAS_KEY_BRACKET_OWN_CLEAR_COID = 'bracket_own_clear_coid'
-# Pine-unit protective levels last replicated onto the leg (audit + modify diff).
+# Pine-unit protective levels the owning exit asks for on the leg (audit + modify
+# diff). Several exits can own one leg; the leg itself carries the merge of every
+# active owner's levels, computed by the emulator, never one row's alone.
 EXTRAS_KEY_BRACKET_OWN_TP = 'bracket_own_tp'
 EXTRAS_KEY_BRACKET_OWN_SL = 'bracket_own_sl'
 # Absolute trailing-stop activation price (``ExitIntent.trail_price``). Persisted
@@ -2028,10 +2029,10 @@ def create_bracket_ownership_row(
     :param from_entry: The exit's parent entry id (its own column for filtering).
     :param leg_id: Broker leg id (cTrader ``positionId``) the bracket is on.
     :param attach_coid: The exit's ``KIND_EXIT_SL`` bracket-attach coid.
-    :param tp_price: Pine-unit take-profit level last replicated (or ``None``).
-    :param sl_price: Pine-unit stop-loss level last replicated (or ``None``).
+    :param tp_price: Pine-unit take-profit level the exit asks for (or ``None``).
+    :param sl_price: Pine-unit stop-loss level the exit asks for (or ``None``).
     :param trail_price: Pine-unit trailing-stop activation price (or ``None``).
-    :param trail_offset: Pine-unit trailing offset last replicated (or ``None``).
+    :param trail_offset: Pine-unit trailing offset the exit asks for (or ``None``).
     :param oca_name: The owning exit's OCA group name (or ``None``).
     :param oca_type: The owning exit's OCA type string (``"reduce"`` /
         ``"cancel"`` / ``"none"``, or ``None``).

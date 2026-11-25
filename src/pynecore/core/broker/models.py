@@ -427,6 +427,21 @@ class PositionLeg:
         derived from this, so it MUST be a stable, broker-reported value
         (not a local wall clock) for replay determinism.
     :ivar unrealized_pnl: Broker-reported mark-to-market P&L for this leg.
+    :ivar entry_id: The Pine entry id (``strategy.entry(id=...)`` /
+        ``strategy.order(id=...)``) whose order opened this leg, or ``None``
+        when the plugin cannot attribute the leg to exactly one entry. The
+        core uses it to replicate a ``strategy.exit(from_entry=...)`` bracket
+        onto that entry's own legs only, so each pyramided entry keeps its own
+        take-profit / stop-loss levels on a venue that holds one leg per entry.
+        Set it only from the bot's own records of the order that opened the
+        leg (the entry's dispatch, matched to the leg through the fill or the
+        position id the venue returned), never from a guess. Leave it ``None``
+        for a leg that aggregates several entries (a netting or one-leg-per-side
+        account), for a leg the bot did not open itself (manual, adopted, or
+        opened by a previous run whose records are gone), and whenever the
+        mapping is uncertain. A ``None`` leg is covered by every exit of its
+        side, with the levels merged; a wrong id makes an exit protect the
+        wrong leg.
     """
     leg_id: str
     symbol: str
@@ -435,6 +450,7 @@ class PositionLeg:
     entry_price: float
     open_time: float
     unrealized_pnl: float = 0.0
+    entry_id: str | None = None
 
 
 @dataclass
@@ -779,6 +795,10 @@ class CloseIntent:
     target_entry_id: str | None = None
     target_position_coid: str | None = None
     target_exchange_id: str | None = None
+    # A defensive close of one hedge leg (the leg the venue refused to
+    # protect): the one-way emulator reduces this leg and no other, so a leg
+    # that already closed or shrank never makes it liquidate a sibling leg.
+    target_leg_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.reduce_only:
@@ -788,7 +808,8 @@ class CloseIntent:
         if self.synthetic_kind is None:
             if (self.target_entry_id is not None
                     or self.target_position_coid is not None
-                    or self.target_exchange_id is not None):
+                    or self.target_exchange_id is not None
+                    or self.target_leg_id is not None):
                 raise ValueError(
                     "CloseIntent synthetic targets require synthetic_kind."
                 )
@@ -810,7 +831,8 @@ class CloseIntent:
             # old position's protective legs to confirm-cancel first.
             if (self.target_entry_id is not None
                     or self.target_position_coid is not None
-                    or self.target_exchange_id is not None):
+                    or self.target_exchange_id is not None
+                    or self.target_leg_id is not None):
                 raise ValueError(
                     "CloseIntent reversal_close is symbol-wide and takes no targets."
                 )
@@ -818,7 +840,8 @@ class CloseIntent:
         if self.synthetic_kind in {'partial_trigger', 'marketable_exit'}:
             if (not self.target_entry_id
                     or self.target_position_coid is not None
-                    or self.target_exchange_id is not None):
+                    or self.target_exchange_id is not None
+                    or self.target_leg_id is not None):
                 raise ValueError(
                     f"CloseIntent {self.synthetic_kind} requires target_entry_id only."
                 )
@@ -908,6 +931,16 @@ class BracketAttachRejectContext:
         of the reject. ``None`` falls back to ``qty`` (conservative).
     :ivar error_code: Plugin-supplied exchange-side error code, if any.
     :ivar error_message: Plugin-supplied exchange-side error message.
+    :ivar position_leg_qty: Open size of the venue leg ``position_deal_id``
+        names (:attr:`PositionLeg.qty` summed over the rows carrying that
+        :attr:`PositionLeg.leg_id`), read by the engine before the defensive
+        close dispatches. The baseline the grace probe measures that leg's
+        reduction against; ``None`` when the plugin has no
+        :class:`~pynecore.core.plugin.broker.PositionPort`, the context names
+        no leg, or the read failed or did not list the leg. Held in memory
+        only: :meth:`to_dict` leaves it out, so a context rebuilt by
+        :meth:`from_dict` after a restart has none, since nothing durable
+        could tell whether the book has moved past it.
     """
     intent_key: str
     position_coid: str
@@ -920,6 +953,7 @@ class BracketAttachRejectContext:
     filled_qty: float | None = None
     error_code: str | None = None
     error_message: str | None = None
+    position_leg_qty: float | None = None
 
     @classmethod
     def from_exception(
@@ -1146,27 +1180,26 @@ class PendingDefensiveClose:
         ``None`` only for markers persisted by an older schema; the
         replay path falls back to the conservative "skip adoption"
         behaviour in that case.
-    :ivar fifo_closed_entry_ids: Snapshot of the entry ids whose FIFO
-        ``Trade`` rows were closed by
-        :meth:`~pynecore.core.broker.position.BrokerPosition.record_fill` for this
-        defensive close, accumulated across every ``partial`` / terminal ``filled``
-        event of the close sequence. The ``t == 'partial'`` branch in
-        :meth:`OrderSyncEngine._route_event` merges each partial's
-        FIFO closures here, and
+    :ivar spent_entry_ids: Snapshot of the entry ids whose bindings
+        :meth:`~pynecore.core.broker.position.BrokerPosition.record_fill` spent
+        for this defensive close, accumulated across every ``partial`` /
+        terminal ``filled`` event of the close sequence. The close is bound to
+        ``entry_id``, so it settles that entry's bindings first and only what
+        they cannot absorb walks the rest of the book. The ``t == 'partial'``
+        branch in :meth:`OrderSyncEngine._route_event` merges each partial's
+        spent entries here, and
         :meth:`OrderSyncEngine._route_defensive_close_fill` merges the
-        terminal slice on top BEFORE the residual-cancel attempt — so
-        in pyramiding (LongA closed by a partial, LongB closed by the
-        terminal) both entries are persisted, not only the terminal's.
+        terminal slice on top BEFORE the residual-cancel attempt, so every
+        entry the sequence spent is persisted, not only the terminal's.
         Persisted so that
         :meth:`OrderSyncEngine._retry_residual_cleanup_after_transient_fill`
-        can run the same FIFO-aware
+        can run the same binding-keyed
         :meth:`OrderSyncEngine._cleanup_position_tracking` walk as the
         in-flight FILL path even when intervening
         :meth:`~pynecore.core.broker.position.BrokerPosition.record_fill` calls have
-        overwritten the live ``_last_fifo_closed_entry_ids`` snapshot. Empty when the
-        FILL produced no FIFO closures (no-FIFO / degenerate path) or when the marker is
-        replayed from an older schema; the retry path falls back to ``marker.entry_id``
-        in that case.
+        overwritten the engine's per-fill snapshot. Empty when the FILL spent no
+        binding (no-FIFO / degenerate path); the retry path falls back to
+        ``marker.entry_id`` in that case.
     :ivar expected_close_qty: Total quantity the close was actually
         dispatched for when the one-way emulator fanned it across more
         than one hedge leg, in PINE units (``CloseFanResult`` reports it
@@ -1265,7 +1298,7 @@ class PendingDefensiveClose:
     partial_filled_qty: float = 0.0
     fill_exchange_order_id: str | None = None
     pre_close_position_size: float | None = None
-    fifo_closed_entry_ids: tuple[str, ...] = ()
+    spent_entry_ids: tuple[str, ...] = ()
     unapplied_partial_qty: float = 0.0
     expected_close_qty: float | None = None
     applied_close_qty: float = 0.0
@@ -1289,7 +1322,7 @@ class PendingDefensiveClose:
             'partial_filled_qty': self.partial_filled_qty,
             'fill_exchange_order_id': self.fill_exchange_order_id,
             'pre_close_position_size': self.pre_close_position_size,
-            'fifo_closed_entry_ids': list(self.fifo_closed_entry_ids),
+            'spent_entry_ids': list(self.spent_entry_ids),
             'unapplied_partial_qty': self.unapplied_partial_qty,
             'expected_close_qty': self.expected_close_qty,
             'applied_close_qty': self.applied_close_qty,
@@ -1380,20 +1413,20 @@ class PendingDefensiveClose:
                 f"PendingDefensiveClose.pre_close_position_size must be "
                 f"numeric or None: {data!r}"
             )
-        fifo_closed_entry_ids_raw = data.get('fifo_closed_entry_ids', [])
-        if not isinstance(fifo_closed_entry_ids_raw, (list, tuple)):
+        spent_entry_ids_raw = data.get('spent_entry_ids', [])
+        if not isinstance(spent_entry_ids_raw, (list, tuple)):
             raise ValueError(
-                f"PendingDefensiveClose.fifo_closed_entry_ids must be "
+                f"PendingDefensiveClose.spent_entry_ids must be "
                 f"a list or tuple: {data!r}"
             )
-        fifo_closed_entry_ids_list: list[str] = []
-        for entry in fifo_closed_entry_ids_raw:
+        spent_entry_ids_list: list[str] = []
+        for entry in spent_entry_ids_raw:
             if not isinstance(entry, str):
                 raise ValueError(
-                    f"PendingDefensiveClose.fifo_closed_entry_ids items "
+                    f"PendingDefensiveClose.spent_entry_ids items "
                     f"must be strings: {data!r}"
                 )
-            fifo_closed_entry_ids_list.append(entry)
+            spent_entry_ids_list.append(entry)
         unapplied_partial_qty_raw = data.get('unapplied_partial_qty', 0.0)
         if not isinstance(unapplied_partial_qty_raw, (int, float)):
             raise ValueError(
@@ -1530,7 +1563,7 @@ class PendingDefensiveClose:
             partial_filled_qty=partial_filled_qty,
             fill_exchange_order_id=fill_exchange_order_id,
             pre_close_position_size=pre_close_position_size,
-            fifo_closed_entry_ids=tuple(fifo_closed_entry_ids_list),
+            spent_entry_ids=tuple(spent_entry_ids_list),
             unapplied_partial_qty=unapplied_partial_qty,
             expected_close_qty=expected_close_qty,
             applied_close_qty=applied_close_qty,

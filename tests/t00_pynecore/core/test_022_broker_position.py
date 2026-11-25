@@ -495,3 +495,394 @@ def __test_same_eval_exit_bracket_replaces_not_nets__():
     # Latest levels win — the first call's stale 100/90 must not survive.
     assert o.limit == 105.0
     assert o.stop == 95.0
+
+
+# === Binding book ===
+
+def _bfill(side: str, qty: float, price: float, *, pine_id: str | None,
+           order_id: str, leg: LegType = LegType.ENTRY,
+           from_entry: str | None = None) -> OrderEvent:
+    """Build a fill event with an explicit venue order id and ``from_entry``."""
+    order = ExchangeOrder(
+        id=order_id, symbol="BTCUSDT", side=side, order_type=OrderType.MARKET,
+        qty=qty, filled_qty=qty, remaining_qty=0.0, price=None, stop_price=None,
+        average_fill_price=price, status=OrderStatus.FILLED, timestamp=0.0,
+        fee=0.0, fee_currency="USDT",
+    )
+    return OrderEvent(
+        order=order, event_type="filled", fill_price=price, fill_qty=qty,
+        timestamp=0.0, pine_id=pine_id, from_entry=from_entry, leg_type=leg,
+    )
+
+
+def _book(p: BrokerPosition) -> list[tuple[str | None, float]]:
+    """The binding book as ``(entry_id, bound)`` pairs, oldest first."""
+    return [(b.entry_id, b.bound) for b in p._entry_book]
+
+
+def _assert_book_covers_position(p: BrokerPosition) -> None:
+    """The bound quantities add up to the position size."""
+    assert sum(b.bound for b in p._entry_book) == pytest.approx(abs(p.size), abs=1e-12)
+
+
+def _pyramid(*legs: tuple[str, float]) -> BrokerPosition:
+    """Open one long entry order per ``(entry id, qty)`` at 100, each its own venue order."""
+    p = BrokerPosition()
+    for i, (entry_id, qty) in enumerate(legs):
+        p.record_fill(_bfill("buy", qty, 100.0, pine_id=entry_id, order_id=f"e{i}"))
+    return p
+
+
+def __test_exit_legs_settle_their_own_bindings_while_rows_drain_fifo__():
+    """Exit fills of L3 then L2 consume the oldest trade rows, but L1's binding survives.
+
+    The c432 sequence (bybit-spot ``pyramid``): three entries open, ``L3-X``
+    fills, then ``L2-X``. The trade rows settle FIFO, so L1's and L2's rows go
+    and L3's row is the one left; the bindings settle by origin, so L3's and
+    L2's bindings are spent and L1 still holds the open unit.
+    """
+    p = _pyramid(("L1", 1.0), ("L2", 1.0), ("L3", 1.0))
+    assert _book(p) == [("L1", 1.0), ("L2", 1.0), ("L3", 1.0)]
+
+    p.record_fill(_bfill("sell", 1.0, 110.0, pine_id="L3-X", order_id="x3",
+                         leg=LegType.TAKE_PROFIT, from_entry="L3"))
+    assert [t.entry_id for t in p.open_trades] == ["L2", "L3"]
+    assert _book(p) == [("L1", 1.0), ("L2", 1.0)]
+    assert p.last_spent_entry_ids == ["L3"]
+
+    p.record_fill(_bfill("sell", 1.0, 110.0, pine_id="L2-X", order_id="x2",
+                         leg=LegType.TAKE_PROFIT, from_entry="L2"))
+    assert [t.entry_id for t in p.open_trades] == ["L3"]
+    assert _book(p) == [("L1", 1.0)]
+    assert p.last_spent_entry_ids == ["L2"]
+    assert p._bound_qty("L1") == 1.0
+    assert p._bound_qty("L3") == 0.0
+    _assert_book_covers_position(p)
+
+
+@pytest.mark.parametrize("leg", [LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP])
+def __test_partial_exit_leg_reduces_only_its_binding__(leg):
+    """A partial exit-leg fill takes its quantity off its own entry's binding only."""
+    p = _pyramid(("L1", 1.0), ("L2", 2.0))
+    p.record_fill(_bfill("sell", 0.5, 110.0, pine_id="L2-X", order_id="x",
+                         leg=leg, from_entry="L2"))
+    assert _book(p) == [("L1", 1.0), ("L2", 1.5)]
+    assert p.last_spent_entry_ids == []
+    _assert_book_covers_position(p)
+
+
+def __test_strategy_close_id_settles_that_ids_bindings_oldest_first__():
+    """A ``strategy.close(id)`` fill spends that id's bindings, oldest first, and no other."""
+    p = _pyramid(("L1", 1.0), ("L2", 2.0), ("L1", 1.0))
+    p.record_fill(_bfill("sell", 1.5, 105.0, pine_id="L1", order_id="c",
+                         leg=LegType.CLOSE), close_entry_id="L1")
+
+    assert [(t.entry_id, t.size) for t in p.open_trades] == [("L2", 1.5), ("L1", 1.0)]
+    assert _book(p) == [("L2", 2.0), ("L1", 0.5)]
+    assert p.last_spent_entry_ids == ["L1"]
+    assert p._bound_qty("L1") == 0.5
+    _assert_book_covers_position(p)
+
+
+def __test_close_leg_without_an_attributed_id_is_unbound__():
+    """A close fill the caller does not attribute walks the whole book oldest first.
+
+    ``event.pine_id`` names the closed entry on some venues, but the event
+    alone cannot tell a ``strategy.close(id)`` from an engine-made close, so
+    only ``close_entry_id`` binds a close.
+    """
+    p = _pyramid(("L1", 1.0), ("L2", 2.0))
+    p.record_fill(_bfill("sell", 1.5, 105.0, pine_id="L2", order_id="c",
+                         leg=LegType.CLOSE, from_entry="L2"))
+    assert _book(p) == [("L2", 1.5)]
+    assert p.last_spent_entry_ids == ["L1"]
+    _assert_book_covers_position(p)
+
+
+def __test_unbound_reduction_walks_the_whole_book_oldest_first__():
+    """An opposite ``strategy.order`` fill settles the bindings oldest first, like the rows."""
+    p = _pyramid(("L1", 1.0), ("L2", 2.0), ("L3", 1.0))
+    p.record_fill(_bfill("sell", 2.5, 105.0, pine_id="O", order_id="o"))
+    assert _book(p) == [("L2", 0.5), ("L3", 1.0)]
+    assert [(t.entry_id, t.size) for t in p.open_trades] == [("L2", 0.5), ("L3", 1.0)]
+    assert p.last_spent_entry_ids == ["L1"]
+    _assert_book_covers_position(p)
+
+
+def __test_external_reduction_is_settled_unbound__():
+    """A venue reduction booked as a provisional close settles the bindings oldest first."""
+    p = _pyramid(("L1", 1.0), ("L2", 2.0))
+    p.record_provisional_close(_bfill("sell", 1.5, 105.0, pine_id=None, order_id="ext",
+                                      leg=LegType.CLOSE))
+    assert _book(p) == [("L2", 1.5)]
+    assert p.last_spent_entry_ids == ["L1"]
+    _assert_book_covers_position(p)
+
+
+def __test_exit_fill_beyond_its_bindings_settles_the_rest_of_the_book__():
+    """An exit fill larger than its entry's bindings takes the excess off the oldest others."""
+    p = _pyramid(("L1", 1.0), ("L2", 1.0), ("L3", 1.0))
+    p.record_fill(_bfill("sell", 1.5, 110.0, pine_id="L3-X", order_id="x",
+                         leg=LegType.STOP_LOSS, from_entry="L3"))
+    assert _book(p) == [("L1", 0.5), ("L2", 1.0)]
+    assert p.last_spent_entry_ids == ["L3"]
+    _assert_book_covers_position(p)
+
+    p.record_fill(_bfill("sell", 0.5, 110.0, pine_id="Z-X", order_id="z",
+                         leg=LegType.TAKE_PROFIT, from_entry="Z"))
+    assert _book(p) == [("L2", 1.0)]
+    assert p.last_spent_entry_ids == ["L1"]
+
+
+def __test_slices_of_one_entry_order_grow_one_binding__():
+    """Partial fills of the same entry order make one binding; another order of the id makes a second."""
+    p = BrokerPosition()
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="L", order_id="e1"))
+    p.record_fill(_bfill("buy", 3.0, 104.0, pine_id="L", order_id="e1"))
+    assert len(p.open_trades) == 2
+    assert len(p._entry_book) == 1
+    binding = p._entry_book[0]
+    assert (binding.init_size, binding.bound) == (4.0, 4.0)
+    assert binding.entry_price == pytest.approx(103.0)
+
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="L", order_id="e2"))
+    assert _book(p) == [("L", 4.0), ("L", 1.0)]
+    _assert_book_covers_position(p)
+
+
+def __test_late_slice_grows_a_partly_settled_binding__():
+    """A slice arriving after an exit took part of its binding grows what is left of it."""
+    p = BrokerPosition()
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="L", order_id="e1"))
+    p.record_fill(_bfill("sell", 0.5, 110.0, pine_id="L-X", order_id="x",
+                         leg=LegType.TAKE_PROFIT, from_entry="L"))
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="L", order_id="e1"))
+    assert len(p._entry_book) == 1
+    assert (p._entry_book[0].init_size, p._entry_book[0].bound) == (2.0, 1.5)
+    _assert_book_covers_position(p)
+
+
+def __test_slice_after_its_binding_is_spent_opens_a_new_one__():
+    """A slice of an entry order whose binding is already spent opens a fresh binding."""
+    p = _pyramid(("L1", 1.0))
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="L2", order_id="e2"))
+    p.record_fill(_bfill("sell", 1.0, 110.0, pine_id="L2-X", order_id="x",
+                         leg=LegType.TAKE_PROFIT, from_entry="L2"))
+    p.record_fill(_bfill("buy", 0.5, 100.0, pine_id="L2", order_id="e2"))
+    assert [(b.entry_id, b.init_size, b.bound) for b in p._entry_book] == [
+        ("L1", 1.0, 1.0), ("L2", 0.5, 0.5)]
+    _assert_book_covers_position(p)
+
+
+def __test_untradable_binding_remainder_is_spread_over_the_other_bindings__():
+    """A binding left below the least tradable quantity is spent and its crumb spread pro rata.
+
+    L1's exit leaves 0.2 on L1, under a least tradable quantity of 0.5: L1 is
+    spent, and L2 (1.0) and L3 (2.0) take a third and two thirds of the
+    crumb, so the book still adds up to the position.
+    """
+    p = _pyramid(("L1", 1.0), ("L2", 1.0), ("L3", 2.0))
+    p.least_tradable_qty = lambda price: 0.5
+    p.record_fill(_bfill("sell", 0.8, 110.0, pine_id="L1-X", order_id="x",
+                         leg=LegType.TAKE_PROFIT, from_entry="L1"))
+
+    assert [b.entry_id for b in p._entry_book] == ["L2", "L3"]
+    assert p._entry_book[0].bound == pytest.approx(1.0 + 0.2 / 3.0)
+    assert p._entry_book[1].bound == pytest.approx(2.0 + 0.4 / 3.0)
+    assert [b.init_size for b in p._entry_book] == [1.0, 2.0]
+    assert p.last_spent_entry_ids == ["L1"]
+    _assert_book_covers_position(p)
+
+
+def __test_rows_and_bindings_spread_their_crumbs_independently__():
+    """L2's exit leaves its crumb on L2's binding but on L1's FIFO row, and each moves on its own.
+
+    The binding crumb lands on L1's binding; the row crumb, left on L1's row
+    by the FIFO walk, lands on L2's row.
+    """
+    p = _pyramid(("L1", 1.0), ("L2", 1.0))
+    p.least_tradable_qty = lambda price: 0.5
+    p.record_fill(_bfill("sell", 0.8, 110.0, pine_id="L2-X", order_id="x",
+                         leg=LegType.TAKE_PROFIT, from_entry="L2"))
+    assert _book(p) == [("L1", pytest.approx(1.2))]
+    assert p.last_spent_entry_ids == ["L2"]
+    assert [(t.entry_id, pytest.approx(t.size)) for t in p.open_trades] == [("L2", 1.2)]
+    _assert_book_covers_position(p)
+
+
+def __test_tradable_binding_remainder_stays__():
+    """A binding remainder at or above the least tradable quantity keeps its binding."""
+    p = _pyramid(("L1", 1.0), ("L2", 1.0))
+    p.least_tradable_qty = lambda price: 0.5
+    p.record_fill(_bfill("sell", 0.5, 110.0, pine_id="L1-X", order_id="x",
+                         leg=LegType.TAKE_PROFIT, from_entry="L1"))
+    assert _book(p) == [("L1", 0.5), ("L2", 1.0)]
+
+
+def __test_untradable_remainder_of_the_last_binding_stays__():
+    """The last binding keeps an untradable remainder: no other binding can take it."""
+    p = _pyramid(("L1", 1.0))
+    p.least_tradable_qty = lambda price: 0.5
+    p.record_fill(_bfill("sell", 0.8, 110.0, pine_id="L1-X", order_id="x",
+                         leg=LegType.TAKE_PROFIT, from_entry="L1"))
+    assert _book(p) == [("L1", pytest.approx(0.2))]
+    assert p.last_spent_entry_ids == []
+
+
+def __test_going_flat_spends_every_binding__():
+    """A fill that flattens the position spends the whole book."""
+    p = _pyramid(("L1", 1.0), ("L2", 2.0))
+    p.record_fill(_bfill("sell", 3.0, 105.0, pine_id="L2-X", order_id="x",
+                         leg=LegType.TAKE_PROFIT, from_entry="L2"))
+    assert p.size == 0.0
+    assert p._entry_book == []
+    assert p.last_spent_entry_ids == ["L2", "L1"]
+
+
+def __test_exit_overshoot_clamped_to_flat_spends_every_binding__():
+    """An exit fill beyond the booked position clamps to flat and leaves no binding."""
+    p = _pyramid(("L1", 1.0))
+    p.record_fill(_bfill("sell", 1.5, 105.0, pine_id="L1-X", order_id="x",
+                         leg=LegType.STOP_LOSS, from_entry="L1"))
+    assert p.size == 0.0
+    assert p._entry_book == []
+    assert p.last_spent_entry_ids == ["L1"]
+
+
+def __test_reversal_spends_the_old_book_and_binds_the_new_side__():
+    """A reversing entry fill spends every old binding and opens one for its flipped quantity."""
+    p = _pyramid(("L1", 1.0), ("L2", 1.0))
+    p.record_fill(_bfill("sell", 5.0, 105.0, pine_id="S", order_id="s"))
+    assert p.size == pytest.approx(-3.0)
+    assert [(b.entry_id, b.bound, b.sign) for b in p._entry_book] == [("S", 3.0, -1.0)]
+    assert p.last_spent_entry_ids == ["L1", "L2"]
+
+    p.record_fill(_bfill("sell", 1.0, 104.0, pine_id="S", order_id="s"))
+    assert [(b.entry_id, b.init_size, b.bound) for b in p._entry_book] == [("S", 4.0, 4.0)]
+    _assert_book_covers_position(p)
+
+
+def __test_record_fill_resets_the_spent_entry_ids__():
+    """Each booked fill reports only the bindings it spent itself."""
+    p = _pyramid(("L1", 1.0), ("L2", 1.0))
+    p.record_fill(_bfill("sell", 1.0, 110.0, pine_id="L1-X", order_id="x",
+                         leg=LegType.TAKE_PROFIT, from_entry="L1"))
+    assert p.last_spent_entry_ids == ["L1"]
+    p.record_fill(_bfill("buy", 1.0, 100.0, pine_id="L3", order_id="e3"))
+    assert p.last_spent_entry_ids == []
+
+
+def __test_dust_flatten_spends_the_remaining_bindings__():
+    """Booking the dust residual flat adds the still-open bindings to the spent ids."""
+    p = _pyramid(("L1", 1.0), ("L2", 1.0))
+    event = _bfill("sell", 1.0, 110.0, pine_id="L1-X", order_id="x",
+                   leg=LegType.TAKE_PROFIT, from_entry="L1")
+    p.record_fill(event)
+    p.flatten_nontradable_dust(110.0, event)
+    assert p._entry_book == []
+    assert p.last_spent_entry_ids == ["L1", "L2"]
+
+
+def __test_liquidation_spends_every_binding__():
+    """An exchange liquidation leaves no binding."""
+    p = _pyramid(("L1", 1.0), ("L2", 1.0))
+    p.record_liquidation(_bfill("sell", 2.0, 90.0, pine_id=None, order_id="liq"))
+    assert p._entry_book == []
+    assert p.last_spent_entry_ids == ["L1", "L2"]
+
+
+def __test_adopted_parent_gets_its_binding__():
+    """Re-seeding an adopted parent's trade also seeds its binding, once."""
+    p = BrokerPosition()
+    p.size = -2.0
+    p.sign = -1.0
+    p.reconstruct_parent_trade(entry_id="P", size=-2.0, entry_price=100.0)
+    p.reconstruct_parent_trade(entry_id="P", size=-2.0, entry_price=100.0)
+    assert [(b.entry_id, b.bound, b.sign) for b in p._entry_book] == [("P", 2.0, -1.0)]
+    _assert_book_covers_position(p)
+
+
+def __test_a_bound_leg_naming_no_binding_warns_and_settles_the_oldest__(caplog):
+    """A take-profit whose entry holds no binding is reported, not passed over in silence.
+
+    The fill still reduces the venue position, so it settles the oldest
+    bindings; the warning names the fill's ids. A leg whose entry merely holds
+    less than the fill does not warn.
+    """
+    p = _pyramid(("L1", 1.0), ("L2", 1.0))
+    with caplog.at_level(logging.WARNING):
+        p.record_fill(_bfill("sell", 0.5, 110.0, pine_id="L2-X", order_id="x2",
+                             leg=LegType.TAKE_PROFIT, from_entry="L2"))
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    with caplog.at_level(logging.WARNING):
+        p.record_fill(_bfill("sell", 1.0, 110.0, pine_id="L9-X", order_id="x9",
+                             leg=LegType.TAKE_PROFIT, from_entry="L9"))
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "'L9-X'" in warnings[0] and "'L9'" in warnings[0]
+    assert _book(p) == [("L2", 0.5)]
+    _assert_book_covers_position(p)
+
+
+def __test_a_book_seeded_without_fills_is_not_faithful_until_flat__(caplog):
+    """An adopted parent or a rebuild from the rows leaves the book FIFO-shaped.
+
+    Only a flat book is faithful again: its bindings then come from fills.
+    """
+    p = BrokerPosition()
+    assert p.book_faithful
+    p.size = 2.0
+    p.sign = 1.0
+    p.reconstruct_parent_trade(entry_id="L1", size=2.0, entry_price=100.0)
+    assert not p.book_faithful
+    p.record_fill(_bfill("sell", 2.0, 110.0, pine_id="", order_id="c1",
+                         leg=LegType.CLOSE))
+    assert p.size == 0.0 and p.book_faithful
+
+    rebuilt = _pyramid(("L1", 1.0))
+    rebuilt._entry_book.clear()
+    with caplog.at_level(logging.WARNING):
+        rebuilt.record_fill(_bfill("buy", 1.0, 100.0, pine_id="L2", order_id="e9"))
+    assert any("invariant breached" in r.getMessage() for r in caplog.records)
+    assert not rebuilt.book_faithful
+    assert _book(rebuilt) == [("L1", 1.0), ("L2", 1.0)]
+
+
+def __test_a_book_with_a_moved_sub_lot_remainder_survives_a_restart_round_trip__():
+    """A binding that took another's untradable remainder binds more than it opened.
+
+    The stored book must still read back: rejecting it would drop the
+    attribution at a routine restart and adopt the position FIFO.
+    """
+    p = _pyramid(("L1", 1.0), ("L2", 2.0))
+    p.least_tradable_qty = lambda price: 0.5
+    p.record_fill(_bfill("sell", 0.8, 110.0, pine_id="", order_id="c1",
+                         leg=LegType.CLOSE))
+    assert _book(p) == [("L2", pytest.approx(2.2))]
+    assert p._entry_book[0].init_size == 2.0
+    snapshot = BrokerPosition.parse_entry_book_snapshot(
+        {**p.entry_book_snapshot(), 'written_ms': 0})
+    assert snapshot is not None
+    restored = BrokerPosition()
+    restored.restore_entry_book(snapshot)
+    assert _book(restored) == [("L2", pytest.approx(2.2))]
+
+
+def __test_the_fill_cursor_counts_only_the_booked_slices__():
+    """An order snapshot already showing a later slice does not advance the cursor past the booked ones.
+
+    A restart compares the cursor with the journal's filled quantity; a cursor
+    credited with the unbooked slice would accept a book that missed it.
+    """
+    p = BrokerPosition()
+    event = _bfill("buy", 1.0, 100.0, pine_id="L1", order_id="e1")
+    event.order.client_order_id = "coid-e1"
+    event.order.qty = 2.0
+    event.order.filled_qty = 2.0  # the venue already filled the second slice
+    p.record_fill(event)
+    assert p.fill_cursor(["coid-e1", "e1"]) == 1.0
+    # A slice reported under the venue id only still adds to the order's cursor.
+    second = _bfill("buy", 1.0, 100.0, pine_id="L1", order_id="e1")
+    p.record_fill(second)
+    assert p.fill_cursor(["coid-e1", "e1"]) == 2.0

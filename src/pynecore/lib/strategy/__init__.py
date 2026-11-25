@@ -676,6 +676,11 @@ class _EntryBinding:
         # (see _filled_targets).
         self.exit_opened: bool = exit_opened
 
+    @property
+    def size(self) -> float:
+        """Signed open bound quantity: positive long, negative short."""
+        return self.sign * self.bound
+
     def __repr__(self):
         return (f"_EntryBinding(seq={self.seq}; entry_id={self.entry_id}; "
                 f"init_size={self.init_size}; bound={self.bound})")
@@ -911,14 +916,18 @@ class PositionBase(ABC):
     exit_orders: dict['_ExitOrderKey', 'Order']
     risk_halt_trading: bool
     risk_halt_day: int
-    def _pyramid_count(self) -> int:
-        """Number of entries counted against the ``pyramiding`` limit.
+    # The binding book, one binding per filled entry, oldest first: what the
+    # pyramiding limit counts and an exit or close settles against, apart from
+    # the FIFO trade rows above (see :class:`_EntryBinding`).
+    _entry_book: list['_EntryBinding']
 
-        The live broker knows only the reported FIFO view, so it counts that.
-        :class:`SimPosition` overrides this with its binding book, which is what
-        TradingView actually gates on (see :class:`_EntryBinding`).
-        """
-        return len(self.open_trades)
+    def _pyramid_count(self) -> int:
+        """Entries counted against ``pyramiding`` — the binding book, not the FIFO one."""
+        return len(self._entry_book)
+
+    def _bound_qty(self, entry_id: str | None) -> float:
+        """Open bound quantity across every live binding of an entry id."""
+        return sum(b.bound for b in self._entry_book if b.entry_id == entry_id)
 
     def begin_evaluation(self) -> None:
         """Hook fired once per script evaluation; overridden in broker mode.
@@ -1727,10 +1736,6 @@ class SimPosition(PositionBase):
                 return binding
         return None
 
-    def _bound_qty(self, entry_id: str | None) -> float:
-        """Open bound quantity across every live binding of an entry id."""
-        return sum(b.bound for b in self._entry_book if b.entry_id == entry_id)
-
     def _bound_init_qty(self, entry_id: str | None) -> float:
         """Original quantity of every live binding of an entry id."""
         return sum(b.init_size for b in self._entry_book if b.entry_id == entry_id)
@@ -1752,10 +1757,6 @@ class SimPosition(PositionBase):
         if order.order_id is None:
             return bool(self.open_trades)
         return self._has_bound(order.order_id)
-
-    def _pyramid_count(self) -> int:
-        """Entries counted against ``pyramiding`` — the binding book, not the FIFO one."""
-        return len(self._entry_book)
 
     def _drop_binding(self, binding: '_EntryBinding', carry_pending: bool = False,
                       reversing_id: str | None = None) -> None:
@@ -6816,26 +6817,19 @@ def close(id: str, comment: PyneStr = na_str, qty: PyneFloat = na_float,
     # Under the default FIFO close_entries_rule the FILL may consume older
     # trades first, but the amount closed is still the bound entry's open size
     # — sizing off the whole position would flatten unrelated entries.
-    if isinstance(position, SimPosition):
+    # noinspection PyProtectedMember
+    bound_size = position.sign * position._bound_qty(id)
+    if bound_size == 0.0 and not isinstance(position, SimPosition):
+        # Startup adoption seeds the open position under a synthetic (or
+        # ``None``) parent id because the real ``strategy.entry`` ids from the
+        # prior process are unknown, so a keyed ``close(id)`` matches no open
+        # binding. Bind it to the adopted exposure instead of dropping the close
+        # (early ``size == 0.0`` return) — otherwise the script could never
+        # flatten an adopted position by entry id. ``_clamp_close_intents``
+        # caps this to the residual position size before dispatch.
         # noinspection PyProtectedMember
-        bound_size = position.sign * position._bound_qty(id)
-    else:
-        bound_size = 0.0
-        adopted_size = 0.0
-        for trade in position.open_trades:
-            if trade.entry_id == id:
-                bound_size += trade.size
-            elif trade.entry_id is None or trade.entry_id == ADOPTED_STARTUP_ENTRY_ID:
-                adopted_size += trade.size
-        if bound_size == 0.0:
-            # Startup adoption seeds the open position under a synthetic (or
-            # ``None``) parent id because the real ``strategy.entry`` ids from the
-            # prior process are unknown, so a keyed ``close(id)`` matches no open
-            # trade. Bind it to the adopted exposure instead of dropping the close
-            # (early ``size == 0.0`` return) — otherwise the script could never
-            # flatten an adopted position by entry id. ``_clamp_close_intents``
-            # caps this to the residual position size before dispatch.
-            bound_size = adopted_size
+        bound_size = position.sign * (position._bound_qty(None)
+                                      + position._bound_qty(ADOPTED_STARTUP_ENTRY_ID))
 
     if not (qty == qty):  # is_na_arg
         if qty_percent == qty_percent:
@@ -8293,9 +8287,12 @@ def _exit_filled_targets(
     TradingView issues ONE leg per FILLED ENTRY, so two pyramid adds sharing a
     ``from_entry`` id each get their own leg reserved off their own entry size
     — and each is consumed on its own, which is why a bracket can fire again
-    for a later add after it already fired for the first. The live broker has
-    no binding book, so it keeps the pre-fan-out shape: one target per entry
-    id, reserved off that id's combined open size.
+    for a later add after it already fired for the first. A live broker keys
+    every leg of one ``strategy.exit`` id and entry id under a single order, so
+    it keeps the pre-fan-out shape: one target per entry id with an open
+    binding, reserved off the original size of that id's open bindings. An
+    entry whose bindings are spent gets no target, even while a fill of
+    another entry left its trade rows open.
 
     :param position: The position whose entry book is scanned.
     :param entry_id: The ``from_entry`` to bind to, or None for all entries
@@ -8314,14 +8311,14 @@ def _exit_filled_targets(
         book.sort(key=lambda b: not b.exit_opened)
         return [(b.seq, b.entry_id or "", b.sign, b.init_size) for b in book]
     grouped: dict[str, list[float]] = {}
-    for open_trade in position.open_trades:
-        trade_id = open_trade.entry_id or ""
-        if entry_id is not None and open_trade.entry_id != entry_id:
+    for binding in position._entry_book:
+        binding_id = binding.entry_id or ""
+        if entry_id is not None and binding.entry_id != entry_id:
             continue
-        slot = grouped.setdefault(trade_id, [0.0, 0.0])
-        slot[0] = open_trade.sign
-        slot[1] += abs(open_trade.init_size)
-    return [(None, trade_id, slot[0], slot[1]) for trade_id, slot in grouped.items()]
+        slot = grouped.setdefault(binding_id, [0.0, 0.0])
+        slot[0] = binding.sign
+        slot[1] += binding.init_size
+    return [(None, binding_id, slot[0], slot[1]) for binding_id, slot in grouped.items()]
 
 
 def _fold_live_pending_into_target(
@@ -8330,10 +8327,9 @@ def _fold_live_pending_into_target(
     """Fold a still-pending entry into the filled target of the same id on a live broker.
 
     The backtest binds a leg to every filled entry and one more to the pending
-    entry order, each under its own ``entry_seq``. A live broker has no binding
-    book: every leg of one ``strategy.exit`` id and entry id shares a single
-    order key, so a separate pending leg would replace the leg covering the
-    filled holding. Here the filled target grows by the pending size instead,
+    entry order, each under its own ``entry_seq``. On a live broker every leg of
+    one ``strategy.exit`` id and entry id shares a single order key, so a
+    separate pending leg would replace the leg covering the filled holding. Here the filled target grows by the pending size instead,
     and its one leg reserves off both -- the holding plus the add once it
     fills, the same pre-fan-out shape the filled targets already have. A
     pending entry on the opposite side (a same-id reversal) is not folded.

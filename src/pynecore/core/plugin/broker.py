@@ -89,7 +89,15 @@ class PositionPort(Protocol):
 
     async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
         """All open legs for ``symbol`` (any direction), oldest first. No
-        aggregation — the core emulator nets them."""
+        aggregation — the core emulator nets them.
+
+        Each leg carries :attr:`~PositionLeg.entry_id`
+        when the plugin knows from its own records which Pine entry opened it,
+        ``None`` otherwise. The bracket replication of :meth:`amend_bracket`
+        is targeted with it: an exit bound to a ``from_entry`` covers that
+        entry's legs plus every unattributed leg, an exit without one covers
+        all net-survivor legs.
+        """
         ...
 
     async def get_volume_quantizer(self, symbol: str) -> Callable[[float], int]:
@@ -152,19 +160,46 @@ class PositionPort(Protocol):
         ``side`` is the exit side, supplied because a trail-only bracket needs it
         to place the initial anchor on the correct side.
 
+        Every call carries the WHOLE protection the leg must hold afterwards:
+        several exits can own the same leg (a TP-only and an SL-only exit, or
+        several exits on an unattributed leg), and the core sends the merge of
+        all their levels, never one exit's levels alone. The plugin writes the
+        levels it receives as a full replacement and must not merge them with
+        what the leg carried before.
+
         Passing ``tp_price`` / ``sl_price`` / ``trail_offset`` all ``None``
         CLEARS the bracket on that one leg: on venues like cTrader the protection
         is a single position attribute that an amend overwrites wholesale, so an
         empty amend wipes it. The core emulator drives this per leg from its
-        ownership index, so a clear touches only the legs the cancelled exit owns
-        (never the whole position side).
+        ownership index: when an exit is cancelled, each leg it owned is amended
+        to the merged levels of the exits that still own it, and only a leg left
+        with no owner is cleared (never the whole position side).
 
-        Must be idempotent on ``coid`` (a restart re-amend with the same levels
-        is a broker no-op) and must NOT halt the bot on a leg-already-gone race —
-        a ``*_NOT_FOUND`` response normalises to a benign return. A genuine
-        rejection propagates as
-        :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError` for
-        the caller to surface.
+        A fixed ``sl_price`` and a ``trail_offset`` in the same call may come
+        from two different exits (one asks for a fixed stop, another for a
+        trailing stop on the same leg). Write the pair the way the venue
+        defines it (on Capital.com the trail replaces the stop, on cTrader the
+        trail is anchored at the stop); the core reports the combination at
+        WARNING, since neither exit's stop is then carried exactly as asked.
+
+        ``coid`` is the attach coid of the exit whose attach decided the levels,
+        or the cancel coid of the exit whose retirement did (also when the
+        remaining owners' levels are re-asserted, which is not all ``None``); a
+        retirement's cancel coid is persisted on the retiring ownership row
+        (``bracket_own_clear_coid``) before the call. The coid is a
+        CORRELATION id only (logs, the venue's client reference): a retry, a
+        per-sync drain or a restart replay can send DIFFERENT levels under a
+        coid already used (the leg's owners changed in between), so a plugin
+        must never dedup or skip an amend because its coid was seen before —
+        always write the levels it receives. A re-amend with the levels the
+        leg already holds must be harmless (a broker no-op, or a benign return
+        when the venue answers "nothing to amend"); the core itself skips an
+        amend whose levels equal the ones it last confirmed on the leg.
+
+        Must NOT halt the bot on a leg-already-gone race — a ``*_NOT_FOUND``
+        response normalises to a benign return. A genuine rejection propagates
+        as :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`
+        for the caller to surface.
         """
         ...
 

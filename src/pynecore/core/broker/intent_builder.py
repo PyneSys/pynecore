@@ -29,6 +29,7 @@ from pynecore.core.broker.models import (
 from pynecore.lib.strategy import (
     Order,
     Trade,
+    _EntryBinding,
     _order_type_normal,
 )
 from pynecore.types.na import NA
@@ -167,7 +168,7 @@ def build_exit_intent(
         :attr:`ExitIntent.is_partial_qty_bracket` when the script asks for a
         bracket on a fraction of the parent. ``0.0`` (the default) leaves
         the flag ``False``; ``build_intents`` supplies the live value from
-        ``position.open_trades`` so the order sync engine can dispatch on
+        the position's bindings so the order sync engine can dispatch on
         ``caps.partial_qty_bracket_exit``.
     """
     oca_name, oca_type_str = _coerce_oca(order)
@@ -254,7 +255,7 @@ def build_intents(
     entry_orders: dict,
     exit_orders: dict,
     symbol: str,
-    open_trades: Iterable[Trade] | None = None,
+    open_trades: Iterable[Trade | _EntryBinding] | None = None,
 ) -> list[EntryIntent | ExitIntent | CloseIntent]:
     """Flatten a position's pending orders into intent objects.
 
@@ -263,24 +264,27 @@ def build_intents(
     marked ``cancelled`` (e.g. via OCA or :func:`strategy.cancel`) are
     filtered out — the caller treats their absence as an implicit cancel.
 
-    ``open_trades`` is ``position.open_trades`` — used solely to compute the
-    total open qty per ``from_entry`` for the partial-qty bracket flag on
-    :class:`ExitIntent`. Optional; when omitted the flag stays ``False``
-    and the exit falls back to the full-row dispatch path (the safe
-    default for unit tests and simulator-only callers that don't carry a
-    live trade ledger).
+    ``open_trades`` is what each entry id still holds — on a live broker the
+    position's bindings (:attr:`~pynecore.core.broker.position.BrokerPosition.bindings`),
+    the quantity an exit of the id settles against even after a fill of
+    another entry consumed the id's trade rows FIFO; trade rows are read the
+    same way. Used solely to compute the total open qty per ``from_entry``
+    for the partial-qty bracket flag on :class:`ExitIntent`. Optional; when
+    omitted the flag stays ``False`` and the exit falls back to the full-row
+    dispatch path (the safe default for unit tests and simulator-only
+    callers that don't carry a live trade ledger).
     """
     intents: list[EntryIntent | ExitIntent | CloseIntent] = []
 
     qty_by_entry: dict[str, float] = {}
     count_by_entry: dict[str, int] = {}
     if open_trades is not None:
-        for trade in open_trades:
-            entry_id = trade.entry_id
+        for holding in open_trades:
+            entry_id = holding.entry_id
             if entry_id is None:
                 continue
             qty_by_entry[entry_id] = (
-                qty_by_entry.get(entry_id, 0.0) + abs(trade.size)
+                qty_by_entry.get(entry_id, 0.0) + abs(holding.size)
             )
             count_by_entry[entry_id] = count_by_entry.get(entry_id, 0) + 1
 
@@ -297,13 +301,10 @@ def build_intents(
             from_entry = order.order_id or ""
             # ``parent_total_qty`` drives ``ExitIntent.is_partial_qty_bracket``
             # (the partial-vs-whole-row dispatch). It is sourced by the open
-            # row count under ``from_entry``. This relies on a simulator
-            # invariant: ``build_intents`` reads ``SimPosition.open_trades``,
-            # where each Pine entry event is exactly one ``Trade`` row (the
-            # simulator has no split fills — an order fills in full when its
-            # condition is met).
+            # holding count under ``from_entry``: one binding per filled entry
+            # order (a venue's split fills of one order grow one binding).
             #
-            #  * >1 row — pyramiding or repeated ``strategy.order`` under one
+            #  * >1 holding — pyramiding or repeated ``strategy.order`` under one
             #    Pine id. ``entry_orders[from_entry]`` keeps only the LATEST
             #    same-id row (``_add_order`` overwrites the dict slot), so the
             #    declared size understates the parent and would misclassify a
@@ -311,7 +312,7 @@ def build_intents(
             #    summed open qty is the only faithful total here — and it is
             #    exactly what Pine's ``strategy.exit(qty=N, from_entry=...)``
             #    measures N against.
-            #  * ==1 row — single-row: use the script-declared size. It is the
+            #  * ==1 holding — single-row: use the script-declared size. It is the
             #    stable "what the script asked for" signal and survives the
             #    fill (``record_fill`` only touches ``open_trades``, never pops
             #    the entry Order), so a broker overfill/partial-fill cannot flip

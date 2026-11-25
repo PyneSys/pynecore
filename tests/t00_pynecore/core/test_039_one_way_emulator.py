@@ -19,10 +19,11 @@ from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    ExchangeRateLimitError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
-from pynecore.core.broker.idempotency import KIND_CLOSE, KIND_ENTRY_TRIGGERED
+from pynecore.core.broker.idempotency import KIND_CANCEL, KIND_CLOSE, KIND_ENTRY_TRIGGERED
 from pynecore.core.broker.models import (
     CancelIntent,
     CloseIntent,
@@ -46,6 +47,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_WORKING,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     EXTRAS_KEY_BRACKET_OWN_STATE,
+    EXTRAS_KEY_BRACKET_OWN_TP,
     EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID,
     STATE_CONFIRMED,
     create_close_leg_row,
@@ -146,10 +148,12 @@ class _FakePort:
         self.amended.append((leg_id, side, tp_price, sl_price, trail_offset, coid))
 
 
-def _leg(leg_id, side, qty, *, symbol="EURUSD", open_time=0.0, price=1.10) -> PositionLeg:
+def _leg(leg_id, side, qty, *, symbol="EURUSD", open_time=0.0, price=1.10,
+         entry_id=None) -> PositionLeg:
     return PositionLeg(
         leg_id=leg_id, symbol=symbol, side=side, qty=qty,
         entry_price=price, open_time=open_time, unrealized_pnl=0.0,
+        entry_id=entry_id,
     )
 
 
@@ -271,6 +275,89 @@ def __test_run_close_whole_legs_pass_without_partial_support__():
     res = _run(eng.run_close(_close_env("sell", 3.0), port))
     assert _dispatched(port) == [("10", 2), ("11", 1)]
     assert res.skipped is False
+
+
+def __test_run_close_of_one_entry_closes_that_entrys_leg__():
+    """``strategy.close("B")`` closes B's attributed leg, not the older leg of A.
+
+    The fill settles B's binding, so a FIFO pick of A's leg would leave B's
+    leg open while B's exits are retired, and A's exits never cover a leg
+    attributed to B: the surviving leg would stay unprotected.
+    """
+    legs = [_leg("1", "buy", 1.0, open_time=1.0, entry_id="A"),
+            _leg("2", "buy", 1.0, open_time=2.0, entry_id="B")]
+    port = _FakePort(legs)
+    eng = OneWayEmulator(store_ctx=None)
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id="B"), port))
+    assert _dispatched(port) == [("2", 1)]
+    # A larger close of B takes B's leg first, then the rest FIFO.
+    port = _FakePort(legs)
+    _run(eng.run_close(_close_env("sell", 2.0, pine_id="B"), port))
+    assert _dispatched(port) == [("2", 1), ("1", 1)]
+    # An engine close aimed at one entry follows its target entry.
+    port = _FakePort(legs)
+    intent = CloseIntent(pine_id="B-X", symbol="EURUSD", side="sell", qty=1.0,
+                         synthetic_kind='marketable_exit', target_entry_id="B")
+    _run(eng.run_close(DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000), port))
+    assert _dispatched(port) == [("2", 1)]
+    # ``strategy.close_all`` (empty pine_id) stays FIFO.
+    port = _FakePort(legs)
+    _run(eng.run_close(_close_env("sell", 1.0, pine_id=""), port))
+    assert _dispatched(port) == [("1", 1)]
+
+
+def __test_defensive_close_closes_the_leg_it_targets__():
+    """A defensive close of B's unprotected leg closes that leg, not the older leg of A.
+
+    The defensive-close marker settles B's binding, so a FIFO pick of A's
+    leg would leave B's leg open and unprotected while the book counts it
+    closed. A defensive close larger than its target (the leg shrank) closes
+    only the target and reports the rest as shortfall.
+    """
+    legs = [_leg("1", "buy", 1.0, open_time=1.0, entry_id="A"),
+            _leg("2", "buy", 1.0, open_time=2.0, entry_id="B"),
+            _leg("3", "buy", 1.0, open_time=3.0, entry_id="B")]
+    eng = OneWayEmulator(store_ctx=None)
+
+    def defensive(qty: float, leg_id: str) -> DispatchEnvelope:
+        intent = CloseIntent(
+            pine_id=f"__pyne_defensive_close__{leg_id}", symbol="EURUSD", side="sell",
+            qty=qty, immediately=True, synthetic_kind='defensive_close',
+            target_position_coid="__pyne_orphan__EURUSD__B", target_exchange_id=leg_id,
+            target_leg_id=leg_id,
+        )
+        return DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000)
+
+    port = _FakePort(legs)
+    _run(eng.run_close(defensive(1.0, "3"), port))
+    assert _dispatched(port) == [("3", 1)]
+    port = _FakePort(legs)
+    fan = _run(eng.run_close(defensive(3.0, "3"), port))
+    assert _dispatched(port) == [("3", 1)]
+    assert fan.shortfall == 2.0
+
+
+def __test_defensive_close_of_a_vanished_leg_closes_no_sibling__():
+    """A defensive close whose target leg is gone dispatches nothing.
+
+    The target closed between the bracket rejection and the close's fresh
+    leg read; the remaining leg of A is a separate holding and must not be
+    liquidated in its place. The whole quantity is reported as shortfall.
+    """
+    eng = OneWayEmulator(store_ctx=None)
+    port = _FakePort([_leg("1", "buy", 1.0, open_time=1.0, entry_id="A")])
+    intent = CloseIntent(
+        pine_id="__pyne_defensive_close__2", symbol="EURUSD", side="sell",
+        qty=1.0, immediately=True, synthetic_kind='defensive_close',
+        target_position_coid="__pyne_orphan__EURUSD__B", target_exchange_id="2",
+        target_leg_id="2",
+    )
+    fan = _run(eng.run_close(
+        DispatchEnvelope(intent=intent, run_tag="t000", bar_ts_ms=1000), port,
+    ))
+    assert _dispatched(port) == []
+    assert fan.legs == ()
+    assert fan.shortfall == 1.0
 
 
 # === Persistence + restart replay =======================================
@@ -580,7 +667,9 @@ def __test_run_exit_bracket_trail_activation_limit_reported_once_per_exit__(monk
         _run(eng.run_exit_bracket(
             _exit_env("TR", "Long", trail=10.0, trail_price=1.15), port))
     assert len(warnings) == 1
-    assert len(port.amended) == 3
+    # The identical re-dispatches change nothing on the leg, so they are not
+    # re-sent (a re-send would reset the venue's trailing stop).
+    assert len(port.amended) == 1
 
     # A different exit is its own limitation instance.
     _run(eng.run_exit_bracket(
@@ -758,9 +847,9 @@ def __test_clear_only_owns__(tmp_path):
     port.amended.clear()
     res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="Long"), port))
     assert set(res.legs) == {"10", "11"}
-    # The clearing amends wipe the whole protection set on each owned leg.
-    assert all(tp is None and sl is None and trail is None
-               for _leg_id, _side, tp, sl, trail, _coid in port.amended)
+    # Each owned leg is re-amended to what its remaining owner (SL) asks for:
+    # the TP is dropped, the stop stays.
+    assert sorted(_amended_levels(port)) == [("10", None, 1.00), ("11", None, 1.00)]
     surviving = list(iter_active_bracket_ownerships(ctx))
     assert len(surviving) == 2
     assert all(row.intent_key == "SL\0Long" for row in surviving)
@@ -921,7 +1010,7 @@ def __test_dropped_leg_clear_timeout_does_not_skip_survivor_amend__(tmp_path):
 
 def __test_restart_replay_clear_timeout_does_not_abort_startup__(tmp_path):
     """A re-clear timeout during restart replay does not abort startup; the row stays clearing."""
-    # F: _replay_bracket_one re-clears a "clearing" row at startup. If that
+    # F: _replay_bracket_leg re-clears a "clearing" row at startup. If that
     # re-clear times out (OrderDispositionUnknownError) it must NOT propagate —
     # restart_replay runs inside a sync wrapper that only catches
     # ExchangeConnectionError, so an ambiguous round-trip would abort startup.
@@ -1070,6 +1159,590 @@ def __test_a_refused_re_clear_on_restart_keeps_the_row_clearing__(tmp_path):
     rows = list(iter_active_bracket_ownerships(ctx))
     assert [row.extras[EXTRAS_KEY_BRACKET_OWN_STATE] for row in rows] == [
         BRACKET_OWN_STATE_CLEARING]
+    store.close()
+
+
+# === Per-entry targeting and merged levels on shared legs ===============
+
+_PYRAMID_LEVELS = {"L1": (1.30, 1.00), "L2": (1.25, 1.05), "L3": (1.20, 1.08)}
+
+
+def _venue_levels(port: _FakePort) -> dict[str, tuple[float | None, float | None]]:
+    """The protection each leg carries after every amend so far (the last one wins)."""
+    levels: dict[str, tuple[float | None, float | None]] = {}
+    for leg_id, _side, tp, sl, _trail, _coid in port.amended:
+        levels[leg_id] = (tp, sl)
+    return levels
+
+
+def _pyramid_legs() -> list[PositionLeg]:
+    return [_leg(str(n), "buy", 1.0, open_time=float(n), entry_id=f"L{n}") for n in (1, 2, 3)]
+
+
+def _attach_pyramid_exits(eng: OneWayEmulator, port: _FakePort) -> None:
+    for entry, (tp, sl) in _PYRAMID_LEVELS.items():
+        res = _run(eng.run_exit_bracket(
+            _exit_env(f"{entry}-X", entry, qty=1.0, tp=tp, sl=sl), port,
+        ))
+        assert res.legs == (entry.removeprefix("L"),)
+
+
+def _capture_warnings(monkeypatch) -> list[str]:
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        "pynecore.core.broker.one_way_emulator._blog_warning",
+        lambda msg, *args, **_kw: warnings.append(msg % args),
+    )
+    return warnings
+
+
+def __test_hedged_pyramid_each_leg_carries_its_own_entrys_bracket__(tmp_path):
+    """Three pyramided entries, one leg each: every leg carries its own exit's levels.
+
+    The live defect: every exit was amended onto every leg, so the last
+    writer (L3-X) won on all three legs and L1's and L2's own levels existed
+    nowhere on the venue.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort(_pyramid_legs())
+    eng = OneWayEmulator(store_ctx=ctx)
+    _attach_pyramid_exits(eng, port)
+    assert _venue_levels(port) == {"1": (1.30, 1.00), "2": (1.25, 1.05), "3": (1.20, 1.08)}
+    assert [leg_id for leg_id, *_rest in port.amended] == ["1", "2", "3"]
+    assert len(list(iter_active_bracket_ownerships(ctx))) == 3  # one row per exit
+    store.close()
+
+
+def __test_hedged_pyramid_retiring_one_exit_touches_only_its_own_leg__(tmp_path):
+    """Retiring L3-X amends only L3's leg; L1's and L2's protection stays untouched."""
+    store, ctx = _make_store(tmp_path)
+    legs = _pyramid_legs()
+    port = _FakePort(legs)
+    eng = OneWayEmulator(store_ctx=ctx)
+    _attach_pyramid_exits(eng, port)
+    port.set_legs(legs[:2])  # the venue closed leg 3 at L3-X's take-profit
+    port.amended.clear()
+    res = _run(eng.run_exit_bracket_clear(_cancel_env("L3-X", from_entry="L3"), port))
+    assert res.legs == ("3",)
+    assert _amended_levels(port) == [("3", None, None)]  # no owner left on leg 3
+    assert {row.intent_key for row in iter_active_bracket_ownerships(ctx)} == {
+        "L1-X\0L1", "L2-X\0L2"}
+    # A restart re-asserts each remaining leg's own levels.
+    port.amended.clear()
+    assert _run(eng.restart_replay(port)) is True
+    assert _venue_levels(port) == {"1": (1.30, 1.00), "2": (1.25, 1.05)}
+    store.close()
+
+
+def __test_tp_only_and_sl_only_exits_on_one_leg_union__(tmp_path):
+    """A TP-only and an SL-only exit of one entry both stay on the leg; retiring one keeps the other."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("1", "buy", 1.0, entry_id="L1")])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "L1", qty=1.0, tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("SL", "L1", qty=1.0, sl=1.00), port))
+    assert _amended_levels(port) == [("1", 1.20, None), ("1", 1.20, 1.00)]
+    # The SL exit is modified: the TP stays.
+    _run(eng.run_exit_bracket(_exit_env("SL", "L1", qty=1.0, sl=1.02), port))
+    assert _venue_levels(port) == {"1": (1.20, 1.02)}
+    port.amended.clear()
+    _run(eng.run_exit_bracket_clear(_cancel_env("SL", from_entry="L1"), port))
+    assert _amended_levels(port) == [("1", 1.20, None)]
+    port.amended.clear()
+    _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="L1"), port))
+    assert _amended_levels(port) == [("1", None, None)]
+    assert list(iter_active_bracket_ownerships(ctx)) == []
+    store.close()
+
+
+def __test_unattributed_legs_keep_the_single_exit_behaviour__(tmp_path):
+    """A plugin that never attributes legs gets every exit replicated onto every leg."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    res = _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.20, sl=1.00), port))
+    assert res.legs == ("10", "11")
+    assert _amended_levels(port) == [("10", 1.20, 1.00), ("11", 1.20, 1.00)]
+    store.close()
+
+
+def __test_two_exits_on_unattributed_legs_merge_to_the_more_protective_levels__(
+        tmp_path, monkeypatch):
+    """Conflicting levels on one leg give the level the price reaches first, reported once.
+
+    For a long the highest stop-loss and the lowest take-profit, independent
+    of the order the exits attached in; retiring the tighter exit hands the
+    leg back to the remaining one.
+    """
+    warnings = _capture_warnings(monkeypatch)
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.30, sl=1.00), port))
+    _run(eng.run_exit_bracket(_exit_env("L2-X", "L2", qty=1.0, tp=1.25, sl=1.05), port))
+    assert _venue_levels(port) == {"10": (1.25, 1.05)}
+    # A re-dispatch of the looser exit does not loosen the leg.
+    _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.30, sl=1.00), port))
+    assert _venue_levels(port) == {"10": (1.25, 1.05)}
+    assert len([w for w in warnings if "different levels" in w]) == 1
+    _run(eng.run_exit_bracket_clear(_cancel_env("L2-X", from_entry="L2"), port))
+    assert _venue_levels(port) == {"10": (1.30, 1.00)}
+    store.close()
+
+
+def __test_merge_mirrors_for_a_short_and_keeps_the_tightest_trail__(tmp_path):
+    """A short takes the lowest stop-loss and the highest take-profit; trailing takes the tightest."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("20", "sell", 1.0)])
+    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    _run(eng.run_exit_bracket(
+        _exit_env("S1-X", "S1", side="buy", qty=1.0, tp=0.90, sl=1.20, trail=20.0), port))
+    _run(eng.run_exit_bracket(
+        _exit_env("S2-X", "S2", side="buy", qty=1.0, tp=0.95, sl=1.15, trail=10.0), port))
+    leg_id, side, tp, sl, trail, _coid = port.amended[-1]
+    assert (leg_id, side, tp, sl, trail) == ("20", "buy", 0.95, 1.15, 0.1)
+    store.close()
+
+
+def __test_an_entry_without_a_leg_never_covers_other_entries_legs__(tmp_path, monkeypatch):
+    """An exit whose entry holds no leg skips instead of covering other entries' legs.
+
+    Attribution comes only from the bot's own records and lost attribution
+    is ``None``, so every open leg attributed to another entry means the
+    exit's entry holds no leg — e.g. its leg was just closed at the venue by
+    its own take-profit and Pine re-emits the exit before the fill is booked.
+    Putting that exit's (touched) levels on the other entry's leg would close
+    or flatten a position it does not protect. The fan is a non-halting skip,
+    reported once per exit, and the exit's rows from an earlier attach on a
+    leg it no longer covers are retired.
+    """
+    warnings = _capture_warnings(monkeypatch)
+    store, ctx = _make_store(tmp_path)
+    legs = [_leg("1", "buy", 1.0, open_time=1.0, entry_id="L1"),
+            _leg("2", "buy", 1.0, open_time=2.0, entry_id="L2"),
+            _leg("3", "buy", 1.0, open_time=3.0, entry_id="L3")]
+    port = _FakePort(legs)
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.30, sl=1.00), port))
+    _run(eng.run_exit_bracket(_exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
+    assert _venue_levels(port) == {"1": (1.30, 1.00), "3": (1.20, 1.08)}
+
+    # L3's leg closes at its take-profit; the fill is not booked yet and Pine
+    # re-emits L3-X.
+    port.set_legs(legs[:2])
+    port.amended.clear()
+    for _ in range(2):
+        res = _run(eng.run_exit_bracket(
+            _exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
+        assert res.skipped and res.entry_without_leg and res.legs == ()
+        assert "'L3' holds no open leg" in (res.skip_reason or "")
+    # L1's and L2's legs are never touched; only L3-X's own row on the closed
+    # leg "3" is retired (once — the port treats the vanished leg as a no-op).
+    assert _amended_levels(port) == [("3", None, None)]
+    assert len([w for w in warnings if "attributed to an entry other than" in w]) == 1
+    assert {row.intent_key for row in iter_active_bracket_ownerships(ctx)} == {"L1-X\0L1"}
+    store.close()
+
+
+def __test_an_entry_without_a_leg_retires_its_rows_from_legs_it_covered__(tmp_path):
+    """The skip still retires the exit from a leg it covered before, keeping co-owners' levels.
+
+    L3-X protected the unattributed leg "9" next to L1-X; once the plugin
+    attributes "9" to L1, L3 holds no leg: L3-X's row comes off "9" and the
+    leg is re-amended to L1-X's levels alone.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("9", "buy", 1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("L1-X", "L1", qty=1.0, tp=1.30, sl=1.00), port))
+    _run(eng.run_exit_bracket(_exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
+    assert _venue_levels(port) == {"9": (1.20, 1.08)}
+    port.set_legs([_leg("9", "buy", 1.0, entry_id="L1")])
+    port.amended.clear()
+    res = _run(eng.run_exit_bracket(_exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
+    assert res.skipped and res.entry_without_leg
+    assert _amended_levels(port) == [("9", 1.30, 1.00)]
+    assert {row.intent_key for row in iter_active_bracket_ownerships(ctx)} == {"L1-X\0L1"}
+    store.close()
+
+
+def __test_an_entry_without_an_attributed_leg_covers_the_unattributed_legs__(tmp_path):
+    """With unattributed legs open, an exit without a leg of its own covers just those."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("1", "buy", 1.0, open_time=1.0, entry_id="L1"),
+                      _leg("9", "buy", 1.0, open_time=2.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    res = _run(eng.run_exit_bracket(_exit_env("L3-X", "L3", qty=1.0, tp=1.20, sl=1.08), port))
+    assert res.legs == ("9",)
+    # An exit without a from_entry covers every survivor leg.
+    res = _run(eng.run_exit_bracket(_exit_env("ALL", "", qty=2.0, sl=1.00), port))
+    assert res.legs == ("1", "9")
+    store.close()
+
+
+def __test_restart_replay_re_asserts_the_merged_levels_once_per_leg__(tmp_path):
+    """The replay amends each leg once, with the merge of all of its owners."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
+    sl_env = _exit_env("SL", "Long", sl=1.00)
+    sl_env = DispatchEnvelope(intent=sl_env.intent, run_tag="t000", bar_ts_ms=2000)
+    _run(eng.run_exit_bracket(sl_env, port))
+    replay_port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                             _leg("11", "buy", 1.0, open_time=1.0)])
+    assert _run(OneWayEmulator(store_ctx=ctx).restart_replay(replay_port)) is True
+    assert sorted(_amended_levels(replay_port)) == [("10", 1.20, 1.00), ("11", 1.20, 1.00)]
+    store.close()
+
+
+def __test_a_retirement_left_clearing_re_asserts_the_remaining_owner__(tmp_path):
+    """The drain and the replay finish an ambiguous retirement with the remaining owner's levels.
+
+    Never all-``None`` while another exit still owns the leg, and under the
+    persisted clear coid, never an attach coid.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("SL", "Long", sl=1.00), port))
+    cancel = _cancel_env("TP", from_entry="Long")
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket_clear(cancel, port))
+    port.fail_amend_unknown = False
+
+    # The restart finishes it.
+    port.amended.clear()
+    assert _run(eng.restart_replay(port)) is True
+    assert port.amended == [("10", "sell", None, 1.00, None, cancel.client_order_id(KIND_CANCEL))]
+    assert [row.intent_key for row in iter_active_bracket_ownerships(ctx)] == ["SL\0Long"]
+
+    # The per-sync drain does the same for a retirement left clearing in-session.
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket_clear(cancel, port))
+    port.fail_amend_unknown = False
+    port.amended.clear()
+    assert _run(eng.drain_clearing_rows("EURUSD", port)) == {"TP\0Long"}
+    assert port.amended == [("10", "sell", None, 1.00, None, cancel.client_order_id(KIND_CANCEL))]
+    assert [row.intent_key for row in iter_active_bracket_ownerships(ctx)] == ["SL\0Long"]
+    store.close()
+
+
+def __test_a_dropped_leg_keeps_its_other_owners_levels__(tmp_path):
+    """A leg leaving one exit's covered set is handed back to the exits still owning it."""
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("SL", "Long", sl=1.00), port))
+    # An opposing leg nets "10" away; the TP exit re-attaches on "11" only.
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
+                   _leg("11", "buy", 1.0, open_time=1.0),
+                   _leg("20", "sell", 1.0, open_time=2.0)])
+    port.amended.clear()
+    res = _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.25), port))
+    assert res.legs == ("11",)
+    assert _amended_levels(port) == [("10", None, 1.00), ("11", 1.25, 1.00)]
+    store.close()
+
+
+# === Venue rules on shared legs: unchanged amends, refused retirements ===
+
+class _VenueRulesPort(_FakePort):
+    """A port with two real venue rules.
+
+    A stop-loss closer than ``min_dist`` to ``mid`` is refused (Capital.com's
+    minimum stop distance), and with ``reject_identical`` an amend that
+    changes nothing on a protected leg is refused ("nothing to amend").
+    ``rate_limited`` makes every amend raise a venue throttle.
+    """
+
+    def __init__(self, legs, *, mid=1.10, min_dist=0.0, reject_identical=False) -> None:
+        super().__init__(legs)
+        self.mid = mid
+        self.min_dist = min_dist
+        self.reject_identical = reject_identical
+        self.rate_limited = False
+        self.current: dict[str, tuple[float | None, float | None, float | None]] = {}
+        self.calls = 0
+
+    async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
+                            trail_offset, coid) -> None:
+        self.calls += 1
+        if self.rate_limited:
+            raise ExchangeRateLimitError("too many requests", retry_after=1.0)
+        levels = (tp_price, sl_price, trail_offset)
+        if sl_price is not None and abs(self.mid - sl_price) < self.min_dist:
+            raise ExchangeOrderRejectedError(
+                f"stop distance too small (sl={sl_price} mid={self.mid})")
+        if (self.reject_identical and levels != (None, None, None)
+                and self.current.get(leg_id) == levels):
+            raise ExchangeOrderRejectedError("INVALID_REQUEST: Nothing to amend.")
+        self.current[leg_id] = levels
+        await super().amend_bracket(
+            symbol, leg_id, side=side, tp_price=tp_price, sl_price=sl_price,
+            trail_offset=trail_offset, coid=coid,
+        )
+
+
+def _own_states(ctx) -> dict[str, str]:
+    return {row.intent_key: row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]
+            for row in iter_active_bracket_ownerships(ctx)}
+
+
+def __test_an_attach_dominated_by_a_co_owner_sends_no_amend__(tmp_path):
+    """Attaching an exit whose levels a co-owner dominates changes nothing on the venue.
+
+    The merge equals what the leg already holds, so no amend goes out (a
+    venue refuses "nothing to amend", and a re-send resets a moved trailing
+    stop); the attaching exit still owns the leg.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _VenueRulesPort([_leg("10", "buy", 1.0)], reject_identical=True)
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("A", "L", tp=1.15), port))
+    res = _run(eng.run_exit_bracket(_exit_env("B", "L", tp=1.20), port))
+    assert res.legs == ("10",) and not res.skipped
+    assert _amended_levels(port) == [("10", 1.15, None)]
+    assert _own_states(ctx) == {"A\0L": "active", "B\0L": "active"}
+    # Once A is retired, B's own level is what the leg must carry: sent.
+    _run(eng.run_exit_bracket_clear(_cancel_env("A", from_entry="L"), port))
+    assert _amended_levels(port) == [("10", 1.15, None), ("10", 1.20, None)]
+    store.close()
+
+
+def __test_retiring_a_dominated_owner_sends_no_amend__(tmp_path):
+    """Retiring an exit whose levels were all dominated leaves the leg as it is, row released."""
+    store, ctx = _make_store(tmp_path)
+    port = _VenueRulesPort([_leg("10", "buy", 1.0)], reject_identical=True)
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("B", "L", tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("A", "L", tp=1.15), port))
+    port.amended.clear()
+    res = _run(eng.run_exit_bracket_clear(_cancel_env("B", from_entry="L"), port))
+    assert res.legs == ("10",)
+    assert port.amended == []
+    assert _own_states(ctx) == {"A\0L": "active"}
+    store.close()
+
+
+def __test_an_unconfirmed_amend_is_never_skipped_as_unchanged__(tmp_path):
+    """Only an amend the venue confirmed makes a leg's levels known; anything else re-sends.
+
+    An ambiguous attach, then the identical re-dispatch, goes out again; the
+    restart replay re-asserts even on the instance that just confirmed the
+    levels.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    port.fail_amend_unknown = True
+    with pytest.raises(OrderDispositionUnknownError):
+        _run(eng.run_exit_bracket(_exit_env("A", "L", tp=1.20, sl=1.00), port))
+    port.fail_amend_unknown = False
+    _run(eng.run_exit_bracket(_exit_env("A", "L", tp=1.20, sl=1.00), port))
+    assert _amended_levels(port) == [("10", 1.20, 1.00)]
+    _run(eng.run_exit_bracket(_exit_env("A", "L", tp=1.20, sl=1.00), port))
+    assert len(port.amended) == 1  # confirmed and unchanged: skipped
+    assert _run(eng.restart_replay(port)) is True
+    assert _amended_levels(port) == [("10", 1.20, 1.00), ("10", 1.20, 1.00)]
+    store.close()
+
+
+def __test_a_refused_retirement_stays_clearing_and_never_raises__(tmp_path, monkeypatch):
+    """The venue refusing the remaining owners' levels never ends the run.
+
+    TP-only exit at 1.20 and SL-only exit at 1.09 on one leg; the price drifts
+    to 1.093, inside the venue's minimum stop distance. Cancelling the TP
+    exit re-sends sl=1.09 alone, which is refused: the TP row stays
+    ``clearing``, one WARNING says the retired levels may still be armed,
+    and neither the clear, the per-sync drain nor a restart raises. Once
+    the price moves away the drain lands the retirement.
+    """
+    warnings = _capture_warnings(monkeypatch)
+    store, ctx = _make_store(tmp_path)
+    port = _VenueRulesPort([_leg("10", "buy", 1.0)], mid=1.10, min_dist=0.005)
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("SL", "L", sl=1.09), port))
+    port.mid = 1.093
+    res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="L"), port))
+    assert res.legs == ()
+    assert _own_states(ctx) == {"TP\0L": BRACKET_OWN_STATE_CLEARING, "SL\0L": "active"}
+    refusals = [w for w in warnings if "may still be armed" in w]
+    assert len(refusals) == 1
+    assert "TP" in refusals[0] and "stop distance too small" in refusals[0]
+
+    assert _run(eng.drain_clearing_rows("EURUSD", port)) == set()
+    restarted = OneWayEmulator(store_ctx=ctx)
+    assert _run(restarted.restart_replay(port)) is True
+    assert _run(restarted.drain_clearing_rows("EURUSD", port)) == set()
+    assert _own_states(ctx) == {"TP\0L": BRACKET_OWN_STATE_CLEARING, "SL\0L": "active"}
+    assert len([w for w in warnings if "may still be armed" in w]) == 2  # once per instance
+
+    port.mid = 1.12
+    port.amended.clear()
+    assert _run(restarted.drain_clearing_rows("EURUSD", port)) == {"TP\0L"}
+    assert _amended_levels(port) == [("10", None, 1.09)]
+    assert _own_states(ctx) == {"SL\0L": "active"}
+    store.close()
+
+
+def __test_a_refused_retirement_does_not_stop_the_other_legs__(tmp_path):
+    """A refusal on one leg keeps that leg clearing; the exit's other legs are still retired."""
+    store, ctx = _make_store(tmp_path)
+    port = _VenueRulesPort([_leg("10", "buy", 1.0, entry_id="L1"),
+                            _leg("11", "buy", 1.0, entry_id="L2")],
+                           mid=1.10, min_dist=0.005)
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "", qty=2.0, tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("SL1", "L1", qty=1.0, sl=1.09), port))
+    port.mid = 1.093
+    res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry=""), port))
+    assert res.legs == ("11",)
+    assert _amended_levels(port)[-1] == ("11", None, None)
+    states = {(row.intent_key, row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID]):
+              row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]
+              for row in iter_active_bracket_ownerships(ctx)}
+    assert states == {("TP\0", "10"): BRACKET_OWN_STATE_CLEARING,
+                      ("SL1\0L1", "10"): "active"}
+    store.close()
+
+
+def __test_a_throttled_retirement_stays_clearing_and_never_raises__(tmp_path):
+    """A venue throttle on a retirement stops the loop, keeps the rows clearing, and retries."""
+    store, ctx = _make_store(tmp_path)
+    port = _VenueRulesPort([_leg("10", "buy", 1.0), _leg("11", "buy", 1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.20), port))
+    port.rate_limited = True
+    port.calls = 0
+    res = _run(eng.run_exit_bracket_clear(_cancel_env("TP", from_entry="L"), port))
+    assert res.legs == ()
+    assert port.calls == 1  # the second leg is not hammered
+    assert set(_own_states(ctx).values()) == {BRACKET_OWN_STATE_CLEARING}
+    assert _run(eng.drain_clearing_rows("EURUSD", port)) == set()
+    assert _run(OneWayEmulator(store_ctx=ctx).restart_replay(port)) is True
+    port.rate_limited = False
+    assert _run(eng.drain_clearing_rows("EURUSD", port)) == {"TP\0L"}
+    assert list(iter_active_bracket_ownerships(ctx)) == []
+    store.close()
+
+
+def __test_a_refused_retirement_of_a_dropped_leg_keeps_the_survivor_amend__(tmp_path):
+    """A refused retirement on a dropped leg stays clearing and never fails the exit's own fan.
+
+    The retirement concerns a leg the exit no longer covers; raising it as
+    the exit's refusal would send the engine into the refused-exit recovery
+    of a bracket the venue accepted on every leg it does cover.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("11", "buy", 1.0, open_time=1.0)])
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.20), port))
+    # An opposing leg nets "10" away; the venue refuses any amend on "10".
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0),
+                   _leg("11", "buy", 1.0, open_time=1.0),
+                   _leg("20", "sell", 1.0, open_time=2.0)])
+    port._fail_amend_leg = "10"
+    port.amended.clear()
+    res = _run(eng.run_exit_bracket(_exit_env("TP", "Long", tp=1.25), port))
+    assert res.legs == ("11",) and not res.skipped
+    assert _amended_levels(port) == [("11", 1.25, None)]
+    states = {row.extras[EXTRAS_KEY_BRACKET_OWN_LEG_ID]: row.extras[EXTRAS_KEY_BRACKET_OWN_STATE]
+              for row in iter_active_bracket_ownerships(ctx)}
+    assert states == {"10": BRACKET_OWN_STATE_CLEARING, "11": "active"}
+    store.close()
+
+
+def __test_a_co_owned_attach_refusal_is_not_an_after_fill_flatten__(tmp_path, monkeypatch):
+    """A refused attach on a leg another exit protects is the exit's refusal, not a flatten.
+
+    The SL exit's 1.09 sits on the leg; the price drifts to 1.093 and the TP
+    exit attaches: the venue refuses the merge (its stop rule). The leg still
+    holds SL's level, so the engine must get the venue's plain reject (the
+    refused-exit recovery: retry, then the defensive close) instead of
+    :class:`BracketAttachAfterFillRejectedError` (an immediate flatten). The
+    TP exit's row is released; SL's stays.
+    """
+    warnings = _capture_warnings(monkeypatch)
+    store, ctx = _make_store(tmp_path)
+    port = _VenueRulesPort([_leg("10", "buy", 1.0)], mid=1.10, min_dist=0.005)
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("SL", "L", sl=1.09), port))
+    port.mid = 1.093
+    with pytest.raises(ExchangeOrderRejectedError) as raised:
+        _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.20), port))
+    assert not isinstance(raised.value, BracketAttachAfterFillRejectedError)
+    assert "stop distance too small" in str(raised.value)
+    assert _own_states(ctx) == {"SL\0L": "active"}
+    assert len([w for w in warnings if "other exits also protect" in w]) == 1
+    store.close()
+
+
+def __test_a_co_owned_modify_refusal_restores_the_previous_row__(tmp_path):
+    """A refused modify on a co-owned leg keeps the exit's previous levels as its row.
+
+    The venue still holds the merge with the exit's previous levels, so the
+    row must keep them (a later retirement must take them off the leg).
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _VenueRulesPort([_leg("10", "buy", 1.0)], mid=1.10, min_dist=0.005)
+    eng = OneWayEmulator(store_ctx=ctx)
+    _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.20), port))
+    _run(eng.run_exit_bracket(_exit_env("SL", "L", sl=1.09), port))
+    port.mid = 1.093
+    with pytest.raises(ExchangeOrderRejectedError) as raised:
+        _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.25), port))
+    assert not isinstance(raised.value, BracketAttachAfterFillRejectedError)
+    rows = {row.intent_key: row for row in iter_active_bracket_ownerships(ctx)}
+    assert rows["TP\0L"].extras[EXTRAS_KEY_BRACKET_OWN_STATE] == "active"
+    assert rows["TP\0L"].extras[EXTRAS_KEY_BRACKET_OWN_TP] == 1.20
+    store.close()
+
+
+def __test_a_sole_owner_attach_refusal_keeps_the_after_fill_flatten__(tmp_path):
+    """With no co-owner the refused attach still means an unprotected position."""
+    store, ctx = _make_store(tmp_path)
+    port = _VenueRulesPort([_leg("10", "buy", 1.0)], mid=1.093, min_dist=0.005)
+    eng = OneWayEmulator(store_ctx=ctx)
+    with pytest.raises(BracketAttachAfterFillRejectedError):
+        _run(eng.run_exit_bracket(_exit_env("SL", "L", sl=1.09), port))
+    assert list(iter_active_bracket_ownerships(ctx)) == []
+    store.close()
+
+
+def __test_a_stop_and_a_trail_of_different_exits_are_reported_once__(tmp_path, monkeypatch):
+    """A fixed stop of one exit and a trail of another cannot be carried as asked; WARN once."""
+    warnings = _capture_warnings(monkeypatch)
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    _run(eng.run_exit_bracket(_exit_env("ST", "L", sl=1.00), port))
+    _run(eng.run_exit_bracket(_exit_env("TR", "L", trail=10.0), port))
+    _run(eng.run_exit_bracket(_exit_env("TR", "L", trail=10.0), port))
+    leg_id, _side, tp, sl, trail, _coid = port.amended[-1]
+    assert (leg_id, tp, sl, trail) == ("10", None, 1.00, 0.1)
+    assert len([w for w in warnings if "fixed stop-loss and a trailing stop" in w]) == 1
+    store.close()
+
+
+def __test_one_exit_asking_for_a_stop_and_a_trail_is_not_reported__(tmp_path, monkeypatch):
+    warnings = _capture_warnings(monkeypatch)
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0)])
+    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    _run(eng.run_exit_bracket(_exit_env("ST", "L", sl=1.00, trail=10.0), port))
+    _run(eng.run_exit_bracket(_exit_env("TP", "L", tp=1.20), port))
+    assert [w for w in warnings if "fixed stop-loss and a trailing stop" in w] == []
     store.close()
 
 
@@ -1645,7 +2318,8 @@ class _FailingReadPort(_FakePort):
     _TransientProviderError("HTTP transport error on /v5/position/list"),
     ConnectionError("Server disconnected without sending a response"),
     TimeoutError("read timed out"),
-], ids=["retryable-provider-error", "connection-error", "timeout-error"])
+    ExchangeRateLimitError("too many requests", retry_after=1.0),
+], ids=["retryable-provider-error", "connection-error", "timeout-error", "rate-limit"])
 @pytest.mark.parametrize("quantizer", [False, True], ids=["legs", "quantizer"])
 def __test_transient_port_read_fault_parks_the_dispatch__(fault, quantizer):
     """A transient fault on a fan-out's venue READ surfaces as ``ExchangeConnectionError``.

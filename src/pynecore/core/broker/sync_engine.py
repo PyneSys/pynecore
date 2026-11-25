@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import itertools
+import json
 import logging
 import math
 import _thread
@@ -158,6 +159,7 @@ from pynecore.core.broker.one_way_emulator import (
     BracketFanResult,
     CloseFanResult,
     OneWayEmulator,
+    close_leg_client_order_id,
 )
 from pynecore.core.broker.parked_dispatch import (
     awaits_venue_answer,
@@ -165,6 +167,7 @@ from pynecore.core.broker.parked_dispatch import (
     park_inherited_dispatches,
 )
 from pynecore.core.broker.storage import (
+    ENTRY_BOOK_EVENT_KIND,
     EnvelopeRecord,
     OrderRow,
     PendingRecord,
@@ -207,7 +210,7 @@ from pynecore.types.strategy import (
 )
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.position import BrokerPosition, ProvisionalClose
+    from pynecore.core.broker.position import BrokerPosition, EntryBookSnapshot, ProvisionalClose
     from pynecore.core.plugin.broker import PositionPort
     from pynecore.lib.strategy import Order
 
@@ -307,6 +310,12 @@ UNATTRIBUTED_CHANGE_EVENT_KINDS = (
 #: applying the same resume again judges the venue against it
 #: (:meth:`OrderSyncEngine._resume_venue_view`).
 RESUME_VENUE_VIEW_EVENT_KIND = 'resume_venue_view'
+
+#: How long before a stored binding book was written a journal row may have
+#: closed and still be judged against it (:meth:`OrderSyncEngine._unseen_journal_fill`):
+#: a plugin closes a fully filled exit row before the engine books the fill,
+#: and the book may be written in between for another event.
+_ENTRY_BOOK_CLOSE_SLACK_MS = 60_000
 
 #: Seconds the stop-coverage guard (:meth:`OrderSyncEngine._check_reduce_coverage`)
 #: waits for the venue's verdict on a missing stop leg whose journal row is still
@@ -813,6 +822,10 @@ _INFO_SKIP_REASONS = frozenset({
     # An exit waiting for its same-sync pyramid entry's fill to drain; a wait
     # that outgrows the grace is ``position_book_incomplete_stalled`` (WARNING).
     'position_book_incomplete',
+    # An exit whose entry holds no leg while every open leg belongs to another
+    # entry; the emulator reports it at WARNING once per exit, and the skip
+    # recurs on every bar until the entry's leg or its close is booked.
+    'entry_holds_no_leg',
     'spot_full_close_pre_clear',
     'pre_clear_leg_fill_pending',
     'pre_clear_leg_filled',
@@ -824,6 +837,8 @@ _INFO_SKIP_REASONS = frozenset({
 
 def _bracket_skip_reason(bracket: BracketFanResult) -> str:
     """The :class:`OrderSkippedByPlugin` reason of a skipped one-way bracket fan."""
+    if bracket.entry_without_leg:
+        return 'entry_holds_no_leg'
     if bracket.skip_reason is None:
         return 'no_position_to_protect'
     if bracket.stalled:
@@ -1698,6 +1713,10 @@ class OrderSyncEngine:
         # and FILL re-arms the same window via
         # :meth:`_replay_pending_defensive_closes`.
         self._pending_defensive_close: dict[str, PendingDefensiveClose] = {}
+        # :attr:`~BrokerPosition.book_moves` as of the last time every pending
+        # marker's target-leg baseline was known to be comparable with the
+        # book (see :meth:`_void_leg_baselines_on_book_move`).
+        self._leg_baseline_book_moves: int = 0
 
         # Entry ids whose :class:`PendingDefensiveClose` marker was
         # re-armed by :meth:`_replay_pending_defensive_closes` after a
@@ -1943,6 +1962,16 @@ class OrderSyncEngine:
         self._unattributed_view: dict | None = None
         self._unattributed_view_loaded = False
         self._unattributed_view_book: float | None = None
+        # The binding book as last written to the store (its JSON), so the
+        # book is written once per change (:meth:`_persist_entry_book`), and
+        # whether the startup adoption has judged the stored one yet: until it
+        # has, the empty book of the fresh process must not overwrite it.
+        self._entry_book_persisted: str | None = None
+        self._entry_book_judged = False
+        # When each fill cursor's order was first seen without a live journal
+        # row (wall-clock ms): past the restart check's close slack the cursor
+        # is never consulted again and is dropped (:meth:`_prune_fill_cursors`).
+        self._fill_cursor_unlive_since_ms: dict[str, int] = {}
 
         # Intent keys whose ``_order_mapping`` entry was seeded from a
         # recovered close-park anchor (see :meth:`_verify_pending_dispatches`).
@@ -1980,20 +2009,18 @@ class OrderSyncEngine:
         self._neutralised_parent_entry_pine_ids: set[str] = set()
         self._neutralised_parent_entry_coids: set[str] = set()
 
-        # Entry ids whose FIFO ``Trade`` rows were just closed by the most
-        # recent :meth:`BrokerPosition.record_fill` call. Captured in
-        # :meth:`_route_event` from the ``new_closed_trades`` slice added
-        # by the FILL and consumed by :meth:`_route_defensive_close_fill`
-        # so its cleanup targets the actually-reduced entries rather than
-        # blindly ``marker.entry_id``. In pyramiding (LongA + LongB, with
-        # a bracket-attach reject on the newer LongB), FIFO closes LongA
-        # but ``marker.entry_id`` is LongB — without this list the
-        # cleanup would clear LongB's intents while LongA's intents stay
-        # live against a Trade that no longer exists, corrupting later
-        # exits and P&L. List (not set) to preserve walk order for
-        # callers that care; entries are not deduplicated here because
-        # ``_cleanup_position_tracking`` is idempotent.
-        self._last_fifo_closed_entry_ids: list[str] = []
+        # Entry ids whose bindings the most recent
+        # :meth:`BrokerPosition.record_fill` call spent
+        # (:attr:`~BrokerPosition.last_spent_entry_ids`, plus the dust
+        # flatten's). Captured in :meth:`_route_event` and consumed by its
+        # closed-entry cleanup and by :meth:`_route_defensive_close_fill`, so
+        # the cleanup retires exactly the entries whose own bound quantity is
+        # gone. The trade rows settle FIFO and are no key for it: an exit of
+        # the newest pyramid add consumes the OLDEST entry's rows while that
+        # entry keeps its binding and its bracket. List (not set) to preserve
+        # walk order for callers that care; entries are not deduplicated here
+        # because ``_cleanup_position_tracking`` is idempotent.
+        self._last_spent_entry_ids: list[str] = []
 
         # Keys that received an empty :attr:`_order_mapping` adoption marker
         # from :meth:`_consume_plugin_resolutions` during the current sync.
@@ -3500,7 +3527,17 @@ class OrderSyncEngine:
             (the default) suppresses the WATCH phase this cycle, which is
             the right behaviour for callers that have no price context yet
             (e.g. startup before the first bar has been ingested).
+
+        Whatever the cycle changed in the binding book is written to the
+        store when it ends (:meth:`_persist_entry_book`), however it ends.
         """
+        try:
+            self._sync_cycle(bar_ts_ms, last_price=last_price)
+        finally:
+            self._persist_entry_book()
+
+    def _sync_cycle(self, bar_ts_ms: int, *, last_price: float | None) -> None:
+        """The diff/dispatch cycle of :meth:`sync`, without the book write."""
         # Surface a latched halt before any state mutation so an async halt
         # triggered from ``run_event_stream`` (e.g. an
         # :class:`UnexpectedCancelError` observed by the polling plugin)
@@ -3695,7 +3732,7 @@ class OrderSyncEngine:
             self._position.entry_orders,
             self._position.exit_orders,
             self._symbol,
-            self._position.open_trades,
+            self._position.bindings,
         )
         resolved = [self._resolve_ticks(i) for i in raw]
         final = self._apply_interceptors(resolved)
@@ -5168,8 +5205,11 @@ class OrderSyncEngine:
         outstanding = round(
             max(marker.expected_qty - marker.filled_qty, 0.0), 12,
         )
-        fifo_consumed_entry_ids: list[str] = []
+        spent_entry_ids: list[str] = []
         if outstanding > 0.0 and self._position.open_trades:
+            # The correction is an unbound reduction: it settles the bindings
+            # oldest first, like the rows below.
+            spent_entry_ids = self._position.settle_unbooked_reduction(outstanding)
             close_qty_remaining = outstanding
             surviving: list = []
             removed_any = False
@@ -5182,8 +5222,6 @@ class OrderSyncEngine:
                     # Whole tranche absorbed by the correction — drop it.
                     close_qty_remaining -= trade_qty
                     removed_any = True
-                    if t.entry_id is not None:
-                        fifo_consumed_entry_ids.append(t.entry_id)
                 else:
                     # Tranche larger than the residual close qty: shrink
                     # it in place and prorate the commission alongside,
@@ -5205,20 +5243,15 @@ class OrderSyncEngine:
                 self._position.open_commission = float(sum(
                     t.commission for t in self._position.open_trades
                 ))
-        # Clean intents only for entries whose FIFO trade was fully
-        # consumed here AND no surviving tranche still references the id
-        # (pyramiding can keep same-id residuals alive). The fold entry
-        # itself normally survives — the correction only trims the
-        # surplus off its legitimate exposure — so no blanket cleanup on
-        # the marker's own entry key.
-        surviving_entry_ids = {
-            trade.entry_id
-            for trade in self._position.open_trades
-            if trade.entry_id is not None
-        }
+        # Clean intents only for entries whose bindings the correction spent
+        # AND no surviving binding still holds the id (pyramiding can keep
+        # same-id bindings alive). The fold entry itself normally survives —
+        # the correction only trims the surplus off its legitimate exposure —
+        # so no blanket cleanup on the marker's own entry key.
         cleaned: set[str] = set()
-        for entry_id in fifo_consumed_entry_ids:
-            if entry_id not in surviving_entry_ids and entry_id not in cleaned:
+        for entry_id in spent_entry_ids:
+            if (self._entry_closed(entry_id)
+                    and entry_id not in cleaned):
                 cleaned.add(entry_id)
                 self._cleanup_position_tracking(entry_id)
         # The parked-close anchor and verification rows die with the
@@ -6117,7 +6150,19 @@ class OrderSyncEngine:
         graceful halt. See the Capital.com plugin's
         ``_reconcile_snapshot`` + ``_emit_unexpected_cancellations`` for the
         reference implementation.
+
+        The startup pass resumes the binding book the previous process wrote
+        when it fits the adopted position (:meth:`_restore_entry_book`).
+        Whatever a pass changed in the book is written to the store when it
+        ends (:meth:`_persist_entry_book`), however it ends.
         """
+        try:
+            self._reconcile_position()
+        finally:
+            self._persist_entry_book()
+
+    def _reconcile_position(self) -> None:
+        """The reconciliation pass of :meth:`reconcile`, without the book write."""
         if self.venue_writes_blocked:
             # External-intervention quarantine: book what the venue reports,
             # adopt and repair nothing. The operator resume restarts the run,
@@ -6360,6 +6405,7 @@ class OrderSyncEngine:
                         broker_signed, self._position.size,
                     )
                 self._adopt_signed_size(broker_signed, broker_entry_price, fifo_trim=True)
+                self._restore_entry_book()
         elif (not is_startup and self._position.size != 0.0
               and (new_size == 0.0 or self._venue_on_opposite_side(exch_pos))):
             if self._held_reduction_fills:
@@ -6452,6 +6498,7 @@ class OrderSyncEngine:
             for trade in self._position.open_trades:
                 if trade.entry_id:
                     cleared_entry_ids.add(trade.entry_id)
+            cleared_entry_ids.update(self._position.clear_entry_book())
             self._position.size = 0.0
             self._position.sign = 0.0
             self._position.avg_price = na_float
@@ -6485,6 +6532,14 @@ class OrderSyncEngine:
             self._shrink_observed = None
             if not is_startup:
                 self._carry_unattributed_view_over(exch_pos)
+        # The startup above set the position: from now on the book this
+        # process keeps is the one the store holds.
+        if is_startup and not self._entry_book_judged:
+            self._judge_entry_book_at_startup(
+                exch_pos, drained=drained_mutated_position,
+                replayed_close=(not drained_mutated_position
+                                and bool(replayed_markers_to_consider) and new_size != 0.0),
+            )
         self._enforce_reduce_coverage_invariant(exch_pos)
 
     def _note_unbooked_exit_fill(self, event: OrderEvent) -> None:
@@ -6587,6 +6642,7 @@ class OrderSyncEngine:
                 trade.entry_id for trade in self._position.open_trades
                 if trade.entry_id is not None
             }
+            held_entry_ids.update(self._position.clear_entry_book())
             self._position.open_trades.clear()
             self._position.open_commission = 0.0
             exact = self._adopt_signed_size(
@@ -6600,8 +6656,9 @@ class OrderSyncEngine:
             # exits are that exposure's protection.
             spent: set[str] = set()
             if exact:
-                spent = held_entry_ids - {
-                    trade.entry_id for trade in self._position.open_trades
+                spent = {
+                    entry_id for entry_id in held_entry_ids
+                    if self._entry_closed(entry_id)
                 }
             else:
                 _blog_warning(
@@ -6687,6 +6744,7 @@ class OrderSyncEngine:
         )
         if broker_signed == 0.0:
             self._position.avg_price = na_float
+            self._position.clear_entry_book()
             self._position.open_trades.clear()
             self._position.openprofit = 0.0
             self._position.open_commission = 0.0
@@ -6748,6 +6806,327 @@ class OrderSyncEngine:
                 entry_price=broker_entry_price,
             )
             return False
+
+    def _persist_entry_book(self) -> None:
+        """Write the binding book to the store when it changed since the last write.
+
+        The book (:meth:`~pynecore.core.broker.position.BrokerPosition.entry_book_snapshot`,
+        plus the wall-clock ``written_ms``) is written as a
+        :data:`~pynecore.core.broker.storage.ENTRY_BOOK_EVENT_KIND` event of
+        the run, at most once per change: every routed event, every
+        :meth:`sync` and every :meth:`reconcile` ends here, and an unchanged
+        book writes nothing. A flat book drops its fill cursors first: it
+        owes no fill of any order; an open one drops, before each write, the
+        cursors no restart check can consult any more
+        (:meth:`_prune_fill_cursors`), so a book that stays open while orders
+        cycle does not grow with every order it ever booked; a failed journal
+        read keeps the cursors (pruning is best effort and never stops the
+        write, nor the fill handling the write runs in). Nothing is
+        written before the startup judged the stored book (:meth:`_judge_entry_book_at_startup`); when no
+        startup adoption ran before the first completed :meth:`sync`, the
+        book is judged here (:meth:`_judge_entry_book_without_adoption`).
+
+        The write follows the plugin's own journal write of the fill, so a
+        crash in between leaves the stored book behind the journal; the
+        restart then finds a fill it did not take in and adopts the position
+        FIFO (:meth:`_restore_entry_book`). A failed write is reported and
+        retried with the next change check.
+
+        Only the newest book of the run is ever read, so a landed write then
+        deletes the run's older ones
+        (:meth:`~pynecore.core.broker.storage.RunContext.delete_superseded_events`):
+        the store holds one book per run, however long the position stays
+        open. The delete follows the committed write, so it can never leave
+        the run without a book; a failed delete is reported and caught up by
+        the next write.
+        """
+        if self._store_ctx is None:
+            return
+        if not self._entry_book_judged:
+            if self._sync_count == 0:
+                return
+            try:
+                self._judge_entry_book_without_adoption()
+            except Exception as exc:  # noqa: BLE001 -- the book must not depend on the disk
+                _blog_warning(
+                    "binding book could not be judged against the journal (%s) — "
+                    "not written yet, retried on the next change check", exc,
+                )
+                return
+        if self._position.size == 0.0 and not self._position.bindings:
+            self._position.forget_fill_cursors()
+        snapshot = self._position.entry_book_snapshot()
+        encoded = json.dumps(snapshot, sort_keys=True)
+        if encoded == self._entry_book_persisted:
+            return
+        now_ms = int(time.time() * 1000)
+        try:
+            pruned = self._prune_fill_cursors(now_ms)
+        except Exception as exc:  # noqa: BLE001 -- pruning is best effort
+            _blog_warning(
+                "fill cursors could not be pruned (%s) — the book is written "
+                "with all of them; pruning is retried with the next write", exc,
+            )
+            pruned = False
+        if pruned:
+            snapshot = self._position.entry_book_snapshot()
+            encoded = json.dumps(snapshot, sort_keys=True)
+        try:
+            self._store_ctx.log_event(
+                ENTRY_BOOK_EVENT_KIND, client_order_id=None, intent_key=None,
+                payload={**snapshot, 'written_ms': now_ms},
+            )
+        except Exception as exc:  # noqa: BLE001 -- the book must not depend on the disk
+            _blog_warning(
+                "binding book could not be written to the store (%s) — retried on "
+                "the next change check; a restart before it lands adopts the "
+                "position from the journal", exc,
+            )
+            return
+        self._entry_book_persisted = encoded
+        try:
+            self._store_ctx.delete_superseded_events(ENTRY_BOOK_EVENT_KIND)
+        except Exception as exc:  # noqa: BLE001 -- trimming is best effort
+            _blog_warning(
+                "superseded binding books could not be deleted from the store (%s) — "
+                "the new book is stored; they are deleted with the next write", exc,
+            )
+
+    def _prune_fill_cursors(self, now_ms: int) -> bool:
+        """Drop the fill cursors no restart check can consult any more.
+
+        The restart check (:meth:`_unseen_journal_fill`) reads a cursor only
+        for a journal row that is live or closed at most
+        :data:`_ENTRY_BOOK_CLOSE_SLACK_MS` before the book was written. A
+        cursor whose order has had no live row of the run for longer than
+        that slack closed before every later book's window, so it only grows
+        each stored book while the position stays open: it is dropped. Only
+        the live rows are read (the indexed, small set), so the cost of a book
+        write does not grow with the run's order history.
+
+        :param now_ms: The wall-clock time of the book write about to happen.
+        :return: Whether any cursor was dropped.
+        """
+        assert self._store_ctx is not None
+        live: set[str] = set()
+        for row in self._store_ctx.iter_live_orders():
+            live.update(self._journal_row_keys(row))
+        cursor_keys = self._position.fill_cursor_keys()
+        unlive_since = self._fill_cursor_unlive_since_ms
+        for key in list(unlive_since):
+            if key in live or key not in cursor_keys:
+                del unlive_since[key]
+        stale = []
+        for key in cursor_keys:
+            if key in live:
+                continue
+            since = unlive_since.setdefault(key, now_ms)
+            if since < now_ms - _ENTRY_BOOK_CLOSE_SLACK_MS:
+                stale.append(key)
+        for key in stale:
+            del unlive_since[key]
+        self._position.drop_fill_cursors(stale)
+        return bool(stale)
+
+    def _judge_entry_book_at_startup(self, exch_pos: ExchangePosition | None, *,
+                                     drained: bool, replayed_close: bool) -> None:
+        """Settle how far the book this process starts with can be trusted.
+
+        Runs once, at the end of the startup reconciliation, whichever way it
+        set the position. The plain adoption already judged the stored book
+        (:meth:`_restore_entry_book`). A book booked from fills the startup
+        drained onto the empty position (``drained``: the adoption was
+        skipped) is faithful only when nothing was held before them (the
+        stored book is flat or missing) and it holds what the venue holds;
+        an adoption around a replayed defensive close (``replayed_close``)
+        sets the size without bindings. Otherwise such a book holds exposure
+        no fill of this process bound, and it is marked not faithful
+        (:attr:`~BrokerPosition.book_faithful`).
+
+        Afterwards the book counts every fill the journal shows as taken in
+        (:meth:`~BrokerPosition.seed_fill_cursors`): from now on, only a fill
+        journaled later is one it has not seen.
+
+        :param exch_pos: The venue position the startup read.
+        :param drained: The startup booked queued fills instead of adopting.
+        :param replayed_close: The startup adopted around replayed defensive
+            close markers.
+        """
+        self._entry_book_judged = True
+        if self._store_ctx is None:
+            return
+        size = self._position.size
+        if size != 0.0 and (drained or replayed_close):
+            reason: str | None = None
+            if replayed_close:
+                reason = "the adoption around a replayed defensive close set it without fills"
+            else:
+                venue = self._venue_signed_size(exch_pos)
+                stored = self._stored_entry_book()
+                if venue is None or not _sizes_match(venue, size):
+                    reason = f"the venue holds {venue}"
+                elif stored is None or stored.bindings:
+                    reason = "the fills were booked over a position the previous process held"
+            if reason is not None and self._position.book_faithful:
+                self._position.book_faithful = False
+                _blog_warning(
+                    "startup: the book (%s) does not account for the position (%s) — "
+                    "not faithful, no protection is retired on its strength",
+                    size, reason,
+                )
+        self._position.seed_fill_cursors(self._journal_fill_cursors())
+
+    def _judge_entry_book_without_adoption(self) -> None:
+        """Judge the book of a process whose startup never adopted the venue position.
+
+        Its book holds only the fills this process booked; an exposure the
+        previous process held is not in it. While it holds any, it is marked
+        not faithful (:attr:`~BrokerPosition.book_faithful`); the fills the
+        journal shows count as taken in from now on. The judgement counts as
+        done only once the journal was read: a failed read leaves it to the
+        next attempt.
+        """
+        if self._position.size != 0.0 and self._position.book_faithful:
+            self._position.book_faithful = False
+            _blog_warning(
+                "the book (%s) was never judged against the venue at startup — "
+                "not faithful, no protection is retired on its strength",
+                self._position.size,
+            )
+        self._position.seed_fill_cursors(self._journal_fill_cursors())
+        self._entry_book_judged = True
+
+    def _stored_entry_book(self) -> EntryBookSnapshot | None:
+        """The latest binding book of the run in the store, ``None`` when none or malformed."""
+        if self._store_ctx is None:
+            return None
+        latest = self._store_ctx.latest_event_for_run_id((ENTRY_BOOK_EVENT_KIND,))
+        if latest is None:
+            return None
+        return self._position.parse_entry_book_snapshot(latest[1])
+
+    @staticmethod
+    def _journal_row_keys(row: OrderRow) -> tuple[str, ...]:
+        """The ids a fill event of a journal row's order can carry.
+
+        Its client order id, its venue order id, and the venue order id a
+        plugin keeps in ``extras['order_id']`` when it keys the row by a
+        position id (cTrader).
+        """
+        keys = [row.client_order_id]
+        if row.exchange_order_id:
+            keys.append(row.exchange_order_id)
+        order_id = (row.extras or {}).get('order_id')
+        if order_id is not None and order_id != '':
+            keys.append(str(order_id))
+        return tuple(keys)
+
+    def _journal_fill_cursors(self) -> dict[str, float]:
+        """The filled quantity of every live journal row of the run, by each of its ids."""
+        cursors: dict[str, float] = {}
+        if self._store_ctx is None:
+            return cursors
+        for row in self._store_ctx.iter_live_orders():
+            filled = float(row.filled_qty)
+            if filled <= 0.0:
+                continue
+            for key in self._journal_row_keys(row):
+                cursors[key] = max(cursors.get(key, 0.0), filled)
+        return cursors
+
+    def _unseen_journal_fill(self, snapshot: EntryBookSnapshot) -> str | None:
+        """A fill the journal shows that the stored book did not take in, described.
+
+        Every plugin raises an order row's ``filled_qty`` when it journals a
+        fill of the order, before the engine books it; netting exposure off
+        entry rows only lowers it. A row of the run, live or closed since
+        shortly before the book was written, whose ``filled_qty`` exceeds
+        what the book took in of its order
+        (the ``fill_cursors`` of
+        :class:`~pynecore.core.broker.position.EntryBookSnapshot`)
+        holds a fill the book never saw.
+
+        :param snapshot: The stored book.
+        :return: ``None`` when the book saw every fill the journal shows.
+        """
+        assert self._store_ctx is not None
+        since = snapshot.written_ms - _ENTRY_BOOK_CLOSE_SLACK_MS
+        for row in itertools.chain(self._store_ctx.iter_live_orders(),
+                                   self._store_ctx.iter_orders_closed_since_for_run_id(since)):
+            filled = float(row.filled_qty)
+            if filled <= 0.0:
+                continue
+            taken = max(snapshot.fill_cursors.get(key, 0.0)
+                        for key in self._journal_row_keys(row))
+            if filled > taken + 1e-9 * max(filled, 1.0):
+                return (f"the journal shows {filled} filled of order {row.client_order_id}, "
+                        f"the book took in {taken}")
+        return None
+
+    def _restore_entry_book(self) -> None:
+        """Resume the binding book the previous process wrote, when it holds the adopted position.
+
+        Runs right after the startup adoption seeded the trade rows and a
+        FIFO-attributed book (:meth:`_adopt_signed_size`). The latest stored
+        book (:data:`~pynecore.core.broker.storage.ENTRY_BOOK_EVENT_KIND`)
+        replaces that book verbatim, :attr:`~BrokerPosition.book_faithful`
+        included, when it holds the adopted position exactly and saw every
+        fill the journal shows: every binding on the position's side, the
+        bound quantities adding up to the adopted size within the book
+        invariant's float tolerance, and no journal row of the run filled
+        beyond what the book took in of its order
+        (:meth:`_unseen_journal_fill`). The trade rows stay as the adoption
+        seeded them.
+
+        A stored book that does not fit (the previous process stopped between
+        a fill's journal write and the book's, the plugin booked executions
+        made while no process ran, an adoption clamped the size, a flat book
+        next to an open position, a malformed record) is rejected with a
+        warning; the FIFO adoption stands and the book stays unfaithful. No
+        stored book (a journal of a run that never wrote one) leaves the
+        adoption as it is, said at INFO. A flat adopted position needs none.
+        """
+        size = self._position.size
+        if self._store_ctx is None or size == 0.0:
+            return
+        latest = self._store_ctx.latest_event_for_run_id((ENTRY_BOOK_EVENT_KIND,))
+        if latest is None:
+            _blog_info(
+                "startup: no stored binding book for the adopted position (%s) — the "
+                "book is attributed FIFO from the journal and is not faithful",
+                size,
+            )
+            return
+        snapshot = self._position.parse_entry_book_snapshot(latest[1])
+        reason: str | None
+        if snapshot is None:
+            reason = "it is malformed"
+        else:
+            sign = 1.0 if size > 0.0 else -1.0
+            bound = sum((binding.bound for binding in snapshot.bindings), 0.0)
+            if any(binding.sign != sign for binding in snapshot.bindings):
+                reason = "it holds the other side"
+            elif abs(bound - abs(size)) > 1e-9 * max(abs(size), 1.0):
+                reason = f"its bindings hold {bound}, the adopted position {size}"
+            else:
+                reason = self._unseen_journal_fill(snapshot)
+        if reason is not None or snapshot is None:
+            _blog_warning(
+                "startup: the stored binding book does not fit the adopted position "
+                "(%s) — %s; the book is attributed FIFO from the journal and stays "
+                "unfaithful, no protection is retired on its strength",
+                size, reason,
+            )
+            return
+        self._position.restore_entry_book(snapshot)
+        self._entry_book_persisted = json.dumps(
+            self._position.entry_book_snapshot(), sort_keys=True)
+        _blog_info(
+            "startup: resumed the binding book of the previous process (%s)%s",
+            ", ".join(f"{binding.entry_id}={binding.bound}"
+                      for binding in snapshot.bindings),
+            "" if snapshot.faithful else " — not faithful, as before the restart",
+        )
 
     def _venue_on_opposite_side(self, exch_pos: ExchangePosition | None) -> bool:
         """Whether an account-net venue position sits on the side opposite the book.
@@ -6863,9 +7242,10 @@ class OrderSyncEngine:
         is not in the snapshot, so the realized P&L on the adopted piece is
         approximate — stated in the log — until a late fill of the bot's own
         turns out to be this reduction and re-prices it) and walked through the FIFO exactly
-        like a real close: a parent consumed in full has its exits cancelled
-        and its tracking retired, a parent that survives keeps its exit and
-        the next diff amends the bracket to the new size. The adopted
+        like a real unbound close, the trade rows and the bindings alike: a
+        parent whose bindings it spent has its exits cancelled and its tracking
+        retired, a parent that survives keeps its exit and the next diff amends
+        the bracket to the new size. The adopted
         quantity stays expected: a late fill of an order live at this moment
         is held until the venue shows whether it was this reduction
         (:meth:`_hold_fill_against_adopted_reduction`).
@@ -6938,10 +7318,11 @@ class OrderSyncEngine:
             for trade in self._position.new_closed_trades[closed_before:]
             if trade.entry_id is not None
         }
+        # An external reduction is unbound: it settles the bindings oldest
+        # first like the rows, and an entry whose bindings it spent retires.
         gone = sorted(
-            entry_id for entry_id in consumed
-            if not any(trade.entry_id == entry_id
-                       for trade in self._position.open_trades)
+            entry_id for entry_id in self._position.last_spent_entry_ids
+            if self._entry_closed(entry_id)
         )
         book_before = round(abs(self._position.size) + delta, 12)
         _blog_error(
@@ -7338,13 +7719,11 @@ class OrderSyncEngine:
                 if part > 0.0:
                     slice_event = event if part == qty else dataclasses.replace(
                         event, fill_qty=part, fee=event.fee * part / qty)
-                    closed_before = len(self._position.new_closed_trades)
-                    self._position.record_fill(slice_event)
-                    consumed.update(
-                        trade.entry_id
-                        for trade in self._position.new_closed_trades[closed_before:]
-                        if trade.entry_id is not None
+                    self._position.record_fill(
+                        slice_event,
+                        close_entry_id=self._close_fill_entry_id(slice_event),
                     )
+                    consumed.update(self._position.last_spent_entry_ids)
                 in_reduction = round(qty - part, 12)
                 if in_reduction > 0.0 and not _sizes_match(in_reduction, 0.0):
                     # This much of the fill was the adopted reduction: the
@@ -7358,7 +7737,7 @@ class OrderSyncEngine:
                 self._clear_adopted_reduction()
             gone = sorted(
                 entry_id for entry_id in consumed
-                if not any(trade.entry_id == entry_id for trade in self._position.open_trades)
+                if self._entry_closed(entry_id)
             )
             for entry_id in gone:
                 for key, intent in list(self._active_intents.items()):
@@ -7723,22 +8102,25 @@ class OrderSyncEngine:
             < self._fill_report_grace_s()
         )
         if (legs_by_exit or orphans_by_exit) and excess > rounding and not settling:
-            candidates: list[tuple[float, float, str, list[tuple[ExchangeOrder, str]]]] = []
+            candidates: list[tuple[bool, float, float, str,
+                                   list[tuple[ExchangeOrder, str]]]] = []
             for key, cov in exit_coverage.items():
                 intent = self._active_intents[key]
                 assert isinstance(intent, ExitIntent)
-                parent_held = sum(
-                    abs(trade.size) for trade in self._position.open_trades
-                    if trade.entry_id == intent.from_entry
-                )
+                parent_held = self._parent_open_exposure(intent.from_entry)[0]
                 deficit = cov - parent_held
                 if deficit > 0.5 * cov:
-                    candidates.append((deficit, cov, key, []))
+                    candidates.append((False, deficit, cov, key, []))
             for owner, legs in orphans_by_exit.items():
                 cov = orphan_coverage[owner]
-                candidates.append((cov, cov, '', legs))
-            candidates.sort(key=lambda c: c[0], reverse=True)
-            for deficit, cov, key, legs in candidates:
+                # An orphan whose exit already filled a leg is a spent
+                # bracket's leftover; orphans of one exit cover the same
+                # unit, so the spent one goes first. Read from the journal:
+                # after a restart the book may not say which parent still
+                # holds its unit (a FIFO adoption).
+                candidates.append((self._journal_exit_leg_filled(owner), cov, cov, '', legs))
+            candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+            for _spent, deficit, cov, key, legs in candidates:
                 if excess <= rounding:
                     break
                 if not legs:
@@ -7831,6 +8213,25 @@ class OrderSyncEngine:
                     payload={'held': held_abs, 'parent_held': parent_held},
                 )
         self._reduce_coverage_current = None
+
+    def _journal_exit_leg_filled(self, owner: str) -> bool:
+        """Whether a closed journal row of exit ``owner`` filled: its bracket is spent.
+
+        :param owner: The exit's intent key (``exit_id`` and ``from_entry``
+            joined by :data:`INTENT_KEY_SEP`, a leg row may add its leg), or a
+            row's client order id when it names no exit.
+        """
+        exit_id, _sep, rest = owner.partition(INTENT_KEY_SEP)
+        from_entry = rest.partition(INTENT_KEY_SEP)[0]
+        if self._store_ctx is None or not exit_id or not from_entry:
+            return False
+        key = f"{exit_id}{INTENT_KEY_SEP}{from_entry}"
+        for row in self._store_ctx.iter_closed_orders_for_run_id(from_entry=from_entry):
+            row_key = row.intent_key or ""
+            if row.filled_qty > 0.0 and (
+                    row_key == key or row_key.startswith(f"{key}{INTENT_KEY_SEP}")):
+                return True
+        return False
 
     def _exit_is_position_attached(self, key: str) -> bool:
         """Whether the exit's bracket is a venue position attribute.
@@ -8187,6 +8588,7 @@ class OrderSyncEngine:
             )
             if broker_signed == 0.0:
                 self._position.avg_price = na_float
+                self._position.clear_entry_book()
                 self._position.open_trades.clear()
                 self._position.openprofit = 0.0
                 self._position.open_commission = 0.0
@@ -8210,6 +8612,7 @@ class OrderSyncEngine:
             )
             if broker_signed == 0.0:
                 self._position.avg_price = na_float
+                self._position.clear_entry_book()
                 self._position.open_trades.clear()
                 self._position.openprofit = 0.0
                 self._position.open_commission = 0.0
@@ -8306,6 +8709,7 @@ class OrderSyncEngine:
                         self._register_native_cancel_all_expected(event.symbol)
                         drained_any = True
                         continue
+                    own_marker = self._match_pending_defensive_close(event)
                     try:
                         self._route_event(event)
                     except VenueWritesQuarantinedError:
@@ -8316,6 +8720,11 @@ class OrderSyncEngine:
                         # (:meth:`_follow_up_write_deferred`). Keep routing the
                         # rest of the batch.
                         _log.debug("follow-up write of %s deferred by quarantine", event)
+                    finally:
+                        self._void_leg_baselines_on_book_move(own_marker)
+                        # The plugin journaled the fill before the event got
+                        # here: write the book it moved right away.
+                        self._persist_entry_book()
                     drained_any = True
             except BaseException:
                 # The raising event is routed (a policy halt raises after its
@@ -8443,17 +8852,17 @@ class OrderSyncEngine:
                     self._cancel_residual_after_partial_resolution(
                         _ct_key,
                     )
-            # Reset the per-event FIFO closure cache. Populated below only
-            # when :meth:`BrokerPosition.record_fill` actually walks FIFO
-            # for this event; consumed by
+            # Reset the per-event spent-binding cache. Populated below only
+            # when :meth:`BrokerPosition.record_fill` actually books this
+            # event; consumed by
             # :meth:`_route_defensive_close_fill` so its cleanup targets
-            # the entries the FIFO walk reduced, not blindly
+            # the entries whose bindings the fill spent, not blindly
             # ``marker.entry_id``. Routing branches that bypass
             # ``record_fill`` (no-FIFO settle, duplicate-drop) must leave
             # this list empty so the cleanup falls back to
             # ``marker.entry_id`` rather than reusing the previous event's
             # ids.
-            self._last_fifo_closed_entry_ids = []
+            self._last_spent_entry_ids = []
             # Defensive-close fill deduplication. The marker-based
             # :meth:`_route_defensive_close_fill` only catches the case
             # where the second delivery still sees a live marker — once
@@ -8722,12 +9131,17 @@ class OrderSyncEngine:
                                 else -fill_qty
                             )
                             self._position.size += signed_delta
+                            # The close is bound to the entry it protects.
+                            self._position.settle_unbooked_reduction(
+                                fill_qty, entry_id=no_fifo_matched_id,
+                            )
                             if abs(self._position.size) < 1e-12:
                                 self._position.size = 0.0
                                 self._position.sign = 0.0
                                 self._position.avg_price = na_float
                                 self._position.openprofit = 0.0
                                 self._position.open_commission = 0.0
+                                self._position.clear_entry_book()
                             else:
                                 self._position.sign = (
                                     1.0 if self._position.size > 0.0 else -1.0
@@ -8752,6 +9166,7 @@ class OrderSyncEngine:
                             self._position.avg_price = na_float
                             self._position.openprofit = 0.0
                             self._position.open_commission = 0.0
+                            self._position.clear_entry_book()
                     elif no_fifo_fan_incomplete:
                         # Flat engine view + an incomplete fan: the parent
                         # ENTRY fill has not routed yet AND it will NOT be
@@ -8831,12 +9246,17 @@ class OrderSyncEngine:
                     signed_delta = (fill_qty if event.order.side == "buy"
                                     else -fill_qty)
                     self._position.size += signed_delta
+                    # The close is bound to the entry it protects.
+                    self._position.settle_unbooked_reduction(
+                        fill_qty, entry_id=no_fifo_matched_id,
+                    )
                     if abs(self._position.size) < 1e-12:
                         self._position.size = 0.0
                         self._position.sign = 0.0
                         self._position.avg_price = na_float
                         self._position.openprofit = 0.0
                         self._position.open_commission = 0.0
+                        self._position.clear_entry_book()
                     else:
                         self._position.sign = (
                             1.0 if self._position.size > 0.0 else -1.0
@@ -9023,35 +9443,27 @@ class OrderSyncEngine:
                                 event.order.id,
                                 fill_qty_value,
                             )
-            # Snapshot the FIFO frontier BEFORE :meth:`record_fill` walks
-            # ``open_trades``. ``record_fill`` closes the OLDEST trades
-            # first (Pine FIFO semantics), which in pyramiding can differ
-            # from ``marker.entry_id``: e.g. with LongA (older) and LongB
-            # (newer, bracket-attach reject → defensive close for
-            # LongB.qty), FIFO reduces LongA. The downstream cleanup in
-            # :meth:`_route_defensive_close_fill` would otherwise clear
-            # tracking for ``marker.entry_id`` (LongB) while LongA's
-            # Trade was the one actually closed — corrupting later exits
-            # and P&L. We capture the pre-FILL ``new_closed_trades``
-            # length here so the post-FILL slice gives us the exact set
-            # of entry ids the FIFO walk consumed.
-            closed_count_before = len(self._position.new_closed_trades)
+            # The trade rows settle FIFO, the bindings by the fill's origin
+            # (:meth:`_close_fill_entry_id`): in pyramiding the two differ, so
+            # the cleanup below keys on the bindings the fill spent, which
+            # :meth:`record_fill` reports, never on the rows it consumed. With
+            # LongA (older) and LongB (newer) open, LongB's exit or a
+            # defensive close of LongB consumes LongA's rows FIFO while LongA
+            # keeps its binding and its bracket, and LongB's binding is spent.
             if not self._hold_fill_against_adopted_reduction(event):
                 if ((event.fill_qty or 0.0) > 0.0 and (event.fill_price or 0.0) > 0.0
                         and self._position.is_non_reducing_exit(event)):
                     self._note_unbooked_exit_fill(event)
-                self._position.record_fill(event)
+                self._position.record_fill(
+                    event, close_entry_id=self._close_fill_entry_id(event),
+                )
+                self._last_spent_entry_ids = list(self._position.last_spent_entry_ids)
             self._last_position_fill_monotonic = time.monotonic()
             # The book moved, so a running external-flatten confirmation no
             # longer measures an unmoved book: a later flat snapshot starts a
             # fresh clock instead of clearing a position booked inside the
             # old window.
             self._flat_observed_since = 0.0
-            self._last_fifo_closed_entry_ids = [
-                trade.entry_id
-                for trade in self._position.new_closed_trades[closed_count_before:]
-                if trade.entry_id is not None
-            ]
             # A closing fill can leave an unsellable residual on the LAST FIFO
             # trade: spot entries are fee-netted (off the venue's qty grid)
             # while the close order is grid-quantized, so every close floors
@@ -9059,9 +9471,9 @@ class OrderSyncEngine:
             # (measured on the Bybit spot lane: 3 x 0.009995 entries, close
             # floored to 0.02998, 5e-06 left on the newest entry; three
             # brackets of 0.00999 left 1.5e-05). The venue cannot
-            # trade the residual — but the surviving trade keeps its entry
-            # out of the closed-entry cleanup below, so the entry's FULL-size
-            # protective legs stay resting and a later trigger sells
+            # trade the residual — but the surviving trade and binding keep
+            # their entry out of the closed-entry cleanup below, so the entry's
+            # FULL-size protective legs stay resting and a later trigger sells
             # inventory the account no longer holds (negative spot ledger →
             # quarantine). Book the residual closed as dust so the cleanup
             # retires the entry and cancels its brackets.
@@ -9083,9 +9495,10 @@ class OrderSyncEngine:
                     dust_consumed = self._position.flatten_nontradable_dust(
                         event.fill_price or 0.0, event,
                     )
-                    for entry_id in dust_consumed:
-                        if entry_id not in self._last_fifo_closed_entry_ids:
-                            self._last_fifo_closed_entry_ids.append(entry_id)
+                    for entry_id in (*self._position.last_spent_entry_ids,
+                                     *dust_consumed):
+                        if entry_id not in self._last_spent_entry_ids:
+                            self._last_spent_entry_ids.append(entry_id)
                     # The fee-netted residue every spot round trip leaves:
                     # expected, not a fault.
                     _blog_info(
@@ -9219,39 +9632,38 @@ class OrderSyncEngine:
             # one fanned-out leg is not proof the whole correction settled.
             if self._pending_flip_surplus_closes:
                 self._track_flip_surplus_close_fill(event)
-            # Persist defensive-close ``partial`` FIFO closures onto the
-            # marker. The transient ``_last_fifo_closed_entry_ids`` list is
+            # Persist the entries a defensive-close ``partial`` spent onto the
+            # marker. The transient ``_last_spent_entry_ids`` list is
             # reset at the top of every :meth:`_route_event`, so a
             # subsequent event (the terminal ``filled``, an unrelated fill,
             # or no event at all when the terminal arrives with zero qty
             # and stale-grace settles the marker) would otherwise discard
-            # the entries this partial closed. In pyramiding (LongA older,
-            # LongB newer with bracket-attach reject), a defensive-close
-            # partial for LongB.qty can fully consume LongA via FIFO; if
-            # the terminal ``filled`` then closes LongB, the snapshot
-            # captured in :meth:`_route_defensive_close_fill` carries only
-            # LongB and the cleanup in
+            # the entries this partial spent. The close is bound to its
+            # parent and spends that entry's bindings; only what they cannot
+            # absorb spends older ones, and the snapshot captured in
+            # :meth:`_route_defensive_close_fill` carries only the terminal
+            # slice's. Without the merge, the cleanup in
             # :meth:`_retry_residual_cleanup_after_transient_fill` /
-            # :meth:`_replay_pending_defensive_closes` falls back to
-            # ``marker.entry_id`` for LongA — leaving LongA's intents
-            # orphaned. Merge here so the marker accumulates every entry
-            # FIFO touched across the partials → terminal sequence.
-            if t == 'partial' and self._last_fifo_closed_entry_ids:
+            # :meth:`_replay_pending_defensive_closes` would leave the
+            # intents of an entry a partial spent orphaned. Merge here so
+            # the marker accumulates every entry spent across the partials
+            # → terminal sequence.
+            if t == 'partial' and self._last_spent_entry_ids:
                 matched_id = self._match_pending_defensive_close(event)
                 if matched_id is not None:
                     existing = self._pending_defensive_close[matched_id]
-                    merged = list(existing.fifo_closed_entry_ids)
+                    merged = list(existing.spent_entry_ids)
                     seen = set(merged)
-                    for entry_id in self._last_fifo_closed_entry_ids:
+                    for entry_id in self._last_spent_entry_ids:
                         if entry_id not in seen:
                             merged.append(entry_id)
                             seen.add(entry_id)
-                    if len(merged) != len(existing.fifo_closed_entry_ids):
+                    if len(merged) != len(existing.spent_entry_ids):
                         self._set_pending_defensive_close(
                             matched_id,
                             dataclasses.replace(
                                 existing,
-                                fifo_closed_entry_ids=tuple(merged),
+                                spent_entry_ids=tuple(merged),
                             ),
                         )
             _blog_info(
@@ -9300,10 +9712,10 @@ class OrderSyncEngine:
             # longer exists on the broker (which on Capital.com fails
             # because the bracket-attached entry row is naturally
             # closed).
-            # ``record_fill`` already told us exactly which entries this fill
-            # consumed — that FIFO evidence is authoritative: it is
-            # independent of leg type, of where the book ended up, and of how
-            # the plugin labelled the event. Leaving a consumed entry behind
+            # ``record_fill`` already told us exactly which entries' bindings
+            # this fill spent — that evidence is authoritative: it is
+            # independent of where the book ended up and of which trade rows
+            # the fill consumed FIFO. Leaving a spent entry behind
             # is what strands a bot — the dead entry's slot still compares
             # equal to Pine's next re-emission, so the diff calls a genuine
             # re-entry "unchanged" and silently never dispatches it, while
@@ -9313,11 +9725,11 @@ class OrderSyncEngine:
                 LegType.TAKE_PROFIT, LegType.STOP_LOSS,
                 LegType.TRAILING_STOP, LegType.CLOSE,
             )
-            fifo_closed = [
+            spent = [
                 closed_entry_id
-                for closed_entry_id in self._last_fifo_closed_entry_ids
+                for closed_entry_id in self._last_spent_entry_ids
                 # This fill's own entry: a same-id flatten-and-reopen ENTRY
-                # fill puts it in the FIFO slice while the entry itself is
+                # fill spends its old binding while the entry itself is
                 # live. A closing leg is exempt from this guard: plugins with
                 # position-attached brackets (Capital.com) label the TP/SL
                 # fill with the PARENT's own pine_id, and skipping the
@@ -9325,18 +9737,17 @@ class OrderSyncEngine:
                 # same-name phase's exit then diffs as a modify against a
                 # parent the venue closed long ago, and the plugin's
                 # "no confirmed entry row" reject kills the run. The
-                # open-trades check below still protects a parent that keeps
-                # a surviving trade (partial TP, pyramiding).
+                # binding check below still protects a parent that keeps a
+                # live binding (partial TP, pyramiding).
                 if (closing_leg or closed_entry_id != event.pine_id)
-                # Pyramiding: another trade under this entry survives, so its
+                # Pyramiding: another binding of this entry survives, so its
                 # bracket and diff slot are still owed.
-                and not any(trade.entry_id == closed_entry_id
-                            for trade in self._position.open_trades)
+                and self._entry_closed(closed_entry_id)
             ]
-            # The label-derived cleanup is only the FALLBACK for fills whose
-            # FIFO walk produced nothing (an adopted position with no
-            # reconstructable parent, or a plugin event ``record_fill``
-            # skipped). It must not run alongside the FIFO evidence: a
+            # The label-derived cleanup is only the FALLBACK for fills that
+            # spent no binding (an adopted position with no reconstructable
+            # parent, or a plugin event ``record_fill`` skipped). It must not
+            # run alongside the binding evidence: a
             # reversal's closing leg is labelled with the REVERSING
             # intent's ``from_entry`` — the id that is about to open — so
             # trusting the label there tears down the live new entry's
@@ -9346,10 +9757,10 @@ class OrderSyncEngine:
             # signals as "unchanged").
             if (closing_leg
                     and self._position.size == 0
-                    and not fifo_closed):
+                    and not spent):
                 with self._follow_up_write_deferred("closed-position cleanup"):
                     self._cleanup_closed_position(event)
-            for closed_entry_id in fifo_closed:
+            for closed_entry_id in spent:
                 with self._follow_up_write_deferred("closed-entry cleanup"):
                     self._cleanup_position_tracking(closed_entry_id)
             if t == 'filled' and event.leg_type in (
@@ -9357,8 +9768,8 @@ class OrderSyncEngine:
                 with self._follow_up_write_deferred("spent bracket retire"):
                     self._retire_spent_software_bracket(event)
             # A flat book must not keep exit tracking under ANY parent id.
-            # The per-entry cleanup above keys on the ids the FIFO walk (and
-            # the dust flatten) actually consumed — but a startup-adopted
+            # The per-entry cleanup above keys on the ids whose bindings the
+            # fill (and the dust flatten) actually spent — but a startup-adopted
             # position can hold its exposure under the synthetic
             # ``ADOPTED_STARTUP_ENTRY_ID`` parent while the adopted protective
             # legs of the SAME exposure stay keyed on the prior run's REAL
@@ -10134,20 +10545,23 @@ class OrderSyncEngine:
         venue legs (TP limit + SL stop) that the venue does not link: a
         full fill of either leg spends the whole exit, yet the sibling
         keeps resting for the exit's full qty — against inventory the fill
-        just sold. The per-entry cleanup reaches it only when the fill's
-        FIFO walk consumed the exit's OWN parent completely; under
-        pyramiding the walk consumes the OLDEST trade instead, and spot
-        fee-netted entries (0.009995) against grid-quantized legs
-        (0.00999) leave a sub-step residual on every parent, so the parent
-        always "survives" (measured live: bybit-spot cycle 274 — the L2-X
-        and L3-X SL legs filled, their TP siblings rested on for 30
-        minutes and then filled too, selling 0.01998 against 0.010005
-        held: negative spot ledger -> quarantine, the surviving trade
-        unprotected in between).
+        just sold. The per-entry cleanup reaches it only when the fill
+        spent the exit's OWN binding completely, and spot fee-netted
+        entries (0.009995) against grid-quantized legs (0.00999) leave a
+        sub-step residual on the binding, so the parent "survives"
+        (measured live: bybit-spot cycle 274 — the L2-X and L3-X SL legs
+        filled, their TP siblings rested on for 30 minutes and then filled
+        too, selling 0.01998 against 0.010005 held: negative spot ledger ->
+        quarantine).
 
-        Cancel the sibling, retire the intent and drop its Pine-side order;
-        the next sync re-arms a fresh bracket for whatever trades the book
-        still holds. Only a venue leg this intent owns qualifies —
+        Cancel the sibling, retire the intent and drop its Pine-side order.
+        The brackets of the other entries stay where they are: each covers
+        its own binding, which this fill did not touch, so nothing is
+        re-armed for them. When the exit's entry order still works a
+        remainder (:meth:`_entry_still_opening`), its Pine-side order stays
+        and the next sync re-arms the bracket for that remainder
+        (:meth:`_retire_exit_for_rearm`), amended as it fills. Only a venue
+        leg this intent owns qualifies —
         position-attached brackets report their fills as ``close`` legs or
         under the parent's own id and never match an exit intent here.
         """
@@ -10171,6 +10585,9 @@ class OrderSyncEngine:
             format_intent_key(key),
             " and cancelling its resting sibling leg" if siblings else "",
         )
+        if self._entry_still_opening(intent.from_entry):
+            self._retire_exit_for_rearm(key, intent)
+            return
         self._cancel_and_retire_exit_leg(key, intent)
 
     def _trim_cancelled_bracket_leg(self, event: OrderEvent, key: str) -> None:
@@ -10510,6 +10927,68 @@ class OrderSyncEngine:
             if order_id in ids:
                 return key
         return None
+
+    def _close_fill_entry_id(self, event: OrderEvent) -> str | None:
+        """The entry a ``CLOSE`` leg fill is bound to, ``None`` when it is unbound.
+
+        Bound closes settle their own entry's bindings
+        (:meth:`BrokerPosition.record_fill`): a script ``strategy.close(id)``
+        settles ``id``'s, an engine-made close aimed at one entry
+        (``partial_trigger``, ``marketable_exit``) its ``target_entry_id``'s, a
+        defensive close the parent entry it protects. A ``strategy.close_all``
+        and a reversal's close are unbound and walk the whole book. A fill whose
+        close the engine cannot identify takes the entry id its labels carry:
+        the ``from_entry`` of a venue's per-position protective close (cTrader
+        HEDGED), or the ``pine_id`` of a close a venue reports under the
+        entry's own id (Capital.com). A label naming an entry with no open
+        binding settles like an unbound reduction. Take-profit, stop-loss and
+        trailing legs are bound by their own labels and need nothing here.
+
+        :param event: The fill event, before it is booked.
+        :return: The entry id, or ``None`` for an unbound reduction.
+        """
+        if event.leg_type is not LegType.CLOSE:
+            return None
+        key = self._find_key_for_order_id(event.order.id)
+        intent = self._close_intent_for_key(key)
+        if intent is None:
+            # A one-way close fans out per leg under composed client order
+            # ids, so the fill's venue order id matches no mapping; its
+            # labels name the close it serves (``from_entry`` on a one-way
+            # close-leg fill, ``pine_id`` on the WS path).
+            for label in (event.pine_id, event.from_entry):
+                intent = self._close_intent_for_key(label)
+                if intent is not None:
+                    break
+        if intent is not None:
+            if intent.synthetic_kind is None:
+                return intent.pine_id or None
+            if intent.synthetic_kind in ('partial_trigger', 'marketable_exit'):
+                return intent.target_entry_id
+            if intent.synthetic_kind == 'reversal_close':
+                return None
+        defensive_entry_id = self._match_pending_defensive_close(event)
+        if defensive_entry_id is not None:
+            return defensive_entry_id
+        if key == "":
+            return None
+        return event.from_entry or event.pine_id or None
+
+    def _close_intent_for_key(self, key: str | None) -> CloseIntent | None:
+        """The close intent dispatched under ``key``, ``None`` when ``key`` names none.
+
+        Looks in the active intents, then in the envelopes of the dispatches
+        still in flight (an engine-made close is never an active intent).
+
+        :param key: An intent key, or ``None``.
+        """
+        if not key:
+            return None
+        intent = self._active_intents.get(key)
+        if intent is None:
+            envelope = self._envelopes.get(key)
+            intent = envelope.intent if envelope is not None else None
+        return intent if isinstance(intent, CloseIntent) else None
 
     def enqueue_native_cancel_all_expected(self, symbol: str | None = None) -> None:
         """Thread-safe expected-cancel arm for a plugin native bulk cancel.
@@ -10959,12 +11438,16 @@ class OrderSyncEngine:
         # close FILL must see that trade already reduced by the
         # deferred slice.
         self._position.size += signed_delta
+        # The deferred slices belong to the defensive close of
+        # ``entry_pine_id``, so they settle that entry's bindings.
+        self._position.settle_unbooked_reduction(applicable, entry_id=entry_pine_id)
         if abs(self._position.size) < 1e-12:
             self._position.size = 0.0
             self._position.sign = 0.0
             self._position.avg_price = na_float
             self._position.openprofit = 0.0
             self._position.open_commission = 0.0
+            self._position.clear_entry_book()
         else:
             self._position.sign = (
                 1.0 if self._position.size > 0.0 else -1.0
@@ -11452,29 +11935,24 @@ class OrderSyncEngine:
             observed_fill_order_id = (
                 event.order.id
             )
-            # Snapshot the FIFO-closed entry ids captured in
-            # :meth:`_route_event` before ``record_fill`` walked
-            # ``open_trades``. Persisting them alongside ``fill_observed``
-            # lets the post-FILL retry branch in
+            # Snapshot the spent entry ids :meth:`_route_event` captured
+            # from ``record_fill``. Persisting them alongside
+            # ``fill_observed`` lets the post-FILL retry branch in
             # :meth:`_retry_residual_cleanup_after_transient_fill` run the
-            # same FIFO-aware cleanup as the in-flight path even after
+            # same binding-keyed cleanup as the in-flight path even after
             # intervening :meth:`record_fill` calls have overwritten the
-            # live ``_last_fifo_closed_entry_ids`` cache. Without this,
-            # the retry path would always clean ``marker.entry_id``,
-            # which in pyramiding can target a different entry than the
-            # one FIFO actually closed.
+            # live ``_last_spent_entry_ids`` cache.
             #
-            # Merge with any closures already accumulated on the marker
+            # Merge with any entries already accumulated on the marker
             # by prior defensive-close ``partial`` events (see the
             # ``t == 'partial'`` branch in :meth:`_route_event`): the
             # live cache only holds THIS terminal fill's slice, so
-            # overwriting would drop entries an earlier partial FIFO
-            # walk consumed (e.g. LongA via partial, LongB via terminal).
+            # overwriting would drop entries an earlier partial spent.
             marker = dataclasses.replace(
                 marker,
                 fill_observed=True,
                 fill_exchange_order_id=observed_fill_order_id,
-                fifo_closed_entry_ids=self._merged_fifo_closed_entry_ids(marker),
+                spent_entry_ids=self._merged_spent_entry_ids(marker),
                 applied_close_qty=new_applied,
                 settled_leg_order_ids=settled_leg_order_ids,
                 booked_leg_count=booked_leg_count,
@@ -11483,13 +11961,13 @@ class OrderSyncEngine:
         elif expected_close_qty is not None:
             # A later leg of a fanned-out close: ``fill_observed`` was
             # already flipped by an earlier leg, but this leg's quantity,
-            # its dedup identity and its own FIFO closures still have to
+            # its dedup identity and the entries it spent still have to
             # reach the marker — the final leg's cleanup targets are
             # derived from the merged snapshot, not from the per-event
             # cache.
             marker = dataclasses.replace(
                 marker,
-                fifo_closed_entry_ids=self._merged_fifo_closed_entry_ids(marker),
+                spent_entry_ids=self._merged_spent_entry_ids(marker),
                 applied_close_qty=new_applied,
                 settled_leg_order_ids=settled_leg_order_ids,
                 booked_leg_count=booked_leg_count,
@@ -11577,68 +12055,42 @@ class OrderSyncEngine:
                 exchange_order_id=audit_exchange_order_id,
                 payload=payload,
             )
-        # Align cleanup with the entry/entries whose FIFO ``Trade`` was
-        # actually closed by :meth:`record_fill`. In pyramiding scenarios
-        # (LongA older, LongB newer with bracket-attach reject), Pine FIFO
-        # semantics close the OLDEST trade first — so ``record_fill``
-        # reduces LongA while ``marker.entry_id`` is LongB. Cleaning only
-        # ``marker.entry_id`` would clear LongB's intents but leave
-        # LongA's intents pointing at a Trade that no longer exists,
-        # corrupting later exits and P&L. ``_last_fifo_closed_entry_ids``
-        # was captured in :meth:`_route_event` from the
-        # ``new_closed_trades`` slice the FIFO walk just appended.
+        # Align cleanup with the entries whose bindings :meth:`record_fill`
+        # spent. The defensive close is bound to ``marker.entry_id``
+        # (:meth:`_close_fill_entry_id`): it spends that entry's bindings
+        # first, while its trade rows settle FIFO and in pyramiding
+        # (LongA older, LongB newer with the bracket-attach reject) consume
+        # LongA's rows. LongA keeps its binding and its bracket; LongB is
+        # spent and retires. Only what LongB's bindings cannot absorb walks
+        # on to the older bindings, and those entries are spent too.
         #
-        # When ``marker.entry_id`` is NOT among the FIFO-closed entries
-        # (i.e. the protected entry's Trade survived because FIFO took
-        # an older sibling instead), its intents must stay live so the
-        # remaining Trade row keeps a path to its exits — otherwise the
-        # next ``sync()`` rebuilds nothing and the Trade goes orphaned.
-        # Fall back to ``marker.entry_id`` only when the FIFO walk
-        # recorded no closure at all (degenerate / no-FIFO path that
-        # bypassed this method), so the marker's own pine-id is still
-        # cleared rather than left dangling.
+        # Fall back to ``marker.entry_id`` only when the fills spent no
+        # binding at all (degenerate / no-FIFO path that bypassed
+        # ``record_fill``), so the marker's own pine-id is still cleared
+        # rather than left dangling.
         #
-        # Partial-close survivor guard: ``record_fill``'s partial-close
-        # branch splits an oversized trade and keeps the residual in
-        # ``open_trades`` while appending the closed slice to
-        # ``new_closed_trades`` — both pieces share the same
-        # ``entry_id``. Cleaning that id here would wipe intents for an
-        # entry whose Trade is still partially open. Exclude entry ids
-        # that still appear in ``open_trades`` (the cleanup helper is
-        # idempotent against ids it cannot find, so the exclusion only
-        # narrows the cleanup, never widens it).
+        # Survivor guard: an entry id with another live binding (a
+        # pyramided same-id add) keeps its intents. When the fills DID
+        # spend bindings and every one of them was filtered out by the
+        # guard, the entries still hold live bindings — falling back to
+        # ``marker.entry_id`` would clear intents for live exposure.
+        # Distinguish the two with the raw spent list, not the post-filter
+        # cleanup_targets length.
         #
-        # Empty-cleanup distinction: when the FIFO walk recorded NO
-        # closure at all (the marker's snapshot is empty — the
-        # degenerate / no-FIFO path that bypassed ``record_fill``'s
-        # FIFO branch), the marker's own pine-id is still the right
-        # cleanup anchor. But when the FIFO walk DID record closures
-        # and every one of them was filtered out by the survivor guard
-        # (e.g. the close partially consumed a single tranche so the
-        # residual is still open with the same ``entry_id``), the
-        # entries are by construction still partially open — falling
-        # back to ``marker.entry_id`` would clear intents for a trade
-        # that still has live exposure. Distinguish the two with the
-        # raw FIFO list, not the post-filter cleanup_targets length.
-        #
-        # Source the FIFO closures from ``marker.fifo_closed_entry_ids``
-        # (just merged above with ``_last_fifo_closed_entry_ids``):
-        # this includes every entry FIFO touched across the partials →
-        # terminal sequence, not only the terminal slice. Reading from
-        # the live cache would lose closures from earlier partial events
-        # whose ``_last_fifo_closed_entry_ids`` was reset at the top of
-        # each subsequent :meth:`_route_event`.
-        surviving_entry_ids = {
-            trade.entry_id
-            for trade in self._position.open_trades
-            if trade.entry_id is not None
-        }
+        # Source the spent entries from ``marker.spent_entry_ids``
+        # (just merged above with ``_last_spent_entry_ids``): this
+        # includes every entry spent across the partials → terminal
+        # sequence, not only the terminal slice. Reading from the live
+        # cache would lose entries spent by earlier partial events whose
+        # ``_last_spent_entry_ids`` was reset at the top of each
+        # subsequent :meth:`_route_event`.
         cleanup_targets: list[str] = [
             entry_id
-            for entry_id in marker.fifo_closed_entry_ids
-            if entry_id not in surviving_entry_ids
+            for entry_id in marker.spent_entry_ids
+            if self._entry_closed(entry_id)
         ]
-        if not cleanup_targets and not marker.fifo_closed_entry_ids:
+        if (not cleanup_targets and not marker.spent_entry_ids
+                and self._parent_open_exposure(marker.entry_id)[0] <= 0.0):
             cleanup_targets.append(marker.entry_id)
         for cleanup_id in cleanup_targets:
             with self._follow_up_write_deferred("closed-entry cleanup"):
@@ -11819,20 +12271,20 @@ class OrderSyncEngine:
         if ctx.position_coid:
             self._neutralised_parent_entry_coids.add(ctx.position_coid)
 
-    def _merged_fifo_closed_entry_ids(
+    def _merged_spent_entry_ids(
             self, marker: PendingDefensiveClose,
     ) -> tuple[str, ...]:
-        """Union of ``marker``'s FIFO closures with this event's slice.
+        """Union of the entries ``marker`` recorded as spent with this event's.
 
-        The live ``_last_fifo_closed_entry_ids`` cache is reset at the top
-        of every :meth:`_route_event`, so it only holds the closures of
-        the event being routed right now. Merging keeps the closures an
+        The live ``_last_spent_entry_ids`` cache is reset at the top
+        of every :meth:`_route_event`, so it only holds the entries the
+        event being routed right now spent. Merging keeps those an
         earlier ``partial`` event (or an earlier leg of a fanned-out
-        close) consumed — order-preserving, duplicates dropped.
+        close) spent — order-preserving, duplicates dropped.
         """
-        merged = list(marker.fifo_closed_entry_ids)
+        merged = list(marker.spent_entry_ids)
         seen = set(merged)
-        for entry_id in self._last_fifo_closed_entry_ids:
+        for entry_id in self._last_spent_entry_ids:
             if entry_id not in seen:
                 merged.append(entry_id)
                 seen.add(entry_id)
@@ -11910,13 +12362,13 @@ class OrderSyncEngine:
         """Retire exit tracking whose parent id owns nothing on a flat book.
 
         Complements the per-entry close-fill cleanup: that path keys on the
-        entry ids the FIFO walk / dust flatten consumed, so an exit whose
-        ``from_entry`` differs from the consumed parent survives it. The one
+        entry ids whose bindings the fill / dust flatten spent, so an exit
+        whose ``from_entry`` differs from the spent parent survives it. The one
         producer of that shape is startup adoption — the net exposure seeded
         under the synthetic :data:`ADOPTED_STARTUP_ENTRY_ID` (or a clamped
         aggregate) while the adopted protective legs keep the prior run's
         real ``from_entry``. Once the book is flat, an exit under a parent
-        with no open trade protects nothing; every venue leg it still owns
+        with no open binding protects nothing; every venue leg it still owns
         can only oversell (spot: negative-inventory quarantine).
 
         Parents that are OPENING rather than gone are skipped — a declared
@@ -11958,8 +12410,7 @@ class OrderSyncEngine:
                              or row.sl_level is not None)):
                     parents.add(row.from_entry)
         for pid in parents:
-            if any(trade.entry_id == pid
-                   for trade in self._position.open_trades):
+            if self._parent_open_exposure(pid)[0] > 0.0:
                 continue
             if pid in self._position.entry_orders:
                 continue
@@ -11978,7 +12429,7 @@ class OrderSyncEngine:
             # filling into the flat book.
             _blog_info(
                 "flat book left exit tracking under parent %r with no open "
-                "trade — retiring its exit legs",
+                "binding — retiring its exit legs",
                 pid,
             )
             self._cleanup_position_tracking(pid)
@@ -12213,7 +12664,7 @@ class OrderSyncEngine:
                 exits_to_retire[key] = active
         for intent in build_intents(
                 {}, self._position.exit_orders, self._symbol,
-                self._position.open_trades):
+                self._position.bindings):
             if (isinstance(intent, ExitIntent)
                     and intent.from_entry == closed_entry_id):
                 exits_to_retire.setdefault(intent.intent_key, intent)
@@ -14471,16 +14922,14 @@ class OrderSyncEngine:
             # newly-filled position (REST eventual consistency). Gating
             # the cascade purely on ``parent_snapshot is None`` would
             # then evict the freshly-armed bracket and leave the just-
-            # opened parent unprotected. Use the local
-            # :attr:`Position.open_trades` ledger — which is updated
+            # opened parent unprotected. Use the local binding book
+            # (:attr:`~BrokerPosition.bindings`) — which is updated
             # synchronously from order events before this WATCH phase
-            # runs — to filter the cascade to ``from_entry``s that
-            # really are gone from BOTH sides; defer the rest until a
-            # later sync sees a consistent snapshot.
-            locally_open_entry_ids: set[str] = {
-                trade.entry_id for trade in self._position.open_trades
-                if trade.entry_id is not None
-            }
+            # runs, and keeps an entry whose trade rows another entry's
+            # fill consumed FIFO — to filter the cascade to
+            # ``from_entry``s that really are gone from BOTH sides; defer
+            # the rest until a later sync sees a consistent snapshot.
+            locally_open_entry_ids: set[str] = self._open_entry_ids()
             from_entries_to_cascade: set[str] = set()
             for leg in self._partial_bracket_engine.iter_legs():
                 if leg.symbol != self._symbol:
@@ -14791,9 +15240,23 @@ class OrderSyncEngine:
     def _find_entry_reference(
             self, from_entry: str,
     ) -> tuple[float | None, float]:
-        for trade in self._position.open_trades:
-            if trade.entry_id == from_entry:
-                return float(trade.entry_price), trade.sign
+        """Entry price and side a tick-based exit of ``from_entry`` measures from.
+
+        Read off the entry's oldest open binding: the entry keeps it, and with
+        it its exit, after a fill of another entry consumed its trade rows FIFO.
+
+        :param from_entry: The exit's ``from_entry``.
+        :return: ``(price, sign)``, or ``(None, 0.0)`` while nothing is held
+            under the entry (its open trade rows count while the book is not
+            faithful, see :meth:`_open_entry_ids`).
+        """
+        for binding in self._position.bindings:
+            if binding.entry_id == from_entry:
+                return float(binding.entry_price), binding.sign
+        if not self._position.book_faithful:
+            for trade in self._position.open_trades:
+                if trade.entry_id == from_entry:
+                    return float(trade.entry_price), trade.sign
         return None, 0.0
 
     def _ticks_to_prices(
@@ -14863,11 +15326,72 @@ class OrderSyncEngine:
         return dataclasses.replace(intent, **mods) if mods else intent
 
     def _bound_exit_intents_to_held(self, intents: list[Intent]) -> list[Intent]:
-        """Apply :meth:`_bound_exit_qty_to_held` to every exit of a rebuilt intent list."""
-        return [
-            self._bound_exit_qty_to_held(i) if isinstance(i, ExitIntent) else i
-            for i in intents
-        ]
+        """Size every exit of a rebuilt intent list to what its parent holds.
+
+        Each exit goes through :meth:`_bound_exit_qty_to_held`. An exit whose
+        parent entry is spent (:meth:`_exit_parent_spent`) is retired instead:
+        its Pine order is dropped and it is left out of the list, so the diff
+        cancels whatever of it still rests on the venue and never dispatches
+        it. Sized from the script's qty, such an exit would close exposure
+        other entries hold (or, on spot, sell inventory the run does not own).
+        """
+        bounded: list[Intent] = []
+        for intent in intents:
+            if isinstance(intent, ExitIntent):
+                if self._exit_parent_spent(intent):
+                    _blog_warning(
+                        "exit %s outlived its parent %r: nothing is bound to the "
+                        "entry and no order of it is waiting to fill — retiring "
+                        "the exit instead of dispatching it",
+                        format_intent_key(intent.intent_key), intent.from_entry,
+                    )
+                    self._position.exit_orders.pop((intent.pine_id, intent.from_entry), None)
+                    continue
+                intent = self._bound_exit_qty_to_held(intent)
+            bounded.append(intent)
+        return bounded
+
+    def _exit_parent_spent(self, intent: ExitIntent) -> bool:
+        """Whether an exit's parent entry holds nothing on an open book and opens nothing.
+
+        Judged only while the book holds a position: on a flat book an exit
+        waits for its entry, and the flat-book sweep
+        (:meth:`_retire_orphan_exits_on_flat_book`) retires what no parent is
+        left for. ``True`` when no binding of the parent is open
+        (:meth:`_parent_open_exposure`) and nothing of it can still fill: no
+        entry order of the id still opening (:meth:`_entry_still_opening`: an
+        exit placed with its entry waits for it), no parked reversal open, no
+        engine-trigger partial legs waiting on the parent. An exit without a
+        ``from_entry`` covers the whole position and never qualifies, nor does
+        any exit while the book was not built from fills
+        (:attr:`~BrokerPosition.book_faithful`: a startup adoption or a
+        rebuild attributed the exposure FIFO, while the exits keep the prior
+        run's entry ids), while it holds exposure attributed to no real entry
+        (:data:`ADOPTED_STARTUP_ENTRY_ID`, or an adopted size no binding was
+        seeded for), nor one whose parent's defensive close is in flight (its
+        exits are frozen until the close settles).
+
+        :param intent: The rebuilt exit.
+        """
+        parent = intent.from_entry
+        size = abs(self._position.size)
+        if (not parent or size == 0.0 or not self._position.book_faithful
+                or self._parent_open_exposure(parent)[0] > 0.0
+                or self._entry_still_opening(parent)):
+            return False
+        if parent in self._pending_reversal_opens or parent in self._pending_defensive_close:
+            return False
+        bound = 0.0
+        for binding in self._position.bindings:
+            if binding.entry_id in (None, ADOPTED_STARTUP_ENTRY_ID):
+                return False
+            bound += binding.bound
+        if size - bound > 1e-9 * max(size, 1.0):
+            return False
+        return not any(
+            leg.from_entry == parent
+            and leg.leg_state in (LEG_STATE_PENDING_ENTRY, LEG_STATE_CANCEL_TENTATIVE)
+            for leg in self._partial_bracket_engine.iter_legs())
 
     def _bound_exit_qty_to_held(self, intent: ExitIntent) -> ExitIntent:
         """Keep a whole-row exit from closing more than its parent entry holds.
@@ -14908,7 +15432,9 @@ class OrderSyncEngine:
           the engine-trigger / reduce-only paths cap its close at the parent
           size when it fires;
         - an exit whose parent holds nothing yet (a bracket placed with its
-          entry, sized again by the fill-time amend);
+          entry, sized again by the fill-time amend). Once part of the entry
+          order filled and that part is spent, the bracket covers only the
+          order's still working remainder: it is capped at that remainder;
         - venues with a native TP/SL bracket (``tp_sl_bracket = NATIVE``),
           which track the parent fills themselves.
 
@@ -14919,7 +15445,12 @@ class OrderSyncEngine:
             return None
         held, _ = self._parent_open_exposure(bracket.from_entry)
         if held <= 0.0:
-            return None
+            entry = self._position.entry_orders.get(bracket.from_entry)
+            if (entry is None or entry.filled_qty <= 0.0
+                    or not self._entry_still_opening(bracket.from_entry)):
+                return None
+            remainder = abs(entry.size) - entry.filled_qty
+            return script_qty if script_qty <= remainder else remainder
         cap = held
         active = self._active_intents.get(bracket.intent_key)
         if (isinstance(active, ExitIntent) and active.qty > cap
@@ -14943,12 +15474,17 @@ class OrderSyncEngine:
         clamps to zero is dropped. Broker reduce-only is a backstop only; the
         engine itself never emits an over-close.
 
-        Exception: when the open FIFO carries a ``None`` or
+        A keyed close's own exposure is the bound quantity of its id
+        (:meth:`~BrokerPosition.bound_exposure`), not its trade rows: a fill of
+        another entry may have consumed those FIFO while the id keeps its
+        binding.
+
+        Exception: when the binding book carries a ``None`` or
         :data:`ADOPTED_STARTUP_ENTRY_ID` parent (a restart adopted the net size
         without the real ``strategy.entry`` ids), a keyed ``close(id)`` that
         matches no known id is capped to the residual rather than clamped away —
         otherwise the adopted live position could never be flattened by the
-        script. Only a fully faithful FIFO (every open trade under a real id)
+        script. Only a fully faithful book (every binding under a real id)
         clamps an unmatched keyed close to zero.
 
         Scope: this guards SCRIPT-emitted closes (the ``build_intents`` list).
@@ -14986,8 +15522,8 @@ class OrderSyncEngine:
             return intents
         qty_by_entry: dict[str, float] = {}
         fifo_faithful = True
-        for trade in self._position.open_trades:
-            entry_id = trade.entry_id
+        for binding in self._position.bindings:
+            entry_id = binding.entry_id
             if entry_id is None:
                 # A ``None`` entry id means the FIFO does NOT faithfully map real
                 # Pine entry ids to exposure (a restart adopted the net size
@@ -15000,11 +15536,7 @@ class OrderSyncEngine:
                 # The synthetic startup-adoption parent id is likewise not a real
                 # Pine entry id — same FIFO-unfaithful reasoning as ``None``.
                 fifo_faithful = False
-            # PyCharm does not narrow ``entry_id`` to ``str`` after the ``is None``
-            # continue above (a slot-attribute narrowing quirk on ``Trade.entry_id``);
-            # basedpyright narrows it correctly and reports this line clean.
-            # noinspection PyTypeChecker
-            qty_by_entry[entry_id] = qty_by_entry.get(entry_id, 0.0) + abs(trade.size)
+            qty_by_entry[entry_id] = qty_by_entry.get(entry_id, 0.0) + binding.bound
 
         # ``capped`` is keyed by the intent's list index (unambiguous and easy to
         # audit) — never by value, since two close intents can compare equal.
@@ -15582,7 +16114,7 @@ class OrderSyncEngine:
             leg = self._journal_exit_leg(row)
             if leg is not None:
                 groups.setdefault((leg[0], row.from_entry or ''), []).append(row)
-        held = {trade.entry_id for trade in self._position.open_trades}
+        held = self._open_entry_ids()
         for (pine_id, from_entry), rows in groups.items():
             key = f"{pine_id}{INTENT_KEY_SEP}{from_entry}"
             if (key in self._active_intents
@@ -15641,7 +16173,7 @@ class OrderSyncEngine:
         """
         if self._store_ctx is None or not self._restart_open_order_ids:
             return
-        held = {trade.entry_id for trade in self._position.open_trades}
+        held = self._open_entry_ids()
         mapped = {order_id for ids in self._order_mapping.values() for order_id in ids}
         for row in self._store_ctx.iter_live_orders():
             leg = self._journal_exit_leg(row)
@@ -16682,8 +17214,8 @@ class OrderSyncEngine:
                 # then releases that key's last ownership row, the engine state is
                 # orphaned: a later re-emission of the same exit would have
                 # ``_build_envelope`` reuse the stale anchor and rebuild the SAME
-                # attach coid, which an idempotent plugin dedups — the re-attach
-                # never arms and the position is left unprotected. Retire the
+                # attach coid as the released attach, so the new attach could not
+                # be told apart from the retired one by its id. Retire the
                 # in-memory state for every drained key Pine no longer emits, mirroring
                 # the direct-success path's ``_drop_envelope``. A still-emitted key
                 # (back in ``_active_intents`` / ``new_map``) keeps its envelope.
@@ -16748,8 +17280,7 @@ class OrderSyncEngine:
                 old = self._active_intents[key]
                 if (isinstance(old, EntryIntent)
                         and self._entry_orders_terminal(key)
-                        and any(trade.entry_id == key
-                                for trade in self._position.open_trades)):
+                        and self._parent_open_exposure(key)[0] > 0.0):
                     # A consumed entry whose position is still open leaves
                     # the intent list when the script re-places it and the
                     # pyramiding limit drops the new order (a second
@@ -17978,7 +18509,7 @@ class OrderSyncEngine:
             is_buy = intent.side == 'buy'
             if is_buy == (self._position.size > 0.0):
                 pyramiding = int(getattr(lib._script, 'pyramiding', 1) or 1)  # noqa
-                if len(self._position.open_trades) >= max(1, pyramiding):
+                if self._position.open_entry_count() >= max(1, pyramiding):
                     self._entry_backing_orders[key] = current_order
                     return
         if self._entry_reject_retry_exhausted(key, intent):
@@ -18226,7 +18757,7 @@ class OrderSyncEngine:
         if is_buy != (self._position.size > 0.0):
             return None
         pyramiding = int(getattr(lib._script, 'pyramiding', 1) or 1)  # noqa
-        if len(self._position.open_trades) < max(1, pyramiding):
+        if self._position.open_entry_count() < max(1, pyramiding):
             return None
         filled = 0.0
         for row in self._store_ctx.iter_live_orders():
@@ -19290,7 +19821,7 @@ class OrderSyncEngine:
         """Best-effort teardown of the old position's closing surfaces.
 
         Runs right before the ``reversal_close`` dispatch. Every active
-        exit whose ``from_entry`` is one of the consumed open trades is
+        exit whose ``from_entry`` is one of the consumed open bindings is
         cancelled through the self-retrying :meth:`_dispatch_cancel` and
         retired from tracking, and the consumed parents' native fail-safe
         stop is cleared with a synchronous PUT. Failures are logged and
@@ -19301,10 +19832,7 @@ class OrderSyncEngine:
         flat. The sweep exists to avoid exactly that noise (a fired SL, an
         orphan resting bracket), not for safety.
         """
-        consumed_ids = {
-            trade.entry_id for trade in self._position.open_trades
-            if trade.entry_id is not None
-        }
+        consumed_ids = self._open_entry_ids()
         for key, old in list(self._active_intents.items()):
             if not isinstance(old, ExitIntent):
                 continue
@@ -19412,17 +19940,14 @@ class OrderSyncEngine:
                     and elapsed < _CLOSE_DECLINE_RETRY_S))
 
     def _fresh_reversal_close_covering_book(self) -> "_PendingReversalOpen | None":
-        """The fresh reversal marker whose close consumes every open trade, if any.
+        """The fresh reversal marker whose close consumes every open binding, if any.
 
         Coverage is judged on journaled entry ids, not quantity: a close
-        dispatched for the trades that are open NOW is the one live close
+        dispatched for the entries that are open NOW is the one live close
         for the book, while a same-side add that filled after an earlier
         close was armed is NOT covered by it and needs its own close.
         """
-        open_ids = {
-            trade.entry_id for trade in self._position.open_trades
-            if trade.entry_id is not None
-        }
+        open_ids = self._open_entry_ids()
         if not open_ids:
             return None
         for other in self._pending_reversal_opens.values():
@@ -19557,10 +20082,7 @@ class OrderSyncEngine:
             # out raw right now into the flat book.
             return
         close_qty = round(abs(self._position.size), 12)
-        consumed_ids = frozenset(
-            trade.entry_id for trade in self._position.open_trades
-            if trade.entry_id is not None
-        )
+        consumed_ids = frozenset(self._open_entry_ids())
         close_intent = CloseIntent(
             pine_id=f"__pyne_reversal_close__{intent.pine_id}",
             symbol=self._symbol,
@@ -19725,18 +20247,11 @@ class OrderSyncEngine:
             return True
         if intent.synthetic_kind is not None:
             return True
-        open_trades = self._position.open_trades
         if intent.pine_id:
             consumed_ids = {intent.pine_id}
-            remaining = sum(
-                abs(trade.size) for trade in open_trades
-                if trade.entry_id == intent.pine_id
-            )
+            remaining = self._parent_open_exposure(intent.pine_id)[0]
         else:
-            consumed_ids = {
-                trade.entry_id for trade in open_trades
-                if trade.entry_id is not None
-            }
+            consumed_ids = self._open_entry_ids()
             remaining = abs(self._position.size)
         # Evaluate every id: the check also releases the settled markers.
         fill_pending = [
@@ -19864,11 +20379,8 @@ class OrderSyncEngine:
         return pending
 
     def _entry_open_size(self, entry_id: str) -> float:
-        """Absolute open size the book holds for ``entry_id``."""
-        return sum(
-            abs(trade.size) for trade in self._position.open_trades
-            if trade.entry_id == entry_id
-        )
+        """Absolute open size bound to ``entry_id`` (:meth:`~BrokerPosition.bound_exposure`)."""
+        return self._parent_open_exposure(entry_id)[0]
 
     def _pre_clear_fill_pending(self, entry_id: str) -> bool:
         """Whether a pre-cleared exit leg of ``entry_id`` sold at the venue unbooked.
@@ -20661,8 +21173,14 @@ class OrderSyncEngine:
                             "open, re-deriving from the net next reconcile",
                             format_intent_key(intent.intent_key), fan.shortfall,
                         )
+                    # Each leg close is mapped under its own composed client
+                    # order id: a ``leg_id``-only handle would be shared by two
+                    # closes of the same leg, so settling one (its handle
+                    # enters the settled caches) would match the other.
+                    parent_coid = envelope.client_order_id(KIND_CLOSE)
                     self._order_mapping[intent.intent_key] = [
-                        f"close-leg:{leg_id}" for leg_id, _vol in fan.legs
+                        close_leg_client_order_id(parent_coid, leg_id)
+                        for leg_id, _vol in fan.legs
                     ]
                     self._record_defensive_close_fan(intent, fan)
                 else:
@@ -20920,21 +21438,86 @@ class OrderSyncEngine:
         )
 
     def _parent_open_exposure(self, from_entry: str | None) -> tuple[float, float]:
-        """Return ``(qty, sign)`` of the open trades booked under ``from_entry``.
+        """Return ``(qty, sign)`` of the bindings open under ``from_entry``.
 
-        ``qty`` is the absolute size summed over every open trade of the entry
-        (pyramiding stacks several under one id); ``sign`` is ``+1.0`` for a
-        long, ``-1.0`` for a short and ``0.0`` when nothing is held.
+        ``qty`` is the bound quantity summed over every binding of the entry
+        (pyramiding stacks several under one id): what an exit of the entry
+        may still close. The trade rows are no measure of it — a fill of
+        another entry consumes the oldest rows FIFO while this entry keeps its
+        binding (:meth:`~BrokerPosition.bound_exposure`). ``sign`` is ``+1.0``
+        for a long, ``-1.0`` for a short and ``0.0`` when nothing is held.
+
+        While the book is not faithful (:attr:`~BrokerPosition.book_faithful`:
+        an adoption or a rebuild attributed its bindings FIFO), the entry's
+        open trade rows count as well, whichever is larger: a missing binding
+        then proves nothing, and no exit is cancelled or shrunk on its
+        strength.
         """
-        qty = 0.0
-        sign = 0.0
-        if from_entry is None:
+        qty, sign = self._position.bound_exposure(from_entry)
+        if self._position.book_faithful or from_entry is None:
             return qty, sign
+        row_qty = 0.0
+        row_sign = 0.0
         for trade in self._position.open_trades:
             if trade.entry_id == from_entry:
-                qty += abs(float(trade.size))
-                sign = trade.sign
+                row_qty += abs(float(trade.size))
+                row_sign = trade.sign
+        if row_qty > qty:
+            return row_qty, row_sign
         return qty, sign
+
+    def _open_entry_ids(self) -> set[str]:
+        """Entry ids the book holds exposure under.
+
+        The ids of the open bindings; while the book is not faithful
+        (:attr:`~BrokerPosition.book_faithful`) the ids of the open trade rows
+        as well, since its bindings were attributed FIFO and a missing one
+        proves nothing about an entry.
+        """
+        ids = {binding.entry_id for binding in self._position.bindings
+               if binding.entry_id is not None}
+        if not self._position.book_faithful:
+            ids.update(trade.entry_id for trade in self._position.open_trades
+                       if trade.entry_id is not None)
+        return ids
+
+    def _entry_closed(self, entry_id: str) -> bool:
+        """Whether an entry is closed: it holds nothing and nothing of it can still fill.
+
+        The key of every spent-entry cleanup: no exposure under the entry
+        (:meth:`_parent_open_exposure`) and no entry order of it still opening
+        (:meth:`_entry_still_opening`). An entry whose order still works a
+        remainder keeps its entry intent and its exit, which cover that
+        remainder once it fills.
+
+        :param entry_id: The entry id.
+        """
+        return (self._parent_open_exposure(entry_id)[0] <= 0.0
+                and not self._entry_still_opening(entry_id))
+
+    def _entry_still_opening(self, entry_id: str | None) -> bool:
+        """Whether an entry order of ``entry_id`` may still fill.
+
+        ``True`` while the Pine entry order has a remainder above float noise
+        (``1e-9``, the engine's tolerance for a filled entry) that is still
+        working: nothing of it filled yet (it waits for its trigger or its
+        dispatch), or a venue order mapped to it has not reported its
+        terminal fill. A fee-netted fill books a little less than the order's
+        quantity, so the terminal ``filled`` event, not the booked quantity,
+        ends the order. ``False`` with no entry order of the id.
+
+        :param entry_id: The entry id, ``None`` for none.
+        """
+        if entry_id is None:
+            return False
+        order = self._position.entry_orders.get(entry_id)
+        if order is None or abs(order.size) - order.filled_qty <= 1e-9:
+            return False
+        if order.filled_qty <= 0.0:
+            return True
+        mapped = self._order_mapping.get(entry_id)
+        return bool(mapped) and not all(
+            order_id in self._filled_entry_order_ids for order_id in mapped)
 
     def _recover_rejected_exit(
             self, intent: ExitIntent, error: ExchangeOrderRejectedError, *, attempt: int,
@@ -21507,11 +22090,10 @@ class OrderSyncEngine:
         # while the parent is still flat, ``_safety_check`` aborts the
         # leg with ``parent_flat`` and the later parent fill has no
         # bracket left to promote. Gate the pending/armed decision on
-        # *both* tick resolution AND parent presence in ``open_trades``.
-        parent_filled = any(
-            trade.entry_id == from_entry
-            for trade in self._position.open_trades
-        )
+        # *both* tick resolution AND parent presence in the binding book
+        # (an entry keeps its binding after another entry's fill consumed
+        # its trade rows FIFO).
+        parent_filled = self._parent_open_exposure(from_entry)[0] > 0.0
         leg_state = (
             LEG_STATE_PENDING_ENTRY
             if (intent.has_unresolved_ticks or not parent_filled)
@@ -21789,6 +22371,7 @@ class OrderSyncEngine:
                 },
             ) from e
 
+        context = self._with_target_leg_baseline(context)
         crossed_at = self._protective_level_crossed_at_fill(intent, e.position_side)
         if crossed_at is not None:
             _blog_info(
@@ -21826,6 +22409,7 @@ class OrderSyncEngine:
             synthetic_kind='defensive_close',
             target_position_coid=e.position_coid,
             target_exchange_id=e.position_deal_id,
+            target_leg_id=e.position_deal_id,
             comment=f"defensive close after bracket attach reject: {e}",
         )
 
@@ -22046,7 +22630,33 @@ class OrderSyncEngine:
                 # transient residual-cleanup failure: live residual
                 # orders can still rebuild the exposure, and the grace
                 # probe is the retry vehicle that cancels them.
-                if marker_armed and not refs and residual_clean:
+                #
+                # The drop is safe only when the book holds nothing
+                # beyond this close: the reconcile then flattens exactly
+                # the target's exposure. When other entries' exposure
+                # remains, only the target leg is known gone, and an
+                # unbound reconcile reduction would settle it FIFO
+                # against the oldest entry, retiring the exits of a leg
+                # the venue still holds. The marker stays armed instead:
+                # the stale-grace broker probe
+                # (:meth:`_raise_if_stale_pending_defensive_close`)
+                # settles the reduction against this entry's bindings
+                # once the venue shows it, or halts when the venue does
+                # not (a leg read that lagged a still-open, unprotected
+                # target).
+                book_abs = abs(float(self._position.size))
+                other_exposure = (book_abs > float(e.qty)
+                                  and not _sizes_match(book_abs, float(e.qty)))
+                if marker_armed and not refs and residual_clean and other_exposure:
+                    _blog_warning(
+                        "defensive close for entry %r dispatched no broker "
+                        "order — its target leg (deal_id=%s) is gone while "
+                        "the book holds %s; the marker stays armed so the "
+                        "broker probe settles the reduction against this "
+                        "entry, or halts if the venue still holds it",
+                        entry_id, e.position_deal_id, self._position.size,
+                    )
+                elif marker_armed and not refs and residual_clean:
                     _blog_warning(
                         "defensive close for entry %r dispatched no broker "
                         "order — the venue holds no %s exposure to close "
@@ -22558,37 +23168,31 @@ class OrderSyncEngine:
                 # the broker) or attach to the already-closed order via
                 # :meth:`_find_key_for_order_id`.
                 #
-                # FIFO-aware cleanup, mirroring
+                # Binding-keyed cleanup, mirroring
                 # :meth:`_route_defensive_close_fill` and the post-FILL
                 # retry branch in
                 # :meth:`_retry_residual_cleanup_after_transient_fill`.
-                # ``marker.fifo_closed_entry_ids`` was persisted alongside
+                # ``marker.spent_entry_ids`` was persisted alongside
                 # ``fill_observed`` by the prior instance's FILL handler;
-                # it names the exact entries whose FIFO ``Trade`` rows the
-                # defensive close consumed. In pyramiding (older + newer
-                # same-side entries), FIFO closes the oldest first — so
-                # cleaning ``marker.entry_id`` here would clear the wrong
-                # entry's intents (the survivor's TP/SL protection) while
-                # leaving the actually-closed entry's intents orphaned.
-                # The post-FILL retry branch already applies the same
-                # logic — keeping the two replay paths divergent would
-                # let a crash between audit-write and cleanup corrupt
-                # state, while a crash a few lines later would not. Fall
-                # back to ``marker.entry_id`` only when the snapshot is
-                # empty (no-FIFO / degenerate path, or replayed from an
-                # older schema that did not persist the field).
-                surviving_entry_ids = {
-                    trade.entry_id
-                    for trade in self._position.open_trades
-                    if trade.entry_id is not None
-                }
+                # it names the exact entries whose bindings the defensive
+                # close spent. Its trade rows settled FIFO and may have
+                # consumed an older sibling's rows, but that sibling kept
+                # its binding and its TP/SL protection. The post-FILL
+                # retry branch already applies the same logic — keeping
+                # the two replay paths divergent would let a crash between
+                # audit-write and cleanup corrupt state, while a crash a
+                # few lines later would not. An id that still holds a live
+                # binding keeps its intents. Fall back to
+                # ``marker.entry_id`` only when the snapshot is empty
+                # (no-FIFO / degenerate path).
                 cleanup_targets: list[str] = [
                     eid
-                    for eid in marker.fifo_closed_entry_ids
-                    if eid not in surviving_entry_ids
+                    for eid in marker.spent_entry_ids
+                    if self._entry_closed(eid)
                 ]
                 if (not cleanup_targets
-                        and not marker.fifo_closed_entry_ids):
+                        and not marker.spent_entry_ids
+                        and self._parent_open_exposure(marker.entry_id)[0] <= 0.0):
                     cleanup_targets.append(marker.entry_id)
                 for cleanup_id in cleanup_targets:
                     self._cleanup_position_tracking(cleanup_id)
@@ -22972,33 +23576,23 @@ class OrderSyncEngine:
                     exchange_order_id=audit_exchange_order_id,
                     payload=payload,
                 )
-            # FIFO-aware cleanup, mirroring the in-flight
+            # Binding-keyed cleanup, mirroring the in-flight
             # :meth:`_route_defensive_close_fill` path. The marker's
-            # ``fifo_closed_entry_ids`` snapshot was captured at FILL
+            # ``spent_entry_ids`` snapshot was captured at FILL
             # time before any later :meth:`record_fill` overwrote the
-            # live ``_last_fifo_closed_entry_ids`` cache, so it still
-            # names the exact entries whose FIFO ``Trade`` rows this
-            # defensive close consumed. In pyramiding (older + newer
-            # same-side entries), FIFO closes the oldest first — so
-            # cleaning ``marker.entry_id`` here would clear the wrong
-            # entry's intents while leaving the actually-closed
-            # entry's intents orphaned. Apply the same partial-close
-            # survivor guard as the in-flight path: skip ids that
-            # still appear in ``open_trades`` (residual after split).
-            # Fall back to ``marker.entry_id`` only when the snapshot
-            # is empty (no-FIFO / degenerate path, or replayed from an
-            # older schema that did not persist the field).
-            surviving_entry_ids = {
-                trade.entry_id
-                for trade in self._position.open_trades
-                if trade.entry_id is not None
-            }
+            # live ``_last_spent_entry_ids`` cache, so it still
+            # names the exact entries whose bindings this defensive
+            # close spent. Apply the same survivor guard as the
+            # in-flight path: skip ids that still hold a live binding
+            # (a pyramided same-id add). Fall back to ``marker.entry_id``
+            # only when the snapshot is empty (no-FIFO / degenerate path).
             cleanup_targets: list[str] = [
                 eid
-                for eid in marker.fifo_closed_entry_ids
-                if eid not in surviving_entry_ids
+                for eid in marker.spent_entry_ids
+                if self._entry_closed(eid)
             ]
-            if not cleanup_targets and not marker.fifo_closed_entry_ids:
+            if (not cleanup_targets and not marker.spent_entry_ids
+                    and self._parent_open_exposure(marker.entry_id)[0] <= 0.0):
                 cleanup_targets.append(marker.entry_id)
             for cleanup_id in cleanup_targets:
                 self._cleanup_position_tracking(cleanup_id)
@@ -23021,6 +23615,37 @@ class OrderSyncEngine:
                 self._order_mapping.pop(close_intent_key, None)
                 self._drop_envelope(close_intent_key)
             self._clear_pending_defensive_close(entry_id)
+
+    @staticmethod
+    def _pending_close_remaining_qty(marker: PendingDefensiveClose) -> float:
+        """The quantity of a defensive close not yet booked in the engine's position size.
+
+        When a no-FIFO defensive close has already booked partial fills,
+        :attr:`~BrokerPosition.size` was reduced by ``partial_filled_qty`` in the
+        partial-fill branch and the marker records that cumulative slice. The
+        terminal fill, still pending, will only apply the REMAINING
+        ``reject_context.qty - partial_filled_qty``. Counting the full close
+        qty would double-count the partials and produce an expected post-close
+        value that is off by exactly the already-booked slice. On single-shot
+        closes ``partial_filled_qty`` is 0.0, so the remaining qty equals the
+        full reject context qty.
+
+        :param marker: The pending defensive close.
+        :return: The outstanding close quantity, never negative.
+        """
+        remaining = float(marker.reject_context.qty) - float(marker.partial_filled_qty)
+        if marker.expected_close_qty is not None:
+            # Multi-leg fan-out (:meth:`_record_defensive_close_fan`):
+            # everything that already landed is reflected in
+            # ``_position.size``; only the outstanding legs may be
+            # expected from the snapshot.
+            # ``applied_close_qty`` is the single cumulative counter
+            # here — it already contains the ``partial`` slices, so
+            # subtracting ``partial_filled_qty`` on top would
+            # double-count them and understate the expected
+            # post-close size.
+            remaining = float(marker.reject_context.qty) - float(marker.applied_close_qty)
+        return max(remaining, 0.0)
 
     def _broker_matches_post_close_expectation(
             self,
@@ -23153,37 +23778,9 @@ class OrderSyncEngine:
         def _marker_delta(marker: PendingDefensiveClose) -> float | None:
             """Signed delta a filled close for ``marker`` would apply to
             :attr:`_position.size`. ``None`` for an unrecognised side.
-
-            When a no-FIFO defensive close has already booked partial
-            fills, :attr:`_position.size` was reduced by
-            ``partial_filled_qty`` in the partial-fill branch and the
-            marker records that cumulative slice. The terminal fill —
-            still pending here — will only apply the REMAINING
-            ``reject_context.qty - partial_filled_qty``. Subtracting the
-            full close qty would double-count the partials and produce
-            an expected post-close value that is off by exactly the
-            already-booked slice, false-halting in non-flat pyramiding
-            scenarios where the broker reports the correct post-close
-            size. On single-shot closes ``partial_filled_qty`` is 0.0
-            so the remaining qty equals the full reject context qty.
             """
             side = marker.reject_context.position_side
-            qty = float(marker.reject_context.qty)
-            partial = float(marker.partial_filled_qty)
-            remaining = qty - partial
-            if marker.expected_close_qty is not None:
-                # Multi-leg fan-out (:meth:`_record_defensive_close_fan`):
-                # everything that already landed is reflected in
-                # ``_position.size``; only the outstanding legs may be
-                # expected from the snapshot.
-                # ``applied_close_qty`` is the single cumulative counter
-                # here — it already contains the ``partial`` slices, so
-                # subtracting ``partial_filled_qty`` on top would
-                # double-count them and understate the expected
-                # post-close size.
-                remaining = qty - float(marker.applied_close_qty)
-            if remaining < 0.0:
-                remaining = 0.0
+            remaining = self._pending_close_remaining_qty(marker)
             if side == "buy":
                 return -remaining
             if side == "sell":
@@ -23321,10 +23918,17 @@ class OrderSyncEngine:
         marker is settled via :meth:`_settle_marker_from_flat_broker`
         instead of halting. If :meth:`~BrokerPlugin.get_position` itself fails, we
         cannot prove the broker is flat and fall through to the
-        original manual-intervention halt.
+        original manual-intervention halt. The same halt follows when the
+        venue still holds a marker's own target leg
+        (:meth:`_defensive_target_legs_verdict`), or the legs cannot be
+        read: an aggregate that matches may then be another leg's shrink.
+        Settlement waits instead when the target leg shrank enough but
+        another pending defensive close aims at the same leg, whose shrink
+        it may be.
 
         :returns: ``True`` when settlement was deferred this pass
-            because the final residual cancel still failed transiently
+            because the final residual cancel still failed transiently,
+            or a target leg's shrink is ambiguous between pending closes
             (markers remain armed). The caller MUST skip adopting the
             broker snapshot into :attr:`_position.size` in that case
             — the broker view is already reduced by the (in fact
@@ -23338,6 +23942,7 @@ class OrderSyncEngine:
         """
         if not self._pending_defensive_close:
             return False
+        self._void_leg_baselines_on_book_move()
         grace = getattr(
             self._broker, 'defensive_close_resolution_grace_s', None,
         )
@@ -23382,6 +23987,46 @@ class OrderSyncEngine:
             extra_to_settle = self._broker_matches_post_close_expectation(
                 exch_pos, stale,
             )
+        if extra_to_settle is not None:
+            # The aggregate cannot tell WHICH leg shrank: a sibling leg
+            # that closed by the same quantity matches the expectation
+            # while the target leg is still open. Where the venue holds
+            # one leg per entry, the target leg's own presence decides.
+            try:
+                open_target, ambiguous_target = self._defensive_target_legs_verdict(
+                    [*stale, *extra_to_settle],
+                )
+            except Exception as exc:  # noqa: BLE001 — diagnostic fallback only
+                _blog_warning(
+                    "stale-grace pre-check: reading the legs raised %s: %s — "
+                    "falling through to manual-intervention halt",
+                    type(exc).__name__, exc,
+                )
+                extra_to_settle = None
+            else:
+                if open_target is not None:
+                    _blog_warning(
+                        "stale-grace pre-check: the broker size matches the "
+                        "expected post-close state, but the target leg %s of "
+                        "entry %r is still open — another leg shrank; "
+                        "falling through to manual-intervention halt",
+                        open_target.reject_context.position_deal_id,
+                        open_target.entry_id,
+                    )
+                    extra_to_settle = None
+                elif ambiguous_target is not None:
+                    # Another pending close aims at the same leg, so its
+                    # shrink may be that close's. Wait for that marker's fill
+                    # or its own grace probe, which judges both together; keep
+                    # the broker snapshot out of the engine meanwhile.
+                    _blog_warning(
+                        "stale-grace pre-check: the target leg %s of entry %r "
+                        "shrank, but another pending defensive close targets "
+                        "the same leg — waiting for it before settling",
+                        ambiguous_target.reject_context.position_deal_id,
+                        ambiguous_target.entry_id,
+                    )
+                    return True
         if extra_to_settle is not None:
             # ``extra_to_settle`` carries non-stale sibling markers whose
             # fills the broker snapshot already reflects (subset-match
@@ -23486,6 +24131,173 @@ class OrderSyncEngine:
         )
         self._record_halt(halt)
         raise halt
+
+    def _read_leg_quantities(self, port: PositionPort) -> dict[str, float]:
+        """The venue's open size per leg id for the engine's symbol.
+
+        Rows sharing a :attr:`~pynecore.core.broker.models.PositionLeg.leg_id`
+        are summed: a defensive close addresses the leg by that id.
+
+        :param port: The plugin's position port.
+        :return: ``{leg_id: open size}`` for every listed leg.
+        :raises Exception: Whatever the leg read raises.
+        """
+        legs = self._run_async_read(port.fetch_raw_positions(self._symbol))
+        open_qty: dict[str, float] = {}
+        for leg in legs:
+            open_qty[leg.leg_id] = open_qty.get(leg.leg_id, 0.0) + abs(float(leg.qty))
+        return open_qty
+
+    def _with_target_leg_baseline(
+            self, context: BracketAttachRejectContext,
+    ) -> BracketAttachRejectContext:
+        """Record the open size of the defensive close's target leg before it dispatches.
+
+        The grace probe (:meth:`_defensive_target_legs_verdict`) proves the
+        close landed on its own leg only by that leg's reduction from this
+        baseline. Neither the entry's bound quantity nor the aggregate can
+        stand in for it: an entry may span several legs, and one leg may hold
+        several entries (one leg per side of a hedge account). Read only for a
+        plugin with a :class:`~pynecore.core.plugin.broker.PositionPort` and a
+        context that names its leg. A failed read or an unlisted leg leaves
+        the baseline unknown, which only keeps the probe from settling on a
+        target it still sees. The baseline is evidence only in the process
+        that read it: it is never journaled, so a marker re-armed by
+        :meth:`_replay_pending_defensive_closes` has none, and the grace
+        probe settles it only once its target leg is gone.
+
+        :param context: The reject context of the close about to dispatch.
+        :return: The context, with
+            :attr:`~pynecore.core.broker.models.BracketAttachRejectContext.position_leg_qty`
+            set when the leg was read.
+        """
+        port: PositionPort | None = getattr(self._broker, 'position_port', None)
+        if port is None or not context.position_deal_id:
+            return context
+        # Moves booked before this read void the older markers' baselines,
+        # never this one's: the read already shows them.
+        self._void_leg_baselines_on_book_move()
+        try:
+            open_qty = self._read_leg_quantities(port)
+        except Exception as exc:  # noqa: BLE001 — the baseline is best effort
+            _blog_warning(
+                "defensive close: reading the target leg %s raised %s: %s — "
+                "its baseline stays unknown",
+                context.position_deal_id, type(exc).__name__, exc,
+            )
+            return context
+        leg_qty = open_qty.get(context.position_deal_id)
+        if leg_qty is None:
+            return context
+        return dataclasses.replace(context, position_leg_qty=leg_qty)
+
+    def _void_leg_baselines_on_book_move(self, own_entry_id: str | None = None) -> None:
+        """Drop the target-leg baselines the book has moved past.
+
+        A baseline (:attr:`~pynecore.core.broker.models.BracketAttachRejectContext.position_leg_qty`)
+        is the leg's size before the marker's close. The grace probe
+        (:meth:`_defensive_target_legs_verdict`) credits the leg's shrink from
+        it to the pending closes aimed at the leg, which is sound only while
+        nothing else took quantity off the leg. The engine cannot tell which
+        leg a booked fill or an unbooked reduction reduced, so once the book
+        moves (:attr:`~BrokerPosition.book_moves`) every baseline read before
+        is voided: the leg can then prove its close only by being gone. A move
+        that is the marker's own close fill (``own_entry_id``) keeps that
+        marker's baseline, since the probe already subtracts the whole close.
+
+        The baseline lives in memory only (the journal never holds it), so
+        voiding it writes nothing and cannot fail.
+
+        :param own_entry_id: The entry of the marker whose close fill moved
+            the book, if any.
+        """
+        moves = self._position.book_moves
+        if moves == self._leg_baseline_book_moves:
+            return
+        for entry_id, marker in list(self._pending_defensive_close.items()):
+            if entry_id == own_entry_id or marker.reject_context.position_leg_qty is None:
+                continue
+            self._pending_defensive_close[entry_id] = dataclasses.replace(
+                marker,
+                reject_context=dataclasses.replace(
+                    marker.reject_context, position_leg_qty=None,
+                ),
+            )
+        self._leg_baseline_book_moves = moves
+
+    def _defensive_target_legs_verdict(
+            self, markers: list[PendingDefensiveClose],
+    ) -> tuple[PendingDefensiveClose | None, PendingDefensiveClose | None]:
+        """Judge, leg by leg, whether the venue shows the markers' closes on their target legs.
+
+        Read only for a plugin with one-way emulation
+        (:attr:`~pynecore.core.plugin.broker.BrokerPlugin.position_port`) and
+        only for markers that name their target leg
+        (:attr:`~pynecore.core.broker.models.BracketAttachRejectContext.position_deal_id`).
+        A leg is matched by its
+        :attr:`~pynecore.core.broker.models.PositionLeg.leg_id` alone, whatever
+        its :attr:`~pynecore.core.broker.models.PositionLeg.entry_id`: a missing
+        attribution only means the plugin cannot name the entry, not that the
+        leg holds another one. A defensive close takes its quantity off its one
+        target leg (``target_leg_id``), so every leg is judged by one rule over
+        all the markers aimed at it:
+
+        - an unlisted leg is closed, whatever it held;
+        - a listed leg is closed only when it holds no more than its size
+          before the first of these closes (the largest
+          :attr:`~pynecore.core.broker.models.BracketAttachRejectContext.position_leg_qty`
+          among them; the leg only shrinks while they are pending) minus all
+          of their closes. A partial exit's close legitimately leaves the rest
+          listed; a listed leg any of whose markers lacks the baseline proves
+          nothing and counts as still open;
+        - a leg that passes, while another pending marker outside ``markers``
+          also targets it, cannot say whose close took the quantity off: it is
+          ambiguous. That marker's own fill or grace probe decides it later.
+
+        A leg holding more is still open whatever else is pending on it: other
+        closes can only shrink it further.
+
+        :param markers: The markers the aggregate probe would settle.
+        :return: ``(open, ambiguous)``: a marker whose target leg is still
+            open, else ``None``; and a marker whose leg is ambiguous, else
+            ``None``.
+        :raises Exception: Whatever the leg read raises; the caller halts.
+        """
+        port: PositionPort | None = getattr(self._broker, 'position_port', None)
+        if port is None:
+            return None, None
+        by_leg: dict[str, list[PendingDefensiveClose]] = {}
+        for marker in markers:
+            leg_id = marker.reject_context.position_deal_id
+            if leg_id:
+                by_leg.setdefault(leg_id, []).append(marker)
+        if not by_leg:
+            return None, None
+        open_qty = self._read_leg_quantities(port)
+        settling = {marker.entry_id for marker in markers}
+        ambiguous: PendingDefensiveClose | None = None
+        for leg_id, group in by_leg.items():
+            leg_qty = open_qty.get(leg_id)
+            if leg_qty is None:
+                continue
+            baseline = 0.0
+            closed_qty = 0.0
+            for marker in group:
+                leg_baseline = marker.reject_context.position_leg_qty
+                if leg_baseline is None:
+                    return marker, None
+                baseline = max(baseline, leg_baseline)
+                closed_qty += (marker.expected_close_qty if marker.expected_close_qty is not None
+                               else float(marker.reject_context.qty))
+            expected = max(baseline - closed_qty, 0.0)
+            if leg_qty > expected + max(leg_qty, expected, 1.0) * 1e-6 + 1e-9:
+                return group[0], None
+            if ambiguous is None and any(
+                    other.entry_id not in settling
+                    and other.reject_context.position_deal_id == leg_id
+                    for other in self._pending_defensive_close.values()):
+                ambiguous = group[0]
+        return None, ambiguous
 
     def _settle_marker_from_flat_broker(
             self, marker: PendingDefensiveClose,
@@ -23651,10 +24463,12 @@ class OrderSyncEngine:
         # later in-process FIFO close) would have produced, leaving exit
         # routing / P&L attached to the wrong tranche. Consume strictly
         # FIFO so this snapshot-settlement path mirrors the FILL-event
-        # path; track the entry ids of fully-consumed trades so the
-        # downstream cleanup can target the same set that
+        # path. The bindings settle the way the FILL would have settled
+        # them: the close is bound to ``marker.entry_id``
+        # (:meth:`_close_fill_entry_id`), and the entries whose bindings it
+        # spent are what the downstream cleanup targets, the same set
         # :meth:`_route_defensive_close_fill` would clean.
-        fifo_consumed_entry_ids: list[str] = []
+        spent_entry_ids: list[str] = []
         if self._position.open_trades:
             close_qty_remaining = (
                 float(marker.reject_context.qty)
@@ -23662,6 +24476,9 @@ class OrderSyncEngine:
             )
             if close_qty_remaining < 0.0:
                 close_qty_remaining = 0.0
+            spent_entry_ids = self._position.settle_unbooked_reduction(
+                close_qty_remaining, entry_id=marker.entry_id,
+            )
             surviving: list = []
             removed_any = False
             for t in self._position.open_trades:
@@ -23673,8 +24490,6 @@ class OrderSyncEngine:
                     # Whole tranche absorbed by the close — drop it.
                     close_qty_remaining -= trade_qty
                     removed_any = True
-                    if t.entry_id is not None:
-                        fifo_consumed_entry_ids.append(t.entry_id)
                 else:
                     # Tranche larger than the residual close qty:
                     # shrink it so FIFO walks the remainder for future
@@ -23717,47 +24532,38 @@ class OrderSyncEngine:
                 self._position.open_commission = float(sum(
                     t.commission for t in self._position.open_trades
                 ))
-        # FIFO-aware cleanup targets. Mirror
+        # Binding-keyed cleanup targets. Mirror
         # :meth:`_route_defensive_close_fill`'s logic: clean intents for
-        # every entry id whose trade was fully consumed AND no longer has
-        # any surviving ``open_trades`` row (a partial-close split keeps
-        # the residual under the same id). When the FIFO walk consumed
-        # nothing (no open trades to begin with, or all consumption
-        # happened earlier via FIFO ``partial`` events accumulated on
+        # every entry id whose binding was spent AND that holds no other
+        # live binding (a pyramided same-id binding keeps the id alive).
+        # When nothing was spent here (no open trades to begin with, or all
+        # consumption happened earlier via ``partial`` events accumulated on
         # ``marker.partial_filled_qty`` so ``close_qty_remaining`` was
         # already zero on entry), fall back to ``marker.entry_id`` so the
-        # marker's own pine-id is still cleared. Mirrors the FIFO route's
-        # degenerate-path fallback (``not _last_fifo_closed_entry_ids``
+        # marker's own pine-id is still cleared. Mirrors the FILL route's
+        # degenerate-path fallback (``not _last_spent_entry_ids``
         # → cleanup marker.entry_id).
-        surviving_entry_ids = {
-            trade.entry_id
-            for trade in self._position.open_trades
-            if trade.entry_id is not None
-        }
-        # Union the FIFO closures from prior partial events (persisted on
-        # ``marker.fifo_closed_entry_ids`` via the merge in
-        # :meth:`_route_event`) with the closures observed during this
-        # snapshot walk. Building ``cleanup_targets`` from
-        # ``fifo_consumed_entry_ids`` alone would leave intents / Pine
-        # order rows for entries closed by earlier partials in place,
-        # since their tranches were already removed from
-        # ``open_trades`` before we ever reached this path. Mirrors the
-        # FIFO route's source (``marker.fifo_closed_entry_ids``) in
-        # :meth:`_route_defensive_close_fill`.
+        # Union the entries spent by prior partial events (persisted on
+        # ``marker.spent_entry_ids`` via the merge in
+        # :meth:`_route_event`) with those spent by this snapshot
+        # settlement. Building ``cleanup_targets`` from this settlement
+        # alone would leave intents / Pine order rows for entries spent by
+        # earlier partials in place. Mirrors the FILL route's source
+        # (``marker.spent_entry_ids``) in :meth:`_route_defensive_close_fill`.
         candidate_closed_ids: list[str] = []
         seen_ids: set[str] = set()
-        for entry_id in marker.fifo_closed_entry_ids:
+        for entry_id in marker.spent_entry_ids:
             if entry_id not in seen_ids:
                 seen_ids.add(entry_id)
                 candidate_closed_ids.append(entry_id)
-        for entry_id in fifo_consumed_entry_ids:
+        for entry_id in spent_entry_ids:
             if entry_id not in seen_ids:
                 seen_ids.add(entry_id)
                 candidate_closed_ids.append(entry_id)
         cleanup_targets: list[str] = [
             entry_id
             for entry_id in candidate_closed_ids
-            if entry_id not in surviving_entry_ids
+            if self._entry_closed(entry_id)
         ]
         if not cleanup_targets and not candidate_closed_ids:
             # Same-id survivor guard for the degenerate-cleanup fallback.
@@ -23772,13 +24578,8 @@ class OrderSyncEngine:
             # entry / exit intents for an id that still has live FIFO
             # trades, leaving the remaining broker exposure without
             # active intents or Pine exit-order rows. Skip cleanup when
-            # ``marker.entry_id`` is still referenced by any remaining
-            # ``open_trades`` row.
-            any_surviving_marker_trade = any(
-                trade.entry_id == marker.entry_id
-                for trade in self._position.open_trades
-            )
-            if not any_surviving_marker_trade:
+            # ``marker.entry_id`` still holds a live binding.
+            if self._parent_open_exposure(marker.entry_id)[0] <= 0.0:
                 cleanup_targets.append(marker.entry_id)
         for cleanup_id in cleanup_targets:
             self._cleanup_position_tracking(cleanup_id)
@@ -23838,6 +24639,7 @@ class OrderSyncEngine:
         if new_signed == 0.0:
             self._position.sign = 0.0
             self._position.avg_price = na_float
+            self._position.clear_entry_book()
             self._position.open_trades.clear()
             self._position.openprofit = 0.0
             self._position.open_commission = 0.0
@@ -24461,11 +25263,10 @@ class OrderSyncEngine:
             # A Pine close's reject retries per bar with a quarantine cap.
             if (isinstance(new, ExitIntent)
                     and new.from_entry is not None
-                    and not any(trade.entry_id == new.from_entry
-                                for trade in self._position.open_trades)):
+                    and self._entry_closed(new.from_entry)):
                 _blog_warning(
                     "modify rejected for %s but parent %r holds no open "
-                    "trade — retiring the stale exit tracking: %s",
+                    "binding — retiring the stale exit tracking: %s",
                     new, new.from_entry, e,
                 )
                 self._cleanup_position_tracking(new.from_entry)
@@ -24831,10 +25632,7 @@ class OrderSyncEngine:
             # position's fail-safe armed. Idempotent no-op when no state is
             # parked under the entry.
             if (isinstance(old, EntryIntent)
-                    and not any(
-                        trade.entry_id == old.intent_key
-                        for trade in self._position.open_trades
-                    )):
+                    and self._parent_open_exposure(old.intent_key)[0] <= 0.0):
                 self._retire_native_failsafe_for_entry(old.intent_key)
             self._order_mapping.pop(old.intent_key, None)
             self._drop_envelope(old.intent_key)

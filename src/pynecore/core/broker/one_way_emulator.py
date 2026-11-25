@@ -39,6 +39,7 @@ from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    ExchangeRateLimitError,
     MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -66,6 +67,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.core.broker.store_helpers import (
+    BRACKET_OWN_STATE_ACTIVE,
     BRACKET_OWN_STATE_CLEARING,
     BRACKET_OWN_STATE_RELEASED,
     CLOSE_LEG_STATE_DISPATCHED,
@@ -105,7 +107,7 @@ BOOK_INCOMPLETE_GRACE_S = 30.0
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pynecore.core.broker.storage import RunContext
+    from pynecore.core.broker.storage import OrderRow, RunContext
     from pynecore.core.plugin.broker import PositionPort
 
 
@@ -134,7 +136,14 @@ async def _read_quantizer(port: 'PositionPort', symbol: str) -> 'Callable[[float
 
 
 def _translate_port_read_fault(exc: Exception) -> Exception:
-    """Map a transient port-read fault to :class:`ExchangeConnectionError`, else keep it."""
+    """Map a transient port-read fault to :class:`ExchangeConnectionError`, else keep it.
+
+    A venue throttle (:class:`ExchangeRateLimitError`) on a read is transient
+    too: the read changed nothing, so the caller parks and retries on a later
+    sync, the verdict the engine's own read bridge reaches for it.
+    """
+    if isinstance(exc, ExchangeRateLimitError):
+        return ExchangeConnectionError(str(exc) or "exchange rate limit hit")
     if isinstance(exc, ProviderError):
         if is_retryable_provider_error(exc):
             return ExchangeConnectionError(str(exc) or "connection lost")
@@ -144,7 +153,21 @@ def _translate_port_read_fault(exc: Exception) -> Exception:
     return exc
 
 
+def close_leg_client_order_id(parent_coid: str, leg_id: str) -> str:
+    """The client order id of one leg's close in a close fan.
+
+    Composed from the fan's own client order id, so it names one dispatch's
+    close of one leg: two closes of the same leg never share it.
+
+    :param parent_coid: The client order id of the close being fanned out.
+    :param leg_id: The :attr:`~pynecore.core.broker.models.PositionLeg.leg_id`
+        of the leg it reduces.
+    """
+    return f"{parent_coid}:{leg_id}"
+
+
 __all__ = [
+    'close_leg_client_order_id',
     'CloseFanResult',
     'ReversalFanResult',
     'BracketFanResult',
@@ -155,13 +178,32 @@ __all__ = [
 
 
 @dataclass(frozen=True)
+class _LegLevels:
+    """The protection one leg carries, or one exit asks for on it.
+
+    :ivar tp_price: Pine-unit take-profit level, or ``None``.
+    :ivar sl_price: Pine-unit stop-loss level, or ``None``.
+    :ivar trail_offset: Trailing offset in Pine ticks (as the
+        :class:`~pynecore.core.broker.models.ExitIntent` carries it), or ``None``.
+    """
+    tp_price: float | None = None
+    sl_price: float | None = None
+    trail_offset: float | None = None
+
+
+@dataclass(frozen=True)
 class BracketReplayRefusal:
     """A bracket the venue definitively refused to re-assert on a restart.
 
+    One is recorded for every exit that owns the refused leg: the leg carries
+    the merge of its owners' levels, so the refusal concerns each of them.
+
     :ivar intent_key: The exit's diff key.
     :ivar leg_id: The position leg the bracket was re-asserted on.
-    :ivar tp_price: The journaled take-profit level that was refused.
-    :ivar sl_price: The journaled stop-loss level that was refused.
+    :ivar tp_price: The take-profit level of the refused re-assert (the merge
+        of the leg's owners).
+    :ivar sl_price: The stop-loss level of the refused re-assert (the merge of
+        the leg's owners).
     :ivar error: The venue's refusal.
     """
     intent_key: str
@@ -221,28 +263,38 @@ class BracketFanResult:
 
     :ivar legs: Broker leg ids the bracket was replicated onto, in FIFO order.
     :ivar skipped: ``True`` when nothing was amended — the symbol was flat (no
-        position-side legs to protect) or the position book is incomplete (a
-        protected-side entry's fill is not yet journaled) — a non-halting
+        position-side legs to protect), the position book is incomplete (a
+        protected-side entry's fill is not yet journaled), or the exit's
+        ``from_entry`` holds no leg (``entry_without_leg``) — a non-halting
         no-op; the caller re-evaluates next bar.
-    :ivar skip_reason: Human-readable cause for an incomplete-book skip, for
-        the caller's skip message; ``None`` for the flat / flipped-side skips.
+    :ivar skip_reason: Human-readable cause for an incomplete-book or
+        entry-without-leg skip, for the caller's skip message; ``None`` for the
+        flat / flipped-side skips.
     :ivar stalled: ``True`` on the one incomplete-book skip where the wait for
         the pending entry's fill outgrew :data:`BOOK_INCOMPLETE_GRACE_S` — the
         deferral is no longer routine and the caller warns.
+    :ivar entry_without_leg: ``True`` when the skip is because every survivor
+        leg is attributed to an entry other than the exit's ``from_entry`` (see
+        :meth:`~OneWayEmulator._target_legs`); already reported at WARNING once
+        per exit by the emulator.
     """
     legs: tuple[str, ...]
     skipped: bool
     skip_reason: str | None = None
     stalled: bool = False
+    entry_without_leg: bool = False
 
 
 @dataclass(frozen=True)
 class ClearFanResult:
     """Outcome of one ownership-scoped exit-bracket clear.
 
-    :ivar legs: Broker leg ids actually cleared — the subset the cancelled exit
-        owns, never the whole position side. Empty when the exit owned nothing
-        (already released, or no persisted ownership index).
+    :ivar legs: Broker leg ids of the ownership rows the clear released, one
+        entry per row (a leg two retired exits shared appears twice) — the
+        subset the cancelled exit owns, never the whole position side. Each was
+        amended to the merged levels of the exits that still own it, and
+        cleared only when none does. Empty when the exit owned nothing (already
+        released, or no persisted ownership index).
     """
     legs: tuple[str, ...]
 
@@ -284,6 +336,24 @@ class OneWayEmulator:
         #: the caller's ``now`` of the first one, and whether the stall was
         #: flagged; dropped once the exit's fan passes the gate.
         self._book_incomplete_deferrals: dict[tuple[object, str], tuple[float, bool]] = {}
+        #: Exits (intent keys) already told that every survivor leg is
+        #: attributed to another entry, so their ``from_entry`` holds no leg
+        #: and the fan is skipped. Reported once per exit, until a fan of the
+        #: exit finds a leg again.
+        self._entry_without_leg_reported: set[str] = set()
+        #: Legs (symbol, leg id, owning intent keys, conflict kind) already
+        #: told that their owners ask for levels one leg cannot carry.
+        self._level_conflicts_reported: set[tuple[str, str, frozenset[str], str]] = set()
+        #: Legs (symbol, leg id, retiring intent keys, remaining owner keys)
+        #: already told that the venue refused the retirement re-assert.
+        self._retirement_refusals_reported: set[
+            tuple[str, str, frozenset[str], frozenset[str]]] = set()
+        #: The levels this process last put on each leg (symbol, leg id) with an
+        #: amend the venue confirmed; see :meth:`_amend_leg`. An entry is dropped
+        #: before every amend and only restored when the amend returns, so it is
+        #: absent after any ambiguous, rejected or interrupted amend and after a
+        #: restart.
+        self._venue_levels: dict[tuple[str, str], _LegLevels] = {}
 
     def take_replay_refusals(self) -> list[BracketReplayRefusal]:
         """Hand over (and forget) the brackets the restart replay could not re-assert."""
@@ -304,7 +374,13 @@ class OneWayEmulator:
         """Fan a :class:`CloseIntent` out as per-leg FIFO closes.
 
         Reads the live legs, nets them, selects the oldest legs on the position
-        side to cover ``intent.qty``, snaps the plan to the broker grid, and
+        side to cover ``intent.qty`` — a close bound to one entry
+        (:meth:`_close_bound_entry`) takes that entry's attributed legs first,
+        so the leg that physically closes is the one whose binding the fill
+        settles, and a defensive close reduces only the leg it targets
+        (``target_leg_id``; a target that already closed or shrank leaves the rest as
+        ``shortfall``; the close's marker then resolves through the
+        stale-grace broker probe) — snaps the plan to the broker grid, and
         dispatches one :meth:`PositionPort.close_leg` per leg — persisting each
         leg PERSIST-FIRST so a crash mid-fan resumes via :meth:`restart_replay`.
 
@@ -325,7 +401,10 @@ class OneWayEmulator:
         # CloseIntent.side is the close direction ("sell" closes a long); the
         # legs to reduce sit on the opposite side of the book.
         leg_side = 'buy' if intent.side == 'sell' else 'sell'
-        closes, shortfall = select_legs_for_close(intent.qty, legs, leg_side)
+        closes, shortfall = select_legs_for_close(
+            intent.qty, legs, leg_side, entry_id=self._close_bound_entry(intent, legs),
+            leg_id=intent.target_leg_id,
+        )
         if not closes:
             return CloseFanResult(
                 legs=(), dispatched_qty=0.0, shortfall=shortfall,
@@ -364,6 +443,34 @@ class OneWayEmulator:
             ),
             shortfall=shortfall, skipped=False,
         )
+
+    @staticmethod
+    def _close_bound_entry(intent: CloseIntent, legs: list[PositionLeg]) -> str | None:
+        """The entry whose bindings a close's fill settles, ``None`` when it is unbound.
+
+        Mirrors the engine's fill-side attribution
+        (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._close_fill_entry_id`):
+        a script ``strategy.close(id)`` is bound to ``id`` (``strategy.close_all``
+        carries an empty ``pine_id`` and is unbound), an engine close aimed at
+        one entry (``partial_trigger``, ``marketable_exit``) to its
+        ``target_entry_id``, a defensive close to the entry of the leg it
+        targets (``target_leg_id``: the leg the venue refused to protect,
+        whose entry's bindings the defensive-close marker settles); every
+        other close walks the book FIFO.
+
+        :param intent: The close being fanned out.
+        :param legs: The symbol's open legs, read for the defensive close's
+            target leg.
+        """
+        if intent.synthetic_kind is None:
+            return intent.pine_id or None
+        if intent.synthetic_kind in ('partial_trigger', 'marketable_exit'):
+            return intent.target_entry_id
+        if intent.target_leg_id is not None:
+            for leg in legs:
+                if leg.leg_id == intent.target_leg_id:
+                    return leg.entry_id
+        return None
 
     async def run_reversal(
             self, envelope: 'DispatchEnvelope', port: 'PositionPort',
@@ -570,7 +677,7 @@ class OneWayEmulator:
         planned = plan_leg_close_volumes(closes, quantize)
         dispatched: list[tuple[str, int]] = []
         for leg_id, volume in planned:
-            leg_coid = f"{parent_coid}:{leg_id}"
+            leg_coid = close_leg_client_order_id(parent_coid, leg_id)
             if self._store_ctx is not None:
                 create_close_leg_row(
                     self._store_ctx,
@@ -621,21 +728,31 @@ class OneWayEmulator:
     async def run_exit_bracket(
             self, envelope: 'DispatchEnvelope', port: 'PositionPort', now: float = 0.0,
     ) -> BracketFanResult:
-        """Replicate a Pine exit's bracket onto the net-survivor position legs.
+        """Replicate a Pine exit's bracket onto the net-survivor legs it covers.
 
         Hedging venues carry protective levels per position, so a one-way bracket
-        over a multi-leg position is delivered by amending the SAME
-        TP/SL/trailing onto each leg that makes up the net one-way position. On a
-        mixed book (a manual hedge or a crash-interrupted reversal left opposing
-        legs open) only the legs that survive virtual-FIFO netting are protected
-        (:func:`net_survivor_legs`), never the gross majority side — amending the
-        whole majority side would close more than the net position when the stop
-        fires and flip it to the minority side. Each leg is recorded PERSIST-FIRST
-        in the ownership index (keyed by the exit's ``intent_key``) BEFORE its
-        amend, so :meth:`run_exit_bracket_clear` later clears ONLY the legs this
-        exit owns and :meth:`restart_replay` can re-assert or release them. A flat
-        symbol — or a book whose net side is the opposite of the one this exit
-        protects — is a non-halting skip.
+        over a multi-leg position is delivered by amending TP/SL/trailing onto
+        each leg the exit covers. On a mixed book (a manual hedge or a
+        crash-interrupted reversal left opposing legs open) only the legs that
+        survive virtual-FIFO netting are candidates (:func:`net_survivor_legs`),
+        never the gross majority side — amending the whole majority side would
+        close more than the net position when the stop fires and flip it to the
+        minority side. Among them the exit covers the legs
+        :meth:`_target_legs` picks from the legs' entry attribution: an exit with
+        a ``from_entry`` covers that entry's own legs and every unattributed
+        leg, so on a venue with one leg per entry each pyramided entry keeps its
+        own exit's levels.
+
+        A leg can be owned by several exits (a TP-only and an SL-only exit, or
+        several exits on an unattributed leg), and a venue leg carries a single
+        protection, so each covered leg is amended to the merge of ALL its
+        active owners' levels (:meth:`_merge_owner_levels`), never to this
+        exit's alone. Each leg is recorded PERSIST-FIRST in the ownership index
+        (keyed by the exit's ``intent_key``, holding this exit's own levels)
+        BEFORE its amend, so :meth:`run_exit_bracket_clear` later retires ONLY
+        the legs this exit owns and :meth:`restart_replay` can re-assert or
+        release them. A flat symbol — or a book whose net side is the opposite
+        of the one this exit protects — is a non-halting skip.
 
         Re-running it (a modify, or a re-attach after pyramiding) upserts the
         same per-leg rows idempotently: the row key is STABLE per (exit
@@ -652,6 +769,27 @@ class OneWayEmulator:
         journal — see :meth:`_pending_position_entry` — so it always runs over
         a complete book and covers a same-sync pyramid entry's own leg. The
         wait is a stall once it outlasts :data:`BOOK_INCOMPLETE_GRACE_S`.
+
+        A leg whose merged levels equal what this process last confirmed on it
+        is not amended again (:meth:`_amend_leg`): attaching an exit every one
+        of whose levels a co-owner already dominates changes nothing on the
+        venue, and a re-send would reset a trailing stop the venue has moved.
+        The ownership row is written exactly as if the amend had gone out.
+
+        A definitive refusal of the amend depends on who owns the leg. When
+        this exit is the leg's only owner the position is open and unprotected:
+        its row is released and the refusal is raised as
+        :class:`~pynecore.core.broker.exceptions.BracketAttachAfterFillRejectedError`
+        (the engine closes the position defensively). When other exits own the
+        leg too, the venue still holds their merge — the position is protected
+        by them and only this exit's own levels are missing — so the leg's row
+        goes back to what it was before this attach (released for a first
+        attach, its previous levels for a modify; see
+        :meth:`_refused_co_owned_attach`) and the venue's
+        :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`
+        propagates unchanged: the engine treats it as a refused exit (one retry
+        under a fresh id, then the crossed-level close or the defensive close),
+        never as an immediate flatten over a co-owner's unchanged level.
 
         :param envelope: The exit's dispatch envelope.
         :param port: The venue's position port.
@@ -726,31 +864,63 @@ class OneWayEmulator:
             for deferral_key in [k for k in self._book_incomplete_deferrals
                                  if k[0] == intent.intent_key]:
                 del self._book_incomplete_deferrals[deferral_key]
-        survivors = {leg.leg_id for leg in on_side}
-        # A re-attach can narrow the survivor set: a manual hedge or an
+        self._forget_vanished_legs(intent.symbol, {leg.leg_id for leg in legs})
+        targets = self._target_legs(intent, on_side)
+        # A re-attach can narrow the covered set: a manual hedge or an
         # interrupted reversal opens an opposing leg that virtually FIFO-consumes
         # the oldest majority leg, so :func:`net_survivor_legs` now drops a leg
-        # this exit owned on a prior attach. That leg is still PHYSICALLY open
-        # (only virtually netted) and still carries the broker bracket from the
-        # earlier attach; its ownership row would otherwise stay ``active`` and the
-        # restart pass would re-assert the stale stop, which on a hit closes more
-        # than the net exposure and flips the book. Clear + release those dropped
-        # legs FIRST: a survivor amend below can raise
-        # :class:`OrderDispositionUnknownError`, which the dispatch path parks
-        # while promoting the NEW intent into ``_active_intents`` — the next diff
-        # then sees Pine == active and never re-runs this fan, so a dropped-leg
-        # clear left AFTER the survivor loop would never get retried. The dropped
-        # set is disjoint from ``survivors`` (the clear skips survivor rows), so
-        # ordering it before the amend loop is otherwise behaviour-neutral.
+        # this exit owned on a prior attach (or the leg's entry attribution now
+        # assigns it to another entry). That leg is still PHYSICALLY open and
+        # still carries this exit's levels from the earlier attach; its ownership
+        # row would otherwise stay ``active`` and the restart pass would re-assert
+        # the stale stop, which on a hit closes more than the net exposure and
+        # flips the book. Retire those dropped legs FIRST: a survivor amend below
+        # can raise :class:`OrderDispositionUnknownError`, which the dispatch path
+        # parks while promoting the NEW intent into ``_active_intents`` — the next
+        # diff then sees Pine == active and never re-runs this fan, so a
+        # dropped-leg retirement left AFTER the survivor loop would never get
+        # retried. The dropped set is disjoint from ``targets`` (the retirement
+        # skips covered rows), so ordering it before the amend loop is otherwise
+        # behaviour-neutral.
         await self._clear_dropped_survivor_legs(
-            envelope, intent, survivors=survivors, port=port,
+            envelope, intent, targets={leg.leg_id for leg in targets}, port=port,
         )
+        if not targets:
+            # Every survivor leg belongs to another entry: the exit's own entry
+            # holds no leg (:meth:`_target_legs`). Its rows on legs it covered
+            # before were retired just above; nothing is amended, and the
+            # caller re-evaluates on the next bar, like a flat book.
+            return BracketFanResult(
+                legs=(), skipped=True, entry_without_leg=True,
+                skip_reason=(
+                    f"entry {intent.from_entry!r} holds no open leg (every open "
+                    f"leg belongs to another entry)"
+                ),
+            )
         # Bar-varying dispatch coid (matches the plugin's per-leg amend anchor);
         # one per bracket attach, reused across its legs.
         attach_coid = envelope.client_order_id(KIND_EXIT_SL)
+        own_levels = _LegLevels(
+            tp_price=intent.tp_price, sl_price=intent.sl_price,
+            trail_offset=intent.trail_offset,
+        )
         replicated: list[str] = []
-        for leg in on_side:
+        for leg in targets:
             own_coid = self._ownership_coid(intent.intent_key, leg.leg_id)
+            # The other exits that own this leg keep their levels on it: the
+            # amend carries the merge of every owner, this exit's new levels
+            # standing in for its own earlier row.
+            owners = [
+                (key, levels)
+                for key, levels in self._active_owner_levels(intent.symbol, leg.leg_id)
+                if key != intent.intent_key
+            ]
+            co_owned = bool(owners)
+            owners.append((intent.intent_key, own_levels))
+            levels = self._merge_owner_levels(
+                intent.symbol, leg.leg_id, intent.side, owners,
+            )
+            prior_row = self._own_active_row(own_coid)
             if self._store_ctx is not None:
                 create_bracket_ownership_row(
                     self._store_ctx,
@@ -771,13 +941,13 @@ class OneWayEmulator:
                     oca_type=intent.oca_type,
                 )
             try:
-                await port.amend_bracket(
-                    intent.symbol, leg.leg_id, side=intent.side,
-                    tp_price=intent.tp_price, sl_price=intent.sl_price,
-                    trail_offset=self._trail_price_distance(intent.trail_offset),
-                    coid=attach_coid,
+                await self._amend_leg(
+                    port, intent.symbol, leg.leg_id, intent.side, levels, attach_coid,
                 )
             except ExchangeOrderRejectedError as exc:
+                if co_owned:
+                    self._refused_co_owned_attach(intent, leg.leg_id, own_coid, prior_row, exc)
+                    raise
                 # The amend was DEFINITIVELY rejected on a leg of an OPEN
                 # position (we hold ``on_side`` legs), so the position is now
                 # open and UNPROTECTED. PERSIST-FIRST wrote this leg's ownership
@@ -837,89 +1007,407 @@ class OneWayEmulator:
                 return row.client_order_id
         return None
 
+    def _target_legs(
+            self, intent: ExitIntent, on_side: list[PositionLeg],
+    ) -> list[PositionLeg]:
+        """The net-survivor legs ``intent``'s bracket covers, in FIFO order.
+
+        An exit without a ``from_entry`` covers every survivor leg. An exit
+        bound to a ``from_entry`` covers the legs attributed to that entry
+        (:attr:`~PositionLeg.entry_id`) and every
+        unattributed leg: an unattributed leg cannot be told apart, so it is
+        protected by every exit of its side, which keeps a plugin that never
+        attributes on the replicate-onto-all behaviour.
+
+        When every survivor leg is attributed to another entry, the exit covers
+        nothing. Attribution only ever comes from the bot's own records, and a
+        leg whose attribution is lost or uncertain is unattributed (``None``),
+        never another entry's, so this means the entry holds no leg: typically
+        its leg was just closed by its own take-profit or stop at the venue and
+        the fill is not booked yet, while Pine re-emits the exit. Covering the
+        other entries' legs then would put this exit's (possibly already
+        touched) levels on them and close or flatten a position it does not
+        protect. :meth:`run_exit_bracket` skips the fan instead (non-halting,
+        re-evaluated on the next bar), reported once per exit at WARNING.
+
+        :param intent: The exit being replicated.
+        :param on_side: The net-survivor legs of the side it protects.
+        :return: The covered legs; empty when the entry holds no leg.
+        """
+        if not intent.from_entry:
+            return list(on_side)
+        targeted = [
+            leg for leg in on_side
+            if leg.entry_id is None or leg.entry_id == intent.from_entry
+        ]
+        if targeted:
+            self._entry_without_leg_reported.discard(intent.intent_key)
+            return targeted
+        if intent.intent_key not in self._entry_without_leg_reported:
+            self._entry_without_leg_reported.add(intent.intent_key)
+            _blog_warning(
+                "one-way bracket replication: every open leg of %s (legs %s) is "
+                "attributed to an entry other than %r, so exit %r has no leg to "
+                "protect and is not attached; it is re-evaluated on every bar (a "
+                "leg its entry opens, or the entry's booked close, settles it)",
+                intent.symbol, ", ".join(leg.leg_id for leg in on_side),
+                intent.from_entry, intent.pine_id,
+            )
+        return []
+
+    def _active_owner_levels(
+            self, symbol: str, leg_id: str,
+    ) -> list[tuple[str, _LegLevels]]:
+        """The levels of every exit that actively owns ``leg_id``.
+
+        Only ``active`` ownership rows count: a ``clearing`` row belongs to an
+        exit being retired from the leg, whose levels must not stay on it.
+
+        :param symbol: The leg's symbol.
+        :param leg_id: The broker leg id.
+        :return: ``(intent_key, levels)`` per owning row, each row's own levels.
+        """
+        if self._store_ctx is None:
+            return []
+        owners: list[tuple[str, _LegLevels]] = []
+        for row in iter_active_bracket_ownerships(self._store_ctx):
+            extras = row.extras or {}
+            if (row.symbol != symbol
+                    or extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID) != leg_id
+                    or extras.get(EXTRAS_KEY_BRACKET_OWN_STATE) != BRACKET_OWN_STATE_ACTIVE):
+                continue
+            owners.append((row.intent_key or row.client_order_id, self._row_levels(row)))
+        return owners
+
+    @staticmethod
+    def _row_levels(row: 'OrderRow') -> _LegLevels:
+        """The owning exit's own levels persisted on an ownership row."""
+        extras = row.extras or {}
+        return _LegLevels(
+            tp_price=extras.get(EXTRAS_KEY_BRACKET_OWN_TP),
+            sl_price=extras.get(EXTRAS_KEY_BRACKET_OWN_SL),
+            trail_offset=extras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET),
+        )
+
+    def _merge_owner_levels(
+            self, symbol: str, leg_id: str, exit_side: str,
+            owners: list[tuple[str, _LegLevels]],
+    ) -> _LegLevels:
+        """The one protection a leg carries for all of its owning exits.
+
+        A venue leg holds a single take-profit, stop-loss and trailing stop, so
+        the owners' levels are merged per field, deterministically and
+        independent of the order the exits attached in. A field only one owner
+        sets is taken as is, so a TP-only and an SL-only exit union. Where
+        several owners set the same field differently the leg cannot express
+        them all; it gets the more protective level, the one the price reaches
+        first — for a long (sell exit) the highest stop-loss and the lowest
+        take-profit, for a short (buy exit) the lowest stop-loss and the highest
+        take-profit — and the tightest trailing offset. That conflict is
+        reported once per leg and owner set at WARNING. No owner at all yields
+        the all-``None`` clear.
+
+        A fixed stop-loss of one exit and a trailing stop of ANOTHER exit are
+        not a "first reached" pair: the port takes ``sl_price`` and
+        ``trail_offset`` together and venues read the pair differently
+        (Capital.com: the trail replaces the stop; cTrader: the trail is
+        anchored at the stop), so the leg carries neither owner's stop as the
+        owner asked for it. Both fields are sent as merged, with no
+        price-dependent choice, and the combination is reported once per leg
+        and owner set at WARNING. One exit asking for both is its own request
+        and is not reported.
+
+        :param symbol: The leg's symbol, for the report.
+        :param leg_id: The broker leg id, for the report.
+        :param exit_side: The owners' exit side (``"sell"`` protects a long).
+        :param owners: ``(intent_key, levels)`` of every owning exit.
+        :return: The merged levels.
+        """
+        long_side = exit_side == 'sell'
+        tps = {levels.tp_price for _key, levels in owners if levels.tp_price is not None}
+        sls = {levels.sl_price for _key, levels in owners if levels.sl_price is not None}
+        trails = {levels.trail_offset for _key, levels in owners
+                  if levels.trail_offset is not None}
+        merged = _LegLevels(
+            tp_price=(min(tps) if long_side else max(tps)) if tps else None,
+            sl_price=(max(sls) if long_side else min(sls)) if sls else None,
+            trail_offset=min(trails) if trails else None,
+        )
+        keys = frozenset(key for key, _levels in owners)
+        if len(tps) > 1 or len(sls) > 1 or len(trails) > 1:
+            report_key = (symbol, leg_id, keys, 'conflict')
+            if report_key not in self._level_conflicts_reported:
+                self._level_conflicts_reported.add(report_key)
+                _blog_warning(
+                    "one-way bracket: exits %s all protect leg %s of %s with "
+                    "different levels, which one leg cannot carry; it gets the "
+                    "level the price reaches first (tp=%s sl=%s trail=%s)",
+                    ", ".join(sorted(format_intent_key(key) for key in keys)),
+                    leg_id, symbol, merged.tp_price, merged.sl_price,
+                    merged.trail_offset,
+                )
+        stop_keys = {key for key, levels in owners
+                     if levels.sl_price is not None or levels.trail_offset is not None}
+        if sls and trails and len(stop_keys) > 1:
+            report_key = (symbol, leg_id, keys, 'sl_trail')
+            if report_key not in self._level_conflicts_reported:
+                self._level_conflicts_reported.add(report_key)
+                _blog_warning(
+                    "one-way bracket: exits %s combine a fixed stop-loss and a "
+                    "trailing stop of different exits on leg %s of %s; the venue "
+                    "takes the pair as one stop and interprets it its own way (a "
+                    "trail replacing the stop, or anchored at it), so neither "
+                    "exit's stop is carried as asked (sl=%s trail=%s)",
+                    ", ".join(sorted(format_intent_key(key) for key in keys)),
+                    leg_id, symbol, merged.sl_price, merged.trail_offset,
+                )
+        return merged
+
+    async def _amend_leg(
+            self, port: 'PositionPort', symbol: str, leg_id: str, side: str,
+            levels: _LegLevels, coid: str, *, reassert: bool = False,
+    ) -> bool:
+        """Send ``levels`` as the whole protection of one leg, unless it already holds them.
+
+        The skip rule: the amend is NOT sent when ``levels`` equal the levels
+        of the last amend THIS process sent to the leg and the venue confirmed
+        (the call returned), and no amend of the leg was started since. The
+        record (:attr:`~OneWayEmulator._venue_levels`) is dropped before every
+        amend and written back only when it returns, so the venue state counts
+        as known only after a confirmed amend: an amend that ended ambiguous
+        (:class:`OrderDispositionUnknownError`), refused, rate-limited or
+        interrupted, and every leg after a restart, is always re-sent. A
+        retirement left ``clearing`` therefore re-sends whenever its own amend
+        failed; a leg the retirement never reached still holds the confirmed
+        levels and is compared against them. ``reassert`` sends
+        unconditionally — the restart replay, whose purpose is to re-assert a
+        venue state the process does not trust.
+
+        A skipped amend is no venue call at all: a venue may reject an amend
+        that changes nothing, and any re-send resets a trailing stop the venue
+        has already moved. The caller's row bookkeeping (persist-first,
+        release) proceeds exactly as if it had been sent.
+
+        :return: ``True`` when the amend was sent, ``False`` when skipped.
+        """
+        key = (symbol, leg_id)
+        if not reassert and self._venue_levels.get(key) == levels:
+            return False
+        self._venue_levels.pop(key, None)
+        await port.amend_bracket(
+            symbol, leg_id, side=side,
+            tp_price=levels.tp_price, sl_price=levels.sl_price,
+            trail_offset=self._trail_price_distance(levels.trail_offset),
+            coid=coid,
+        )
+        self._venue_levels[key] = levels
+        return True
+
+    def _forget_vanished_legs(self, symbol: str, live_ids: set[str]) -> None:
+        """Drop the confirmed-levels record of every ``symbol`` leg no longer open."""
+        for key in [key for key in self._venue_levels
+                    if key[0] == symbol and key[1] not in live_ids]:
+            del self._venue_levels[key]
+
+    def _own_active_row(self, coid: str) -> 'OrderRow | None':
+        """The live, ``active`` ownership row ``coid``, or ``None``."""
+        if self._store_ctx is None:
+            return None
+        row = self._store_ctx.get_order(coid)
+        if (row is None or row.closed_ts_ms is not None
+                or (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_STATE)
+                != BRACKET_OWN_STATE_ACTIVE):
+            return None
+        return row
+
+    def _refused_co_owned_attach(
+            self, intent: ExitIntent, leg_id: str, own_coid: str,
+            prior_row: 'OrderRow | None', exc: ExchangeOrderRejectedError,
+    ) -> None:
+        """Undo this attach's ownership row on a co-owned leg the venue refused.
+
+        The venue still holds the merge it held before this attach. A first
+        attach owned nothing there, so its row is released; a modify owned the
+        leg with its previous levels, which are still part of that merge, so
+        the row is restored to them (still ``active``: a later retirement must
+        take them off the leg). Logged at WARNING with the refusal.
+        """
+        if self._store_ctx is not None:
+            if prior_row is None:
+                update_bracket_ownership_state(
+                    self._store_ctx, coid=own_coid,
+                    new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+                )
+            else:
+                self._store_ctx.upsert_order(own_coid, extras=dict(prior_row.extras or {}))
+        _blog_warning(
+            "one-way bracket: the venue refused exit %r of entry %r on leg %s of "
+            "%s, which other exits also protect (%s: %s); the leg keeps their "
+            "levels%s, and the exit's own levels are not attached — the refusal "
+            "goes to the refused-exit recovery",
+            intent.pine_id, intent.from_entry, leg_id, intent.symbol,
+            type(exc).__name__, exc,
+            "" if prior_row is None else " and this exit's previous ones",
+        )
+
+    def _report_retirement_refusal(
+            self, symbol: str, leg_id: str, retiring: list['OrderRow'], exc: Exception,
+    ) -> None:
+        """WARN once per (leg, owner set) that a retirement re-assert did not go through.
+
+        :param symbol: The leg's symbol.
+        :param leg_id: The broker leg id.
+        :param retiring: The leg's ``clearing`` rows, which stay ``clearing``.
+        :param exc: The venue's refusal or throttle.
+        """
+        remaining = self._active_owner_levels(symbol, leg_id)
+        retiring_keys = frozenset(row.intent_key or row.client_order_id for row in retiring)
+        remaining_keys = frozenset(key for key, _levels in remaining)
+        report_key = (symbol, leg_id, retiring_keys, remaining_keys)
+        if report_key in self._retirement_refusals_reported:
+            return
+        self._retirement_refusals_reported.add(report_key)
+        _blog_warning(
+            "one-way bracket: retiring exit(s) %s from leg %s of %s did not go "
+            "through — the venue answered the re-assert of %s with %s: %s. The "
+            "retired exit's levels may still be armed on the leg; the "
+            "retirement is retried on every sync until it lands",
+            ", ".join(sorted(format_intent_key(key) for key in retiring_keys)),
+            leg_id, symbol,
+            ("the remaining exits' levels ("
+             + ", ".join(sorted(format_intent_key(key) for key in remaining_keys)) + ")"
+             if remaining_keys else "an empty protection (no exit owns the leg any more)"),
+            type(exc).__name__, exc,
+        )
+
+    async def _reassert_remaining_owners(
+            self, port: 'PositionPort', symbol: str, leg_id: str, side: str,
+            coid: str,
+    ) -> None:
+        """Amend one leg to the merged levels of its remaining active owners.
+
+        The retirement step of every clear path: the retiring rows are already
+        ``clearing`` (so they no longer count as owners), and the leg keeps the
+        protection of the exits that still own it — cleared (all ``None``)
+        only when none does. A merge equal to the leg's confirmed levels (a
+        retired exit every one of whose levels was dominated) is not re-sent
+        (:meth:`_amend_leg`). Raises whatever the amend raises; the caller's
+        ``clearing`` rows then stay live for the retry.
+        """
+        levels = self._merge_owner_levels(
+            symbol, leg_id, side, self._active_owner_levels(symbol, leg_id),
+        )
+        await self._amend_leg(port, symbol, leg_id, side, levels, coid)
+
     async def _clear_dropped_survivor_legs(
             self, envelope: 'DispatchEnvelope', intent: ExitIntent, *,
-            survivors: set[str], port: 'PositionPort',
+            targets: set[str], port: 'PositionPort',
     ) -> None:
-        """Clear + release this exit's owned legs that fell out of the survivor set.
+        """Retire + release this exit's owned legs that fell out of its covered set.
 
-        On a re-attach the net survivor set can shrink (an opposing leg now
-        virtually FIFO-consumes a leg this exit protected before). Each such leg is
-        still physically open and still carries the prior broker bracket, so its
-        active ownership row is cleared on the broker (amend-to-None) under a clear
-        coid distinct from the attach coid, then released — mirroring
+        On a re-attach the covered set can shrink (an opposing leg now virtually
+        FIFO-consumes a leg this exit protected before, or the leg's attribution
+        now assigns it to another entry). Each such leg is still physically open
+        and still carries this exit's levels, so its ownership row is marked
+        ``clearing`` PERSIST-FIRST, the leg is amended to the merged levels of
+        its remaining owners (cleared only when none is left) under a clear coid
+        distinct from the attach coid, and the row is released — mirroring
         :meth:`run_exit_bracket_clear` for the implicit drop. A ``*_NOT_FOUND``
         race on a vanished leg is the port's benign no-op; the restart pass would
         otherwise re-assert the stale stop.
 
-        An ambiguous clear (:class:`OrderDispositionUnknownError`) on a dropped
-        leg must NOT abort this call: :meth:`run_exit_bracket` runs the drop FIRST,
-        before the survivor amend loop, so propagating here would skip the NEW
-        protection on the surviving legs entirely — the dispatch path then parks
-        the error while promoting the new intent into ``_active_intents``, so the
-        next diff sees Pine == active, never re-runs the fan, and the survivors
-        stay on STALE TP/SL indefinitely. The drop is persist-first ``clearing``,
-        so leaving its row in that phase lets :meth:`drain_clearing_rows` (per
-        sync) and :meth:`restart_replay` retry the idempotent re-clear; the
-        survivor amend below proceeds with the new levels. This mirrors the
-        unknown-disposition handling in :meth:`drain_clearing_rows`.
+        An ambiguous retirement (:class:`OrderDispositionUnknownError`) on a
+        dropped leg must NOT abort this call: :meth:`run_exit_bracket` runs the
+        drop FIRST, before the survivor amend loop, so propagating here would
+        skip the NEW protection on the surviving legs entirely — the dispatch
+        path then parks the error while promoting the new intent into
+        ``_active_intents``, so the next diff sees Pine == active, never re-runs
+        the fan, and the survivors stay on STALE TP/SL indefinitely. Leaving the
+        row ``clearing`` lets :meth:`drain_clearing_rows` (per sync) and
+        :meth:`restart_replay` retry the idempotent re-amend; the survivor amend
+        below proceeds with the new levels. This mirrors the unknown-disposition
+        handling in :meth:`drain_clearing_rows`. A definitive refusal or a
+        venue throttle of the retirement is handled the same way (the row stays
+        ``clearing``, see :meth:`_report_retirement_refusal`): the retirement
+        concerns a leg this exit no longer covers, and surfacing it as the
+        exit's own refusal would send the engine into the refused-exit recovery
+        of a bracket that was never refused.
         """
         if self._store_ctx is None:
             return
         clear_coid = envelope.client_order_id(KIND_CANCEL)
-        rows = list(iter_active_bracket_ownerships(
-            self._store_ctx, from_entry=intent.from_entry,
-        ))
-        for row in rows:
+        dropped: dict[str, list['OrderRow']] = {}
+        for row in iter_active_bracket_ownerships(
+                self._store_ctx, from_entry=intent.from_entry):
             if (row.intent_key or '') != intent.intent_key:
                 continue
             leg_id: str | None = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
-            if leg_id is None or leg_id in survivors:
+            if leg_id is None or leg_id in targets:
                 continue
-            update_bracket_ownership_state(
-                self._store_ctx, coid=row.client_order_id,
-                new_state=BRACKET_OWN_STATE_CLEARING,
-                extras_patch={EXTRAS_KEY_BRACKET_OWN_CLEAR_COID: clear_coid},
-            )
+            dropped.setdefault(leg_id, []).append(row)
+        for leg_rows in dropped.values():
+            for row in leg_rows:
+                update_bracket_ownership_state(
+                    self._store_ctx, coid=row.client_order_id,
+                    new_state=BRACKET_OWN_STATE_CLEARING,
+                    extras_patch={EXTRAS_KEY_BRACKET_OWN_CLEAR_COID: clear_coid},
+                )
+        for leg_id, leg_rows in dropped.items():
             try:
-                await port.amend_bracket(
-                    intent.symbol, leg_id, side=row.side,
-                    tp_price=None, sl_price=None, trail_offset=None,
-                    coid=clear_coid,
+                await self._reassert_remaining_owners(
+                    port, intent.symbol, leg_id, leg_rows[0].side, clear_coid,
                 )
             except OrderDispositionUnknownError:
-                # The clear did not confirm; leave the row ``clearing`` so
+                # The retirement did not confirm; leave the row ``clearing`` so
                 # ``drain_clearing_rows`` / ``restart_replay`` retry the
-                # idempotent re-clear, and DO NOT abort the survivor amend
+                # idempotent re-amend, and DO NOT abort the survivor amend
                 # below — those legs need their new protection now.
                 continue
-            update_bracket_ownership_state(
-                self._store_ctx, coid=row.client_order_id,
-                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
-            )
+            except ExchangeOrderRejectedError as exc:
+                # The venue refused the remaining owners' levels; the row stays
+                # ``clearing`` for the per-sync drain, and the survivor amend
+                # below still runs.
+                self._report_retirement_refusal(intent.symbol, leg_id, leg_rows, exc)
+                continue
+            except ExchangeRateLimitError as exc:
+                # Throttled: stop retiring (every further call would be refused
+                # too); the rows stay ``clearing`` for the per-sync drain.
+                self._report_retirement_refusal(intent.symbol, leg_id, leg_rows, exc)
+                break
+            for row in leg_rows:
+                update_bracket_ownership_state(
+                    self._store_ctx, coid=row.client_order_id,
+                    new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+                )
 
     async def drain_clearing_rows(self, symbol: str, port: 'PositionPort') -> set[str]:
-        """Re-clear + release any ``clearing`` bracket-ownership rows in-session.
+        """Finish + release any ``clearing`` bracket-ownership rows in-session.
 
         :meth:`_clear_dropped_survivor_legs` (and :meth:`run_exit_bracket_clear`)
-        mark a row ``clearing`` PERSIST-FIRST, then amend-to-None on the broker.
-        An ambiguous :class:`OrderDispositionUnknownError` on that amend leaves the
-        row stranded in ``clearing``: the dispatch path parks the exit and promotes
-        it into ``_active_intents``, so the next diff sees Pine == active and never
-        re-runs the owning fan, and the one-way orphan sweep skips active keys —
-        the stale leg stays armed until the next restart's :meth:`restart_replay`.
+        mark a row ``clearing`` PERSIST-FIRST, then amend its leg to the merged
+        levels of the leg's remaining owners. An ambiguous
+        :class:`OrderDispositionUnknownError` on that amend leaves the row
+        stranded in ``clearing``: the dispatch path parks the exit and promotes
+        it into ``_active_intents``, so the next diff sees Pine == active and
+        never re-runs the owning fan, and the one-way orphan sweep skips active
+        keys — the stale levels stay armed until the next restart's
+        :meth:`restart_replay`.
 
-        This drain closes that window. The engine calls it once per sync (after the
-        orphan sweep): every live ``clearing`` row is re-cleared under its persisted
-        clear coid and released, exactly like :meth:`_replay_bracket_one`'s clearing
-        branch but per-sync rather than restart-only. A ``clearing`` row is by
-        definition marked-for-removal, NEVER wanted protection, so re-clearing it is
-        always safe even while the owning exit is still active (its survivor legs
-        carry ``active`` rows, untouched here). A vanished leg's bracket is moot —
-        release the row. Amending to None is idempotent (an already-cleared leg
-        no-ops), so a re-clear that already landed is a broker no-op. A timeout on
-        the re-clear leaves the row ``clearing`` for the next sync to retry rather
-        than halting the bot.
+        This drain closes that window. The engine calls it once per sync (after
+        the orphan sweep): every leg with a live ``clearing`` row is re-amended to
+        the merged levels of its CURRENT ``active`` owners (cleared when none is
+        left) under the persisted clear coid, and its ``clearing`` rows are
+        released, exactly like :meth:`_replay_bracket_leg`'s clearing branch but
+        per-sync rather than restart-only. A ``clearing`` row is by definition
+        marked-for-removal, NEVER wanted protection, so dropping its levels is
+        always safe even while the owning exit is still active; the leg's
+        ``active`` owners keep theirs, since the amend carries them. A vanished
+        leg's bracket is moot — release the rows. The amend is a full
+        replacement, so a retirement that already landed is a broker no-op. A
+        timeout, a definitive refusal or a venue throttle leaves the rows
+        ``clearing`` for the next sync to retry rather than halting the bot; a
+        refusal or throttle is reported once per leg and owner set
+        (:meth:`_report_retirement_refusal`).
 
         Returns the set of ``intent_key`` values whose LAST surviving ownership row
         the drain released this call. The engine drops the in-memory
@@ -942,23 +1430,42 @@ class OneWayEmulator:
             return set()
         legs = await _read_legs(port, symbol)
         live_ids = {leg.leg_id for leg in legs}
-        released: set[str] = set()
+        self._forget_vanished_legs(symbol, live_ids)
+        by_leg: dict[str | None, list['OrderRow']] = {}
         for row in rows:
-            extras = row.extras or {}
-            leg_id: str | None = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+            by_leg.setdefault(
+                (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID), [],
+            ).append(row)
+        released: set[str] = set()
+        for leg_id, leg_rows in by_leg.items():
             if leg_id is not None and leg_id in live_ids:
+                first = leg_rows[0]
                 try:
-                    await port.amend_bracket(
-                        symbol, leg_id, side=row.side,
-                        tp_price=None, sl_price=None, trail_offset=None,
-                        coid=extras.get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID)
-                        or row.client_order_id,
+                    await self._reassert_remaining_owners(
+                        port, symbol, leg_id, first.side,
+                        (first.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID)
+                        or first.client_order_id,
                     )
                 except OrderDispositionUnknownError:
-                    # Re-clear did not confirm; leave the row ``clearing`` so the
-                    # next sync retries it (idempotent amend-to-None). Halting here
-                    # would strand the bot on a recoverable broker round-trip.
+                    # The re-amend did not confirm; leave the rows ``clearing`` so
+                    # the next sync retries it (idempotent full replacement).
+                    # Halting here would strand the bot on a recoverable broker
+                    # round-trip.
                     continue
+                except ExchangeOrderRejectedError as exc:
+                    # The venue refused the remaining owners' levels (a stop now
+                    # inside the venue's minimum distance, a closed market). The
+                    # rows stay ``clearing`` and the next sync retries; raising
+                    # would end the run, and after a restart the same drain would
+                    # raise again on every start.
+                    self._report_retirement_refusal(symbol, leg_id, leg_rows, exc)
+                    continue
+                except ExchangeRateLimitError as exc:
+                    # Throttled: stop draining (every further amend would be
+                    # refused too) but return what was already released, like a
+                    # dropped link below; the rest stays ``clearing``.
+                    self._report_retirement_refusal(symbol, leg_id, leg_rows, exc)
+                    break
                 except ExchangeConnectionError:
                     # The connection dropped mid-drain. Earlier rows in this loop
                     # may already be RELEASED (durably closed in the store) and
@@ -966,17 +1473,18 @@ class OneWayEmulator:
                     # escape, that partial progress is lost — the caller logs +
                     # retries but never runs the envelope/mapping retirement, so a
                     # released row's stale anchor survives and a later re-emission
-                    # rebuilds the same attach coid an idempotent plugin dedups,
-                    # leaving the leg unprotected. Stop draining (the link is down)
+                    # of the exit is built on it instead of on a fresh anchor.
+                    # Stop draining (the link is down)
                     # but RETURN what was already released so the engine retires it;
-                    # this row stays ``clearing`` for the next sync to retry.
+                    # these rows stay ``clearing`` for the next sync to retry.
                     break
-            update_bracket_ownership_state(
-                self._store_ctx, coid=row.client_order_id,
-                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
-            )
-            if row.intent_key is not None:
-                released.add(row.intent_key)
+            for row in leg_rows:
+                update_bracket_ownership_state(
+                    self._store_ctx, coid=row.client_order_id,
+                    new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+                )
+                if row.intent_key is not None:
+                    released.add(row.intent_key)
         # Only report a key whose every ownership row is now gone: a key still
         # carrying an ``active`` row (a live exit's survivor legs) must keep its
         # envelope, so the engine must not retire it.
@@ -1033,55 +1541,82 @@ class OneWayEmulator:
     async def run_exit_bracket_clear(
             self, envelope: 'DispatchEnvelope', port: 'PositionPort',
     ) -> ClearFanResult:
-        """Clear ONLY the legs the cancelled exit owns (the per-leg ownership fix).
+        """Retire the cancelled exit from ONLY the legs it owns.
 
         A broadcast clear amends every position-side leg, stripping a bracket a
         DIFFERENT exit set. This consults the persisted ownership index instead:
-        it amends-to-clear only the legs whose row matches the cancel's
-        ``intent_key`` (or, for a cancel-all-by-pine_id with ``from_entry`` None,
-        every row whose exit shares that pine_id), then releases each cleared
-        row. Without a persisted index (``store_ctx`` None) there is nothing to
-        clear — a benign empty result.
+        it retires only the rows matching the cancel's ``intent_key`` (or, for a
+        cancel-all-by-pine_id with ``from_entry`` None, every row whose exit
+        shares that pine_id). Each leg those rows sit on is amended to the merged
+        levels of the exits that STILL own it — so a co-owning exit (an SL-only
+        exit next to the cancelled TP-only one, or another entry's exit on an
+        unattributed leg) keeps its protection — and is cleared only when no
+        owner is left; then the rows are released. Without a persisted index
+        (``store_ctx`` None) there is nothing to clear — a benign empty result.
+
+        A definitive refusal (:class:`ExchangeOrderRejectedError`) of a leg's
+        re-assert never escapes: the leg's rows stay ``clearing``, the refusal
+        is reported once per leg and owner set at WARNING
+        (:meth:`_report_retirement_refusal`) and the remaining legs are still
+        retired; :meth:`drain_clearing_rows` retries the leg on every sync. A
+        venue throttle (:class:`ExchangeRateLimitError`) is reported the same
+        way and stops the loop, leaving the legs not reached ``clearing`` too.
+        For the engine the cancel is then settled, exactly as when the
+        retirement's disposition is unknown: the drain owns the leftover rows.
+        Any other amend error (an ambiguous timeout, a dropped link)
+        propagates; the rows of that leg and of the legs not reached yet stay
+        ``clearing`` for :meth:`drain_clearing_rows` / :meth:`restart_replay`
+        to finish.
         """
         intent = envelope.intent
         assert isinstance(intent, CancelIntent)
         if self._store_ctx is None:
             return ClearFanResult(legs=())
         cancel_coid = envelope.client_order_id(KIND_CANCEL)
-        rows = list(iter_active_bracket_ownerships(
-            self._store_ctx, from_entry=intent.from_entry,
-        ))
-        cleared: list[str] = []
-        for row in rows:
+        owned: dict[str, list['OrderRow']] = {}
+        for row in iter_active_bracket_ownerships(
+                self._store_ctx, from_entry=intent.from_entry):
             if not self._owns(row, intent):
                 continue
             leg_id: str | None = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
             if leg_id is None:
                 continue
-            # PERSIST-FIRST: mark the row ``clearing`` BEFORE the amend, so an
-            # ambiguous (timed-out) clear leaves a row that :meth:`restart_replay`
-            # re-CLEARS rather than re-asserting the original bracket — the
-            # close-leg ``pending`` -> ``dispatched`` two-phase applied to the
-            # clear. Without it a timed-out clear stays ``active`` and the next
-            # restart resurrects the bracket the script asked to cancel. Record the
-            # clear coid too, so the restart re-clears under the SAME clear coid —
-            # NOT the attach coid, which a coid-idempotent plugin could dedup as a
-            # repeat of the attach and swallow, leaving the bracket armed.
-            update_bracket_ownership_state(
-                self._store_ctx, coid=row.client_order_id,
-                new_state=BRACKET_OWN_STATE_CLEARING,
-                extras_patch={EXTRAS_KEY_BRACKET_OWN_CLEAR_COID: cancel_coid},
-            )
-            await port.amend_bracket(
-                intent.symbol, leg_id, side=row.side,
-                tp_price=None, sl_price=None, trail_offset=None,
-                coid=cancel_coid,
-            )
-            update_bracket_ownership_state(
-                self._store_ctx, coid=row.client_order_id,
-                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
-            )
-            cleared.append(leg_id)
+            owned.setdefault(leg_id, []).append(row)
+        # PERSIST-FIRST: mark every retiring row ``clearing`` BEFORE any amend,
+        # so an ambiguous (timed-out) amend leaves rows that :meth:`restart_replay`
+        # / :meth:`drain_clearing_rows` finish rather than re-asserting the
+        # retired levels — the close-leg ``pending`` -> ``dispatched`` two-phase
+        # applied to the clear. Without it a timed-out clear stays ``active`` and
+        # the next restart resurrects the bracket the script asked to cancel.
+        # Marking them all first also takes them out of the owner set the merge
+        # below reads, whichever leg is amended first. Record the clear coid too,
+        # so the retry re-amends under the SAME clear coid, which correlates the
+        # venue call with this retirement rather than with the attach.
+        for leg_rows in owned.values():
+            for row in leg_rows:
+                update_bracket_ownership_state(
+                    self._store_ctx, coid=row.client_order_id,
+                    new_state=BRACKET_OWN_STATE_CLEARING,
+                    extras_patch={EXTRAS_KEY_BRACKET_OWN_CLEAR_COID: cancel_coid},
+                )
+        cleared: list[str] = []
+        for leg_id, leg_rows in owned.items():
+            try:
+                await self._reassert_remaining_owners(
+                    port, intent.symbol, leg_id, leg_rows[0].side, cancel_coid,
+                )
+            except ExchangeOrderRejectedError as exc:
+                self._report_retirement_refusal(intent.symbol, leg_id, leg_rows, exc)
+                continue
+            except ExchangeRateLimitError as exc:
+                self._report_retirement_refusal(intent.symbol, leg_id, leg_rows, exc)
+                break
+            for row in leg_rows:
+                update_bracket_ownership_state(
+                    self._store_ctx, coid=row.client_order_id,
+                    new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+                )
+                cleared.append(leg_id)
         return ClearFanResult(legs=tuple(cleared))
 
     @staticmethod
@@ -1107,9 +1642,10 @@ class OneWayEmulator:
         residual re-dispatched (an already-settled leg is never re-closed); THEN
         reversal residual-open breadcrumbs are reconciled (the closes are now
         resolved, so a still-owed residual is safely re-opened) and the open
-        re-dispatched only when its own entry row never landed; THEN active
-        bracket-ownership rows are re-asserted on still-open legs (idempotent on
-        the per-leg coid) and released when their leg has vanished.
+        re-dispatched only when its own entry row never landed; THEN each
+        still-open leg with live bracket-ownership rows is amended once to the
+        merged levels of its active owners (finishing any interrupted
+        retirement on it), and the rows of a vanished leg are released.
 
         A bracket the venue refuses to re-assert never ends the run: a closed
         market leaves its row active and the replay reports itself incomplete,
@@ -1336,14 +1872,12 @@ class OneWayEmulator:
     async def _replay_bracket_ownership(self, port: 'PositionPort') -> bool:
         """Re-assert / finish live bracket-ownership rows (second replay pass).
 
-        For every live ownership row: if its leg is still open, an ``active`` row
-        is re-asserted idempotently on the same per-leg coid (the broker no-ops an
-        unchanged amend) while a ``clearing`` row (a clear a crash interrupted) is
-        finished by re-clearing then releasing it; if the leg has vanished, the
-        bracket it carried is moot — release the orphan row so it leaves the live
-        index.
+        Rows are handled per leg, because a leg carries ONE protection merged
+        from all of its owners (:meth:`_merge_owner_levels`): re-asserting each
+        row's own levels in turn would leave the leg on whichever row came last.
+        See :meth:`_replay_bracket_leg`.
 
-        :return: ``False`` when a re-assert met a closed market (its row stays
+        :return: ``False`` when a re-assert met a closed market (its rows stay
             active for the next replay), ``True`` otherwise.
         """
         if self._store_ctx is None:
@@ -1351,93 +1885,120 @@ class OneWayEmulator:
         rows = list(iter_active_bracket_ownerships(self._store_ctx))
         if not rows:
             return True
-        by_symbol: dict[str, list] = {}
+        by_symbol: dict[str, dict[str | None, list['OrderRow']]] = {}
         for row in rows:
-            by_symbol.setdefault(row.symbol, []).append(row)
+            by_symbol.setdefault(row.symbol, {}).setdefault(
+                (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID), [],
+            ).append(row)
         complete = True
-        for symbol, srows in by_symbol.items():
+        for symbol, by_leg in by_symbol.items():
             legs = await _read_legs(port, symbol)
             live_ids = {leg.leg_id for leg in legs}
-            for row in srows:
-                if not await self._replay_bracket_one(row, symbol, live_ids, port):
+            for leg_id, leg_rows in by_leg.items():
+                if not await self._replay_bracket_leg(
+                        leg_rows, symbol, leg_id, live_ids, port):
                     complete = False
         return complete
 
-    async def _replay_bracket_one(
-            self, row, symbol: str, live_ids: set, port: 'PositionPort',
+    async def _replay_bracket_leg(
+            self, rows: list['OrderRow'], symbol: str, leg_id: str | None,
+            live_ids: set[str], port: 'PositionPort',
     ) -> bool:
-        """Re-assert / finish one bracket-ownership row, or release a vanished leg.
+        """Re-assert / finish the ownership rows of one leg, or release a vanished leg.
+
+        If the leg has vanished, the bracket it carried is moot — its rows are
+        released so they leave the live index. Otherwise the leg is amended ONCE
+        to the merged levels of its ``active`` rows:
+
+        * With a ``clearing`` row on the leg (a retirement a crash or an
+          ambiguous timeout interrupted), the amend finishes it under that row's
+          persisted clear coid, so the venue call correlates with the
+          retirement, and the ``clearing`` rows are released. The retired
+          levels are NEVER re-asserted; a leg left without an active owner is
+          cleared. A coid only correlates: the amend may carry levels other
+          than the ones first sent under it (the owners changed since), which
+          the :meth:`~PositionPort.amend_bracket`
+          contract allows.
+        * Otherwise the merge is re-asserted under the attach coid of the most
+          recently written active row.
+
+        The amend is always sent (``reassert``): the replay exists because the
+        venue state is not trusted after a restart, so it is never skipped as
+        unchanged.
 
         :return: ``False`` when the venue refused the re-assert because the
-            market is closed, ``True`` otherwise.
+            market is closed or throttled the call, ``True`` otherwise.
         """
         if self._store_ctx is None:
             return True
-        extras = row.extras or {}
-        leg_id: str | None = extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
         if leg_id is None or leg_id not in live_ids:
-            update_bracket_ownership_state(
-                self._store_ctx, coid=row.client_order_id,
-                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
-            )
-            return True
-        if extras.get(EXTRAS_KEY_BRACKET_OWN_STATE) == BRACKET_OWN_STATE_CLEARING:
-            # A clear interrupted before it confirmed (crash or ambiguous
-            # timeout): finish it. Amending to None is idempotent — an already
-            # cleared leg no-ops — so re-clear then release, NEVER re-assert the
-            # original levels (that would resurrect a cancelled bracket). Re-clear
-            # under the persisted clear coid (NOT the attach coid): the contract
-            # lets a plugin dedup a repeated coid, so reusing the attach coid here
-            # could be swallowed as a duplicate attach, leaving the bracket armed.
-            try:
-                await port.amend_bracket(
-                    symbol, leg_id, side=row.side,
-                    tp_price=None, sl_price=None, trail_offset=None,
-                    coid=extras.get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID)
-                    or row.client_order_id,
+            if leg_id is not None:
+                self._venue_levels.pop((symbol, leg_id), None)
+            for row in rows:
+                update_bracket_ownership_state(
+                    self._store_ctx, coid=row.client_order_id,
+                    new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
                 )
-            except (OrderDispositionUnknownError, ExchangeOrderRejectedError) as e:
-                # The re-clear did not confirm, or the venue refused it (a closed
-                # market). ``restart_replay`` runs inside the sync startup
+            return True
+        clearing = [
+            row for row in rows
+            if (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_STATE)
+            == BRACKET_OWN_STATE_CLEARING
+        ]
+        active = [row for row in rows if row not in clearing]
+        side = rows[0].side
+        levels = self._merge_owner_levels(
+            symbol, leg_id, side,
+            [(row.intent_key or row.client_order_id, self._row_levels(row))
+             for row in active],
+        )
+        if clearing:
+            first = clearing[0]
+            try:
+                await self._amend_leg(
+                    port, symbol, leg_id, side, levels,
+                    (first.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID)
+                    or first.client_order_id,
+                    reassert=True,
+                )
+            except (OrderDispositionUnknownError, ExchangeOrderRejectedError,
+                    ExchangeRateLimitError) as e:
+                # The retirement did not confirm, or the venue refused it (a
+                # closed market). ``restart_replay`` runs inside the sync startup
                 # wrapper, which only catches ``ExchangeConnectionError``;
                 # propagating would abort startup on a recoverable round-trip.
-                # Leave the row ``clearing`` (NOT released) so the next
+                # Leave the rows ``clearing`` (NOT released) so the next
                 # ``drain_clearing_rows`` / replay retries the idempotent
-                # re-clear, mirroring ``drain_clearing_rows``.
-                if isinstance(e, ExchangeOrderRejectedError):
-                    _blog_warning(
-                        "one-way bracket re-clear of %r refused on restart (%s: %s) — "
-                        "the clear is retried", row.client_order_id,
-                        type(e).__name__, e,
-                    )
+                # re-amend, mirroring ``drain_clearing_rows``.
+                if not isinstance(e, OrderDispositionUnknownError):
+                    self._report_retirement_refusal(symbol, leg_id, clearing, e)
                 return True
-            update_bracket_ownership_state(
-                self._store_ctx, coid=row.client_order_id,
-                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
-            )
+            for row in clearing:
+                update_bracket_ownership_state(
+                    self._store_ctx, coid=row.client_order_id,
+                    new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+                )
             return True
-        tp_price = extras.get(EXTRAS_KEY_BRACKET_OWN_TP)
-        sl_price = extras.get(EXTRAS_KEY_BRACKET_OWN_SL)
+        newest = max(active, key=lambda owner: (owner.updated_ts_ms, owner.client_order_id))
         try:
-            await port.amend_bracket(
-                symbol, leg_id, side=row.side,
-                tp_price=tp_price,
-                sl_price=sl_price,
-                trail_offset=self._trail_price_distance(
-                    extras.get(EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET)
-                ),
-                coid=extras.get(EXTRAS_KEY_BRACKET_OWN_ATTACH_COID) or row.client_order_id,
+            await self._amend_leg(
+                port, symbol, leg_id, side, levels,
+                (newest.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_ATTACH_COID)
+                or newest.client_order_id,
+                reassert=True,
             )
-        except MarketClosedError as e:
+        except (MarketClosedError, ExchangeRateLimitError) as e:
             _blog_warning(
-                "one-way bracket re-assert of %r on leg %s declined: the market is "
-                "closed (%s) — retried on the next sync", row.client_order_id,
-                leg_id, e,
+                "one-way bracket re-assert of %r on leg %s declined (%s: %s) — "
+                "retried on the next sync", newest.client_order_id,
+                leg_id, type(e).__name__, e,
             )
             return False
         except ExchangeOrderRejectedError as e:
-            self._replay_refusals.append(BracketReplayRefusal(
-                intent_key=row.intent_key or row.client_order_id,
-                leg_id=leg_id, tp_price=tp_price, sl_price=sl_price, error=e,
-            ))
+            for row in active:
+                self._replay_refusals.append(BracketReplayRefusal(
+                    intent_key=row.intent_key or row.client_order_id,
+                    leg_id=leg_id, tp_price=levels.tp_price,
+                    sl_price=levels.sl_price, error=e,
+                ))
         return True

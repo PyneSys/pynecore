@@ -8,9 +8,10 @@ prices, fees, and margin state.
 from __future__ import annotations
 
 import copy
+import math
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 from pynecore import lib
 from pynecore.core.broker.intent_builder import CLOSE_ALL_EXIT_ID, CLOSE_EXIT_ID_PREFIX
@@ -20,6 +21,8 @@ from pynecore.lib.log import broker_error as _blog_error
 from pynecore.lib.log import broker_info as _blog_info
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.lib.strategy import PositionBase, Trade
+# noinspection PyProtectedMember
+from pynecore.lib.strategy import _EntryBinding
 from pynecore.types.na import na_float
 
 if TYPE_CHECKING:
@@ -29,13 +32,42 @@ if TYPE_CHECKING:
     from pynecore.types.strategy import QtyType
     from pynecore.core.broker.models import OrderEvent
 
-__all__ = ['BrokerPosition', 'ProvisionalClose']
+__all__ = ['BrokerPosition', 'EntryBookSnapshot', 'ProvisionalClose']
 
 # Legs that only ever reduce exposure: the plugin contract requires reduce-only
 # delivery for them (``ExchangeCapabilities.reduce_only``)
 _EXIT_LEG_TYPES = frozenset((
     LegType.CLOSE, LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP,
 ))
+# The legs of a ``strategy.exit`` bracket: a fill settles the bindings of the
+# leg's ``from_entry``
+_BOUND_LEG_TYPES = frozenset((
+    LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP,
+))
+
+
+@dataclass(frozen=True, slots=True)
+class EntryBookSnapshot:
+    """A binding book read back from the store (:meth:`BrokerPosition.parse_entry_book_snapshot`).
+
+    :ivar size: The position size the book was written for.
+    :ivar entry_seq: The binding sequence counter at the time.
+    :ivar faithful: Whether every binding was opened by a fill
+        (:attr:`~BrokerPosition.book_faithful`).
+    :ivar written_ms: Wall-clock time of the write, epoch milliseconds.
+    :ivar bindings: The open bindings, oldest first.
+    :ivar order_bindings: Venue order id -> index into :attr:`bindings` of the
+        binding a further slice of that order grows.
+    :ivar fill_cursors: Client / venue order id -> the most the book had
+        taken in of that order (:meth:`BrokerPosition.fill_cursor`).
+    """
+    size: float
+    entry_seq: int
+    faithful: bool
+    written_ms: int
+    bindings: tuple[_EntryBinding, ...]
+    order_bindings: dict[str, int]
+    fill_cursors: dict[str, float]
 
 
 @dataclass(slots=True)
@@ -78,6 +110,12 @@ class BrokerPosition(PositionBase):
     Trades are tracked FIFO: the first entry filled is the first closed
     when the position is reduced, matching TradingView default semantics.
 
+    Beside the trade rows the position keeps the simulator's binding book
+    (:attr:`~BrokerPosition._entry_book`, see
+    :class:`~pynecore.lib.strategy._EntryBinding`): one binding per entry fill,
+    settled by the origin of each closing fill rather than FIFO. Its bound
+    quantities add up to the position size.
+
     Note: margin, liquidation price, and fee currency conversion are all
     handled by the exchange. This class only records what the exchange
     tells it.
@@ -95,6 +133,9 @@ class BrokerPosition(PositionBase):
         'sum_profit_ratio', 'sum_win_profit_ratio', 'sum_loss_profit_ratio',
         'open_trades', 'closed_trades', 'new_closed_trades',
         'entry_orders', 'exit_orders',
+        # The binding book (see :class:`~pynecore.lib.strategy._EntryBinding`):
+        '_entry_book', '_entry_seq', '_order_bindings', 'last_spent_entry_ids',
+        'book_faithful', '_fill_cursors', 'book_moves',
         # Per-evaluation set of close keys already seen this script run, so a
         # second same-key ``strategy.close()`` THIS evaluation nets onto the
         # first while a next-tick re-issue (calc_on_every_tick) replaces it.
@@ -150,6 +191,30 @@ class BrokerPosition(PositionBase):
         self.open_trades: list[Trade] = []
         self.closed_trades: deque[Trade] = deque(maxlen=9000)
         self.new_closed_trades: list[Trade] = []
+        # The binding book, one binding per entry fill, oldest first. The trade
+        # rows above settle FIFO; a binding settles by the origin of the closing
+        # fill (see :meth:`~BrokerPosition._settle_bindings`).
+        self._entry_book: list[_EntryBinding] = []
+        self._entry_seq: int = 0
+        # Venue order id -> the binding its fills opened, so a further slice of
+        # the same entry order grows that binding instead of adding one.
+        self._order_bindings: dict[str, _EntryBinding] = {}
+        # Entry ids of the bindings the last booked fill spent, oldest first.
+        self.last_spent_entry_ids: list[str] = []
+        # Whether every open binding was opened by a fill. A binding seeded
+        # without one (an adopted parent, a rebuild from the trade rows) is
+        # attributed FIFO, not by origin, so a missing binding proves nothing
+        # about an entry until the book is flat again.
+        self.book_faithful: bool = True
+        # Client order id / venue order id -> the most a fill booked into
+        # the book reported filled of that order (see
+        # :meth:`~BrokerPosition.fill_cursor`): what a restart compares the
+        # journal's fill cursors with to prove the stored book saw every fill.
+        self._fill_cursors: dict[str, float] = {}
+        # How many times a booked fill or an unbooked reduction moved the
+        # book in this process: a reading of the venue taken at one count is
+        # comparable with the book only while the count stays the same.
+        self.book_moves: int = 0
         # The venue's least tradable quantity at a price, in the book's units
         # (``BrokerPlugin.least_tradable_qty``); ``None`` keeps every remainder.
         self.least_tradable_qty: Callable[[float], float] | None = None
@@ -467,7 +532,10 @@ class BrokerPosition(PositionBase):
         a whole-row bracket and adopted on the wrong dispatch path. The trade is
         inert until a real broker fill routes through :meth:`record_fill` (the
         sole :attr:`open_trades` mutator), so seeding it cannot emit an intent or
-        re-open anything.
+        re-open anything. The parent also gets its binding, so the binding book
+        keeps adding up to the adopted size; the book is then no longer
+        faithful (:attr:`~BrokerPosition.book_faithful`): the adoption
+        attributes the exposure FIFO, not by the origin of its fills.
 
         :param entry_id: The parent entry id (``from_entry``).
         :param size: Signed parent open size (positive long, negative short).
@@ -493,6 +561,9 @@ class BrokerPosition(PositionBase):
             commission=0.0,
             entry_equity=0.0,
         ))
+        if not any(binding.entry_id == entry_id for binding in self._entry_book):
+            self._bind_fill(entry_id, None, size, entry_price)
+            self.book_faithful = False
 
     # === Exchange-side state updates ===
 
@@ -514,15 +585,32 @@ class BrokerPosition(PositionBase):
         signed_delta = fill_qty if event.order.side == "buy" else -fill_qty
         return not self.size * signed_delta < 0.0
 
-    def record_fill(self, event: 'OrderEvent') -> bool:
+    def record_fill(self, event: 'OrderEvent', *, close_entry_id: str | None = None) -> bool:
         """
         Record an exchange fill.
+
+        An entry fill opens a binding (a further slice of the same venue order
+        grows it). A closing fill settles the trade rows FIFO and, apart from
+        them, the binding book by its origin (see :meth:`_settle_bindings`): a
+        take-profit, stop-loss or trailing leg settles the bindings of its
+        ``from_entry`` (of its ``pine_id`` when the venue labels the leg with
+        the parent entry's own id and no ``from_entry``); a close the caller
+        attributes through ``close_entry_id`` settles that id's bindings; every
+        other reduction walks the whole book. The entry ids of the bindings it
+        spent are left in :attr:`~BrokerPosition.last_spent_entry_ids`.
 
         :param event: An :class:`OrderEvent` with ``fill_qty`` and
             ``fill_price`` populated, plus Pine identity fields
             (``pine_id``, ``from_entry``, ``leg_type``) filled by the plugin.
+        :param close_entry_id: The entry id a closing fill other than a
+            take-profit, stop-loss or trailing leg is bound to: the id of a
+            ``strategy.close(id)``, of an engine-made close aimed at one entry,
+            or the owner of a venue's per-position protective close. ``None``
+            books the fill as an unbound reduction.
         :return: ``True`` if the position side changed as a result of this fill.
         """
+        self.last_spent_entry_ids = []
+        self._keep_book_in_step()
         fill_qty = event.fill_qty or 0.0
         fill_price = event.fill_price or 0.0
         if fill_qty <= 0.0 or fill_price <= 0.0:
@@ -550,6 +638,8 @@ class BrokerPosition(PositionBase):
         # order. The sync engine settles such a fill against the venue position.
         if self.is_non_reducing_exit(event):
             return False
+        self._advance_fill_cursor(event, fill_qty)
+        self.book_moves += 1
 
         # Commission bookkeeping — realized fee becomes part of net P&L at close
         fee = event.fee
@@ -586,6 +676,7 @@ class BrokerPosition(PositionBase):
                 entry_equity=self.equity,
             )
             self.open_trades.append(trade)
+            self._bind_fill(event.pine_id, event.order.id, signed_delta, fill_price)
             self.open_commission += fee
             # The entry Order stays in ``entry_orders`` for intent stability, but
             # its filled slice now lives in ``open_trades``. Record how much of it
@@ -597,6 +688,7 @@ class BrokerPosition(PositionBase):
             return False
 
         # Reducing or flipping — FIFO close of existing trades
+        reduced = min(fill_qty, abs(self.size))
         remaining = fill_qty
         closed_profit = 0.0
         closed_fee = 0.0
@@ -612,7 +704,7 @@ class BrokerPosition(PositionBase):
             else:
                 # Partial close: split the trade
                 residue = trade_abs - remaining
-                floor = self._untradable_floor(residue, fill_price)
+                floor = self._untradable_floor(residue, fill_price, len(self.open_trades))
                 absorb = floor is not None
                 closed_piece = Trade(
                     size=trade.sign * remaining,
@@ -653,6 +745,21 @@ class BrokerPosition(PositionBase):
             self.avg_price = na_float
         else:
             self.sign = 1.0 if self.size > 0.0 else -1.0
+
+        if event.leg_type in _BOUND_LEG_TYPES and (event.from_entry or event.pine_id):
+            # A venue with position-attached brackets (Capital.com) labels the
+            # leg's fill with the parent entry's own ``pine_id`` and no
+            # ``from_entry``.
+            bound_entry_id: str | None = event.from_entry or event.pine_id
+            if not any(binding.entry_id == bound_entry_id for binding in self._entry_book):
+                _blog_warning(
+                    "%s fill (pine=%r from_entry=%r qty=%s) names no open binding "
+                    "of its entry — settled against the oldest bindings instead",
+                    event.leg_type, event.pine_id, event.from_entry, reduced,
+                )
+        else:
+            bound_entry_id = close_entry_id
+        self._settle_bindings(bound_entry_id, reduced, fill_price)
 
         # If there is leftover qty after closing all open_trades → side flip.
         # On a one-way account only an ENTRY leg may legitimately open the
@@ -710,6 +817,13 @@ class BrokerPosition(PositionBase):
                     entry_equity=self.equity,
                 )
                 self.open_trades.append(flipped)
+                # Every trade row is closed, so the flipped trade is the whole
+                # position and its binding the whole book.
+                self.clear_entry_book()
+                self._bind_fill(event.pine_id, event.order.id, new_size, fill_price)
+
+        if self.size == 0.0:
+            self.clear_entry_book()
 
         self._count_close_profit(closed_profit, 1)
 
@@ -717,7 +831,7 @@ class BrokerPosition(PositionBase):
 
         return self.sign != old_sign
 
-    def _untradable_floor(self, residue: float, price: float) -> float | None:
+    def _untradable_floor(self, residue: float, price: float, holders: int) -> float | None:
         """The venue's least tradable quantity, when a remainder falls below it.
 
         A partially closed trade's remainder below the venue's least tradable
@@ -727,14 +841,18 @@ class BrokerPosition(PositionBase):
         quantities on an inverse contract (whole USD contracts converted at
         each fill's price), so a FIFO close of one leg leaves such a remainder
         on another. The remainder moves only when another trade stays open to
-        take it; the last trade keeps it for the flat-book dust handling.
+        take it; the last trade keeps it for the flat-book dust handling. A
+        partially settled binding's remainder follows the same rule.
 
         :param residue: What the trade would keep, unsigned.
-        :param price: The closing fill's price.
+        :param price: The closing fill's price; ``0.0`` when the reduction has
+            no price, which keeps every remainder.
+        :param holders: The open trades (or bindings) the remainder is one of.
         :return: The least tradable quantity when ``residue`` is below it and
             another trade can take it, otherwise ``None``.
         """
-        if residue <= 0.0 or len(self.open_trades) < 2 or self.least_tradable_qty is None:
+        if (residue <= 0.0 or holders < 2 or price <= 0.0
+                or self.least_tradable_qty is None):
             return None
         floor = self.least_tradable_qty(price)
         return floor if residue < floor else None
@@ -768,6 +886,404 @@ class BrokerPosition(PositionBase):
             "spread over the open trades",
             residue, source.entry_id, floor,
         )
+
+    # === Binding book ===
+
+    @property
+    def bindings(self) -> Sequence[_EntryBinding]:
+        """The open bindings, oldest first; read-only for callers."""
+        return self._entry_book
+
+    def bound_exposure(self, entry_id: str | None) -> tuple[float, float]:
+        """Open bound quantity and side of an entry id's bindings.
+
+        What an exit or close of the id may still take off the position: the
+        id's own bound quantity, not its trade rows, which a fill of another
+        entry may already have consumed FIFO.
+
+        :param entry_id: The entry id.
+        :return: ``(qty, sign)``: the summed bound quantity of the id's
+            bindings (:class:`~pynecore.lib.strategy._EntryBinding`), unsigned, and
+            ``+1.0`` long / ``-1.0`` short; ``(0.0, 0.0)`` once every binding
+            of the id is spent.
+        """
+        qty = 0.0
+        sign = 0.0
+        if entry_id is None:
+            return qty, sign
+        for binding in self._entry_book:
+            if binding.entry_id == entry_id:
+                qty += binding.bound
+                sign = binding.sign
+        return qty, sign
+
+    def open_entry_count(self) -> int:
+        """Entries counted against ``pyramiding``: one per open binding.
+
+        An entry keeps its slot until its own bound quantity is spent, even
+        after a fill of another entry consumed its trade rows FIFO.
+        """
+        return self._pyramid_count()
+
+    def _keep_book_in_step(self) -> None:
+        """Rebuild the binding book from the trade rows when it no longer adds up.
+
+        Every fill and every reduction the position takes moves the bindings by
+        the same quantity as the trade rows and the size, so the bound
+        quantities add up to the position size up to float noise. The venue's
+        least tradable quantity governs single remainders, which move onto
+        the other bindings without changing the sum (:meth:`_reduce_binding`).
+        A larger difference is an invariant breach: a change of the rows and
+        the size reached the position without its bindings. It is reported,
+        and while the rows still add up to the size the book is rebuilt from
+        them, one binding per row, so every held quantity keeps an entry its
+        exits and closes are bound to (FIFO, like the rows) instead of being
+        judged unprotected exposure. The rebuilt book is FIFO-shaped, so it is
+        no longer faithful (:attr:`~BrokerPosition.book_faithful`). Rows that
+        do not add up to the size either (an adopted size the rows were not
+        seeded for) are left alone.
+        """
+        size = abs(self.size)
+        tolerance = 1e-9 * max(size, 1.0)
+        bound = sum(binding.bound for binding in self._entry_book)
+        if abs(bound - size) <= tolerance:
+            return
+        held = sum(abs(trade.size) for trade in self.open_trades)
+        if abs(held - size) > tolerance:
+            return
+        _blog_warning(
+            "binding book invariant breached: the bindings hold %s, the "
+            "position %s and its %d open trade rows %s — rebuilt from the rows",
+            bound, self.size, len(self.open_trades), held,
+        )
+        self._entry_book.clear()
+        self._order_bindings.clear()
+        self.book_faithful = False
+        for trade in self.open_trades:
+            self._entry_seq += 1
+            self._entry_book.append(_EntryBinding(
+                self._entry_seq, trade.entry_id, trade.size, trade.entry_price,
+            ))
+
+    def _bind_fill(self, entry_id: str | None, order_id: str | None,
+                   size: float, price: float) -> None:
+        """Book an entry fill in the binding book.
+
+        A further slice of an entry order whose binding is still open grows
+        that binding: one entry order is one binding however many fills the
+        venue reports for it. Every other fill opens a new binding.
+
+        :param entry_id: The entry id the fill opened.
+        :param order_id: The venue order id of the fill, or ``None`` when it
+            has none (an adopted parent).
+        :param size: The signed quantity the fill opened.
+        :param price: The fill price.
+        """
+        binding = self._order_bindings.get(order_id) if order_id is not None else None
+        if (binding is not None and binding in self._entry_book
+                and binding.entry_id == entry_id and binding.sign * size > 0.0):
+            qty = abs(size)
+            binding.entry_price = ((binding.entry_price * binding.init_size + price * qty)
+                                   / (binding.init_size + qty))
+            binding.init_size += qty
+            binding.bound += qty
+            return
+        self._entry_seq += 1
+        binding = _EntryBinding(self._entry_seq, entry_id, size, price)
+        self._entry_book.append(binding)
+        if order_id is not None:
+            self._order_bindings[order_id] = binding
+
+    def _settle_bindings(self, entry_id: str | None, qty: float, price: float) -> None:
+        """Settle a closing fill's quantity against the binding book.
+
+        The fill settles the bindings of ``entry_id`` oldest first; an unbound
+        fill (``entry_id`` ``None``) walks the whole book oldest first. What a
+        bound fill finds no binding of its id for still reduces the position
+        on the venue, so it walks the rest of the book oldest first and the
+        bound quantities keep adding up to the position size.
+
+        :param entry_id: The entry id the fill is bound to, or ``None``.
+        :param qty: The quantity the fill took off the position, unsigned.
+        :param price: The fill price.
+        """
+        if entry_id is not None:
+            for binding in list(self._entry_book):
+                if qty <= 1e-12:
+                    return
+                if binding.entry_id == entry_id:
+                    qty = self._reduce_binding(binding, qty, price)
+        for binding in list(self._entry_book):
+            if qty <= 1e-12:
+                return
+            qty = self._reduce_binding(binding, qty, price)
+
+    def _reduce_binding(self, binding: _EntryBinding, qty: float, price: float) -> float:
+        """Take up to ``qty`` off one binding; return what it could not absorb.
+
+        A binding whose remainder falls below the venue's least tradable
+        quantity is spent as well: the remainder moves onto the other bindings
+        in proportion to their bound quantity, the way
+        :meth:`_spread_residue` moves a trade row's.
+
+        :param binding: The binding to reduce.
+        :param qty: The quantity to take, unsigned.
+        :param price: The closing fill's price.
+        :return: The part of ``qty`` the binding could not absorb.
+        """
+        take = min(binding.bound, qty)
+        binding.bound -= take
+        if binding.bound <= 1e-12:
+            self._drop_binding(binding)
+            return qty - take
+        floor = self._untradable_floor(binding.bound, price, len(self._entry_book))
+        if floor is not None:
+            residue = binding.bound
+            self._drop_binding(binding)
+            total = sum(b.bound for b in self._entry_book)
+            given = 0.0
+            last = len(self._entry_book) - 1
+            for i, other in enumerate(self._entry_book):
+                share = residue - given if i == last else residue * other.bound / total
+                given += share
+                other.bound += share
+        return qty - take
+
+    def _drop_binding(self, binding: _EntryBinding) -> None:
+        """Retire a spent binding and note its entry id in :attr:`~BrokerPosition.last_spent_entry_ids`."""
+        self._entry_book.remove(binding)
+        for order_id in [k for k, v in self._order_bindings.items() if v is binding]:
+            del self._order_bindings[order_id]
+        entry_id = binding.entry_id
+        if entry_id is not None and entry_id not in self.last_spent_entry_ids:
+            self.last_spent_entry_ids.append(entry_id)
+
+    def clear_entry_book(self) -> list[str]:
+        """Spend every binding: the position holds nothing they could be bound to.
+
+        Their entry ids are added to
+        :attr:`~BrokerPosition.last_spent_entry_ids` as well. The empty book is
+        faithful again (:attr:`~BrokerPosition.book_faithful`).
+
+        :return: The distinct entry ids of the bindings spent, oldest first.
+        """
+        spent: list[str] = []
+        for binding in list(self._entry_book):
+            self._drop_binding(binding)
+            if binding.entry_id is not None and binding.entry_id not in spent:
+                spent.append(binding.entry_id)
+        self._order_bindings.clear()
+        self.book_faithful = True
+        return spent
+
+    def settle_unbooked_reduction(self, qty: float, *, entry_id: str | None = None,
+                                  price: float = 0.0) -> list[str]:
+        """Settle a reduction the trade rows took without a booked fill.
+
+        A reduction the caller applies to the rows or the size by itself (a
+        close the venue settled while no trade rows were held, a correction a
+        snapshot proved) settles the binding book the way
+        :meth:`record_fill` settles a closing fill, so the bound quantities
+        keep adding up to the position size.
+
+        :param qty: The quantity taken off the position, unsigned.
+        :param entry_id: The entry id the reduction is bound to; ``None``
+            walks the whole book oldest first.
+        :param price: The reduction's price; ``0.0`` when it has none.
+        :return: The entry ids of the bindings it spent, oldest first (also
+            left in :attr:`~BrokerPosition.last_spent_entry_ids`).
+        """
+        self.last_spent_entry_ids = []
+        if qty > 0.0:
+            self.book_moves += 1
+            self._settle_bindings(entry_id, qty, price)
+        return list(self.last_spent_entry_ids)
+
+    def _advance_fill_cursor(self, event: 'OrderEvent', fill_qty: float) -> None:
+        """Note how much of the fill's order the book has now taken in.
+
+        Kept under the order's client order id and its venue order id: the
+        sum of the fills booked for it, whichever of its ids each one carried.
+        Only the slices the book applied count, never the cumulative filled
+        quantity the plugin reports on the order: that snapshot can already
+        include a slice whose own event is not booked yet, and a cursor
+        credited with it would let a restart judge a book that missed the
+        slice as complete.
+
+        :param event: The fill being booked.
+        :param fill_qty: Its booked quantity.
+        """
+        order = event.order
+        keys = [key for key in (order.client_order_id, order.id) if key]
+        booked = max((self._fill_cursors.get(key, 0.0) for key in keys), default=0.0) + fill_qty
+        for key in keys:
+            self._fill_cursors[key] = booked
+
+    def fill_cursor(self, keys: Sequence[str | None]) -> float:
+        """The most the book took in of an order known by any of ``keys``.
+
+        :param keys: The order's client order id and venue order ids.
+        :return: ``0.0`` when no fill of it was booked.
+        """
+        return max((self._fill_cursors.get(key, 0.0) for key in keys if key), default=0.0)
+
+    def seed_fill_cursors(self, cursors: dict[str, float]) -> None:
+        """Count the given orders as taken in up to the given quantities.
+
+        For a book built from the journal rather than from fills (a startup
+        adoption): it accounts for every quantity the journal shows at the
+        time, so only a fill journaled later is one the book has not seen.
+
+        :param cursors: Client / venue order id -> filled quantity.
+        """
+        for key, qty in cursors.items():
+            if qty > self._fill_cursors.get(key, 0.0):
+                self._fill_cursors[key] = qty
+
+    def forget_fill_cursors(self) -> None:
+        """Drop the fill cursors: a flat book owes no fill of any order."""
+        self._fill_cursors.clear()
+
+    def fill_cursor_keys(self) -> frozenset[str]:
+        """The order ids (client and venue) the book keeps a fill cursor for."""
+        return frozenset(self._fill_cursors)
+
+    def drop_fill_cursors(self, keys: Iterable[str]) -> None:
+        """Drop the fill cursors of the given order ids; unknown ids are ignored.
+
+        :param keys: Client / venue order ids.
+        """
+        for key in keys:
+            self._fill_cursors.pop(key, None)
+
+    def entry_book_snapshot(self) -> dict[str, Any]:
+        """The whole binding book as a JSON-serializable dict.
+
+        What a restart needs to resume the book exactly
+        (:meth:`restore_entry_book`) and to judge whether it saw every fill:
+        every open binding with the venue order ids whose further slices grow
+        it, the binding sequence counter, the position size the book belongs
+        to, whether the book is faithful
+        (:attr:`~BrokerPosition.book_faithful`), and the fill cursors
+        (:meth:`fill_cursor`).
+
+        :return: ``{'size', 'entry_seq', 'faithful', 'bindings',
+            'fill_cursors'}``; each binding is ``{'seq', 'entry_id',
+            'init_size', 'bound', 'sign', 'entry_price', 'order_ids'}``,
+            oldest first.
+        """
+        order_ids: dict[int, list[str]] = {}
+        for order_id, binding in self._order_bindings.items():
+            order_ids.setdefault(binding.seq, []).append(order_id)
+        return {
+            'size': float(self.size),
+            'entry_seq': self._entry_seq,
+            'faithful': self.book_faithful,
+            'bindings': [
+                {'seq': binding.seq, 'entry_id': binding.entry_id,
+                 'init_size': binding.init_size, 'bound': binding.bound,
+                 'sign': binding.sign, 'entry_price': float(binding.entry_price),
+                 'order_ids': order_ids.get(binding.seq, [])}
+                for binding in self._entry_book
+            ],
+            'fill_cursors': dict(self._fill_cursors),
+        }
+
+    @staticmethod
+    def parse_entry_book_snapshot(payload: dict[str, Any]) -> EntryBookSnapshot | None:
+        """Read back a book written by :meth:`entry_book_snapshot`.
+
+        The payload also carries ``written_ms``, the wall-clock time of the
+        write. Every number must be finite, every binding's initial size and
+        bound quantity positive, and binding sequence numbers and venue order
+        ids unique. The bound quantity may exceed the initial size: a spent
+        binding's untradable remainder moves onto the other bindings
+        (:meth:`_reduce_binding`) without changing their initial sizes.
+
+        :param payload: The stored dict.
+        :return: The parsed snapshot, or ``None`` when a field is missing, of
+            the wrong type or out of range.
+        """
+        def number(value: Any) -> float | None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            value = float(value)
+            return value if math.isfinite(value) else None
+
+        def integer(value: Any) -> int | None:
+            return None if isinstance(value, bool) or not isinstance(value, int) else value
+
+        size = number(payload.get('size'))
+        entry_seq = integer(payload.get('entry_seq'))
+        written_ms = integer(payload.get('written_ms'))
+        faithful = payload.get('faithful')
+        rows = payload.get('bindings')
+        raw_cursors = payload.get('fill_cursors')
+        if (size is None or entry_seq is None or written_ms is None
+                or not isinstance(faithful, bool) or not isinstance(rows, list)
+                or not isinstance(raw_cursors, dict)):
+            return None
+        fill_cursors: dict[str, float] = {}
+        for key, raw in raw_cursors.items():
+            qty = number(raw)
+            if not isinstance(key, str) or qty is None or qty < 0.0:
+                return None
+            fill_cursors[key] = qty
+        bindings: list[_EntryBinding] = []
+        order_bindings: dict[str, int] = {}
+        seqs: set[int] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            seq = integer(row.get('seq'))
+            entry_id = row.get('entry_id')
+            init_size = number(row.get('init_size'))
+            bound = number(row.get('bound'))
+            sign = number(row.get('sign'))
+            entry_price = number(row.get('entry_price'))
+            order_ids = row.get('order_ids')
+            if (seq is None or seq in seqs
+                    or not (entry_id is None or isinstance(entry_id, str))
+                    or init_size is None or init_size <= 0.0
+                    or bound is None or bound <= 0.0 or sign not in (1.0, -1.0)
+                    or entry_price is None or not isinstance(order_ids, list)
+                    or not all(isinstance(order_id, str) and order_id not in order_bindings
+                               for order_id in order_ids)
+                    or len(set(order_ids)) != len(order_ids)):
+                return None
+            seqs.add(seq)
+            binding = _EntryBinding(seq, entry_id, sign * init_size, entry_price)
+            binding.bound = bound
+            binding.sign = sign
+            for order_id in order_ids:
+                order_bindings[order_id] = len(bindings)
+            bindings.append(binding)
+        return EntryBookSnapshot(
+            size=size, entry_seq=entry_seq, faithful=faithful, written_ms=written_ms,
+            bindings=tuple(bindings), order_bindings=order_bindings,
+            fill_cursors=fill_cursors,
+        )
+
+    def restore_entry_book(self, snapshot: EntryBookSnapshot) -> None:
+        """Replace the binding book with a stored one, verbatim.
+
+        The bindings, the venue order ids whose further slices grow them, the
+        sequence counter, the fill cursors and
+        :attr:`~BrokerPosition.book_faithful` come back as they were written;
+        the trade rows and the size are left alone. Whether the stored book
+        fits the position is the caller's to judge.
+
+        :param snapshot: The book :meth:`parse_entry_book_snapshot` read back.
+        """
+        self._entry_book = list(snapshot.bindings)
+        self._order_bindings = {
+            order_id: snapshot.bindings[index]
+            for order_id, index in snapshot.order_bindings.items()
+        }
+        self._entry_seq = max(
+            [snapshot.entry_seq, *(binding.seq for binding in snapshot.bindings)])
+        self._fill_cursors = dict(snapshot.fill_cursors)
+        self.book_faithful = snapshot.faithful
 
     def record_provisional_close(self, event: 'OrderEvent') -> ProvisionalClose:
         """
@@ -915,12 +1431,17 @@ class BrokerPosition(PositionBase):
         closed-entry cleanup, leaving the entry's full-size protective
         legs resting against inventory the account no longer holds.
 
+        The bindings still open are spent with it and added to
+        :attr:`~BrokerPosition.last_spent_entry_ids`, after those of the closing
+        fill.
+
         :param fill_price: Exit price the dust slices are booked at (the
             closing fill's own price).
         :param event: The closing :class:`OrderEvent` whose fill left the
             sub-step residual.
         :return: The distinct entry ids the flatten consumed, oldest first.
         """
+        self.clear_entry_book()
         consumed: list[str] = []
         for trade in list(self.open_trades):
             self._close_trade(trade, fill_price, event, fee_share=0.0)
@@ -1095,9 +1616,11 @@ class BrokerPosition(PositionBase):
         self.risk_halt_day = self.risk_last_trading_day if until_day_end else -1
 
     def record_liquidation(self, event: 'OrderEvent') -> None:
-        """Record an exchange-initiated liquidation — close all open trades."""
+        """Record an exchange-initiated liquidation — close all open trades and bindings."""
         if not self.open_trades:
             return
+        self.last_spent_entry_ids = []
+        self.clear_entry_book()
         fill_price = event.fill_price or 0.0
         for trade in list(self.open_trades):
             self._close_trade(trade, fill_price, event, fee_share=event.fee / max(len(self.open_trades), 1))

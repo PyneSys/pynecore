@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from pynecore import lib
+from pynecore.lib import strategy, syminfo
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
@@ -34,7 +35,7 @@ from pynecore.core.broker.exceptions import (
     UnexpectedCancelError,
     VenueWritesQuarantinedError,
 )
-from pynecore.core.broker.idempotency import KIND_ENTRY, KIND_ENTRY_TRIGGERED
+from pynecore.core.broker.idempotency import KIND_CLOSE, KIND_ENTRY, KIND_ENTRY_TRIGGERED
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.sync_engine import (
     EXTERNAL_FLATTEN_CONFIRM_GRACE_S,
@@ -55,6 +56,7 @@ from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REDUCE_ONLY,
     CANCEL_REASON_VENUE_REJECTED,
     INTENT_KEY_SEP,
+    BracketAttachRejectContext,
     BrokerEvent,
     QuarantineEnteredEvent,
     QuarantineKind,
@@ -76,13 +78,19 @@ from pynecore.core.broker.models import (
     OrderType,
     LegType,
     InterceptorResult,
+    PendingDefensiveClose,
     PositionLeg,
     QuarantineEnteredEvent,
     Quote,
 )
 from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, FailsafeOwner
 from pynecore.core.broker.software_partial_bracket_engine import PartialBracketLeg
+from pynecore.core.broker.storage import BrokerStore
+from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.store_helpers import (
+    BRACKET_OWN_STATE_CLEARING as _BRACKET_OWN_STATE_CLEARING,
+    EXTRAS_KEY_BRACKET_OWN_STATE as _EXTRAS_KEY_BRACKET_OWN_STATE,
+    iter_active_bracket_ownerships as _iter_active_bracket_ownerships,
     LEG_KIND_SL_PARTIAL as _LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL as _LEG_KIND_TP_PARTIAL,
     LEG_STATE_ARMED as _LEG_STATE_ARMED,
@@ -834,12 +842,11 @@ def __test_partial_fifo_close_keeps_a_pyramided_entry_alive__():
     engine.sync(BAR_TS)
     engine._route_event(  # type: ignore[attr-defined]
         _fill_event('buy', 1.0, 50_000.0, pine_id="L"))
-    pos.open_trades.append(Trade(
-        size=1.0, entry_id="L", entry_bar_index=0, entry_time=0,
-        entry_price=50_000.0, commission=0.0, entry_comment=None,
-        entry_equity=1_000_000.0,
-    ))
-    pos.size = 2.0
+    # A pyramid add under the same id: a second venue order's fill.
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_000.0, pine_id="L", xchg_id="xchg-1b",
+                    fill_id="l-add"))
+    assert pos.size == 2.0
 
     # A one-unit close consumes the older trade only.
     engine._route_event(replace(  # type: ignore[attr-defined]
@@ -852,14 +859,16 @@ def __test_partial_fifo_close_keeps_a_pyramided_entry_alive__():
     assert "L" in engine.active_intents
 
 
-def __test_untradable_fifo_remainder_retires_its_entry_instead_of_a_dust_amend__():
-    """A FIFO close may not leave a pyramid leg holding less than the venue trades.
+def __test_exit_fill_retires_its_own_entry_and_no_exit_is_dust_amended__():
+    """An exit fill retires its own entry; a FIFO remainder never resizes an exit.
 
     Inverse legs of the same contract count book different base quantities,
-    so S3's exit fill FIFO-closes S1 and left it 1.4e-6 BTC, which the engine
-    then tried to resize S1's exit to (bybit-inverse cycle 340). With the
-    venue's least tradable quantity the remainder moves onto S2 and S3: S1
-    closes, its exit retires, and no exit is amended to a sub-contract size.
+    so S3's exit fill FIFO-closes S1's trade row and left it 1.4e-6 BTC, which
+    the engine then tried to resize S1's exit to (bybit-inverse cycle 340).
+    With the venue's least tradable quantity the row remainder moves onto S2
+    and S3. The fill is bound to S3: S3's binding is spent and its exit
+    retires, while S1 and S2 keep their bindings and their exits, and no exit
+    is amended to a sub-contract size.
     """
     @dataclass
     class InverseBroker(MockBroker):
@@ -889,10 +898,858 @@ def __test_untradable_fifo_remainder_retires_its_entry_instead_of_a_dust_amend__
     engine.sync(BAR_TS + 10 * 60_000)
 
     assert [trade.entry_id for trade in pos.open_trades] == ["S2", "S3"]
-    assert ("S1-X", "S1") not in pos.exit_orders
-    assert "S1" not in engine.active_intents
+    assert pos.bound_exposure("S3")[0] == 0.0
+    assert ("S3-X", "S3") not in pos.exit_orders
+    assert "S3" not in engine.active_intents
+    assert ("S1-X", "S1") in pos.exit_orders
+    assert ("S2-X", "S2") in pos.exit_orders
     resized = [new.intent.qty for _old, new in b.modify_exit_calls]
     assert all(qty >= 1.0 / 100_500.0 for qty in resized), resized
+
+
+def _open_bracketed_pyramid(b, engine, pos, legs):
+    """Open ``(pine_id, qty)`` long legs in order, each with its own two-leg bracket."""
+    for i, (pine_id, qty) in enumerate(legs, start=1):
+        pos.entry_orders[pine_id] = _entry_order(pine_id, qty)
+        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
+            pine_id, -qty, f"{pine_id}-X", limit=51_000.0, stop=49_000.0)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', qty, 50_000.0 + i, pine_id=pine_id,
+                        xchg_id=f"xchg-{pine_id}"))
+
+
+def _cancelled_exits(b, since: int = 0) -> list[tuple[str, str]]:
+    """The ``(pine_id, from_entry)`` of every exit cancel dispatched after ``since``."""
+    return [(envelope.intent.pine_id, envelope.intent.from_entry)
+            for envelope in b.cancel_calls[since:]]
+
+
+@pytest.fixture
+def _live_strategy_calls():
+    """Let the test call ``strategy.*`` against a broker position."""
+    prev = (lib._lib_semaphore, lib._strategy_suppressed,
+            getattr(lib, "bar_index", 0), syminfo.pricescale, syminfo.minmove,
+            syminfo.mintick, getattr(syminfo, "_size_round_factor", None))
+    lib._lib_semaphore = False
+    lib._strategy_suppressed = False
+    lib.bar_index = 5
+    syminfo.pricescale = 1
+    syminfo.minmove = 1
+    syminfo.mintick = 1.0
+    syminfo._size_round_factor = 1000
+    try:
+        yield
+    finally:
+        (lib._lib_semaphore, lib._strategy_suppressed, lib.bar_index,
+         syminfo.pricescale, syminfo.minmove, syminfo.mintick,
+         syminfo._size_round_factor) = prev
+
+
+def __test_exit_fill_of_a_pyramid_add_cancels_only_its_own_bracket__(_live_strategy_calls):
+    """An exit fill settles its own entry: the oldest entry's bracket survives FIFO.
+
+    bybit-spot cycle c432: L1, L2, L3 open, each under its own bracket. L3-X's
+    take-profit fills and the trade rows settle FIFO, consuming L1's row. The
+    fill is bound to L3, so only L3-X's resting sibling is cancelled; L1 keeps
+    its binding and both legs of L1-X. After L2-X fills the same way, one unit
+    is left under the one bracket that covers it, and a script that issues
+    its exits on every bar re-arms neither spent bracket.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _mk_engine(b)
+    lib._script.position = pos
+    lib._script.pyramiding = 3
+    for i, pine_id in enumerate(("L1", "L2", "L3"), start=1):
+        pos.entry_orders[pine_id] = _entry_order(pine_id, 1.0)
+        engine.sync(BAR_TS + i * 60_000)
+        engine._route_event(  # type: ignore[attr-defined]
+            _fill_event('buy', 1.0, 50_000.0 + i, pine_id=pine_id,
+                        xchg_id=f"xchg-{pine_id}"))
+        strategy.exit(f"{pine_id}-X", from_entry=pine_id, limit=51_000.0, stop=49_000.0)
+        engine.sync(BAR_TS + i * 60_000)
+    keys = {pine_id: f"{pine_id}-X{INTENT_KEY_SEP}{pine_id}" for pine_id in ("L1", "L2", "L3")}
+    legs = {pine_id: list(engine.order_mapping[key]) for pine_id, key in keys.items()}
+    n_cancels = len(b.cancel_calls)
+
+    for step, pine_id in enumerate(("L3", "L2"), start=1):
+        tp, _sl = legs[pine_id]
+        engine._route_event(replace(  # type: ignore[attr-defined]
+            _fill_event('sell', 1.0, 51_000.0, pine_id=f"{pine_id}-X",
+                        leg=LegType.TAKE_PROFIT, xchg_id=tp, fill_id=f"tp-{pine_id}"),
+            from_entry=pine_id,
+        ))
+        assert pos.size == 3.0 - step
+
+    # The rows settled FIFO; the bindings by the fills' own entries.
+    assert [trade.entry_id for trade in pos.open_trades] == ["L3"]
+    assert [binding.entry_id for binding in pos.bindings] == ["L1"]
+    assert _cancelled_exits(b, n_cancels) == [("L3-X", "L3"), ("L2-X", "L2")]
+    assert engine.order_mapping[keys["L1"]] == legs["L1"]
+    assert keys["L2"] not in engine.active_intents
+    assert keys["L3"] not in engine.active_intents
+
+    # The script issues its exits on every bar: only L1-X has a target left,
+    # and it rests unchanged.
+    n_cancels = len(b.cancel_calls)
+    n_exits = len(b.exit_calls)
+    for pine_id in ("L1", "L2", "L3"):
+        strategy.exit(f"{pine_id}-X", from_entry=pine_id, limit=51_000.0, stop=49_000.0)
+    assert ("L2-X", "L2") not in pos.exit_orders
+    assert ("L3-X", "L3") not in pos.exit_orders
+    engine.sync(BAR_TS + 10 * 60_000)
+    assert b.exit_calls[n_exits:] == []
+    assert b.modify_exit_calls == []
+    assert b.cancel_calls[n_cancels:] == []
+    assert engine.order_mapping[keys["L1"]] == legs["L1"]
+
+
+def __test_a_close_of_one_id_settles_that_entry_and_close_all_the_oldest__():
+    """``strategy.close(id)`` is bound to its id; ``close_all`` walks the book.
+
+    The keyed close of L3 consumes L1's trade row FIFO, yet it is L3 whose
+    binding is spent: L3-X retires, L1 and L2 keep their brackets. A partial
+    ``close_all`` fill is unbound and settles the oldest binding, L1's.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 3
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 1.0), ("L3", 1.0)])
+    keys = {pine_id: f"{pine_id}-X{INTENT_KEY_SEP}{pine_id}" for pine_id in ("L1", "L2", "L3")}
+    n_cancels = len(b.cancel_calls)
+
+    pos.exit_orders[("Close entry(s) order L3", "L3")] = Order(
+        "L3", -1.0, order_type=_order_type_close, exit_id="Close entry(s) order L3",
+    )
+    engine.sync(BAR_TS + 10 * 60_000)
+    close = _dispatched_close(b.close_calls[-1])
+    assert close.pine_id == "L3"
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_500.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id=engine.order_mapping["L3"][0], fill_id="c-l3"),
+        pine_id=None, from_entry="L3",
+    ))
+
+    assert pos.size == 2.0
+    assert [trade.entry_id for trade in pos.open_trades] == ["L2", "L3"]
+    assert [binding.entry_id for binding in pos.bindings] == ["L1", "L2"]
+    assert _cancelled_exits(b, n_cancels) == [("L3-X", "L3")]
+    assert keys["L1"] in engine.active_intents
+    assert keys["L2"] in engine.active_intents
+    assert keys["L3"] not in engine.active_intents
+
+    n_cancels = len(b.cancel_calls)
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -2.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 11 * 60_000)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_500.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id=engine.order_mapping[""][0], fill_id="ca-1",
+                    event_type='partial', remaining_qty=1.0))
+
+    assert pos.size == 1.0
+    assert [binding.entry_id for binding in pos.bindings] == ["L2"]
+    assert _cancelled_exits(b, n_cancels) == [("L1-X", "L1")]
+    assert keys["L2"] in engine.active_intents
+
+
+def __test_a_one_way_close_leg_fill_is_bound_by_the_close_it_names__():
+    """A one-way close-leg fill settles the binding of the entry its close targets.
+
+    The one-way fan maps the close to its per-leg client order ids, so the
+    fill's venue order id matches no mapping; the fill names the close it
+    serves as ``from_entry``. That synthetic key is no entry id: read as
+    one, the fill would settle FIFO and spend the older entry's binding while
+    the closed leg was the target entry's.
+    """
+    b = MockBroker()
+    engine, _pos = _mk_engine(b)
+    synth_pine_id = "__pyne_marketable_exit__B-X\0B"
+    intent = CloseIntent(pine_id=synth_pine_id, symbol=SYMBOL, side="sell", qty=1.0,
+                         immediately=True, synthetic_kind='marketable_exit',
+                         target_entry_id="B")
+    engine._build_envelope(intent)  # type: ignore[attr-defined]
+    engine._order_mapping[synth_pine_id] = ["coid-close:2"]  # type: ignore[attr-defined]
+    event = replace(
+        _fill_event('sell', 1.0, 50_500.0, pine_id="", leg=LegType.CLOSE,
+                    xchg_id="venue-close-77"),
+        pine_id=None, from_entry=synth_pine_id,
+    )
+    assert engine._close_fill_entry_id(event) == "B"  # type: ignore[attr-defined]
+    # The WS path labels the fill with the close key as ``pine_id``.
+    assert engine._close_fill_entry_id(  # type: ignore[attr-defined]
+        replace(event, pine_id=synth_pine_id, from_entry=None)) == "B"
+
+
+def __test_a_vanished_defensive_target_settles_its_own_entry_not_the_older_leg__():
+    """A defensive close whose target leg is gone keeps the older leg's stop armed.
+
+    L2's bracket is refused and its leg vanished before the close read the
+    legs (its fill withheld), while L1's leg stays open. The empty fan sends
+    nothing; dropping the marker then would leave only an aggregate shrink,
+    which the reconcile settles FIFO against L1 and retires L1's exit. The
+    marker stays armed instead, and the stale-grace broker probe settles the
+    reduction against L2's binding.
+    """
+    from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 1.0)])
+    l1_key = f"L1-X{INTENT_KEY_SEP}L1"
+    n_cancels = len(b.cancel_calls)
+
+    b.position_port = b
+    b.raw_legs = [PositionLeg(leg_id="leg-L1", symbol=SYMBOL, side="buy", qty=1.0,
+                              entry_price=50_001.0, open_time=0.0, unrealized_pnl=0.0,
+                              entry_id="L1")]
+    reject = BracketAttachAfterFillRejectedError(
+        "bracket attach reject", position_deal_id='leg-L2', position_coid='coid-L2',
+        symbol=SYMBOL, position_side='buy', qty=1.0, from_entry='L2',
+    )
+    exit_l2 = ExitIntent(pine_id='L2-X', from_entry='L2', symbol=SYMBOL, side='sell',
+                         qty=1.0, tp_price=51_000.0, sl_price=49_000.0)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._handle_bracket_attach_after_fill_reject(exit_l2, reject)  # type: ignore[attr-defined]
+
+    assert b.close_leg_calls == []
+    assert 'L2' in engine._pending_defensive_close  # type: ignore[attr-defined]
+
+    engine._pending_defensive_close['L2'] = replace(  # type: ignore[attr-defined]
+        engine._pending_defensive_close['L2'],  # type: ignore[attr-defined]
+        pending_since=engine._pending_defensive_close['L2'].pending_since  # type: ignore[attr-defined]
+        - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 60.0,
+    )
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1.0, entry_price=50_001.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+    )
+    engine.reconcile()
+
+    assert engine.halted is False
+    assert 'L2' not in engine._pending_defensive_close  # type: ignore[attr-defined]
+    assert pos.size == 1.0
+    assert [binding.entry_id for binding in pos.bindings] == ["L1"]
+    assert ("L1-X", "L1") not in _cancelled_exits(b, n_cancels)
+    assert l1_key in engine.active_intents
+
+
+@pytest.mark.parametrize("target_entry_id", ["L2", None])
+def __test_a_sibling_reduction_of_the_same_size_does_not_settle_an_open_defensive_target__(
+        target_entry_id):
+    """The grace probe does not settle a defensive target whose own leg is still open.
+
+    L2's bracket is refused and the close read no L2 leg (a lagging read), so
+    the marker stays armed. By the probe, L1's leg has closed instead: the
+    aggregate shrank by exactly the marker's quantity, yet the venue still
+    holds L2's leg, unprotected. The probe must not take the aggregate for
+    L2's close; past the grace it halts, whether or not the plugin attributes
+    the surviving leg to its entry.
+    """
+    from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 1.0)])
+
+    b.position_port = b
+    b.raw_legs = [PositionLeg(leg_id="leg-L1", symbol=SYMBOL, side="buy", qty=1.0,
+                              entry_price=50_001.0, open_time=0.0, unrealized_pnl=0.0,
+                              entry_id="L1")]
+    reject = BracketAttachAfterFillRejectedError(
+        "bracket attach reject", position_deal_id='leg-L2', position_coid='coid-L2',
+        symbol=SYMBOL, position_side='buy', qty=1.0, from_entry='L2',
+    )
+    exit_l2 = ExitIntent(pine_id='L2-X', from_entry='L2', symbol=SYMBOL, side='sell',
+                         qty=1.0, tp_price=51_000.0, sl_price=49_000.0)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._handle_bracket_attach_after_fill_reject(exit_l2, reject)  # type: ignore[attr-defined]
+    assert 'L2' in engine._pending_defensive_close  # type: ignore[attr-defined]
+
+    engine._pending_defensive_close['L2'] = replace(  # type: ignore[attr-defined]
+        engine._pending_defensive_close['L2'],  # type: ignore[attr-defined]
+        pending_since=engine._pending_defensive_close['L2'].pending_since  # type: ignore[attr-defined]
+        - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 60.0,
+    )
+    b.raw_legs = [PositionLeg(leg_id="leg-L2", symbol=SYMBOL, side="buy", qty=1.0,
+                              entry_price=50_002.0, open_time=1.0, unrealized_pnl=0.0,
+                              entry_id=target_entry_id)]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1.0, entry_price=50_002.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+    )
+    with pytest.raises(BrokerManualInterventionError):
+        engine.reconcile()
+
+    assert 'L2' in engine._pending_defensive_close  # type: ignore[attr-defined]
+    assert [binding.entry_id for binding in pos.bindings] == ["L1", "L2"]
+
+
+def __test_a_partial_defensive_close_settles_while_its_target_leg_keeps_the_rest__():
+    """A defensive close for part of an entry settles though its leg stays listed.
+
+    L2 holds 2 units; its 1-unit exit is refused, so the defensive close takes
+    1 unit off L2's leg. The close fill is withheld past the grace while the
+    venue shows L2's leg at 1 unit and the aggregate down by 1: the leg holds
+    no more than the entry's bound quantity minus the close, so the probe
+    settles the close instead of halting on the listed leg.
+    """
+    from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 2.0)])
+
+    b.position_port = b
+    b.raw_legs = [
+        PositionLeg(leg_id="leg-L1", symbol=SYMBOL, side="buy", qty=1.0,
+                    entry_price=50_001.0, open_time=0.0, unrealized_pnl=0.0),
+        PositionLeg(leg_id="leg-L2", symbol=SYMBOL, side="buy", qty=2.0,
+                    entry_price=50_002.0, open_time=1.0, unrealized_pnl=0.0),
+    ]
+    reject = BracketAttachAfterFillRejectedError(
+        "bracket attach reject", position_deal_id='leg-L2', position_coid='coid-L2',
+        symbol=SYMBOL, position_side='buy', qty=1.0, from_entry='L2',
+    )
+    exit_l2 = ExitIntent(pine_id='L2-X', from_entry='L2', symbol=SYMBOL, side='sell',
+                         qty=1.0, tp_price=51_000.0, sl_price=49_000.0)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._handle_bracket_attach_after_fill_reject(exit_l2, reject)  # type: ignore[attr-defined]
+    assert 'L2' in engine._pending_defensive_close  # type: ignore[attr-defined]
+
+    engine._pending_defensive_close['L2'] = replace(  # type: ignore[attr-defined]
+        engine._pending_defensive_close['L2'],  # type: ignore[attr-defined]
+        pending_since=engine._pending_defensive_close['L2'].pending_since  # type: ignore[attr-defined]
+        - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 60.0,
+    )
+    b.raw_legs = [
+        PositionLeg(leg_id="leg-L1", symbol=SYMBOL, side="buy", qty=1.0,
+                    entry_price=50_001.0, open_time=0.0, unrealized_pnl=0.0),
+        PositionLeg(leg_id="leg-L2", symbol=SYMBOL, side="buy", qty=1.0,
+                    entry_price=50_002.0, open_time=1.0, unrealized_pnl=0.0),
+    ]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=2.0, entry_price=50_001.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+    )
+    engine.reconcile()
+
+    assert engine.halted is False
+    assert 'L2' not in engine._pending_defensive_close  # type: ignore[attr-defined]
+    assert pos.size == 2.0
+
+
+@pytest.mark.parametrize("target_closed", [False, True])
+def __test_a_defensive_target_leg_is_judged_by_its_own_size_not_its_entrys__(target_closed):
+    """The grace probe measures the target leg against its own size before the close.
+
+    L2 holds 2 units in two venue legs of 1 unit each; its refused exit's
+    defensive close targets ``leg-L2a``. By the probe the aggregate fell by
+    the close's 1 unit. When L1's leg closed instead, ``leg-L2a`` still holds
+    its whole unit: L2's bound quantity minus the close also equals 1, but the
+    leg itself did not shrink, so the probe halts. When ``leg-L2a`` is gone,
+    the close landed and the probe settles it.
+    """
+    from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 2.0)])
+
+    leg_l1 = PositionLeg(leg_id="leg-L1", symbol=SYMBOL, side="buy", qty=1.0,
+                         entry_price=50_001.0, open_time=0.0, unrealized_pnl=0.0,
+                         entry_id="L1")
+    leg_l2a = PositionLeg(leg_id="leg-L2a", symbol=SYMBOL, side="buy", qty=1.0,
+                          entry_price=50_002.0, open_time=1.0, unrealized_pnl=0.0,
+                          entry_id="L2")
+    leg_l2b = PositionLeg(leg_id="leg-L2b", symbol=SYMBOL, side="buy", qty=1.0,
+                          entry_price=50_002.0, open_time=2.0, unrealized_pnl=0.0,
+                          entry_id="L2")
+    b.position_port = b
+    b.raw_legs = [leg_l1, leg_l2a, leg_l2b]
+    reject = BracketAttachAfterFillRejectedError(
+        "bracket attach reject", position_deal_id='leg-L2a', position_coid='coid-L2',
+        symbol=SYMBOL, position_side='buy', qty=1.0, from_entry='L2',
+    )
+    exit_l2 = ExitIntent(pine_id='L2-X', from_entry='L2', symbol=SYMBOL, side='sell',
+                         qty=1.0, tp_price=51_000.0, sl_price=49_000.0)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._handle_bracket_attach_after_fill_reject(exit_l2, reject)  # type: ignore[attr-defined]
+    marker = engine._pending_defensive_close['L2']  # type: ignore[attr-defined]
+    assert marker.reject_context.position_leg_qty == 1.0
+
+    engine._pending_defensive_close['L2'] = replace(  # type: ignore[attr-defined]
+        marker, pending_since=marker.pending_since - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 60.0,
+    )
+    b.raw_legs = [leg_l1, leg_l2b] if target_closed else [leg_l2a, leg_l2b]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=2.0, entry_price=50_001.5,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+    )
+    if target_closed:
+        engine.reconcile()
+        assert engine.halted is False
+        assert 'L2' not in engine._pending_defensive_close  # type: ignore[attr-defined]
+        assert pos.size == 2.0
+    else:
+        with pytest.raises(BrokerManualInterventionError):
+            engine.reconcile()
+        assert 'L2' in engine._pending_defensive_close  # type: ignore[attr-defined]
+        assert [binding.entry_id for binding in pos.bindings] == ["L1", "L2"]
+
+
+def __test_helper_reject_on_shared_leg(engine, entry_id):
+    """Run the bracket-reject recovery for ``entry_id``'s 1-unit exit on ``leg-long``."""
+    reject = BracketAttachAfterFillRejectedError(
+        "bracket attach reject", position_deal_id='leg-long', position_coid=f'coid-{entry_id}',
+        symbol=SYMBOL, position_side='buy', qty=1.0, from_entry=entry_id,
+    )
+    exit_intent = ExitIntent(pine_id=f'{entry_id}-X', from_entry=entry_id, symbol=SYMBOL,
+                             side='sell', qty=1.0, tp_price=51_000.0, sl_price=49_000.0)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._handle_bracket_attach_after_fill_reject(exit_intent, reject)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("both_landed", [False, True])
+def __test_a_shared_target_leg_shrink_waits_for_every_close_aimed_at_it__(both_landed):
+    """Defensive closes aimed at one leg are judged together, never one by one.
+
+    L1, L2 and L3 hold 1 unit each on one aggregated venue leg (one leg per
+    side). The exits of L2 and L3 are refused, so two defensive closes target
+    that leg, each read it at 3 units before dispatch, and both fills are
+    withheld. When only L3's marker is past the grace and the leg is down by
+    one unit, that unit may be L2's close: the probe neither settles L3 nor
+    halts, it waits. Once both markers are stale, a leg down by one unit
+    proves one close missing and the probe halts; a leg down by two settles
+    both.
+    """
+    from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
+
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 3
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 1.0), ("L3", 1.0)])
+
+    b.position_port = b
+    b.raw_legs = [PositionLeg(leg_id="leg-long", symbol=SYMBOL, side="buy", qty=3.0,
+                              entry_price=50_002.0, open_time=0.0, unrealized_pnl=0.0)]
+    __test_helper_reject_on_shared_leg(engine, 'L2')
+    __test_helper_reject_on_shared_leg(engine, 'L3')
+    markers = engine._pending_defensive_close  # type: ignore[attr-defined]
+    assert markers['L2'].reject_context.position_leg_qty == 3.0
+    assert markers['L3'].reject_context.position_leg_qty == 3.0
+
+    past_grace = DEFENSIVE_CLOSE_RESOLUTION_GRACE_S + 60.0
+    markers['L3'] = replace(markers['L3'], pending_since=markers['L3'].pending_since - past_grace)
+    b.raw_legs = [replace(b.raw_legs[0], qty=2.0)]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=2.0, entry_price=50_002.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+    )
+    engine.reconcile()
+
+    assert engine.halted is False
+    assert set(markers) == {'L2', 'L3'}
+    assert pos.size == 3.0
+
+    markers['L2'] = replace(markers['L2'], pending_since=markers['L2'].pending_since - past_grace)
+    if both_landed:
+        b.raw_legs = [replace(b.raw_legs[0], qty=1.0)]
+        b.position = replace(b.position, size=1.0)
+        engine.reconcile()
+        assert engine.halted is False
+        assert not markers
+        assert pos.size == 1.0
+    else:
+        with pytest.raises(BrokerManualInterventionError):
+            engine.reconcile()
+        assert set(markers) == {'L2', 'L3'}
+
+
+def __test_helper_shared_leg_with_two_defensive_closes(extra_legs):
+    """L1, L2, L3 hold 1 unit each; L2 and L3 sit on ``leg-long`` with defensive closes on it.
+
+    :param extra_legs: Further venue legs listed beside ``leg-long``; their
+        sizes count in the venue aggregate.
+    :return: ``(broker, engine, position)``.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 3
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 1.0), ("L3", 1.0)])
+    b.position_port = b
+    b.raw_legs = [*extra_legs,
+                  PositionLeg(leg_id="leg-long", symbol=SYMBOL, side="buy",
+                              qty=3.0 - sum(leg.qty for leg in extra_legs),
+                              entry_price=50_002.0, open_time=1.0, unrealized_pnl=0.0)]
+    __test_helper_reject_on_shared_leg(engine, 'L2')
+    __test_helper_reject_on_shared_leg(engine, 'L3')
+    return b, engine, pos
+
+
+def __test_one_close_of_a_shared_leg_does_not_settle_the_other__():
+    """Two defensive closes of one leg keep separate settlement identities.
+
+    Both closes reduce ``leg-long``. Only L2's close fill is booked; L3's has
+    neither filled nor passed the grace. The reconcile's residual retry must
+    not take L3's close for settled because L2's, aimed at the same leg,
+    was: L3's marker stays armed and the run goes on.
+    """
+    b, engine, pos = __test_helper_shared_leg_with_two_defensive_closes([])
+    markers = engine._pending_defensive_close  # type: ignore[attr-defined]
+    assert markers['L2'].close_order_ref != markers['L3'].close_order_ref
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_500.0, pine_id=markers['L2'].close_intent_key,
+                    leg=LegType.CLOSE, xchg_id="venue-close-L2"),
+        order=replace(_fill_event('sell', 1.0, 50_500.0, pine_id="").order,
+                      id="venue-close-L2",
+                      client_order_id=markers['L2'].close_client_order_id),
+    ))
+    assert 'L2' not in markers
+    b.raw_legs = [replace(b.raw_legs[0], qty=2.0)]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=2.0, entry_price=50_002.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+    )
+    engine.reconcile()
+
+    assert engine.halted is False
+    assert set(markers) == {'L3'}
+    assert pos.size == 2.0
+
+
+def __test_a_booked_reduction_voids_the_target_leg_baselines__():
+    """A leg baseline stops counting once the book has moved past it.
+
+    L2 and L3 sit on ``leg-long`` (2 units, read as the baseline of both
+    closes), L1 on its own leg. L2's close fill is booked, then L1's leg
+    vanishes without a fill while L3's close never lands. The aggregate shrank
+    by L3's unit and ``leg-long`` is one unit below the baseline, but that
+    unit was L2's: the probe must not credit it to L3. With the baseline
+    voided by the booked fill, the still-listed leg proves nothing and the
+    probe halts.
+    """
+    from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
+
+    leg_l1 = PositionLeg(leg_id="leg-L1", symbol=SYMBOL, side="buy", qty=1.0,
+                         entry_price=50_001.0, open_time=0.0, unrealized_pnl=0.0,
+                         entry_id="L1")
+    b, engine, pos = __test_helper_shared_leg_with_two_defensive_closes([leg_l1])
+    markers = engine._pending_defensive_close  # type: ignore[attr-defined]
+    assert markers['L3'].reject_context.position_leg_qty == 2.0
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_500.0, pine_id=markers['L2'].close_intent_key,
+                    leg=LegType.CLOSE, xchg_id="venue-close-L2"),
+        order=replace(_fill_event('sell', 1.0, 50_500.0, pine_id="").order,
+                      id="venue-close-L2",
+                      client_order_id=markers['L2'].close_client_order_id),
+    ))
+    assert set(markers) == {'L3'}
+    markers['L3'] = replace(markers['L3'], pending_since=markers['L3'].pending_since
+                            - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 60.0)
+    b.raw_legs = [replace(b.raw_legs[1], qty=1.0)]
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=1.0, entry_price=50_002.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+    )
+    with pytest.raises(BrokerManualInterventionError):
+        engine.reconcile()
+
+    assert set(markers) == {'L3'}
+    assert markers['L3'].reject_context.position_leg_qty is None
+    assert pos.size == 2.0
+
+
+def __test_a_baseline_void_is_in_memory_only_and_writes_nothing__():
+    """Voiding leg baselines on a book move touches no journal row.
+
+    L2 and L3 both hold a baseline of ``leg-long``. L1's take-profit books,
+    so both baselines are void. The void must clear both in memory without
+    a marker write, so a failing journal can neither keep one usable nor
+    raise.
+    """
+    b, engine, pos = __test_helper_shared_leg_with_two_defensive_closes([])
+    markers = engine._pending_defensive_close  # type: ignore[attr-defined]
+    assert markers['L2'].reject_context.position_leg_qty == 3.0
+    assert markers['L3'].reject_context.position_leg_qty == 3.0
+    l1_leg = engine.order_mapping[f"L1-X{INTENT_KEY_SEP}L1"][0]
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 51_000.0, pine_id="L1-X",
+                    leg=LegType.TAKE_PROFIT, xchg_id=l1_leg, fill_id="tp-l1"),
+        from_entry="L1",
+    ))
+    assert pos.size == 2.0
+
+    def failing_write(entry_id, marker):
+        raise OSError("journal unavailable")
+
+    engine._set_pending_defensive_close = failing_write  # type: ignore[method-assign]
+    engine._void_leg_baselines_on_book_move()  # type: ignore[attr-defined]
+    assert markers['L2'].reject_context.position_leg_qty is None
+    assert markers['L3'].reject_context.position_leg_qty is None
+
+
+def __test_a_replayed_leg_baseline_is_never_evidence__(tmp_path):
+    """A target-leg baseline never reaches the journal, so it proves nothing after a restart.
+
+    The prior process read ``leg-long`` at 3 units for L3's 1-unit close, then
+    booked L2's close on the same leg and crashed. The venue now lists the leg
+    at 2 units: that unit is L2's, and L3's close never landed. The journaled
+    marker holds no baseline, so the replayed one has none either and the
+    still-listed leg keeps L3's close unproven.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                        account_id="testbroker-demo", label=None),
+            script_source="src", script_path="t025.py",
+        )
+        ctx.upsert_order('coid-L3', symbol=SYMBOL, side='buy', qty=1.0, state='confirmed',
+                         pine_entry_id='L3', filled_qty=1.0, extras={'kind': 'position'})
+        marker = PendingDefensiveClose(
+            entry_id='L3', close_intent_key='__pyne_defensive_close__coid-L3',
+            close_order_ref='xchg-close-L3', pending_since=time.time(),
+            reject_context=BracketAttachRejectContext(
+                intent_key='Bracket\0L3', position_coid='coid-L3', position_side='buy',
+                qty=1.0, symbol=SYMBOL, position_deal_id='leg-long', position_leg_qty=3.0,
+            ),
+        )
+        payload = marker.to_extras_dict()
+        assert 'position_leg_qty' not in payload['reject_context']
+        ctx.upsert_order('coid-L3', extras={'kind': 'position',
+                                            'defensive_close_pending': payload})
+
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [PositionLeg(leg_id="leg-long", symbol=SYMBOL, side="buy", qty=2.0,
+                                  entry_price=50_002.0, open_time=0.0, unrealized_pnl=0.0)]
+        engine, _pos = _mk_engine(b, store_ctx=ctx)
+        engine._replay_pending_defensive_closes()  # type: ignore[attr-defined]
+
+        replayed = engine.pending_defensive_close['L3']
+        assert replayed.reject_context.position_leg_qty is None
+        assert engine._defensive_target_legs_verdict([replayed]) == (  # type: ignore[attr-defined]
+            replayed, None,
+        )
+
+
+def __test_an_entry_keeps_its_pyramiding_slot_until_its_binding_is_spent__():
+    """A pyramid slot frees only when its own entry's bound quantity is spent.
+
+    TradingView (see :class:`~pynecore.lib.strategy._EntryBinding`): with
+    L1 (1 unit) and L2 (3 units) under ``pyramiding=2``, one unit of L2's
+    exit consumes L1's trade row FIFO, yet both entries still hold their
+    slots, so a fresh same-direction re-issue stays dropped.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 3.0)])
+    l2_leg = engine.order_mapping[f"L2-X{INTENT_KEY_SEP}L2"][0]
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 51_000.0, pine_id="L2-X",
+                    leg=LegType.TAKE_PROFIT, xchg_id=l2_leg, fill_id="tp-l2",
+                    event_type='partial', remaining_qty=2.0),
+        from_entry="L2",
+    ))
+    assert [trade.entry_id for trade in pos.open_trades] == ["L2"]
+    assert pos.open_entry_count() == 2
+    n_entries = len(b.entry_calls)
+
+    pos.entry_orders["L2"] = _entry_order("L2", 3.0)
+    engine.sync(BAR_TS + 10 * 60_000)
+
+    assert len(b.entry_calls) == n_entries
+
+
+def __test_native_bracket_fill_labelled_with_its_entry_settles_that_entry__():
+    """A position-attached TP labelled ``pine_id=<entry>``, no ``from_entry``, is bound.
+
+    Capital.com reports a deal's native take-profit under the parent entry's
+    own pine id. L2's take-profit consumes L1's trade row FIFO, yet only L2
+    is spent: L1 keeps its binding and its bracket.
+    """
+    b = MockBroker(capabilities=ExchangeCapabilities(
+        short_selling=CapabilityLevel.NATIVE, tp_sl_bracket=CapabilityLevel.NATIVE,
+    ))
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 1.0)])
+    n_cancels = len(b.cancel_calls)
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 51_000.0, pine_id="L2",
+                    leg=LegType.TAKE_PROFIT, xchg_id="deal-2", fill_id="tp-2"),
+        from_entry=None,
+    ))
+
+    assert [trade.entry_id for trade in pos.open_trades] == ["L2"]
+    assert [binding.entry_id for binding in pos.bindings] == ["L1"]
+    assert f"L1-X{INTENT_KEY_SEP}L1" in engine.active_intents
+    assert ("L1-X", "L1") in pos.exit_orders
+    assert f"L2-X{INTENT_KEY_SEP}L2" not in engine.active_intents
+    assert ("L1-X", "L1") not in _cancelled_exits(b, n_cancels)
+
+
+def __test_defensive_close_settles_the_entry_it_protects__():
+    """A defensive close is bound to the entry whose bracket the venue refused.
+
+    With Old (older) and Long open, Long's bracket attach is rejected and the
+    engine closes Long defensively. The close's trade rows settle FIFO and
+    consume Old's row, yet it is Long's binding that is spent: Old keeps its
+    binding and its tracking.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    _open_bracketed_pyramid(b, engine, pos, [("Old", 1.0)])
+    pos.entry_orders["Long"] = _entry_order("Long", 1.0)
+    engine.sync(BAR_TS + 5 * 60_000)
+    engine._route_event(  # type: ignore[attr-defined]
+        _fill_event('buy', 1.0, 50_100.0, pine_id="Long", xchg_id="xchg-Long"))
+    b.raise_on_next_exit = _bracket_reject_error()
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._dispatch_new(_bracket_reject_exit_intent())  # type: ignore[attr-defined]
+    close = _dispatched_close(b.close_calls[-1])
+    assert "Long" in engine.pending_defensive_close
+
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 50_000.0, pine_id=close.pine_id,
+                    leg=LegType.CLOSE, xchg_id="xchg-dc", fill_id="dc-1"),
+    ))
+
+    assert pos.size == 1.0
+    assert [trade.entry_id for trade in pos.open_trades] == ["Long"]
+    assert [binding.entry_id for binding in pos.bindings] == ["Old"]
+    assert "Long" not in engine.pending_defensive_close
+    assert "Long" not in engine.active_intents
+    assert "Old" in engine.active_intents
+    assert f"Old-X{INTENT_KEY_SEP}Old" in engine.active_intents
+    assert ("Old-X", "Old") in pos.exit_orders
+
+
+def __test_an_exit_that_outlived_its_spent_parent_is_retired_not_dispatched__(caplog):
+    """A Pine exit slot whose parent holds nothing on an open book never dispatches.
+
+    L2's own take-profit spent its binding and the cleanup retired L2-X. A
+    slot for it that comes back on a book built from fills (a cleanup a
+    transient failure cut short) has nothing bound to its entry and no entry
+    order still opening; sized from the script's qty it would close L1's
+    unit. The sizing pass retires it instead. A book seeded without fills
+    (a restart) attributes FIFO and is exempt, see
+    ``__test_a_book_seeded_without_fills_never_retires_protection_it_does_not_bind__``.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 2
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0), ("L2", 1.0)])
+    l2_leg = engine.order_mapping[f"L2-X{INTENT_KEY_SEP}L2"][0]
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 1.0, 51_000.0, pine_id="L2-X",
+                    leg=LegType.TAKE_PROFIT, xchg_id=l2_leg, fill_id="tp-l2"),
+        from_entry="L2",
+    ))
+    assert pos.size == 1.0
+    assert "L2" not in pos.entry_orders
+    n_exits = len(b.exit_calls)
+
+    pos.exit_orders[("L2-X", "L2")] = _exit_order(
+        "L2", -1.0, "L2-X", limit=51_000.0, stop=49_000.0)
+    with caplog.at_level(logging.WARNING):
+        engine.sync(BAR_TS + 10 * 60_000)
+
+    assert b.exit_calls[n_exits:] == []
+    assert ("L2-X", "L2") not in pos.exit_orders
+    assert f"L2-X{INTENT_KEY_SEP}L2" not in engine.active_intents
+    assert f"L1-X{INTENT_KEY_SEP}L1" in engine.active_intents
+    assert any("outlived its parent" in record.getMessage() for record in caplog.records)
+
+
+def __test_a_book_seeded_without_fills_never_retires_protection_it_does_not_bind__():
+    """An adoption-seeded book attributes FIFO: a missing binding cancels nothing.
+
+    In session L1 holds the unit left after the c432 sequence under L1-X. A
+    restart seeds the book from the journal, whose FIFO trim attributes the
+    unit to L3, and reconstructs L1-X. Nothing is bound to L1 then, yet L1-X
+    is the unit's protection: the book was not built from fills, so the
+    spent-parent gate stands down and L1-X keeps resting.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 3
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0)])
+    key = f"L1-X{INTENT_KEY_SEP}L1"
+    legs = list(engine.order_mapping[key])
+
+    pos.clear_entry_book()
+    pos.open_trades.clear()
+    pos.reconstruct_parent_trade(entry_id="L3", size=1.0, entry_price=50_000.0)
+    assert not pos.book_faithful
+    n_cancels = len(b.cancel_calls)
+    engine.sync(BAR_TS + 10 * 60_000)
+
+    assert ("L1-X", "L1") not in _cancelled_exits(b, n_cancels)
+    assert engine.order_mapping[key] == legs
+    assert ("L1-X", "L1") in pos.exit_orders
+
+
+def __test_spent_pyramid_add_keeps_its_exit_for_the_resting_remainder__():
+    """An add whose binding is spent while its entry order still works keeps its exit.
+
+    L2's limit entry fills 0.5 of 1.0 and its take-profit closes that 0.5:
+    L2's binding is spent, but the other 0.5 still rests on the venue. The
+    entry intent and L2-X stay; once the remainder fills, the 0.5 sits under
+    an L2-X bracket again.
+    """
+    b = MockBroker(two_leg_exits=True)
+    engine, pos = _mk_engine(b)
+    lib._script.pyramiding = 3
+    _open_bracketed_pyramid(b, engine, pos, [("L1", 1.0)])
+    pos.entry_orders["L2"] = _entry_order("L2", 1.0, limit=49_900.0)
+    pos.exit_orders[("L2-X", "L2")] = _exit_order(
+        "L2", -1.0, "L2-X", limit=51_000.0, stop=49_000.0)
+    engine.sync(BAR_TS + 2 * 60_000)
+    l2_order = engine.order_mapping["L2"][0]
+    engine._route_event(_fill_event(  # type: ignore[attr-defined]
+        'buy', 0.5, 49_900.0, pine_id="L2", xchg_id=l2_order, fill_id="l2-a",
+        event_type='partial', filled_qty=0.5, remaining_qty=0.5))
+    engine.sync(BAR_TS + 3 * 60_000)
+    key = f"L2-X{INTENT_KEY_SEP}L2"
+    tp = engine.order_mapping[key][0]
+    engine._route_event(replace(  # type: ignore[attr-defined]
+        _fill_event('sell', 0.5, 51_000.0, pine_id="L2-X",
+                    leg=LegType.TAKE_PROFIT, xchg_id=tp, fill_id="tp-l2"),
+        from_entry="L2",
+    ))
+    n_exits = len(b.exit_calls)
+    engine.sync(BAR_TS + 4 * 60_000)
+
+    assert pos.size == 1.0
+    assert "L2" in engine.active_intents
+    assert engine.order_mapping["L2"] == [l2_order]
+    assert ("L2-X", "L2") in pos.exit_orders
+    # The re-armed bracket covers the remainder still working, not the order.
+    assert [(call.intent.pine_id, call.intent.qty) for call in b.exit_calls[n_exits:]] == [
+        ("L2-X", 0.5)]
+
+    engine._route_event(_fill_event(  # type: ignore[attr-defined]
+        'buy', 0.5, 49_900.0, pine_id="L2", xchg_id=l2_order, fill_id="l2-b",
+        filled_qty=1.0))
+    engine.sync(BAR_TS + 5 * 60_000)
+
+    assert pos.size == 1.5
+    assert pos.bound_exposure("L2")[0] == 0.5
+    bracket = engine.active_intents[key]
+    assert isinstance(bracket, ExitIntent) and bracket.qty == 0.5
+    assert engine.order_mapping[key]
+    assert f"L1-X{INTENT_KEY_SEP}L1" in engine.active_intents
 
 
 def __test_reversal_close_labelled_with_the_reversing_id_spares_the_new_entry__():
@@ -1325,9 +2182,7 @@ def __test_plain_redispatch_retires_the_stale_reversal_marker__():
     # External flatten clears the book before the close leg's own fill
     # lands (mirror of the engine's external-clear: position wiped, the
     # marker untouched).
-    pos.size = 0.0
-    pos.sign = 0.0
-    pos.open_trades.clear()
+    _seed_book(pos, {"L": 0.0})
 
     # Pine re-emits S against the flat book: it dispatches PLAIN — and
     # the stale marker must retire with it.
@@ -3506,12 +4361,7 @@ def __test_partial_close_of_the_whole_parent_leaves_its_native_stop__(held, writ
     b = MockBroker()
     engine, pos = _mk_engine(b)
     if held:
-        pos.open_trades.append(Trade(
-            size=-held, entry_id="S", entry_bar_index=0, entry_time=0,
-            entry_price=75_600.0, commission=0.0, entry_comment=None,
-            entry_equity=1_000_000.0,
-        ))
-        pos.size = -held
+        pos.record_fill(_fill_event('sell', held, 75_600.0, pine_id="S", xchg_id="seed-S"))
     ref = "ref-S"
     mgr = engine._native_failsafe_manager  # type: ignore[attr-defined]
     mgr.register_parent(
@@ -5531,13 +6381,42 @@ def _long_trade(entry_id: str, size: float) -> Trade:
                  entry_time=0, entry_price=50_000.0, commission=0.0)
 
 
+# noinspection PyProtectedMember
+def _seed_book(pos: BrokerPosition, holdings: dict[str, float]) -> None:
+    """Rewrite what open entries hold, in the trade rows and the bindings alike.
+
+    Test-only, for a state no fill sequence yields (a residual an earlier
+    path left behind, a venue-side close the cleanup missed). Each named
+    entry's rows collapse to one row of the given signed size and its
+    bindings to one binding of it; zero removes both. The position size and
+    side follow the rows.
+    """
+    for entry_id, size in holdings.items():
+        rows = [trade for trade in pos.open_trades if trade.entry_id == entry_id]
+        book = [binding for binding in pos._entry_book if binding.entry_id == entry_id]
+        for trade in rows[1:] if size else rows:
+            pos.open_trades.remove(trade)
+        for binding in book[1:] if size else book:
+            pos._entry_book.remove(binding)
+        if size:
+            rows[0].size = size
+            book[0].bound = abs(size)
+    pos.size = sum(trade.size for trade in pos.open_trades)
+    pos.sign = 0.0 if pos.size == 0.0 else 1.0 if pos.size > 0.0 else -1.0
+
+
+def _book_long_entries(pos: BrokerPosition, *entries: tuple[str, float]) -> None:
+    """Book each ``(entry_id, qty)`` as a long entry fill at 50,000, oldest first."""
+    for i, (entry_id, qty) in enumerate(entries):
+        pos.record_fill(_fill_event('buy', qty, 50_000.0, pine_id=entry_id,
+                                    xchg_id=f"seed-{entry_id}-{i}"))
+
+
 def __test_netted_over_close_clamps_to_flat__():
     """A netted close exceeding the position (70%+70%) clamps to flat, never reverses."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     # BrokerPosition already netted the two 70% slices into one 14-unit close.
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -14.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
@@ -5837,9 +6716,7 @@ def __test_close_plus_close_all_clamps_total__():
     """close(id) is honoured first; close_all flattens only the residual exposure."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -3.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
     )
@@ -5857,9 +6734,7 @@ def __test_single_close_within_exposure_unchanged__():
     """A close within the position exposure is dispatched untouched by the clamp."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -4.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
     )
@@ -5875,9 +6750,7 @@ def __test_close_clamped_by_per_id_exposure__():
     b = MockBroker()
     engine, pos = _mk_engine(b)
     # Pyramid: L1=6 + L2=4 = 10 net long.
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L1", 6.0), _long_trade("L2", 4.0)]
+    _book_long_entries(pos, ("L1", 6.0), ("L2", 4.0))
     # An oversized close of L1 (8) must clamp to L1's 6-unit exposure.
     pos.exit_orders[("Close entry(s) order L1", "L1")] = Order(
         "L1", -8.0, order_type=_order_type_close, exit_id="Close entry(s) order L1",
@@ -5900,9 +6773,7 @@ def __test_clamped_away_close_all_is_removed_from_order_book__():
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     # close("L") takes the full 10; close_all has nothing left -> clamps to 0.
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -10.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
@@ -5965,7 +6836,7 @@ def __test_keyed_close_flattens_startup_adopted_position__():
     engine, pos = _mk_engine(b)
     pos.size = 5.0
     pos.sign = 1.0
-    pos.open_trades = [_long_trade("__adopted_startup__", 5.0)]
+    pos.reconstruct_parent_trade(entry_id="__adopted_startup__", size=5.0, entry_price=50_000.0)
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -5.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
     )
@@ -5997,9 +6868,7 @@ def __test_in_flight_close_not_redispatched_after_partial_fill__():
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -10.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
     )
@@ -6009,9 +6878,8 @@ def __test_in_flight_close_not_redispatched_after_partial_fill__():
     assert b.close_calls[0].intent.qty == 10.0
 
     # Broker partially fills 6; residual 4 still working on the same close.
-    pos.size = 4.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 4.0)]
+    pos.record_fill(_fill_event('sell', 6.0, 50_000.0, pine_id="", leg=LegType.CLOSE,
+                                 xchg_id="xchg-partial"))
 
     engine.sync(BAR_TS + 60_000)
 
@@ -6039,9 +6907,7 @@ def __test_in_flight_clamped_close_not_redispatched_after_partial_fill__():
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     # Pine order book carries the full script-declared 14 (clamp never rewrites it).
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -14.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
@@ -6052,9 +6918,8 @@ def __test_in_flight_clamped_close_not_redispatched_after_partial_fill__():
     assert b.close_calls[0].intent.qty == 10.0  # clamped to the 10-unit long
 
     # Broker partially fills 6; residual 4 still working on the same close.
-    pos.size = 4.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 4.0)]
+    pos.record_fill(_fill_event('sell', 6.0, 50_000.0, pine_id="", leg=LegType.CLOSE,
+                                 xchg_id="xchg-partial"))
 
     engine.sync(BAR_TS + 60_000)
 
@@ -6079,9 +6944,7 @@ def __test_inflight_smaller_close_reserves_only_working_qty_for_close_all__():
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     # Sync 1: close("L", qty=5) — a 5-unit slice goes on the wire.
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -5.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
@@ -6129,9 +6992,7 @@ def __test_fully_filled_inflight_keyed_close_drops_stale_order_no_redispatch__()
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L1", 6.0), _long_trade("L2", 4.0)]
+    _book_long_entries(pos, ("L1", 6.0), ("L2", 4.0))
     pos.exit_orders[("Close entry(s) order L1", "L1")] = Order(
         "L1", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L1",
     )
@@ -6183,9 +7044,7 @@ def __test_completed_partial_close_retires_state_final_close_dispatches__():
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
     )
@@ -6234,9 +7093,7 @@ def __test_inverse_undershoot_partial_close_retires_on_filled_event__():
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
     )
@@ -6285,9 +7142,7 @@ def __test_same_bar_residual_close_mints_fresh_client_order_id__():
     from pynecore.core.broker.idempotency import KIND_CLOSE
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -6.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
     )
@@ -7362,17 +8217,11 @@ def __test_record_fill_float_residue_of_the_fifo_walk_is_no_exposure__(caplog):
     the walk. Read as leftover qty, the close warned of an over-close
     (measured live: 8.7e-19 on a bybit-inverse reversal close).
     """
-    from pynecore.lib.strategy import Trade
     pos = BrokerPosition()
     for entry_id, size in (("L1", 0.1), ("L2", 0.2)):
-        pos.open_trades.append(Trade(
-            size=size, entry_id=entry_id, entry_bar_index=0, entry_time=0,
-            entry_price=100.0, commission=0.0, entry_comment=None,
-            entry_equity=1_000_000.0,
-        ))
-    pos.size = 0.1 + 0.2
-    pos.sign = 1.0
-    pos.avg_price = 100.0
+        pos.record_fill(_fill_event("buy", size, 100.0, pine_id=entry_id,
+                                    xchg_id=f"seed-{entry_id}"))
+    assert pos.size == 0.1 + 0.2
 
     with caplog.at_level(logging.WARNING):
         pos.record_fill(
@@ -7385,16 +8234,9 @@ def __test_record_fill_float_residue_of_the_fifo_walk_is_no_exposure__(caplog):
 
 def __test_record_fill_entry_leg_still_flips_for_reversal__():
     """An ENTRY leg may still flip the side (stop-and-reverse) — the clamp only blocks exit legs."""
-    from pynecore.lib.strategy import Trade
     pos = BrokerPosition()
-    pos.size = 1000.0
-    pos.sign = 1.0
-    pos.avg_price = 1.15200
-    pos.open_trades.append(Trade(
-        size=1000.0, entry_id="L", entry_bar_index=0, entry_time=0,
-        entry_price=1.15200, commission=0.0, entry_comment=None,
-        entry_equity=1_000_000.0,
-    ))
+    pos.record_fill(_fill_event('buy', 1000.0, 1.15200, pine_id="L",
+                                xchg_id="seed-L"))
 
     pos.record_fill(
         _fill_event("sell", 1500.0, 1.15300, pine_id="Short", leg=LegType.ENTRY)
@@ -7557,36 +8399,45 @@ def __test_close_fill_books_subdust_residual_flat_and_retires_the_bracket__(capl
     )
 
 
-def __test_full_leg_fill_retires_the_spent_software_bracket__():
+def __test_full_leg_fill_retires_the_spent_software_bracket__(_live_strategy_calls):
     """A bracket leg's full fill must cancel its sibling and retire the exit.
 
     The venue does not link the two legs of a SOFTWARE bracket, so once the
-    SL fills the TP keeps resting for the exit's full qty. Under pyramiding
-    the fill's FIFO walk consumes the OLDEST trade, not the exit's own
-    parent, and spot fee-netted entries (0.009995) against grid-quantized
-    legs (0.00999) leave a sub-step residual on the parent anyway — so the
-    per-entry cleanup never retires the spent exit. Measured live:
-    bybit-spot cycle 274, the stale L2-X / L3-X TP legs filled 30 minutes
-    after their SL siblings and sold 0.01998 against 0.010005 held
-    (negative spot ledger -> quarantine).
+    SL fills the TP keeps resting for the exit's full qty. Spot fee-netted
+    entries (0.009995) against grid-quantized legs (0.00999) leave a sub-step
+    residual on the leg's own binding, which the venue's least tradable
+    quantity spreads onto the other bindings. Measured live: bybit-spot cycle
+    274, the stale L2-X / L3-X TP legs filled 30 minutes after their SL
+    siblings and sold 0.01998 against 0.010005 held (negative spot ledger ->
+    quarantine). Neither fill is bound to L1, so the unit left sits under
+    L1-X, and a script issuing its exits on every bar re-arms neither spent
+    bracket.
     """
     from decimal import Decimal
 
-    b = MockBroker(two_leg_exits=True)
+    @dataclass
+    class SpotBroker(MockBroker):
+        @staticmethod
+        def least_tradable_qty(price: float) -> float:
+            return 0.00001
+
+    b = SpotBroker(two_leg_exits=True)
     b.spot_inventory_port = SimpleNamespace(
         position_dust_threshold=Decimal("0.00001"),
     )
     engine, pos = _mk_engine(b, mintick=0.01)
+    lib._script.position = pos
+    lib._script.pyramiding = 3
 
     for i, (pine_id, price) in enumerate(
             [("L1", 2488.0), ("L2", 2489.0), ("L3", 2490.0)], start=1):
         pos.entry_orders[pine_id] = _entry_order(pine_id, 0.009995)
-        pos.exit_orders[(f"{pine_id}-X", pine_id)] = _exit_order(
-            pine_id, 0.009995, f"{pine_id}-X", limit=2492.0, stop=2488.5)
         engine.sync(BAR_TS + i * 60_000)
         engine._route_event(  # type: ignore[attr-defined]
             _fill_event('buy', 0.009995, price, pine_id=pine_id,
                         xchg_id=f"xchg-{pine_id}"))
+        strategy.exit(f"{pine_id}-X", from_entry=pine_id, limit=2492.0, stop=2488.5)
+        engine.sync(BAR_TS + i * 60_000)
     assert pos.size == pytest.approx(0.029985)
     l3_key = f"L3-X{chr(0)}L3"
     l2_key = f"L2-X{chr(0)}L2"
@@ -7594,8 +8445,9 @@ def __test_full_leg_fill_retires_the_spent_software_bracket__():
     _l2_tp, l2_sl = engine.order_mapping[l2_key]
     n_cancels = len(b.cancel_calls)
 
-    # L3's SL fires first: FIFO consumes L1 (partially — the fee-netted
-    # entry is a hair larger than the grid-sized leg).
+    # L3's SL fires first: FIFO consumes L1's row (the fee-netted entry is a
+    # hair larger than the grid-sized leg; the remainder moves onto L2 and
+    # L3), while the fill spends L3's binding.
     engine._route_event(replace(  # type: ignore[attr-defined]
         _fill_event('sell', 0.00999, 2488.4, pine_id="L3-X",
                     leg=LegType.STOP_LOSS, xchg_id=l3_sl, fill_id="f-l3"),
@@ -7616,28 +8468,38 @@ def __test_full_leg_fill_retires_the_spent_software_bracket__():
     # The untouched bracket keeps both legs.
     assert len(engine.order_mapping[l2_key]) == 2
 
-    # L2's SL fires next: FIFO finishes L1 and leaves a residual on L2 —
-    # the parent survives, the spent exit must still go.
+    # L2's SL fires next: FIFO consumes L2's row, whose sub-step remainder
+    # moves onto L3's; the spent exit must still go.
     engine._route_event(replace(  # type: ignore[attr-defined]
         _fill_event('sell', 0.00999, 2488.3, pine_id="L2-X",
                     leg=LegType.STOP_LOSS, xchg_id=l2_sl, fill_id="f-l2"),
         from_entry="L2",
     ))
     assert pos.size == pytest.approx(0.010005)
-    assert any(trade.entry_id == "L2" for trade in pos.open_trades)
+    assert [trade.entry_id for trade in pos.open_trades] == ["L3"]
     assert l2_key not in engine.active_intents
     assert ("L2-X", "L2") not in pos.exit_orders
-    assert "L1" not in engine.active_intents
+    # Neither fill was bound to L1: its binding and its bracket survive the
+    # FIFO walk that consumed its trade rows.
+    assert "L1" in engine.active_intents
+    assert ("L1-X", "L1") in pos.exit_orders
+    assert len(engine.order_mapping[f"L1-X{chr(0)}L1"]) == 2
 
-    # Pine re-emits L3's exit for the still-open trade: a FRESH bracket
-    # is dispatched for it instead of the dead one diffing "unchanged".
+    # The script issues its exits on every bar: L2 and L3 are spent, the
+    # unit left sits under L1-X with both legs, and nothing is dispatched.
+    l1_key = f"L1-X{chr(0)}L1"
+    l1_legs = list(engine.order_mapping[l1_key])
     n_exits = len(b.exit_calls)
-    pos.exit_orders[("L3-X", "L3")] = _exit_order(
-        "L3", 0.009995, "L3-X", limit=2492.0, stop=2488.5)
+    n_modifies = len(b.modify_exit_calls)
+    n_cancels = len(b.cancel_calls)
+    for pine_id in ("L1", "L2", "L3"):
+        strategy.exit(f"{pine_id}-X", from_entry=pine_id, limit=2492.0, stop=2488.5)
     engine.sync(BAR_TS + 10 * 60_000)
-    assert len(b.exit_calls) == n_exits + 1
-    assert b.exit_calls[-1].intent.from_entry == "L3"
-    assert len(engine.order_mapping[l3_key]) == 2
+    assert b.exit_calls[n_exits:] == []
+    assert b.modify_exit_calls[n_modifies:] == []
+    assert b.cancel_calls[n_cancels:] == []
+    assert l3_key not in engine.active_intents
+    assert engine.order_mapping[l1_key] == l1_legs
 
 
 def _resting_leg(order: ExchangeOrder, *, qty: float, stop: float | None = None,
@@ -7695,9 +8557,7 @@ def __test_reconcile_cancels_the_stale_bracket_whose_parent_no_longer_holds__():
 
     # The book after L2's SL leg filled and the FIFO walk ate L1's residual:
     # L2 keeps a sub-step residual, L3 is whole.
-    l2_trade = next(t for t in pos.open_trades if t.entry_id == "L2")
-    l2_trade.size = 0.00001
-    pos.size = 0.010005
+    _seed_book(pos, {"L2": 0.00001})
     b.position = ExchangePosition(
         symbol=SYMBOL, side="long", size=0.010005, entry_price=2489.5,
         unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
@@ -8359,7 +9219,11 @@ def __test_external_reduction_waits_the_plugin_declared_fill_report_grace__():
 
 
 def __test_external_reduction_consuming_a_pyramid_parent_retires_it__():
-    """FIFO consumption of a whole parent cancels its exit and drops its tracking."""
+    """An unbound external reduction spending a whole parent cancels its exit and tracking.
+
+    The reduction is bound to no entry, so it settles the bindings oldest
+    first, like the trade rows: L1's binding is spent, L2 keeps its own.
+    """
     from pynecore.core.broker.sync_engine import EXTERNAL_FLATTEN_CONFIRM_GRACE_S
 
     b = MockBroker()
@@ -9374,12 +10238,8 @@ def __test_emulated_leg_close_fill_settles_the_defensive_close_marker__():
     for wire_sep in (':', '_'):
         b = MockBroker()
         engine, pos = _mk_engine(b)
-        pos.size = 1.0
-        pos.open_trades.append(Trade(
-            size=1.0, entry_id="Long", entry_bar_index=0, entry_time=0,
-            entry_price=50_000.0, commission=0.0, entry_comment=None,
-            entry_equity=1_000_000.0,
-        ))
+        pos.record_fill(_fill_event('buy', 1.0, 50_000.0, pine_id="Long",
+                                    xchg_id="seed-Long"))
         engine._pending_defensive_close['Long'] = PendingDefensiveClose(
             entry_id='Long',
             close_intent_key='__pyne_defensive_close__coid-1',
@@ -9420,12 +10280,8 @@ def __test_close_leg_fill_naming_the_close_as_from_entry_settles_the_marker__():
 
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 1.0
-    pos.open_trades.append(Trade(
-        size=1.0, entry_id="Long", entry_bar_index=0, entry_time=0,
-        entry_price=50_000.0, commission=0.0, entry_comment=None,
-        entry_equity=1_000_000.0,
-    ))
+    pos.record_fill(_fill_event('buy', 1.0, 50_000.0, pine_id="Long",
+                                xchg_id="seed-Long"))
     engine._pending_defensive_close['Long'] = PendingDefensiveClose(  # noqa
         entry_id='Long',
         close_intent_key='__pyne_defensive_close__coid-1',
@@ -9497,13 +10353,11 @@ def _mk_fanned_defensive_close_engine(expected_close_qty: float | None,
 
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 2.0
     if with_fifo:
-        pos.open_trades.append(Trade(
-            size=2.0, entry_id="Long", entry_bar_index=0, entry_time=0,
-            entry_price=50_000.0, commission=0.0, entry_comment=None,
-            entry_equity=1_000_000.0,
-        ))
+        pos.record_fill(_fill_event('buy', 2.0, 50_000.0, pine_id="Long",
+                                    xchg_id="seed-Long"))
+    else:
+        pos.size = 2.0
     engine._pending_defensive_close['Long'] = PendingDefensiveClose(
         entry_id='Long',
         close_intent_key='__pyne_defensive_close__coid-1',
@@ -14956,10 +15810,12 @@ def __test_emulated_close_routes_through_position_port__():
     engine, _pos = _mk_engine(b)
     close = CloseIntent(pine_id="x", symbol=SYMBOL, side="sell", qty=2.0)
     engine._dispatch_new(close)
-    # Fanned through the port, NOT execute_close; synthetic close-leg marker.
+    # Fanned through the port, NOT execute_close; mapped under the leg close's
+    # own client order id.
     assert b.close_leg_calls == [("1", 2)]
     assert b.close_calls == []
-    assert engine.order_mapping[close.intent_key] == ["close-leg:1"]
+    parent_coid = engine._build_envelope(close).client_order_id(KIND_CLOSE)  # type: ignore[attr-defined]
+    assert engine.order_mapping[close.intent_key] == [f"{parent_coid}:1"]
 
 
 def __test_emulated_close_transient_fault_halts_controlled_not_raw__():
@@ -16037,12 +16893,7 @@ def __test_partial_bracket_read_as_whole_row_keeps_its_legs__(caplog, held, caus
     """
     engine, pos = _mk_engine(_software_partial_broker())
     if held:
-        pos.open_trades.append(Trade(
-            size=held, entry_id="L", entry_bar_index=0, entry_time=0,
-            entry_price=74_562.69, commission=0.0, entry_comment=None,
-            entry_equity=1_000_000.0,
-        ))
-        pos.size = held
+        pos.record_fill(_fill_event('buy', held, 74_562.69, pine_id="L", xchg_id="seed-L"))
     engine._partial_bracket_engine.register_leg(PartialBracketLeg(  # type: ignore[attr-defined]
         coid="leg-tp", symbol=SYMBOL, pine_id="L-X2", from_entry="L",
         leg_kind=_LEG_KIND_TP_PARTIAL, leg_state=_LEG_STATE_ARMED, side='sell',
@@ -16279,6 +17130,215 @@ def __test_drain_connection_failure_preserves_already_released_keys__(tmp_path):
         assert "B\0M" in engine._envelopes  # still owns a live clearing row
 
 
+class _StopDistanceVenue:
+    """Amend hook refusing every stop-loss (a price inside the minimum distance).
+
+    ``throttled`` turns every amend into a venue rate limit; ``refusals``
+    caps how many stop-loss amends are refused (``None`` = all of them).
+    """
+
+    def __init__(self, broker: MockBroker, *, refusals: int | None = None) -> None:
+        self.broker = broker
+        self.refusals = refusals
+        self.throttled = False
+        self.refused: list[tuple[str, float | None, float | None]] = []
+        self.calls: list[tuple[str, float | None, float | None]] = []
+
+    async def amend_bracket(self, symbol, leg_id, *, side, tp_price, sl_price,
+                            trail_offset, coid):
+        self.calls.append((leg_id, tp_price, sl_price))
+        if self.throttled:
+            raise ExchangeRateLimitError("too many requests", retry_after=1.0)
+        if sl_price is not None and (self.refusals is None or self.refusals > 0):
+            if self.refusals is not None:
+                self.refusals -= 1
+            self.refused.append((leg_id, tp_price, sl_price))
+            raise ExchangeOrderRejectedError("stop distance too small")
+        self.broker.amend_calls.append((leg_id, tp_price, sl_price))
+
+
+def _own_states(ctx) -> dict[str, str]:
+    return {row.intent_key: row.extras[_EXTRAS_KEY_BRACKET_OWN_STATE]
+            for row in _iter_active_bracket_ownerships(ctx)}
+
+
+def __test_refused_one_way_retirement_never_kills_the_run__(tmp_path):
+    """A definitive refusal of a retirement re-assert stays clearing and retries every sync.
+
+    A TP-only and an SL-only exit share a leg; the price sits inside the
+    venue's minimum stop distance, so cancelling the TP exit re-sends the SL
+    alone and the venue refuses it. Before: the reject escaped ``sync()``
+    from the diff-cancel, and the per-sync drain raised it again (also after
+    every restart). Now the cancel is settled for the engine (like an
+    unknown disposition: mapping and envelope retired), the TP row stays
+    ``clearing``, the drain retries it on every sync — a throttle included —
+    and lands it once the venue accepts.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 1.0)]
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(), symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        tp = ExitIntent(pine_id="TP", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=1.0, tp_price=120.0)
+        sl = ExitIntent(pine_id="SL", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=1.0, sl_price=99.0)
+        for intent in (tp, sl):
+            engine._dispatch_new(intent)
+            engine._active_intents[intent.intent_key] = intent
+        venue = _StopDistanceVenue(b)
+        b.amend_bracket = venue.amend_bracket  # type: ignore[method-assign]
+
+        engine._diff_and_dispatch([sl])  # Pine drops the TP exit: must not raise
+        assert venue.refused == [("1", None, 99.0)]
+        assert _own_states(ctx) == {"TP\0L": _BRACKET_OWN_STATE_CLEARING, "SL\0L": "active"}
+        assert tp.intent_key not in engine._active_intents
+        assert tp.intent_key not in engine._envelopes
+        assert tp.intent_key not in engine._order_mapping
+
+        # The next sync retries (the orphan sweep re-clears the no longer
+        # emitted key, then the drain): refused again, still no raise.
+        engine._diff_and_dispatch([sl])
+        assert len(venue.refused) == 3
+        venue.throttled = True
+        engine._diff_and_dispatch([sl])  # a throttled drain does not raise either
+        venue.throttled = False
+        venue.refusals = 0  # the price moved away: the venue accepts
+        engine._diff_and_dispatch([sl])
+        assert b.amend_calls[-1] == ("1", None, 99.0)
+        assert _own_states(ctx) == {"SL\0L": "active"}
+        assert engine._active_intents[sl.intent_key] == sl
+
+
+def __test_throttled_orphan_retirement_after_restart_never_kills_the_run__(tmp_path):
+    """The restart orphan sweep and the drain tolerate a venue throttle on the retirement."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        _persist_bracket_ownership(ctx, intent_key="TP\0L", pine_id="TP")
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 1.0)]
+        venue = _StopDistanceVenue(b)
+        b.amend_bracket = venue.amend_bracket  # type: ignore[method-assign]
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(), symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        venue.throttled = True
+        engine._diff_and_dispatch([])  # orphan clear + drain throttled: no raise
+        assert _own_states(ctx) == {"TP\0L": _BRACKET_OWN_STATE_CLEARING}
+        venue.throttled = False
+        engine._diff_and_dispatch([])  # the drain clears the leg
+        assert b.amend_calls[-1] == ("1", None, None)
+        assert _own_states(ctx) == {}
+
+
+def __test_co_owned_one_way_attach_refusal_retries_before_any_close__(tmp_path):
+    """A refused attach of exit B on a leg exit A protects is retried, never flattened at once.
+
+    The venue refuses the merge once (A's stop then inside its minimum
+    distance) and accepts the retry: no defensive close, B owns the leg.
+    Before: the refusal was wrapped as an after-fill reject and the engine
+    flattened the position at once while A's protection was still on it.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 10.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        _book_long_entries(pos, ("L", 10.0))
+        sl = ExitIntent(pine_id="SL", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=10.0, sl_price=49_000.0)
+        engine._dispatch_new(sl)
+        venue = _StopDistanceVenue(b, refusals=1)
+        b.amend_bracket = venue.amend_bracket  # type: ignore[method-assign]
+        tp = ExitIntent(pine_id="TP", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=10.0, tp_price=51_000.0)
+        engine._dispatch_new(tp)
+        assert venue.refused == [("1", 51_000.0, 49_000.0)]
+        assert b.amend_calls[-1] == ("1", 51_000.0, 49_000.0)  # the retry landed
+        assert b.close_leg_calls == []
+        assert not engine._pending_defensive_close
+        assert _own_states(ctx) == {"SL\0L": "active", "TP\0L": "active"}
+        assert engine._order_mapping[tp.intent_key] == ["bracket:1"]
+
+
+def __test_co_owned_one_way_attach_refused_twice_goes_through_the_exit_recovery__(tmp_path):
+    """Refused again on the retry, the co-owned attach takes the refused-exit recovery.
+
+    The venue will not carry B's levels: the position is closed defensively
+    and new entries are quarantined (the regular second-refusal verdict),
+    after exactly one retry; A's row is untouched until the close settles.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        b.position_port = b
+        b.raw_legs = [_pleg("1", "buy", 10.0)]
+        pos = BrokerPosition()
+        engine = OrderSyncEngine(
+            broker=b, position=pos, symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        _book_long_entries(pos, ("L", 10.0))
+        sl = ExitIntent(pine_id="SL", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=10.0, sl_price=49_000.0)
+        engine._dispatch_new(sl)
+        venue = _StopDistanceVenue(b)
+        b.amend_bracket = venue.amend_bracket  # type: ignore[method-assign]
+        tp = ExitIntent(pine_id="TP", from_entry="L", symbol=SYMBOL, side="sell",
+                        qty=10.0, tp_price=51_000.0)
+        with pytest.raises(OrderSkippedByPlugin) as skipped:
+            engine._dispatch_new(tp)
+        assert skipped.value.reason == "bracket_reject_defensive_close"
+        assert len(venue.refused) == 2  # the attach and its one retry
+        assert b.close_leg_calls == [("1", 10)]
+        assert _own_states(ctx) == {"SL\0L": "active"}
+
+
+def __test_one_way_exit_whose_entry_holds_no_leg_keeps_retrying__(tmp_path):
+    """An exit whose entry holds no leg is skipped every sync, never marked active.
+
+    Every open leg is attributed to entry "G"; the exit of entry "F" covers
+    nothing (its leg is gone, the close not booked yet). The skip keeps the
+    intent out of ``_active_intents`` so the next sync re-evaluates it, and
+    once F's leg appears the bracket attaches.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        b.position_port = b
+        g_leg = PositionLeg(leg_id="1", symbol=SYMBOL, side="buy", qty=1.0,
+                            entry_price=100.0, open_time=0.0, unrealized_pnl=0.0,
+                            entry_id="G")
+        b.raw_legs = [g_leg]
+        engine = OrderSyncEngine(
+            broker=b, position=BrokerPosition(), symbol=SYMBOL,  # type: ignore[arg-type]
+            run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
+        )
+        ex = ExitIntent(pine_id="X", from_entry="F", symbol=SYMBOL, side="sell",
+                        qty=1.0, tp_price=120.0, sl_price=90.0)
+        for _ in range(2):
+            engine._diff_and_dispatch([ex])
+            assert ex.intent_key not in engine._active_intents
+            assert b.amend_calls == []
+        b.raw_legs = [g_leg, PositionLeg(
+            leg_id="2", symbol=SYMBOL, side="buy", qty=1.0, entry_price=100.0,
+            open_time=1.0, unrealized_pnl=0.0, entry_id="F")]
+        engine._diff_and_dispatch([ex])
+        assert b.amend_calls == [("2", 120.0, 90.0)]
+        assert engine._active_intents[ex.intent_key] == ex
+
+
 def __test_partially_filled_inflight_close_reserves_only_working_qty_for_close_all__():
     """A same-evaluation ``close_all`` covers the full residual past a PARTIALLY filled close.
 
@@ -16298,9 +17358,7 @@ def __test_partially_filled_inflight_close_reserves_only_working_qty_for_close_a
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    pos.size = 10.0
-    pos.sign = 1.0
-    pos.open_trades = [_long_trade("L", 10.0)]
+    _book_long_entries(pos, ("L", 10.0))
     # Sync 1: close("L", qty=5) — a 5-unit slice goes on the wire.
     pos.exit_orders[("Close entry(s) order L", "L")] = Order(
         "L", -5.0, order_type=_order_type_close, exit_id="Close entry(s) order L",
@@ -17062,9 +18120,7 @@ def __test_short_gate_modify_replace_resets_fill_ledger__():
     oversell on a spot venue."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1
@@ -17105,9 +18161,7 @@ def __test_short_gate_modify_late_old_order_fill_not_credited__():
     inventory moved); only the spurious ledger credit must be suppressed."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1  # order id xchg-1
@@ -17156,9 +18210,7 @@ def __test_short_gate_fill_time_reconcile_cancels_unbacked_sell__():
     reconcile must cancel the now-unbacked resting sell — without halting."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1  # order id xchg-1, 5 - 5 = 0 backs it exactly
@@ -17197,9 +18249,7 @@ def __test_short_gate_fill_time_reconcile_noop_when_still_backed__():
     untouched (mirrors the F3 fill-not-credited scenario, which stays flat)."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1  # 5 - 3 = 2 backs it
@@ -17228,9 +18278,7 @@ def __test_short_gate_fill_time_reconcile_noop_on_short_capable_venue__():
     fill must never cancel a resting sell."""
     b = MockBroker()  # default capabilities: short_selling NATIVE
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1
@@ -17258,9 +18306,7 @@ def _reconcile_deficit_setup() -> tuple[MockBroker, OrderSyncEngine, BrokerPosit
     to 3 and leave the resting sell unbacked (deficit 2)."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
     engine.sync(BAR_TS)  # xchg-1
     pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
@@ -17416,9 +18462,7 @@ def __test_short_gate_reconcile_failed_first_cancel_continues_to_next__():
     fill and drive the venue short."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 9.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 9.0))
+    _book_long_entries(pos, ("L", 9.0))
     # Two resting sells of 4 each: 4 + 4 = 8 <= 9 backs both at dispatch.
     pos.entry_orders["S1"] = _order_order("S1", -4.0, limit=50_000.0)
     pos.entry_orders["S2"] = _order_order("S2", -4.0, limit=52_000.0)
@@ -17497,9 +18541,7 @@ def __test_short_gate_filled_sell_entry_not_double_reserved__():
     into a false halt."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1
@@ -17523,9 +18565,7 @@ def __test_short_gate_partial_fill_reserves_working_residual__():
     the filled slice already left ``_position.size`` via ``record_fill``."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1
@@ -17557,9 +18597,7 @@ def __test_short_gate_reused_pine_id_reseeds_fill_ledger__():
     resting qty is reserved in full again."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
-    pos.size = 5.0
-    pos.sign = 1.0
-    pos.open_trades.append(_long_trade("L", 5.0))
+    _book_long_entries(pos, ("L", 5.0))
     pos.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
     engine.sync(BAR_TS)
     engine.on_order_event(_fill_event('sell', 3.0, 50_000.0, pine_id="S"))
@@ -17754,9 +18792,7 @@ def __test_forced_cancel_survives_restart_reissued_from_journal__(tmp_path):
             position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
             mintick=1.0, store_ctx=ctx,
         )
-        pos.size = 5.0
-        pos.sign = 1.0
-        pos.open_trades.append(_long_trade("L", 5.0))
+        _book_long_entries(pos, ("L", 5.0))
         pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
         engine.sync(BAR_TS)  # xchg-1
         pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
@@ -17788,9 +18824,7 @@ def __test_forced_cancel_survives_restart_reissued_from_journal__(tmp_path):
             position=pos2, symbol=SYMBOL, run_tag=RUN_TAG,
             mintick=1.0, store_ctx=ctx2,
         )
-        pos2.size = 3.0
-        pos2.sign = 1.0
-        pos2.open_trades.append(_long_trade("L", 3.0))
+        _book_long_entries(pos2, ("L", 3.0))
 
         # The journal re-armed the forced cancel at construction already.
         assert "S" in engine2._forced_cancel_pending
@@ -17830,9 +18864,7 @@ def __test_forced_cancel_restart_recovers_working_sell_qty_from_orders__(tmp_pat
             position=pos, symbol=SYMBOL, run_tag=RUN_TAG,
             mintick=1.0, store_ctx=ctx,
         )
-        pos.size = 5.0
-        pos.sign = 1.0
-        pos.open_trades.append(_long_trade("L", 5.0))
+        _book_long_entries(pos, ("L", 5.0))
         pos.entry_orders["S"] = _order_order("S", -5.0, limit=50_000.0)
         engine.sync(BAR_TS)  # xchg-1
         pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
@@ -17868,9 +18900,7 @@ def __test_forced_cancel_restart_recovers_working_sell_qty_from_orders__(tmp_pat
             position=pos2, symbol=SYMBOL, run_tag=RUN_TAG,
             mintick=1.0, store_ctx=ctx2,
         )
-        pos2.size = 3.0
-        pos2.sign = 1.0
-        pos2.open_trades.append(_long_trade("L", 3.0))
+        _book_long_entries(pos2, ("L", 3.0))
 
         # The journal re-armed "S" with a synthesized qty=0.0 placeholder.
         assert "S" in engine2._forced_cancel_pending
@@ -18119,9 +19149,7 @@ def __test_moot_exit_modify_reject_retires_instead_of_crashing__():
 
     # Simulate a venue-side close the engine's cleanup missed: the book is
     # flat but the L1 / L1-X intents are still active.
-    pos.open_trades.clear()
-    pos.size = 0.0
-    pos.sign = 0.0
+    _seed_book(pos, {"L1": 0.0})
     assert "L1" in engine.active_intents
 
     # Pine's next phase re-emits L1-X with fresh levels; the diff modifies.

@@ -70,6 +70,7 @@ __all__ = [
     'STALE_THRESHOLD_MS',
     'RETENTION_DAYS',
     'PURGE_INTERVAL_MS',
+    'ENTRY_BOOK_EVENT_KIND',
 ]
 
 _log = logging.getLogger(__name__)
@@ -90,6 +91,11 @@ RETENTION_DAYS: Final[int] = 180
 # for months never revisits ``open_run()``, so the heartbeat path is
 # what keeps the DB bounded while live.
 PURGE_INTERVAL_MS: Final[int] = 24 * 60 * 60 * 1000  # 1 day
+# Event kind of the sync engine's binding book, written after every change of
+# it (``OrderSyncEngine._persist_entry_book``). The newest one of a run is
+# what a restart resumes the book from, so the retention purge keeps it
+# however old it is (:meth:`BrokerStore.cleanup_old_data`).
+ENTRY_BOOK_EVENT_KIND: Final[str] = 'entry_book_snapshot'
 
 
 def _now_ms() -> int:
@@ -1428,14 +1434,16 @@ class BrokerStore:
 
         Four deletions in one transaction:
 
-        1. ``events`` older than the cutoff. Two rows are protected
+        1. ``events`` older than the cutoff. Three rows are protected
            regardless of age: events whose ``client_order_id`` matches a
            still-live order (the audit trail of an open position stays
-           intact), and events whose ``intent_key`` still has a live
+           intact), events whose ``intent_key`` still has a live
            envelope for the same logical ``run_id`` — the engine's
            startup replay (:meth:`RunContext.find_event_by_intent_key`,
            :meth:`RunContext.iter_events_by_kind_for_run_id`) reads
-           those to dedup defensive-close FILLs across restarts.
+           those to dedup defensive-close FILLs across restarts — and the
+           newest :data:`ENTRY_BOOK_EVENT_KIND` event of each logical
+           ``run_id``, the binding book a restart resumes.
         2. ``orders`` closed before the cutoff. Live rows are never
            touched.
         3. Orphan ``order_refs`` — rows whose order no longer exists.
@@ -1471,8 +1479,13 @@ class BrokerStore:
                 "      SELECT 1 FROM envelopes v "
                 "      JOIN runs r ON r.run_instance_id = events.run_instance_id "
                 "      WHERE v.run_id = r.run_id "
-                "        AND v.intent_key = events.intent_key)",
-                (cutoff,),
+                "        AND v.intent_key = events.intent_key) "
+                "  AND NOT (events.kind = ? AND events.id = ("
+                "      SELECT MAX(e.id) FROM events e "
+                "      JOIN runs r ON r.run_instance_id = e.run_instance_id "
+                "      JOIN runs own ON own.run_instance_id = events.run_instance_id "
+                "      WHERE r.run_id = own.run_id AND e.kind = events.kind))",
+                (cutoff, ENTRY_BOOK_EVENT_KIND),
             ).rowcount
             deleted_orders = self._conn.execute(
                 "DELETE FROM orders "
@@ -2351,6 +2364,27 @@ class RunContext:
         for row in rows:
             yield _row_to_order(row)
 
+    def iter_orders_closed_since_for_run_id(self, since_ts_ms: int) -> Iterator[OrderRow]:
+        """Iterate the order rows of this logical run closed at or after ``since_ts_ms``.
+
+        Scoped to ``runs.run_id`` like :meth:`iter_closed_orders_for_run_id`:
+        the rows every process instance of the run closed, until the
+        retention purge removes them. Oldest closed first. Read-only.
+
+        :param since_ts_ms: Lower bound on ``closed_ts_ms`` (inclusive).
+        """
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT o.* FROM orders AS o "
+                "JOIN runs AS r ON o.run_instance_id = r.run_instance_id "
+                "WHERE r.run_id = ? AND o.closed_ts_ms IS NOT NULL "
+                "AND o.closed_ts_ms >= ? "
+                "ORDER BY o.closed_ts_ms",
+                (self.run_id, since_ts_ms),
+            ).fetchall()
+        for row in rows:
+            yield _row_to_order(row)
+
     def foreign_live_exchange_order_ids(self) -> set[str]:
         """Return physical order ids claimed by another run on this account and instrument.
 
@@ -2553,6 +2587,34 @@ class RunContext:
             if isinstance(parsed, dict):
                 payload = parsed
         return row['kind'], payload
+
+    def delete_superseded_events(self, kind: str) -> int:
+        """Delete every event of ``kind`` of this logical run but the newest one.
+
+        For a kind of which only the newest event is ever read
+        (:meth:`latest_event_for_run_id`), such as the binding book
+        (:data:`ENTRY_BOOK_EVENT_KIND`): the writer calls this after its own
+        write committed, so the stored events of the kind stay bounded by one
+        per run. Scoped to ``runs.run_id`` like :meth:`latest_event_for_run_id`,
+        so the events earlier process instances of the run wrote go too. The
+        newest event is never deleted: a crash, or a failure of this call,
+        leaves more events, never none.
+
+        :param kind: The event kind to trim.
+        :return: Number of deleted events.
+        """
+        with self._store.transaction() as conn:
+            return conn.execute(
+                "DELETE FROM events "
+                "WHERE kind = ? "
+                "  AND run_instance_id IN ("
+                "      SELECT run_instance_id FROM runs WHERE run_id = ?) "
+                "  AND id < ("
+                "      SELECT MAX(e.id) FROM events AS e "
+                "      JOIN runs AS r ON r.run_instance_id = e.run_instance_id "
+                "      WHERE r.run_id = ? AND e.kind = ?)",
+                (kind, self.run_id, self.run_id, kind),
+            ).rowcount
 
     # --- Spot inventory: execution ledger ----------------------------------
 

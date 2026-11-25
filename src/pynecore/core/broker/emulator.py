@@ -153,7 +153,8 @@ def aggregate_positions(
 
 
 def select_legs_for_close(
-        qty: float, legs: list[PositionLeg], side: str,
+        qty: float, legs: list[PositionLeg], side: str, *,
+        entry_id: str | None = None, leg_id: str | None = None,
 ) -> tuple[tuple[LegClose, ...], float]:
     """Pick which ``side`` legs to close for a ``qty`` reduction, oldest first.
 
@@ -161,23 +162,41 @@ def select_legs_for_close(
     plan matches Pine's oldest-trade-first close order and is deterministic
     across restarts (a replay sees the same legs in the same order).
 
+    A close bound to one entry (``entry_id``) takes the legs attributed to
+    that entry (:attr:`~PositionLeg.entry_id`) first, oldest first, and only
+    then the other legs FIFO — the order in which the engine settles the
+    close's fill against the binding book. A FIFO pick would close another
+    entry's leg while the fill spends the closed entry's binding, leaving the
+    surviving leg attributed to an entry whose exits were retired. A close
+    aimed at one leg (``leg_id``, a defensive close of the leg the venue
+    refused to protect) takes that leg only: every other leg is a separate
+    holding, so a target that already closed or shrank leaves the uncovered
+    quantity as ``shortfall`` instead of liquidating a sibling leg.
+
     :param qty: Total size to close (positive).
     :param legs: All open legs for the symbol; only those on ``side`` are
         considered.
     :param side: Direction of the legs to reduce (``"buy"`` for a long
         position, ``"sell"`` for a short).
+    :param entry_id: The entry the close is bound to; ``None`` for an
+        unbound close (plain FIFO).
+    :param leg_id: The :attr:`~PositionLeg.leg_id` of the only leg the close
+        may reduce; ``None`` when it targets no single leg.
     :return: ``(closes, shortfall)`` — the per-leg close plan and any quantity
         that could not be covered because the open legs summed to less than
         ``qty`` (``0.0`` in the normal case). A non-zero shortfall is the
         caller's signal that the broker holds less than Pine believes.
     """
     candidates = sorted(
-        (leg for leg in legs if leg.side == side),
+        (leg for leg in legs
+         if leg.side == side and (leg_id is None or leg.leg_id == leg_id)),
         # ``leg_id`` is the stable secondary key: two legs sharing an
         # ``open_time`` must close in the same order across a restart even if
         # the broker returns them in a different sequence, so the plan stays
         # replay-deterministic as the FIFO docstring promises.
-        key=lambda leg: (leg.open_time, leg.leg_id),
+        key=lambda leg: (
+            entry_id is None or leg.entry_id != entry_id, leg.open_time, leg.leg_id,
+        ),
     )
     closes: list[LegClose] = []
     remaining = qty

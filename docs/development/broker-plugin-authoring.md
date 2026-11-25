@@ -733,7 +733,31 @@ crash-replay logic.
 On a hedging account `fetch_raw_positions()` returns the legs this run
 opened, and `get_position()` their net. Another party's leg on the same
 symbol is not the bot's position and not an intervention; counted in, its
-close would read as a reduction of the bot's share. The optional
+close would read as a reduction of the bot's share.
+
+Fill `PositionLeg.entry_id` with the Pine entry id whose order opened
+the leg whenever your own records tie the leg to that one entry (the
+entry's dispatch matched to the leg through its fill or the position id
+the venue returned). Leave it `None` for a leg that aggregates several
+entries (one leg per side), for a leg the bot did not open itself
+(manual, adopted, or opened by a run whose records are gone), and
+whenever the mapping is uncertain. The emulator replicates a
+`strategy.exit(from_entry=...)` bracket onto that entry's legs plus
+every unattributed leg, so each pyramided entry keeps its own levels on a
+venue with one leg per entry. A leg owned by several exits gets the merge
+of their levels in one `amend_bracket` call (a field only one exit sets
+is kept; a field several exits set differently gets the level the price
+reaches first), and retiring an exit re-amends its legs to the merge of
+the exits that still own them, clearing a leg only when none is left.
+Treat every `amend_bracket` call as the leg's complete protection. A
+fixed `sl_price` and a `trail_offset` in one call may come from two
+different exits; write the pair the way your venue defines it (the core
+logs that combination as a warning). The `coid` of an `amend_bracket`
+call is a correlation id only: a retry, the per-sync drain or a restart
+replay can send different levels under a coid used before, so never
+dedup or skip an amend by its coid, always write the levels you receive.
+A re-amend with the levels the leg already holds must be harmless. The
+optional
 `supports_partial_leg_close = False` attribute makes the emulator
 atomically skip plans containing partial leg slices on venues whose
 position close is full-row only (Capital.com).
