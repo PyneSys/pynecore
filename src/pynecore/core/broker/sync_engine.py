@@ -59,6 +59,20 @@ again with the next drain, and its id leaves the duplicate gate
 written once per change, and a book write that failed is retried with the
 next change check.
 
+Every fill the engine takes (one with a ``fill_id``) gets a durable receipt
+(:class:`~pynecore.core.broker.storage.FillReceipt`), written in the same
+transaction as the binding-book write that follows its routing
+(:meth:`OrderSyncEngine._persist_entry_book`), alone when the book did not
+change. So a receipt exists exactly when the stored books hold the fill: a
+failed write keeps the receipt pending with the book, and a crash before it
+lands leaves the fill without one. A fill held for the venue's verdict gets
+its receipt when the verdict settles it. The duplicate gate reads the
+receipts, so a fill the run took in an earlier process is dropped too; a
+plugin reads them with :meth:`RunContext.fill_delivered`. A fee that arrives
+without its fill (``event_type`` ``'fee'``) is booked by the difference to the
+total its receipt holds (:meth:`OrderSyncEngine._route_fee_event`), and that
+receipt follows the same write.
+
 A restart settle a storage failure ended
 (:meth:`OrderSyncEngine.settle_restart_state`) leaves the restart unsettled:
 no sync reaches its diff, so nothing derived from the book that lacks the
@@ -152,6 +166,7 @@ from pynecore.lib.log import (
     broker_error as _blog_error,
 )
 from pynecore.core.broker.models import (
+    FEE_EVENT_TYPE,
     VENUE_DRIVEN_CANCEL_REASONS,
     BracketAttachRejectContext,
     BrokerEvent,
@@ -226,8 +241,12 @@ from pynecore.core.broker.parked_dispatch import (
 from pynecore.core.broker.storage import (
     ENTRY_BOOK_CURSOR_EVENT_KIND,
     ENTRY_FILL_ORDER_EVENT_KIND,
+    ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND,
+    ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND,
     ENTRY_BOOK_EVENT_KIND,
+    FILL_EVIDENCE_OPERATOR_RELEASE_FIELD,
     EnvelopeRecord,
+    FillReceipt,
     OrderRow,
     PendingRecord,
     QuarantineRow,
@@ -243,8 +262,19 @@ from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET,
     EXTRAS_KEY_BRACKET_OWN_OCA_NAME,
     EXTRAS_KEY_BRACKET_OWN_OCA_TYPE,
+    EXTRAS_KEY_CLOSE_FAN_VOLUME,
+    EXTRAS_KEY_CLOSE_LEG_ATTEMPTS,
+    EXTRAS_KEY_CLOSE_LEG_ID,
+    EXTRAS_KEY_CLOSE_LEG_SINCE_MS,
+    EXTRAS_KEY_CLOSE_LEG_STATE,
+    EXTRAS_KEY_CLOSE_LEG_VOLUME,
     EXTRAS_KEY_CLOSE_PARENT_COID,
+    EXTRAS_KEY_CLOSE_REQUESTED_VOLUME,
     BRACKET_OWN_STATE_ACTIVE,
+    CLOSE_ENDED_PARTIALLY_EVENT,
+    CLOSE_ENDED_UNFILLED_EVENT,
+    CLOSE_EXECUTED_QTY_KEY,
+    CLOSE_LEG_STATE_PENDING,
     LEG_KIND_SL_PARTIAL,
     LEG_KIND_TP_PARTIAL,
     LEG_KIND_TRAIL_PARTIAL,
@@ -252,13 +282,18 @@ from pynecore.core.broker.store_helpers import (
     LEG_STATE_ARMED,
     LEG_STATE_CANCEL_TENTATIVE,
     LEG_STATE_PENDING_ENTRY,
+    LEG_STATE_TERMINAL,
+    LEG_STATE_TRIGGERED,
+    LEG_STATE_TRIGGERING,
     LEGACY_OCO_STATE_MARKET_PENDING,
     STOP_LIMIT_STATE_ARMED,
     STOP_LIMIT_STATE_LIMIT_PENDING,
     STATE_CLOSE_LEG,
     STATE_REJECTED,
     STATE_SUBMITTED,
+    absorb_netting_fills,
     create_engine_trigger_partial_leg_row,
+    is_proven_refusal,
     iter_active_bracket_ownerships,
 )
 from pynecore.types.na import na_float
@@ -498,7 +533,9 @@ class _CancelTentativeMeta:
     wholesale purge cannot be used there).
 
     ``resolved`` is the verdict a resolution is applying (outcome, ``via``,
-    whether a partial fill triggered it). The entry stays in the map until
+    whether a partial fill triggered it, whether the order's unfilled
+    remainder is dead at the venue so its mapping goes, whether the
+    remainder still working there is to be cancelled). The entry stays in the map until
     the resolution's store writes committed, so a storage failure midway
     leaves it here and the next cancel-retry pass applies the same verdict
     again instead of probing the venue anew
@@ -510,7 +547,304 @@ class _CancelTentativeMeta:
     last_retry_ts_ms: int | None = None
     last_retry_outcome: CancelDispositionOutcome | None = None
     park_coid: str | None = None
-    resolved: tuple[CancelDispositionOutcome, str, bool] | None = None
+    resolved: tuple[CancelDispositionOutcome, str, bool, bool, bool] | None = None
+
+
+@dataclasses.dataclass
+class _FillEvidenceHold:
+    """An entry held until its execution evidence arrives.
+
+    Its order is terminal at the venue and the terminal event did not say how
+    much executed (:meth:`OrderSyncEngine._defer_entry_terminal_without_fill_evidence`).
+    ``order_ids`` and ``since_ms`` (wall clock, epoch ms) are persisted with
+    ``expired`` as a keyed
+    :data:`~pynecore.core.broker.storage.ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND`
+    event, so a restart re-arms the hold and the mapping the evidence routes
+    through (:meth:`OrderSyncEngine._restore_fill_evidence_holds`).
+
+    ``expired`` is set once the hold outlived the fill-report grace without
+    evidence (:meth:`OrderSyncEngine._expire_fill_evidence_holds`); the
+    in-memory ``action_logged`` and ``quarantined`` make the hold warning and
+    the quarantine fire once per process. ``booked_qty`` (persisted) is what
+    the book had taken in of the hold's orders when the hold began
+    (:meth:`~pynecore.core.broker.position.BrokerPosition.fill_cursor`).
+
+    **State machine.** Durable records: the hold row (keyed by intent key)
+    and one arrival row per order (keyed by venue order id). Owed writes
+    (:meth:`OrderSyncEngine._owe_store_write`) land in queue order.
+
+    ``HELD``
+        In :attr:`~OrderSyncEngine._entries_awaiting_fill_evidence`, the key
+        in :attr:`~OrderSyncEngine._fill_evidence_entry_keys`, the orders
+        mapped; durable: the hold row, and the arrival row once evidence was
+        received. Entered by a terminal event without the venue's quantity
+        (:meth:`OrderSyncEngine._defer_entry_terminal_without_fill_evidence`):
+        memory first, then the owed hold write. A restart re-arms ``HELD``
+        from the hold row with its mapping and queues the stored arrivals
+        (:meth:`OrderSyncEngine._restore_fill_evidence_holds`). Strategy
+        cancels, replacements, closes, OCA cascades and reductions, the short
+        gate, forced-cancel retries and the close sweep leave the venue state
+        and the protection of a ``HELD`` entry alone
+        (:meth:`OrderSyncEngine._hold_entry_awaiting_fill_evidence`,
+        :meth:`OrderSyncEngine._cleanup_position_tracking`).
+        A copy of the evidence-less terminal event keeps it ``HELD``. An
+        entry the strategy dropped whose cancel is parked for its retry
+        enters ``HELD`` too
+        (:meth:`OrderSyncEngine._forced_cancel_parked_entry`); its venue
+        cancel is then the engine's own, never an external one.
+    ``HELD`` + received evidence
+        A terminal event with the venue's quantity for an order of a hold not
+        released yet (``HELD``, ``SETTLING`` or ``AWAITING_EXECUTION``,
+        :meth:`OrderSyncEngine._refresh_fill_evidence_order_ids`) is
+        written as the arrival row on the broker thread before it is queued
+        (:meth:`OrderSyncEngine._record_fill_evidence_arrival`); a crash
+        before the drain replays it at the restart. The row is monotonic per
+        order: a report of less than the highest one received is applied but
+        never replaces the row. A positive executed quantity it reports is
+        also kept in memory (:attr:`~OrderSyncEngine._fill_evidence_received`,
+        seeded from the replayed rows at a restart): a fill queued
+        ahead of it that settles the hold leaves it in ``AWAITING_EXECUTION``
+        for that quantity (:meth:`OrderSyncEngine._absorb_received_execution`),
+        never released by the first slice. A received fill of such an order
+        keeps the cumulative executed quantity it shows the same way
+        (:attr:`~OrderSyncEngine._fill_evidence_queued`): an earlier queued
+        fill reaching everything routed so far does not release the hold
+        below it, and the hold row stores it as that order's booking target.
+    ``HELD`` + parked positive evidence
+        After a restart, a terminal event reporting a positive executed
+        quantity waits until the script re-issues the entry
+        (:meth:`OrderSyncEngine._park_positive_evidence_until_intent`); the
+        hold and arrival rows stay, and the hold (row too) takes the reported
+        quantity as ``awaiting_execution``, so a fill settling it first moves
+        it to ``AWAITING_EXECUTION`` rather than releasing it; a terminal
+        event arriving in that state before the re-issue waits the same way.
+        Until the event is routed the entry counts as held; once the book took in what it
+        reported, the hold ends and the event is spent with it
+        (:meth:`OrderSyncEngine._finish_fill_evidence_hold`).
+    ``SETTLING``
+        In :attr:`~OrderSyncEngine._settled_fill_evidence`, out of the held
+        map, both rows still stored. A fill whose order shows more executed
+        than the book holds after it carries that cumulative quantity as
+        ``awaiting_execution``, a lower bound of the execution. Entered when a
+        fill, a terminal event
+        with the venue's quantity, an ``ALREADY_FILLED`` cancel-tentative
+        verdict (:meth:`OrderSyncEngine._settle_fill_evidence`) or the
+        envelope's retirement (:meth:`OrderSyncEngine._drop_envelope`) ends
+        the hold. An entry without a hold enters it too, with a fresh hold
+        naming the reported quantity, when its terminal event (or a
+        cancel-tentative parent's) reports more executed than the book holds
+        of the order (:meth:`OrderSyncEngine._await_reported_execution`); that
+        hold row is written before any write of the event's handling, so a
+        restart midway re-arms it. When the routing or resolution completed,
+        the release is owed behind every write of its consequences, the book write included
+        (:meth:`OrderSyncEngine._end_fill_evidence_settlement`). When it
+        raised, the hold is ``HELD`` again with its mapping and the event is
+        routed again (:meth:`OrderSyncEngine._rearm_settled_fill_evidence`,
+        :meth:`OrderSyncEngine._keep_unbooked_fill_for_retry`), except a hold
+        whose evidence the book already took in (a booked fill is never
+        routed twice): that one is released instead. A release after a fill
+        consumes the entry at the booked quantity, as no terminal event
+        applied it, and drops a mapping a restart re-seeded for the ended
+        order (:meth:`OrderSyncEngine._finish_fill_evidence_hold`).
+    ``AWAITING_EXECUTION``
+        In :attr:`~OrderSyncEngine._fill_evidence_awaiting_execution`: a
+        terminal event reported a positive executed quantity the book has not
+        taken in yet (``awaiting_execution``, written into the hold row on
+        entry). Both rows stay, so a restart re-arms ``HELD`` with that
+        quantity (from the row, or from the stored arrival when the row was
+        not rewritten yet) and replays the arrival. The entry's intent is
+        consumed at the executed quantity; every guard of ``HELD`` holds it
+        too, nothing is sent on the key (no new cycle, changed-parameter
+        re-issue, re-added entry or close) and nothing of it retired (strategy
+        cancel, OCA cascade, close sweep), and a parked forced cancel of it
+        waits
+        (:meth:`OrderSyncEngine._entry_execution_unresolved`,
+        :meth:`OrderSyncEngine._hold_entry_awaiting_booking`,
+        :meth:`OrderSyncEngine._retry_forced_cancels`). Any later event of
+        any order of the hold showing more executed of that order than it
+        reported (a fill, or a terminal event the dropped mapping no longer
+        routes to the entry) raises that order's booking target, in memory
+        and in the row (:attr:`~OrderSyncEngine._fill_evidence_floors`,
+        :meth:`OrderSyncEngine._raise_fill_evidence_floor`). A fill of any
+        order of the hold after which the book holds the reported quantity of
+        the reporting order, and of every order of the hold the most any of
+        its events showed executed, moves it to ``SETTLING`` (a ``SETTLING`` hold short of
+        either re-enters ``AWAITING_EXECUTION``); the booked fills of a
+        sibling order of the entry never count toward the reporting one's
+        (:meth:`OrderSyncEngine._fill_evidence_booked`,
+        :meth:`OrderSyncEngine._release_fill_evidence_awaiting_execution`).
+
+    Terminal outcomes, each deleting the hold row and then the arrival rows
+    (:meth:`OrderSyncEngine._owe_fill_evidence_release`; a crash between the
+    two leaves an arrival without its hold, which the restart drops):
+
+    - **evidence applied**: ``SETTLING`` completed;
+    - **evidence booked**: the book took in more of the hold's orders than
+      ``booked_qty`` (all of the reported quantity for a hold that knows
+      one), so a fill of them was booked and its consequences
+      written; a restart between that book write and the release, or a
+      storage error after the booking, re-arms such a hold, which the next
+      reconcile releases (:meth:`OrderSyncEngine._release_booked_fill_evidence_holds`);
+    - **operator release**: ``pyne broker resume --entry-not-executed``; the
+      restart applies the operator's word as a proven zero (or drops a hold
+      without orders);
+    - **expiry quarantine** is not an outcome: a ``HELD`` or
+      ``AWAITING_EXECUTION`` hold past the fill-report grace persists
+      ``expired`` and quarantines the bot, and stays until one of the
+      outcomes above (:meth:`OrderSyncEngine._expire_fill_evidence_holds`).
+      A cancel-tentative probe of a held entry never halts the bot in its
+      place (:meth:`OrderSyncEngine._drive_cancel_tentative`).
+    """
+    order_ids: list[str]
+    since_ms: int
+    booked_qty: float = 0.0
+    expired: bool = False
+    action_logged: bool = False
+    quarantined: bool = False
+    #: The executed quantity a terminal event of the hold's order reported
+    #: (:attr:`ExchangeOrder.filled_qty`), with that order's venue id: the
+    #: stored hold and arrival stay until a fill of the order books it
+    #: (:meth:`OrderSyncEngine._release_settled_fill_evidence`).
+    awaiting_execution: tuple[str, float] | None = None
+
+
+#: Quarantine reason of an entry whose execution evidence did not arrive within
+#: the fill-report grace (:meth:`OrderSyncEngine._expire_fill_evidence_holds`).
+_FILL_EVIDENCE_QUARANTINE_REASON = 'entry_execution_evidence_missing'
+
+
+def _fill_evidence_arrival_payload(event: OrderEvent) -> dict:
+    """The stored form of a held entry's terminal event with its execution evidence.
+
+    Written by :meth:`OrderSyncEngine._record_fill_evidence_arrival` and read
+    back by :func:`_fill_evidence_arrival_event`.
+
+    :param event: The ``cancelled`` / ``rejected`` event.
+    """
+    order = event.order
+    return {
+        'event_type': event.event_type,
+        'timestamp': event.timestamp,
+        'pine_id': event.pine_id,
+        'from_entry': event.from_entry,
+        'leg_type': event.leg_type.value if event.leg_type is not None else None,
+        'cancel_reason': event.cancel_reason,
+        'from_disappearance_tracker': event.from_disappearance_tracker,
+        'order': {
+            'id': order.id, 'symbol': order.symbol, 'side': order.side,
+            'order_type': order.order_type.value, 'qty': order.qty,
+            'filled_qty': order.filled_qty, 'remaining_qty': order.remaining_qty,
+            'price': order.price, 'stop_price': order.stop_price,
+            'average_fill_price': order.average_fill_price,
+            'status': order.status.value, 'timestamp': order.timestamp,
+            'fee': order.fee, 'fee_currency': order.fee_currency,
+            'reduce_only': order.reduce_only,
+            'client_order_id': order.client_order_id,
+            'filled_qty_known': order.filled_qty_known,
+        },
+    }
+
+
+def _operator_not_executed_event(order_id: str, symbol: str) -> OrderEvent:
+    """The proven-zero terminal event an operator's ``--entry-not-executed`` stands for.
+
+    Queued by :meth:`OrderSyncEngine._restore_fill_evidence_holds` for a hold
+    the operator released, so the entry is torn down exactly like one whose
+    venue reported nothing executed: a ``rejected`` event with
+    ``filled_qty`` 0 and :attr:`ExchangeOrder.filled_qty_known` ``True``,
+    which applies no ``on_unexpected_cancel`` policy.
+
+    :param order_id: The held order's venue id (its mapping routes the event).
+    :param symbol: The run's symbol.
+    """
+    now = time.time()
+    return OrderEvent(
+        order=ExchangeOrder(
+            id=order_id, symbol=symbol, side='', order_type=OrderType.MARKET,
+            qty=0.0, filled_qty=0.0, remaining_qty=0.0, price=None, stop_price=None,
+            average_fill_price=None, status=OrderStatus.REJECTED, timestamp=now,
+            fee=0.0, fee_currency='', filled_qty_known=True,
+        ),
+        event_type='rejected',
+        fill_price=None,
+        fill_qty=None,
+        timestamp=now,
+    )
+
+
+def _stored_awaiting_execution(
+        stored: object, order_ids: list[str], arrivals: dict[str, dict],
+) -> tuple[str, float] | None:
+    """The executed quantity a restored hold waits for the book to take in.
+
+    The hold row names it once the terminal event reporting it was applied
+    (:meth:`OrderSyncEngine._release_settled_fill_evidence`); a stored
+    arrival of one of the hold's orders reporting a positive executed
+    quantity names it too, before that event was applied or the hold row
+    rewritten. The larger quantity wins. A restored hold with a quantity is
+    released by the book only once it took that quantity in
+    (:meth:`OrderSyncEngine._fill_evidence_booked`).
+
+    :param stored: The hold row's ``awaiting_execution`` field.
+    :param order_ids: The hold's venue order ids.
+    :param arrivals: The stored arrivals, by venue order id.
+    :return: The order's venue id and the quantity, ``None`` for none.
+    """
+    best: tuple[str, float] | None = None
+    if (isinstance(stored, list) and len(stored) == 2 and isinstance(stored[0], str)
+            and isinstance(stored[1], (int, float)) and stored[1] > 0.0):
+        best = (stored[0], float(stored[1]))
+    for order_id in order_ids:
+        arrival = arrivals.get(order_id)
+        if arrival is None:
+            continue
+        event = _fill_evidence_arrival_event(arrival)
+        if event is None or event.order.filled_qty <= 0.0:
+            continue
+        if best is None or event.order.filled_qty > best[1]:
+            best = (order_id, event.order.filled_qty)
+    return best
+
+
+def _fill_evidence_arrival_event(payload: dict) -> OrderEvent | None:
+    """Rebuild the event :func:`_fill_evidence_arrival_payload` stored.
+
+    :param payload: The stored payload.
+    :return: The event, ``None`` for a payload that does not parse (the hold
+        then waits for the venue's quantity again).
+    """
+    try:
+        raw = payload['order']
+        order = ExchangeOrder(
+            id=str(raw['id']), symbol=str(raw['symbol']), side=str(raw['side']),
+            order_type=OrderType(raw['order_type']), qty=float(raw['qty']),
+            filled_qty=float(raw['filled_qty']),
+            remaining_qty=float(raw['remaining_qty']),
+            price=None if raw['price'] is None else float(raw['price']),
+            stop_price=None if raw['stop_price'] is None else float(raw['stop_price']),
+            average_fill_price=(None if raw['average_fill_price'] is None
+                                else float(raw['average_fill_price'])),
+            status=OrderStatus(raw['status']), timestamp=float(raw['timestamp']),
+            fee=float(raw['fee']), fee_currency=str(raw['fee_currency']),
+            reduce_only=bool(raw['reduce_only']),
+            client_order_id=raw['client_order_id'],
+            filled_qty_known=bool(raw['filled_qty_known']),
+        )
+        leg_type = payload['leg_type']
+        return OrderEvent(
+            order=order,
+            event_type=str(payload['event_type']),
+            fill_price=None,
+            fill_qty=None,
+            timestamp=float(payload['timestamp']),
+            pine_id=payload['pine_id'],
+            from_entry=payload['from_entry'],
+            leg_type=None if leg_type is None else LegType(leg_type),
+            cancel_reason=payload['cancel_reason'],
+            from_disappearance_tracker=bool(payload['from_disappearance_tracker']),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 DEFENSIVE_CLOSE_RESOLUTION_GRACE_S = 30.0
@@ -547,8 +881,9 @@ window (poll+stream race, reconnect replay) — duplicates always arrive
 close behind the original, so evicting ids thousands of fills old cannot
 cause a missed dedupe in practice. Sized generously (≈8k fills) so the
 ring is effectively unbounded for any realistic single-session fill count
-while still capping memory. In-memory only — cross-restart dedupe is owned
-by the plugins' persisted ``filled_qty`` cursors.
+while still capping memory. In memory only; a fill an evicted id names, or one
+an earlier process took, is still caught by its durable receipt
+(:class:`~pynecore.core.broker.storage.FillReceipt`).
 """
 
 
@@ -767,6 +1102,76 @@ def _partial_trigger_pine_id(leg: PartialBracketLeg) -> str:
     collides with a script's own close.
     """
     return f"__pyne_partial_trigger__{leg.pine_id}\0{leg.from_entry}\0{leg.leg_kind}"
+
+
+@dataclasses.dataclass(frozen=True)
+class _HeldCloseEvidence:
+    """What the evidence says about a held partial-bracket close.
+
+    :ivar outcome: ``'sent'`` (executed in full), ``'partial'`` (ended after
+        executing part of it), ``'refused'`` (ended, or refused, with nothing
+        executed), ``'working'`` (acknowledged by the venue and not ended),
+        ``'pending'`` (the venue's answer is still open in the plugin's
+        journal) or ``'unknown'`` (no record shows whether it executed, and
+        none will).
+    :ivar executed_fraction: For ``'partial'``: the part of the close that
+        executed, between 0 and 1.
+    :ivar operator: The outcome is the operator's decision, not the venue's
+        evidence.
+    :ivar operator_may_decide: For ``'unknown'``: whether an operator decision
+        may settle it. A hedging close whose leg send the emulator has not
+        settled yet is not the operator's to decide: the restart replay
+        completes that send first.
+    """
+    outcome: str
+    executed_fraction: float = 0.0
+    operator: bool = False
+    operator_may_decide: bool = True
+
+
+def _trigger_close_executed_at_ack(ack: ExchangeOrder | CloseFanResult | None, qty: float) -> bool:
+    """Whether a partial-bracket close's acknowledgement already shows it executed.
+
+    An order the venue answered ``FILLED``, or with its whole quantity filled,
+    executed with the answer. A hedging fan that sent nothing (the position
+    was already flat) has nothing left to execute. Without an answer the
+    dispatch settles as it did before (``None``).
+
+    :param ack: The venue's answer to the close (:attr:`~OrderSyncEngine._trigger_close_ack`).
+    :param qty: The close's quantity.
+    """
+    if ack is None:
+        return True
+    if isinstance(ack, CloseFanResult):
+        return not ack.legs
+    return (ack.status is OrderStatus.FILLED
+            or ack.filled_qty >= qty * (1.0 - _HELD_CLOSE_SHARE_EPS))
+
+
+def _fill_fee_total(event: OrderEvent, receipt: FillReceipt | None) -> float:
+    """The commission total a fill event reports, as far as it reports one.
+
+    A fill event's ``fee`` is the fill's total commission, and ``0.0`` (the
+    default) is also what a fill carries when its source had no commission
+    data (a fill booked from a snapshot). When a fee event already accounted
+    a commission of the fill (its receipt's
+    :attr:`~pynecore.core.broker.storage.FillReceipt.fee`), a fill event of
+    ``0.0`` brings no commission data: the known total stands, rather than a
+    reversal of the commission already booked. A non-zero ``fee`` is the
+    total as now known.
+
+    :param event: The fill event.
+    :param receipt: The fill's receipt before this delivery, if any.
+    :return: The fill's commission total.
+    """
+    if event.fee == 0.0 and receipt is not None and receipt.fee:
+        return receipt.fee
+    return event.fee
+
+
+#: Tolerance of an executed share of a held partial-bracket close that counts as
+#: the whole close (:meth:`OrderSyncEngine._held_order_close_outcome`).
+_HELD_CLOSE_SHARE_EPS = 1e-9
 
 
 def _sizes_match(actual: float, expected: float) -> bool:
@@ -1490,9 +1895,23 @@ class OrderSyncEngine:
         # is dispatching right now: :meth:`_dispatch_new` records the close's
         # client order id on it right before the venue call.
         self._trigger_close_leg: tuple[str, str, str] | None = None
-        # Held partial-bracket closes already reported at ERROR, with the
-        # outcome reported (:meth:`_settle_held_partial_bracket_closes`).
+        # Held partial-bracket closes already reported, with the outcome
+        # reported (:meth:`_settle_held_partial_bracket_closes`).
         self._held_trigger_close_reported: set[tuple[str, str]] = set()
+        # The venue's answer to the last close :meth:`_dispatch_new` sent: the
+        # order, or the fan of a hedging venue. A partial-bracket close
+        # dispatch (:meth:`_dispatch_partial_bracket_close`) clears it before
+        # its send and takes it right after, so it reads only its own answer.
+        self._trigger_close_ack: ExchangeOrder | CloseFanResult | None = None
+        # Client order ids of the held partial-bracket closes the venue
+        # acknowledged in this process: a known, working close, held for its
+        # execution without an alarm (:meth:`_dispatch_partial_bracket_close`).
+        self._acknowledged_trigger_closes: set[str] = set()
+        # Of those, the closes that take the parent's whole position (judged
+        # at the acknowledgement, before their fill is booked): their
+        # settlement leaves the parent's native stop as it is
+        # (:meth:`_settle_sent_partial_bracket_close`).
+        self._trigger_closes_taking_parent: set[str | None] = set()
         # Engine-trigger partial bracket state machine. The state
         # machine itself is cheap to keep around (empty ledger when the
         # mode is UNSUPPORTED), so it is constructed unconditionally —
@@ -1833,6 +2252,75 @@ class OrderSyncEngine:
         # parallel new dispatch would create a double-life. Stale-
         # grace expiry promotes the parent to ``DEGRADED_HALT``.
         self._cancel_disposition_pending: dict[str, _CancelTentativeMeta] = {}
+        # Entries whose ``cancelled`` / ``rejected`` event came without the
+        # venue's executed quantity and was left unapplied
+        # (:meth:`_defer_entry_terminal_without_fill_evidence`). The order is
+        # terminal at the venue but may have executed, so until a fill or a
+        # terminal event with the venue's quantity arrives, no strategy cancel
+        # or replacement may retire its envelope and pending protection
+        # (:meth:`_hold_entry_awaiting_fill_evidence`). Persisted, so a
+        # restart re-arms it (:meth:`_restore_fill_evidence_holds`); one that
+        # outlives the fill-report grace quarantines the bot
+        # (:meth:`_expire_fill_evidence_holds`).
+        self._entries_awaiting_fill_evidence: dict[str, _FillEvidenceHold] = {}
+        # The keys a hold proved to be entries, kept past the hold's release
+        # until the entry's envelope is dropped: a hold re-armed by a restart
+        # has no active EntryIntent until the script re-issues it, and the
+        # evidence that settles the hold before then must still retire the
+        # entry's pending protection (:meth:`_is_entry_key`).
+        self._fill_evidence_entry_keys: set[str] = set()
+        # The venue order ids of every hold, read on the broker thread by
+        # :meth:`_record_fill_evidence_arrival`. Replaced whole on the main
+        # thread whenever a hold changes, so the read never sees a dict being
+        # mutated.
+        self._fill_evidence_order_ids: frozenset[str] = frozenset()
+        # The executed quantity a received terminal event of a held order
+        # reported, by venue order id: written on the broker thread when the
+        # event is received (:meth:`_record_fill_evidence_arrival`), before it
+        # is routed. A hold settled meanwhile by an earlier queued fill waits
+        # for that quantity (:meth:`_absorb_received_execution`). Dropped with
+        # the hold's release (:meth:`_owe_fill_evidence_release`).
+        self._fill_evidence_received: dict[str, float] = {}
+        # The most executed a routed event (a fill, or a terminal event) of an
+        # order of an unreleased hold showed, by venue order id, when it is
+        # more than the order's received report: a lower bound of that order's
+        # execution the hold waits for the book to take in
+        # (:meth:`_fill_evidence_booked`). Stored in the hold row
+        # (:meth:`_persist_fill_evidence_hold`), re-seeded at a restart, and
+        # dropped with the hold's release (:meth:`_owe_fill_evidence_release`).
+        self._fill_evidence_floors: dict[str, float] = {}
+        # The most executed a received fill of an order of an unreleased hold
+        # showed (its cumulative quantity), by venue order id: written on the
+        # broker thread when the fill is received
+        # (:meth:`_record_fill_evidence_arrival`), before it is routed, so an
+        # earlier queued fill cannot release the hold below it
+        # (:meth:`_fill_evidence_target`). Stored with the floors in the hold
+        # row, dropped with the hold's release.
+        self._fill_evidence_queued: dict[str, float] = {}
+        # Holds the evidence of the event being routed settled: out of memory
+        # already, still in the store until the event's routing completed
+        # (:meth:`_release_settled_fill_evidence`), so a process that dies
+        # while the event's consequences are written replays the evidence at
+        # its restart.
+        self._settled_fill_evidence: dict[str, _FillEvidenceHold] = {}
+        # Nesting depth of the routings and resolutions that release those
+        # holds themselves once they completed; an envelope retirement
+        # outside them releases at once (:meth:`_drop_envelope`).
+        self._fill_evidence_release_depth = 0
+        # Terminal events with a positive executed quantity for a held entry
+        # whose EntryIntent the script has not re-issued since the restart
+        # (:meth:`_park_positive_evidence_until_intent`), by key and venue
+        # order id. The hold, its mapping and the stored arrival stay; the
+        # events are routed again once the entry's intent is active.
+        self._positive_evidence_awaiting_intent: dict[str, dict[str, OrderEvent]] = {}
+        # Holds a terminal event with a positive executed quantity settled
+        # before the execution itself was booked, by the venue order id: out
+        # of memory as holds, still stored, so a restart before the booking
+        # re-arms the hold and its mapping instead of letting the script send
+        # the entry again next to what the order executed. A fill of the order
+        # reporting that quantity releases them
+        # (:meth:`_release_fill_evidence_awaiting_execution`).
+        self._fill_evidence_awaiting_execution: dict[str, tuple[str, _FillEvidenceHold]] = {}
         # Deferred rehydrate flag — analogous to
         # ``_pending_native_failsafe_rehydrate``. Set in ``__init__``
         # when the persisted leg ledger contains any
@@ -1960,10 +2448,25 @@ class OrderSyncEngine:
         # with its uncorrelated push copy) cannot double-apply — over-closing,
         # double-counting P&L/``closed_trades``/risk counters, or (on an ENTRY)
         # opening a phantom second trade. A bounded FIFO ring capped at
-        # :data:`_SEEN_FILL_IDS_CAP`. In-memory only — cross-restart dedupe is
-        # owned by the plugins' persisted ``filled_qty`` cursors (this gate is
-        # defence-in-depth over the plugins' own per-fill dedup).
+        # :data:`_SEEN_FILL_IDS_CAP`, in memory; across processes the durable
+        # fill receipts (:class:`FillReceipt`) carry the same gate
+        # (:meth:`_route_event`). Defence-in-depth over the plugins' own
+        # per-fill dedup.
         self._seen_fill_ids = _BoundedIdSet(_SEEN_FILL_IDS_CAP)
+        # Receipts of the fills (and fill fees) this process took and the
+        # store does not hold yet, by fill id: written with the next binding
+        # book write (:meth:`_persist_entry_book`).
+        self._pending_fill_receipts: dict[str, FillReceipt] = {}
+        # Fills held for the venue's verdict (:meth:`_note_unbooked_exit_fill`,
+        # :meth:`_hold_fill_against_adopted_reduction`), by fill id, with the
+        # receipt they get once the verdict settles them (``None`` until their
+        # routing ends): a crash while one waits leaves it without a receipt.
+        self._deferred_fill_receipts: dict[str, FillReceipt | None] = {}
+        # Close fills booked as fill-time netting (:meth:`_take_netting_fill`)
+        # whose count toward their netting records waits for the fill's
+        # receipt: fill id -> record coid -> fill side -> Pine quantity.
+        # Written in the receipt's transaction (:meth:`_write_fill_receipts`).
+        self._pending_netting_absorptions: dict[str, dict[str, dict[str, float]]] = {}
 
         # External-flatten confirmation clock: first ``monotonic()`` moment a
         # periodic reconcile observed the venue flat while the book was not
@@ -2116,10 +2619,15 @@ class OrderSyncEngine:
         # wait with the monotonic time it was first seen at that size.
         self._unbooked_exit_delta = 0.0
         self._unbooked_exit_ids: list[str] = []
+        # Their fill ids, whose receipts wait for the settlement.
+        self._unbooked_exit_fill_ids: list[str] = []
         self._unbooked_exit_observed: tuple[float | None, float] | None = None
         # The startup comparison of the venue with the journal waits for the
         # exit fills held at startup (:meth:`_report_startup_reduction`).
         self._startup_reduction_deferred = False
+        # The Pine entry ids whose pending fill recovery holds the startup
+        # comparison (:meth:`_report_startup_reduction`), or ``None``.
+        self._startup_reduction_recovery_ids: set[str] | None = None
         # The latest recorded view of an unexplained position change
         # (:data:`UNATTRIBUTED_CHANGE_EVENT_KINDS`), loaded on first use, and the
         # book size it was last carried over at
@@ -2490,6 +2998,7 @@ class OrderSyncEngine:
             self._persisted_envelope_anchors = dict(envelopes)
             pending = self._absorb_journal_retry_rows(pending)
             self._persisted_pending_anchors = self._unresolved_pending(pending)
+            self._restore_fill_evidence_holds(store_ctx)
             if envelopes or pending:
                 _log.info(
                     "broker state replay: %d envelope(s), %d pending verification(s)",
@@ -2828,6 +3337,7 @@ class OrderSyncEngine:
         Called from the :meth:`run_event_stream` background task or by
         tests injecting synthetic events.
         """
+        self._record_fill_evidence_arrival(event)
         self._event_queue.put(event)
 
     async def run_event_stream(self) -> None:
@@ -2860,6 +3370,7 @@ class OrderSyncEngine:
                 stream = self._broker.watch_orders()
                 async for event in stream:
                     _blog_info("event %s", event)
+                    self._record_fill_evidence_arrival(event)
                     self._event_queue.put(event)
                 return
             except NotImplementedError:
@@ -3200,7 +3711,12 @@ class OrderSyncEngine:
         here: it never survived a restart. A resume requested for it changes
         nothing else: the latch blocked entries over the bot's own venue
         trouble, so the operator accepted no venue change by lifting it, and
-        the restart judges the venue as usual.
+        the restart judges the venue as usual. The latch of an entry whose
+        execution evidence never arrived (:meth:`_expire_fill_evidence_holds`)
+        is no exception: the hold that latched it stays until the evidence
+        arrives or the operator states the entry did not execute
+        (``pyne broker resume --entry-not-executed``,
+        :meth:`_restore_fill_evidence_holds`), so the restart latches it again.
 
         An external-intervention latch whose resume was requested is resumed
         here, whether the request came while the bot was down or while the
@@ -6188,6 +6704,13 @@ class OrderSyncEngine:
         until those fills settle (:meth:`_settle_unbooked_exit_fills`) and the
         journal is final; nothing is recorded before.
 
+        A fill the plugin still recovers for one of the journal's entries
+        (:meth:`BrokerPlugin.fill_recovery_pending`, e.g. a close the venue's
+        deal history did not show yet) may explain the difference too: the
+        verdict waits, for as long as the plugin reports that recovery, and is
+        judged on the journal as it stands once the recovery settled
+        (:meth:`_settle_startup_reduction_recovery`).
+
         A spot run is skipped: its journal counts gross executed quantities
         while the venue position is the fee-net inventory, and the spot
         inventory manager owns its ownership conflicts.
@@ -6231,6 +6754,17 @@ class OrderSyncEngine:
                 "takes the venue position", broker_signed, owned_signed,
             )
             return
+        recovering = self._startup_recovery_entry_ids(store_ctx, journal_rows)
+        if recovering:
+            if self._startup_reduction_recovery_ids is None:
+                _blog_info(
+                    "startup: the venue holds %s against this run's journal-owned %s "
+                    "while the plugin recovers fills for entries %s — the difference "
+                    "is judged once that recovery settles",
+                    broker_signed, owned_signed, sorted(recovering),
+                )
+            self._startup_reduction_recovery_ids = recovering
+            return
         if self._resumed_from_quarantine and (
                 resume_view is None
                 or self._report_covers(resume_view, journal_rows, broker_signed)):
@@ -6252,6 +6786,58 @@ class OrderSyncEngine:
             kind, {'journal_owned': owned_signed, 'venue_signed': broker_signed,
                    'journal_rows': journal_rows},
         )
+
+    def _startup_recovery_entry_ids(
+            self, store_ctx: RunContext, journal_rows: dict[str, float],
+    ) -> set[str]:
+        """The entry ids of the journal rows whose fill recovery the plugin reports pending.
+
+        Asks :meth:`BrokerPlugin.fill_recovery_pending` with the Pine entry ids
+        of the rows behind the journal-owned exposure (the book is empty at
+        startup, so the rows name the entries). A plugin without the port, or
+        one whose answer raises, holds nothing.
+
+        :param store_ctx: The run's store.
+        :param journal_rows: The rows behind the journal-owned exposure
+            (:meth:`_durable_owned_rows`).
+        :return: The entry ids when a recovery is pending for one of them,
+            else an empty set.
+        """
+        if not hasattr(self._broker, 'fill_recovery_pending'):
+            return set()
+        entry_ids: set[str] = set()
+        for coid in journal_rows:
+            row = store_ctx.get_order(coid)
+            if row is not None and row.pine_entry_id:
+                entry_ids.add(row.pine_entry_id)
+        if not entry_ids:
+            return set()
+        try:
+            pending = bool(self._broker.fill_recovery_pending(entry_ids))
+        except Exception as exc:  # noqa: BLE001 -- a faulty port must not block the verdict
+            _blog_warning("fill_recovery_pending failed (%s); not holding the startup "
+                          "verdict", exc)
+            return set()
+        return entry_ids if pending else set()
+
+    def _settle_startup_reduction_recovery(self, exch_pos: ExchangePosition | None) -> None:
+        """Judge a startup reduction once the fill recovery that held it settled.
+
+        :meth:`_report_startup_reduction` held its verdict while the plugin
+        reported a fill recovery for the journal's entries. Each reconcile pass
+        asks again; once the recovery settled, the venue this pass read is
+        compared with the journal as the recovered fills left it. A recovery
+        still pending keeps the hold: the plugin's signal bounds it.
+
+        :param exch_pos: The venue position this reconcile pass read.
+        """
+        if self._startup_reduction_recovery_ids is None or self._store_ctx is None:
+            return
+        venue = self._venue_signed_size(exch_pos)
+        if self._unbooked_exit_ids or venue is None:
+            return
+        self._startup_reduction_recovery_ids = None
+        self._report_startup_reduction(venue, self._durable_owned_signed_size())
 
     def _log_unattributed_view(self, kind: str, payload: dict) -> None:
         """Audit a view of an unexplained position change and keep it as the latest.
@@ -6620,6 +7206,7 @@ class OrderSyncEngine:
         # ``bar_ts_ms`` anchor.
         if self._current_bar_ts_ms > 0:
             self._drive_cancel_tentative(now_ms=self._cancel_tentative_now_ms())
+        self._expire_fill_evidence_holds(now_ms=int(time.time() * 1000))
         # Retry residual cleanup for markers whose FILL already routed
         # but the bracket-reject residual cancel failed transiently. The
         # duplicate-fill cache is already seeded (so no second FILL can
@@ -6705,6 +7292,7 @@ class OrderSyncEngine:
         ]
         self._settle_unbooked_exit_fills(exch_pos)
         self._settle_held_reduction_fills(exch_pos)
+        self._settle_startup_reduction_recovery(exch_pos)
         if is_startup and drained_mutated_position:
             _blog_info(
                 "skipping startup size adoption (exchange=%s, internal=%s) "
@@ -6766,6 +7354,19 @@ class OrderSyncEngine:
                 self._report_startup_reduction(broker_signed, owned_signed)
                 adoptable = self._adoptable_owned_size(owned_signed, broker_entry_price)
                 run_owned = adoptable is not None
+                if (adoptable is not None and not _sizes_match(broker_signed, adoptable)
+                        and getattr(self._broker, 'position_port', None) is not None
+                        and self._one_way_emulator.netting_in_flight()):
+                    # A fill-time netting closes the two sides one close at a
+                    # time, so the venue's net is off until both have landed;
+                    # the journal's net is what the netting ends at (its
+                    # closes are net-neutral on the rows as well).
+                    _blog_info(
+                        "startup: a netting of the hedging account's two sides is in "
+                        "flight — the book takes this run's journal-owned %s, not the "
+                        "venue's %s", adoptable, broker_signed,
+                    )
+                    broker_signed = adoptable
                 clamped = (broker_signed if adoptable is None
                            else self._clamp_adoption_to_owned(broker_signed, adoptable))
                 if clamped != broker_signed:
@@ -6948,6 +7549,9 @@ class OrderSyncEngine:
         signed = qty if event.order.side == 'buy' else -qty
         self._unbooked_exit_delta = round(self._unbooked_exit_delta + signed, 12)
         self._unbooked_exit_ids.append(event.from_entry or event.pine_id or '')
+        if event.fill_id:
+            self._unbooked_exit_fill_ids.append(event.fill_id)
+            self._defer_fill_receipt(event.fill_id)
         self._unbooked_exit_observed = None
         _blog_warning(
             "exit fill (leg=%s qty=%s pine=%r from_entry=%r) does not reduce the "
@@ -7008,6 +7612,9 @@ class OrderSyncEngine:
         self._unbooked_exit_delta = 0.0
         self._unbooked_exit_ids = []
         self._unbooked_exit_observed = None
+        for fill_id in self._unbooked_exit_fill_ids:
+            self._release_fill_receipt(fill_id)
+        self._unbooked_exit_fill_ids = []
         if venue is not None and _sizes_match(venue, book):
             outcome = 'already_booked'
             _blog_info(
@@ -7082,6 +7689,26 @@ class OrderSyncEngine:
             self._startup_reduction_deferred = False
             if venue is not None and self._store_ctx is not None:
                 self._report_startup_reduction(venue, self._durable_owned_signed_size())
+
+    def _defer_fill_receipt(self, fill_id: str) -> None:
+        """Hold a fill's receipt back until the venue's verdict settles the fill.
+
+        A held fill is not in the books yet: a crash before its settlement
+        must leave it without a receipt, so the plugin delivers it again.
+
+        :param fill_id: The held fill's id.
+        """
+        self._deferred_fill_receipts.setdefault(
+            fill_id, self._pending_fill_receipts.pop(fill_id, None))
+
+    def _release_fill_receipt(self, fill_id: str) -> None:
+        """Hand a settled held fill's receipt to the next book write (:meth:`_defer_fill_receipt`).
+
+        :param fill_id: The settled fill's id.
+        """
+        receipt = self._deferred_fill_receipts.pop(fill_id, None)
+        if receipt is not None:
+            self._pending_fill_receipts[fill_id] = receipt
 
     @staticmethod
     def _venue_signed_size(exch_pos: ExchangePosition | None) -> float | None:
@@ -7165,15 +7792,16 @@ class OrderSyncEngine:
             # the ledger cannot faithfully account for the net (unmapped
             # / opposing exposure, or a durable sum that disagrees with
             # the adopted net).
-            adopted_trades = self._recover_adopted_parent_trades(
-                broker_signed, fifo_trim=fifo_trim,
-            )
-            if adopted_trades:
-                for entry_id, trade_size in adopted_trades:
+            adopted_rows = self._adopted_parent_rows(broker_signed, fifo_trim=fifo_trim)
+            if adopted_rows:
+                commissions = self._adopted_entry_commissions(adopted_rows)
+                for entry_id, trade_size in self._parent_trades_of_rows(
+                        adopted_rows, broker_signed):
                     self._position.reconstruct_parent_trade(
                         entry_id=entry_id,
                         size=trade_size,
                         entry_price=broker_entry_price,
+                        commission=commissions.get(entry_id, 0.0),
                     )
                 return True
             # Prefer the real Pine parent entry id recovered from the
@@ -7231,6 +7859,14 @@ class OrderSyncEngine:
         retried with the next change check; while it stays failed, every sync
         that ends counts toward the storage quarantine of :meth:`sync`.
 
+        The receipts of the fills taken since the last write
+        (:class:`~pynecore.core.broker.storage.FillReceipt`,
+        :attr:`~OrderSyncEngine._pending_fill_receipts`) go in the same transaction as the
+        book, so a receipt exists exactly when the stored books hold its fill;
+        with the book unchanged (a fill that moved nothing, a fee) they are
+        written alone. Until they land they stay pending, and a restart before
+        that finds the fill without a receipt, like the book without the fill.
+
         Only the newest book of the run is ever read, so a landed write then
         deletes the run's older ones
         (:meth:`~pynecore.core.broker.storage.RunContext.delete_superseded_events`):
@@ -7261,6 +7897,7 @@ class OrderSyncEngine:
                 and cursors == self._entry_book_cursors_persisted):
             # The stored book is the current one: nothing is owed any more.
             self._book_write_failures.pop('book', None)
+            self._persist_fill_receipts()
             return
         now_ms = int(time.time() * 1000)
         try:
@@ -7274,6 +7911,7 @@ class OrderSyncEngine:
         if pruned:
             book, cursors = self._entry_book_parts()
             encoded = json.dumps(book, sort_keys=True)
+        receipts = dict(self._pending_fill_receipts)
         try:
             with self._store_ctx.transaction():
                 persisted = self._entry_book_cursors_persisted
@@ -7289,6 +7927,7 @@ class OrderSyncEngine:
                 if changed or removed:
                     self._store_ctx.replace_keyed_events(
                         ENTRY_BOOK_CURSOR_EVENT_KIND, changed, removed)
+                self._write_fill_receipts(receipts)
         except Exception as exc:  # noqa: BLE001 -- the book must not depend on the disk
             _blog_warning(
                 "binding book could not be written to the store (%s) — retried on "
@@ -7298,6 +7937,8 @@ class OrderSyncEngine:
             self._book_write_failures['book'] = exc
             return
         self._book_write_failures.pop('book', None)
+        self._book_write_failures.pop('receipts', None)
+        self._forget_written_fill_receipts(receipts)
         self._entry_book_persisted = encoded
         self._entry_book_cursors_persisted = cursors
         try:
@@ -7307,6 +7948,65 @@ class OrderSyncEngine:
                 "superseded binding books could not be deleted from the store (%s) — "
                 "the new book is stored; they are deleted with the next write", exc,
             )
+
+    def _persist_fill_receipts(self) -> None:
+        """Write the pending fill receipts on their own, the book being stored already.
+
+        Part of :meth:`_persist_entry_book` for the case the book did not
+        change. A failed write keeps them pending, is reported and retried
+        with the next change check; while it stays failed, every sync that
+        ends counts toward the storage quarantine of :meth:`sync`.
+        """
+        assert self._store_ctx is not None
+        receipts = dict(self._pending_fill_receipts)
+        if not receipts:
+            self._book_write_failures.pop('receipts', None)
+            return
+        try:
+            with self._store_ctx.transaction():
+                self._write_fill_receipts(receipts)
+        except Exception as exc:  # noqa: BLE001 -- the receipts must not depend on the disk
+            _blog_warning(
+                "fill receipts of %s could not be written to the store (%s) — retried "
+                "on the next change check", sorted(receipts), exc,
+            )
+            self._book_write_failures['receipts'] = exc
+            return
+        self._book_write_failures.pop('receipts', None)
+        self._forget_written_fill_receipts(receipts)
+
+    def _write_fill_receipts(self, receipts: dict[str, FillReceipt]) -> None:
+        """Write fill receipts and the netting counts of their fills, in the caller's transaction.
+
+        A close fill taken as fill-time netting (:meth:`_take_netting_fill`)
+        counts toward its netting record exactly when its receipt is stored,
+        so a fill is counted once whichever way a crash cuts the write.
+
+        :param receipts: The receipts to write, by fill id.
+        """
+        assert self._store_ctx is not None
+        self._store_ctx.record_fill_receipts(receipts.values())
+        absorbed: dict[str, dict[str, float]] = {}
+        for fill_id in receipts:
+            for coid, by_side in self._pending_netting_absorptions.get(fill_id, {}).items():
+                merged = absorbed.setdefault(coid, {})
+                for side, qty in by_side.items():
+                    merged[side] = merged.get(side, 0.0) + qty
+        if absorbed:
+            absorb_netting_fills(self._store_ctx, absorbed)
+
+    def _forget_written_fill_receipts(self, written: dict[str, FillReceipt]) -> None:
+        """Drop the pending receipts a write stored, unless one changed since it was read.
+
+        The netting counts written with them (:meth:`_write_fill_receipts`)
+        are dropped with them.
+
+        :param written: The receipts the write took, by fill id.
+        """
+        for fill_id, receipt in written.items():
+            self._pending_netting_absorptions.pop(fill_id, None)
+            if self._pending_fill_receipts.get(fill_id) is receipt:
+                del self._pending_fill_receipts[fill_id]
 
     def _persist_entry_fill_order(self) -> None:
         """Write the entry orders' places in the fill order that changed since the last write.
@@ -8126,6 +8826,8 @@ class OrderSyncEngine:
             return False
         self._held_reduction_fills.append(event)
         self._held_reduction_observed = None
+        if event.fill_id:
+            self._defer_fill_receipt(event.fill_id)
         _blog_warning(
             "exit fill (leg=%s qty=%s pine=%r from_entry=%r) of an order that was live "
             "when an unexplained reduction of %s was adopted — not booked yet; the "
@@ -8203,6 +8905,11 @@ class OrderSyncEngine:
         held = self._held_reduction_fills
         self._held_reduction_fills = []
         self._held_reduction_observed = None
+        # Settled here, whatever the verdict; a fill this hands on to the
+        # unbooked-exit settlement waits for that one instead.
+        for event in held:
+            if event.fill_id:
+                self._release_fill_receipt(event.fill_id)
         held_qty = round(sum(event.fill_qty or 0.0 for event in held), 12)
         book = self._position.size
         expected = self._adopted_reduction_qty
@@ -8427,12 +9134,19 @@ class OrderSyncEngine:
         An engine-trigger partial close counts until a fill is booked after
         it, for at most the fill-report grace: its mapping is retired at
         dispatch, and a venue can show the reduction before the fill event
-        reaches the queue at all (capitalcom cycle 439).
+        reaches the queue at all (capitalcom cycle 439). So does a fill-time
+        netting of a hedging account's two sides
+        (:meth:`OneWayEmulator.drain_nettings`) until its record is done.
         """
         if (self._pending_verification or self._pending_defensive_close
                 or self._pending_reversal_opens
                 or self._pending_flip_surplus_closes
                 or not self._event_queue.empty()):
+            return True
+        if (getattr(self._broker, 'position_port', None) is not None
+                and self._one_way_emulator.netting_in_flight()):
+            # A fill-time netting moves the venue's two sides one close at a
+            # time, so the venue can differ from the book until both landed.
             return True
         dispatched = self._trigger_close_dispatched_monotonic
         if (dispatched > self._last_position_fill_monotonic
@@ -8918,6 +9632,47 @@ class OrderSyncEngine:
                 parents.add(event.from_entry)
         return {key for key, intent in exits if intent.from_entry in parents}
 
+    def _entry_execution_queued(self, intent_key: str) -> bool:
+        """Whether an execution of the entry's venue orders is received but not routed.
+
+        A plugin journals an execution and delivers its event before the
+        engine routes it: the event waits in
+        :attr:`~OrderSyncEngine._event_queue`, in the carry of a drain a
+        storage error ended (:attr:`~OrderSyncEngine._drain_carry`) or behind
+        the event the running drain routes. A cancel answered ``True`` in that
+        window is truthful (the venue order is gone and its executions are
+        journaled), but the entry's teardown would drop the mapping, the
+        envelope and the pending protection before the execution is booked,
+        so the execution would arrive for an entry the engine no longer
+        tracks. An event of one of the entry's order ids counts when it
+        carries an executed slice (``fill_qty``) or a positive cumulative
+        executed quantity (a terminal event of a partly executed order), and
+        so does a ``cancelled`` / ``rejected`` event that does not say how
+        much executed (:attr:`ExchangeOrder.filled_qty_known` ``False``): its
+        routing holds the entry for its execution evidence
+        (:meth:`_defer_entry_terminal_without_fill_evidence`), which the
+        teardown would pre-empt.
+
+        :param intent_key: The entry's intent key.
+        """
+        order_ids = {order_id for order_id in self._order_mapping.get(intent_key, ()) if order_id}
+        if not order_ids:
+            return False
+        with self._event_queue.mutex:
+            queued: list[OrderEvent | _NativeCancelAllExpected] = list(self._event_queue.queue)
+        queued.extend(self._drain_carry)
+        queued.extend(self._drain_batch[self._drain_batch_pos:])
+        for event in queued:
+            if (not isinstance(event, OrderEvent) or event.event_type == FEE_EVENT_TYPE
+                    or event.order.id not in order_ids):
+                continue
+            if (event.fill_qty or 0.0) > 0.0 or event.order.filled_qty > 0.0:
+                return True
+            if (event.event_type in ('cancelled', 'rejected')
+                    and not event.order.filled_qty_known):
+                return True
+        return False
+
     def _cancel_owned_venue_order(
             self, order: ExchangeOrder, coid: str | None, event_kind: str,
             *, payload: dict,
@@ -9237,6 +9992,7 @@ class OrderSyncEngine:
     # === Event routing ===
 
     def _drain_events(self) -> None:
+        self._route_positive_evidence_awaiting_intent()
         drained_any = False
         while True:
             # Snapshot everything currently queued into one batch before
@@ -9269,14 +10025,30 @@ class OrderSyncEngine:
                         self._register_native_cancel_all_expected(event.symbol)
                         drained_any = True
                         continue
-                    own_marker = self._match_pending_defensive_close(event)
+                    # The fill's identity is settled before the book mark: a
+                    # retry after a storage error forgets the same id the
+                    # routing recorded.
+                    event = self._with_slice_fill_id(event)
+                    batch[pos] = event
+                    own_marker = (None if event.event_type == FEE_EVENT_TYPE
+                                  else self._match_pending_defensive_close(event))
                     book_mark = self._fill_book_mark(event)
+                    self._fill_evidence_release_depth += 1
+                    completed = False
                     try:
                         self._route_event(event)
+                        completed = True
                     except sqlite3.Error:
-                        self._keep_unbooked_fill_for_retry(event, pos, book_mark)
+                        self._keep_unbooked_fill_for_retry(
+                            event, pos, book_mark,
+                            settling=bool(self._settled_fill_evidence))
+                        raise
+                    except BrokerManualInterventionError:
+                        # A policy halt raises after the event's bookkeeping.
+                        completed = True
                         raise
                     except VenueWritesQuarantinedError:
+                        completed = True
                         # A follow-up write that ends the event's routing (its
                         # bookkeeping is done) is deferred to the post-resume
                         # restart; writes with bookkeeping after them are
@@ -9285,10 +10057,14 @@ class OrderSyncEngine:
                         # rest of the batch.
                         _log.debug("follow-up write of %s deferred by quarantine", event)
                     finally:
+                        self._fill_evidence_release_depth -= 1
                         self._void_leg_baselines_on_book_move(own_marker)
                         # The plugin journaled the fill before the event got
                         # here: write the book it moved right away.
                         self._persist_entry_book()
+                        # Last: a hold the event settled leaves the store only
+                        # behind every write of the event's consequences.
+                        self._end_fill_evidence_settlement(completed)
                     drained_any = True
             except BaseException:
                 # The raising event is routed (a policy halt raises after its
@@ -9331,19 +10107,49 @@ class OrderSyncEngine:
     def _keep_unbooked_fill_for_retry(
             self, event: OrderEvent, pos: int,
             mark: tuple[bool, float, int, int, int] | None,
+            *, settling: bool = False,
     ) -> None:
         """Keep a fill whose routing a storage error ended before it was booked.
 
         The fill is routed again with the next drain: it stays in the batch
         carry, and an id the duplicate gate recorded for it is forgotten, so
-        the retry is not dropped as a redelivery. A fill booked before the
-        error is not routed again, so it can never be applied twice.
+        the retry is not dropped as a redelivery, and so is the receipt its
+        routing noted (:attr:`~OrderSyncEngine._pending_fill_receipts`). A fill booked before
+        the error is not routed again, so it can never be applied twice. A fee
+        event (:meth:`_route_fee_event`) is always routed again: the only
+        store access of its routing is the receipt read before it books
+        anything.
+
+        An event without a fill that settled a fill-evidence hold (a terminal
+        event with the venue's executed quantity) is routed again too: its
+        hold stands again (:meth:`_rearm_settled_fill_evidence`) and only this
+        event ends it, the plugin delivered it once and the restart replay
+        needs a restart. Its teardown steps are idempotent, and the hold
+        re-armed with its mapping routes the retry to the same entry. So is
+        such an event whose routing raised before it settled the hold
+        (:meth:`_is_held_order_evidence`): the hold never left.
 
         :param event: The event whose routing raised.
         :param pos: The event's index in the drain batch.
         :param mark: :meth:`_fill_book_mark` taken before the routing.
+        :param settling: Whether the routing settled a fill-evidence hold
+            (:attr:`~OrderSyncEngine._settled_fill_evidence` not empty).
         """
+        if event.event_type == FEE_EVENT_TYPE:
+            self._drain_batch_pos = pos
+            _blog_warning(
+                "fee of fill %s not booked: a storage read failed while it was routed "
+                "— routed again with the next drain", event.fill_id,
+            )
+            return
         if mark is None:
+            if settling or self._is_held_order_evidence(event):
+                self._drain_batch_pos = pos
+                _blog_warning(
+                    "%s event of order %s not applied: a storage write failed while it "
+                    "settled the entry's fill-evidence hold — routed again with the "
+                    "next drain", event.event_type, event.order.id,
+                )
             return
         seen, size, open_count, closed_count, held_count = mark
         if (self._position.size != size
@@ -9353,11 +10159,28 @@ class OrderSyncEngine:
             return
         if not seen and event.fill_id is not None:
             self._seen_fill_ids.discard(event.fill_id)
+            self._pending_fill_receipts.pop(event.fill_id, None)
+            self._deferred_fill_receipts.pop(event.fill_id, None)
+            self._pending_netting_absorptions.pop(event.fill_id, None)
         self._drain_batch_pos = pos
         _blog_warning(
             "fill %s (order %s) not booked: a storage write failed while it was "
             "routed — routed again with the next drain", event.fill_id, event.order.id,
         )
+
+    def _is_held_order_evidence(self, event: OrderEvent) -> bool:
+        """Whether ``event`` is execution evidence for an order a hold waits on.
+
+        A ``cancelled`` / ``rejected`` event of such an order that carries the
+        venue's executed quantity, the same test the broker thread stores
+        arrivals by (:meth:`_record_fill_evidence_arrival`).
+
+        :param event: A routed event.
+        """
+        order = event.order
+        return (event.event_type in ('cancelled', 'rejected')
+                and order.id in self._fill_evidence_order_ids
+                and (order.filled_qty_known or order.filled_qty > 0.0))
 
     def _unpark_filled_entry(self, event: OrderEvent) -> None:
         """Retire the park of an entry dispatch the venue reports fully filled.
@@ -9397,6 +10220,507 @@ class OrderSyncEngine:
         _log.info("parked entry dispatch %s filled at the venue; park retired", coid)
 
     def _route_event(self, event: OrderEvent) -> None:
+        """Route one event, then release in the store the fill-evidence holds it settled.
+
+        :meth:`_route_event_with_receipts` does the routing. A hold the event's
+        evidence ended (:meth:`_settle_fill_evidence`) leaves the store only
+        after the routing returned, behind every write of the event's
+        consequences, so a process that dies midway replays the evidence at
+        its restart. A routing that raised a storage error re-arms the hold.
+        Inside :meth:`_drain_events` the drain releases instead, after the
+        event's book write.
+
+        :param event: The event to route.
+        """
+        outermost = not self._fill_evidence_release_depth
+        self._fill_evidence_release_depth += 1
+        completed = False
+        try:
+            self._route_event_with_receipts(event)
+            self._release_fill_evidence_awaiting_execution(event)
+            completed = True
+        except (VenueWritesQuarantinedError, BrokerManualInterventionError):
+            completed = True
+            raise
+        finally:
+            self._fill_evidence_release_depth -= 1
+            if outermost:
+                self._end_fill_evidence_settlement(completed)
+
+    def _route_event_with_receipts(self, event: OrderEvent) -> None:
+        """Route one drained event, keeping the durable fill receipts.
+
+        A fee event goes to :meth:`_route_fee_event`. Every other event is
+        routed by :meth:`_route_order_event`; for a fill that event would
+        apply (a ``fill_id``, a positive quantity and price) the receipts
+        (:class:`~pynecore.core.broker.storage.FillReceipt`) are kept around
+        it:
+
+        - A fill whose receipt says the run took it already, in this process
+          or an earlier one, is dropped by the duplicate gate.
+        - A fill delivered with
+          :attr:`~OrderEvent.journaled_before_restart`
+          and no receipt is in the position this process started with: it is
+          given its receipt and routed no further; only the fee of an entry
+          fill is booked, onto the entry's adopted open trades
+          (:meth:`_book_restart_held_fill_fee`).
+        - Any other fill is routed, with its fee less the commission a fee
+          event already accounted for it, and gets its receipt once its
+          routing ends, the receipt waiting for the venue's verdict when the
+          routing held the fill (:attr:`~OrderSyncEngine._deferred_fill_receipts`). The receipt
+          is written with the next book write (:meth:`_persist_entry_book`).
+
+        The store read of a receipt happens before anything changes, so a
+        failing read leaves the fill for the next drain
+        (:meth:`_keep_unbooked_fill_for_retry`).
+
+        :param event: The event to route.
+        """
+        if event.event_type == FEE_EVENT_TYPE:
+            self._route_fee_event(event)
+            return
+        event = self._with_slice_fill_id(event)
+        fill_id = event.fill_id
+        if (event.event_type not in ('filled', 'partial') or not fill_id
+                or not (event.fill_qty or 0.0) > 0.0 or not (event.fill_price or 0.0) > 0.0
+                or fill_id in self._seen_fill_ids):
+            if not fill_id and event.event_type in ('filled', 'partial'):
+                self._record_resting_entry_netting(event, None)
+            self._route_order_event(event)
+            return
+        receipt = self._fill_receipt(fill_id)
+        if receipt is not None and receipt.booked:
+            _blog_debug(
+                "%s of order %s (fill_id=%s) already taken by the run (its receipt "
+                "is stored) — dropped as a duplicate",
+                event.event_type, event.order.id, fill_id,
+            )
+            self._seen_fill_ids.add(fill_id)
+            self._route_order_event(event)
+            return
+        journal_qty = event.journal_fill_qty
+        fee_total = _fill_fee_total(event, receipt)
+        taken = FillReceipt(
+            fill_id=fill_id, booked=True, fee=fee_total,
+            client_order_id=event.order.client_order_id, order_id=event.order.id or None,
+            entry_id=event.pine_id if event.leg_type is LegType.ENTRY else None,
+            qty=float(event.fill_qty if journal_qty is None else journal_qty),
+        )
+        # Reads and the netting record's write come first: a store failure
+        # leaves the fill for the next drain with nothing changed.
+        netting = self._netting_share(event)
+        self._record_resting_entry_netting(event, fill_id)
+        if event.journaled_before_restart:
+            self._seen_fill_ids.add(fill_id)
+            if netting:
+                # The position this process started with holds the netting
+                # close as well: it is counted, never booked.
+                self._note_netting_absorption(fill_id, event, netting)
+            fee_booked = self._book_restart_held_fill_fee(event, receipt)
+            self._pending_fill_receipts[fill_id] = taken
+            _blog_info(
+                "%s of order %s (fill_id=%s, pine=%r) was journaled before the restart: "
+                "the position this process started with holds it — receipt recorded, "
+                "%s",
+                event.event_type, event.order.id, fill_id, event.pine_id,
+                "its fee booked onto the entry's open trades" if fee_booked
+                else "nothing booked",
+            )
+            return
+        routed = event
+        if receipt is not None and receipt.fee:
+            # A fee event booked part of the fee already: only the rest is new.
+            routed = dataclasses.replace(event, fee=fee_total - receipt.fee)
+        if netting:
+            self._take_netting_fill(routed, netting, taken)
+            return
+        try:
+            self._route_order_event(routed)
+        finally:
+            if fill_id in self._deferred_fill_receipts:
+                self._deferred_fill_receipts[fill_id] = taken
+            else:
+                self._pending_fill_receipts[fill_id] = taken
+
+    def _with_slice_fill_id(self, event: OrderEvent) -> OrderEvent:
+        """The event with the slice id of a fill that carries no ``fill_id``.
+
+        See :meth:`~OrderSyncEngine._slice_fill_id`. Applied by
+        :meth:`~OrderSyncEngine._drain_events` before the fill's book mark is
+        taken, so the routing, the receipts and the retry after a storage
+        error (:meth:`~OrderSyncEngine._keep_unbooked_fill_for_retry`) all see
+        one id; :meth:`~OrderSyncEngine._route_event` applies it too (a no-op
+        then).
+
+        :param event: The drained event.
+        :return: ``event`` itself, or a copy carrying the slice id.
+        """
+        if event.fill_id or event.event_type == FEE_EVENT_TYPE:
+            return event
+        derived = self._slice_fill_id(event)
+        return event if derived is None else dataclasses.replace(event, fill_id=derived)
+
+    def _slice_fill_id(self, event: OrderEvent) -> str | None:
+        """A durable id for a fill slice on a hedging account that carries no ``fill_id``.
+
+        A plugin that keeps single delivery through its persisted fill cursor
+        may report a fill without an execution id. On a position port the
+        fill-time netting and its close fills are keyed by the fill's id
+        (:meth:`_record_resting_entry_netting`, :meth:`_netting_share`), so
+        such a fill gets one from what identifies its slice: the leg type, the
+        side, the order (its client order id, else its venue id) and the
+        order's cumulative executed quantity after the slice
+        (:attr:`~pynecore.core.broker.models.ExchangeOrder.filled_qty`, which
+        grows with every slice). The same slice delivered again, also as
+        journaled before a restart, carries the same id, so it finds the
+        receipt and the netting record its first delivery wrote. A fill
+        without an order reference gets no id.
+
+        :param event: The fill, without a ``fill_id``.
+        :return: The slice id, or ``None`` when none applies.
+        """
+        if (getattr(self._broker, 'position_port', None) is None
+                or event.event_type not in ('filled', 'partial')
+                or event.leg_type not in (LegType.ENTRY, LegType.CLOSE)
+                or not (event.fill_qty or 0.0) > 0.0
+                or not (event.order.filled_qty or 0.0) > 0.0):
+            return None
+        ref = event.order.client_order_id or event.order.id
+        leg_type = event.leg_type
+        if not ref or leg_type is None:
+            return None
+        return (f"slice:{leg_type.value}:{event.order.side}:{ref}"
+                f"@{round(float(event.order.filled_qty), 12)!r}")
+
+    def _record_resting_entry_netting(self, event: OrderEvent, fill_id: str | None) -> None:
+        """Write the netting record of a resting entry fill that a hedging account holds apart.
+
+        On a hedging account (a position port) a resting LIMIT / STOP entry
+        rests as a leg of its own (:meth:`OneWayEmulator.run_reversal`). The
+        book takes its fill the way a one-way account's position takes it:
+        against an opposite position the fill closes it first, and only the
+        rest opens the entry's side. The venue instead holds the old legs and
+        the new one side by side. So before the fill is booked the netting
+        record of the slice is written (:meth:`OneWayEmulator.record_netting`,
+        keyed by the fill id), and the per-sync netting pass
+        (:meth:`OneWayEmulator.drain_nettings`) closes the opposing legs and
+        the new leg by the quantity the fill closed in the book.
+
+        A fill the position this process started with holds already
+        (:attr:`~OrderEvent.journaled_before_restart`) moves no book: its
+        record (if the earlier process did not write it) nets whatever the
+        venue still holds on both sides, up to the fill.
+
+        A fill that needs a record but has no id for it (no ``fill_id`` and
+        no slice id, :meth:`_slice_fill_id`) cannot be netted: the venue would
+        keep both sides open while the book holds the net. That is never left
+        silent: the run is quarantined (:attr:`QuarantineKind.ENTRY_BLOCK`)
+        with a warning, and the operator nets the sides.
+
+        :param event: The fill, before it is booked.
+        :param fill_id: The fill's id, ``None`` when it has none.
+        :raises sqlite3.Error: When the record or the quarantine cannot be
+            written; nothing was written then.
+        """
+        if (getattr(self._broker, 'position_port', None) is None
+                or event.leg_type is not LegType.ENTRY):
+            return
+        fill_qty = event.fill_qty or 0.0
+        key = self._find_key_for_order_id(event.order.id) if event.order.id else None
+        intent = self._active_intents.get(key) if key is not None else None
+        resting = (intent.order_type is not OrderType.MARKET
+                   if isinstance(intent, EntryIntent)
+                   else event.order.order_type is not OrderType.MARKET)
+        if not resting or fill_qty <= 0.0:
+            return
+        if event.journaled_before_restart:
+            qty = fill_qty
+        else:
+            size = self._position.size
+            signed = fill_qty if event.order.side == 'buy' else -fill_qty
+            if size * signed >= 0.0:
+                return
+            qty = min(fill_qty, abs(size))
+        if fill_id is None:
+            _blog_warning(
+                "resting entry %r filled %s %s against the opposite position on a "
+                "hedging account, and the fill carries no id to net it by: the venue "
+                "keeps both sides open (%s to net); net them on the venue",
+                event.pine_id, event.order.side, fill_qty, qty,
+            )
+            self.record_quarantine(
+                "netting_fill_without_id", kind=QuarantineKind.ENTRY_BLOCK,
+                intent_key=key)
+            return
+        coid = self._one_way_emulator.record_netting(
+            entry_coid=event.order.client_order_id or event.order.id or (event.pine_id or ''),
+            fill_key=fill_id, symbol=self._symbol, side=event.order.side, qty=qty,
+            intent_key=key, entry_id=event.pine_id, fill_grace_s=self._fill_report_grace_s(),
+        )
+        if coid is not None:
+            _blog_info(
+                "resting entry %r filled %s %s against the opposite position on a "
+                "hedging account: netting %s of the two sides is owed (%s)",
+                event.pine_id, event.order.side, fill_qty, qty, coid,
+            )
+
+    def _netting_share(self, event: OrderEvent) -> dict[str, float]:
+        """How much of a close fill the netting records expect, by record.
+
+        A netting pass (:meth:`OneWayEmulator.drain_nettings`) closes the two
+        sides of a hedging account by the same quantity; the fills of those
+        closes move no Pine position. Which close a fill reports is decided by
+        its client order id first (:meth:`OneWayEmulator.netting_close_owner`):
+
+        - the id of one of a netting record's closes: the fill is that
+          record's, up to what the record still expects, however late it
+          comes (the record need not be live any more);
+        - the id of any other order the run sent (another close, or an
+          entry's own id, which a plugin reports for a close of the entry's
+          position it cannot attribute to a close of the run): the fill is no
+          netting fill and moves the book as an ordinary close;
+        - an id that names nothing the run sent: the fill is taken by its side,
+          oldest live record first, up to what each still expects less the
+          fills taken for it and not yet written. Where another close of the
+          run went out on that side while the record was live
+          (:meth:`OneWayEmulator.netting_contended_sides`), the fill cannot be
+          told from that close's: it is routed as an ordinary close, and the
+          run is quarantined (:attr:`QuarantineKind.ENTRY_BLOCK`) so the
+          operator checks the books against the venue.
+
+        :param event: The fill.
+        :return: Pine quantity per record coid; empty when nothing is expected.
+        :raises sqlite3.Error: When the store cannot be read or the quarantine
+            cannot be written.
+        """
+        if (event.leg_type is not LegType.CLOSE
+                or getattr(self._broker, 'position_port', None) is None):
+            return {}
+        side = event.order.side
+        left = event.fill_qty or 0.0
+        emulator = self._one_way_emulator
+        identified, owner = emulator.netting_close_owner(
+            event.order.client_order_id, run_tag=self._run_tag)
+        if identified:
+            if owner is None:
+                return {}
+            expectations = [(owner, emulator.netting_expectation_of(owner))]
+        else:
+            expectations = emulator.netting_expectations()
+        taken: dict[str, float] = {}
+        for coid, expected in expectations:
+            available = expected.get(side, 0.0) - sum(
+                parts.get(coid, {}).get(side, 0.0)
+                for parts in self._pending_netting_absorptions.values())
+            part = min(left, available)
+            if part <= 1e-12:
+                continue
+            taken[coid] = part
+            left -= part
+            if left <= 1e-12:
+                break
+        if not identified and taken:
+            contended = [coid for coid in taken
+                         if side in emulator.netting_contended_sides(coid)]
+            if contended:
+                _blog_warning(
+                    "close fill %s (%s %s, coid=%r) names no close the run sent, and "
+                    "both the netting %s and another close of the run closed on that "
+                    "side: it is booked as an ordinary close; check the books against "
+                    "the venue",
+                    event.fill_id, side, event.fill_qty, event.order.client_order_id,
+                    contended,
+                )
+                self.record_quarantine(
+                    "netting_close_fill_unidentified", kind=QuarantineKind.ENTRY_BLOCK)
+                return {}
+        return taken
+
+    def _note_netting_absorption(self, fill_id: str, event: OrderEvent,
+                                 netting: dict[str, float]) -> None:
+        """Hold the count of a netting close fill until its receipt is written.
+
+        On a run without a store there is no receipt: the count is written to
+        the emulator's journal at once.
+        """
+        side = event.order.side
+        parts = {coid: {side: qty} for coid, qty in netting.items()}
+        if self._store_ctx is None:
+            self._one_way_emulator.absorb_netting_fills(parts)
+            return
+        self._pending_netting_absorptions[fill_id] = parts
+
+    def _take_netting_fill(self, event: OrderEvent, netting: dict[str, float],
+                           taken: FillReceipt) -> None:
+        """Take a close fill a fill-time netting expects (:meth:`_netting_share`).
+
+        The netted part moves no position and opens or closes no trade: the
+        book took the entry fill it nets as closing the opposite position
+        already. Its fee is a commission of that closed trade
+        (:meth:`BrokerPosition.book_fill_fee`), and its journal quantity is
+        taken in by the fill cursor of its order. A part beyond the netted
+        quantity (a whole-leg close wider than the netting) is routed as an
+        ordinary close fill.
+
+        :param event: The fill, its fee less what a fee event already booked.
+        :param netting: The netted quantity per record coid.
+        :param taken: The fill's receipt.
+        """
+        fill_id = event.fill_id or ''
+        fill_qty = event.fill_qty or 0.0
+        netted = min(fill_qty, sum(netting.values()))
+        share = netted / fill_qty if fill_qty > 0.0 else 1.0
+        journal_qty = event.journal_fill_qty
+        netted_fee = event.fee * share
+        try:
+            if fill_qty - netted > 1e-12 * max(1.0, fill_qty):
+                # The routing marks the fill id seen (:meth:`_is_duplicate_fill`).
+                self._route_order_event(dataclasses.replace(
+                    event, fill_qty=fill_qty - netted, fee=event.fee - netted_fee,
+                    journal_fill_qty=(None if journal_qty is None
+                                      else journal_qty * (1.0 - share)),
+                ))
+            else:
+                self._seen_fill_ids.add(fill_id)
+            self._position.take_in_fill(dataclasses.replace(
+                event, journal_fill_qty=None if journal_qty is None else journal_qty * share))
+            if netted_fee and math.isfinite(netted_fee):
+                self._position.book_fill_fee(fill_id, netted_fee, entry_id=None, opening=False)
+            self._last_position_fill_monotonic = time.monotonic()
+            self._note_netting_absorption(fill_id, event, netting)
+            _blog_info(
+                "close fill %s (%s %s) nets the two sides of a filled resting entry "
+                "(%s of it): no position move, its fee %s goes to the closed trade",
+                fill_id, event.order.side, fill_qty, netted, netted_fee,
+            )
+        finally:
+            if fill_id in self._deferred_fill_receipts:
+                self._deferred_fill_receipts[fill_id] = taken
+            else:
+                self._pending_fill_receipts[fill_id] = taken
+
+    def _book_restart_held_fill_fee(self, event: OrderEvent,
+                                    receipt: FillReceipt | None) -> bool:
+        """Book the fee of an entry fill an earlier process journaled onto its adopted trades.
+
+        The position this process started with holds the fill
+        (:attr:`~OrderEvent.journaled_before_restart`), and the trades the
+        startup adopted for it carry the commission of the receipted entry
+        fills only (:meth:`_adopted_entry_commissions`): a fill delivered so
+        has no booked receipt, its fee is not in them. The fill's fee, less
+        what a fee event of it already accounted (its receipt's
+        :attr:`~FillReceipt.fee`), goes to the open trades of its entry by
+        size, the way the fee channel books a fee of a fill this process did
+        not book (:meth:`BrokerPosition.book_fill_fee`).
+
+        Nothing is booked for an exit-leg fill (its commission belonged to the
+        trade it closed, which the earlier process held and the restart does
+        not recover) or when the entry has no open trade: the closed trade the
+        fill belongs to is not recoverable either. The caller's receipt
+        records the fee as accounted in every case, so a redelivery books
+        nothing.
+
+        :param event: The fill, flagged ``journaled_before_restart``.
+        :param receipt: The fill's receipt before this delivery, if any.
+        :return: Whether a fee was booked.
+        """
+        if event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                              LegType.TRAILING_STOP, LegType.CLOSE):
+            return False
+        fee_total = _fill_fee_total(event, receipt)
+        amount = fee_total - (receipt.fee if receipt is not None else 0.0)
+        if not math.isfinite(amount) or abs(amount) <= 1e-12 * max(1.0, abs(fee_total)):
+            return False
+        if not any(trade.entry_id == event.pine_id for trade in self._position.open_trades):
+            _blog_warning(
+                "fee %s of fill %s (pine=%r), journaled before the restart, not booked: "
+                "the entry holds no open trade, and the trade the fill belonged to is "
+                "not recoverable", event.fee, event.fill_id, event.pine_id,
+            )
+            return False
+        return self._position.book_fill_fee(
+            event.fill_id or '', amount, entry_id=event.pine_id, opening=True)
+
+    def _fill_receipt(self, fill_id: str) -> FillReceipt | None:
+        """The receipt of a fill: the one this process holds back, else the stored one.
+
+        :param fill_id: The fill's id.
+        :return: ``None`` when the run never took the fill nor a fee of it.
+        :raises sqlite3.Error: When the store cannot be read.
+        """
+        receipt = self._pending_fill_receipts.get(fill_id)
+        if receipt is None:
+            receipt = self._deferred_fill_receipts.get(fill_id)
+        if receipt is None and self._store_ctx is not None:
+            receipt = self._store_ctx.fill_receipt(fill_id)
+        return receipt
+
+    def _route_fee_event(self, event: OrderEvent) -> None:
+        """Book a fee that arrived without its fill (an ``event_type`` ``'fee'`` event).
+
+        The event's ``fee`` is the fill's total commission; what the run has
+        accounted the fill id with (its receipt's
+        :attr:`~FillReceipt.fee`, ``0`` without
+        one) is subtracted, and the rest is booked onto the fill's trades
+        (:meth:`BrokerPosition.book_fill_fee`), so a repeated report books
+        nothing. The receipt then carries the new total, written with the next
+        book write; it is ``booked`` only if the fill was. No trade is
+        created and the position does not move.
+
+        Not booked, with a warning: an event without ``fill_id`` (nothing
+        makes it idempotent), a non-finite fee, a fee of a fill held for the
+        venue's verdict (its booking carries the fill's own fee), and a fee
+        no trade can take.
+
+        :param event: The fee event.
+        :raises sqlite3.Error: When the receipt cannot be read; nothing was
+            booked then.
+        """
+        fill_id = event.fill_id
+        if not fill_id or not math.isfinite(event.fee):
+            _blog_warning(
+                "fee event of order %s (pine=%r) carries no fill id or no finite fee "
+                "(%s) — not booked", event.order.id, event.pine_id, event.fee,
+            )
+            return
+        if fill_id in self._deferred_fill_receipts:
+            _blog_warning(
+                "fee %s of fill %s not booked: the fill waits for the venue's verdict, "
+                "and its booking carries the fill's own fee", event.fee, fill_id,
+            )
+            return
+        receipt = self._fill_receipt(fill_id)
+        accounted = receipt.fee if receipt is not None else 0.0
+        amount = event.fee - accounted
+        if abs(amount) <= 1e-12 * max(1.0, abs(event.fee)):
+            _blog_debug("fee %s of fill %s already accounted", event.fee, fill_id)
+            return
+        exit_leg = event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                                      LegType.TRAILING_STOP, LegType.CLOSE)
+        entry_id = (event.from_entry or event.pine_id) if exit_leg else event.pine_id
+        if not self._position.book_fill_fee(fill_id, amount, entry_id=entry_id,
+                                            opening=not exit_leg):
+            _blog_warning(
+                "fee %s of fill %s (pine=%r) not booked: no trade of %r can take it",
+                event.fee, fill_id, event.pine_id, entry_id,
+            )
+            return
+        self._pending_fill_receipts[fill_id] = FillReceipt(
+            fill_id=fill_id, booked=receipt is not None and receipt.booked, fee=event.fee,
+            client_order_id=(event.order.client_order_id
+                             or (receipt.client_order_id if receipt is not None else None)),
+            order_id=(event.order.id
+                      or (receipt.order_id if receipt is not None else None)) or None,
+            entry_id=(receipt.entry_id if receipt is not None and receipt.entry_id
+                      else (event.pine_id if event.leg_type is LegType.ENTRY else None)),
+            qty=receipt.qty if receipt is not None else 0.0,
+        )
+        _blog_info(
+            "fee of fill %s (pine=%r) booked: %s more, %s in all",
+            fill_id, event.pine_id, amount, event.fee,
+        )
+
+    def _route_order_event(self, event: OrderEvent) -> None:
         # Generic ``event %s`` arrival logging happens in
         # :meth:`run_event_stream` so the timestamp + ``bar_index`` reflect
         # when the broker observed the transition, not when this drain
@@ -9453,23 +10777,29 @@ class OrderSyncEngine:
             # ultimately fills the residual against an unprotected
             # position.
             _ct_key = self._find_key_for_order_id(event.order.id)
+            # The order's cumulative executed quantity on the fill is a lower
+            # bound of what it executed: the hold waits until the book holds it.
+            self._settle_fill_evidence(
+                _ct_key, executed=((event.order.id, event.order.filled_qty)
+                                   if event.order.filled_qty > 0.0 else None))
             if (_ct_key is not None
                     and _ct_key in self._cancel_disposition_pending):
                 _blog_info(
                     "cancel-tentative %r resolved by broker %s event",
                     _ct_key, t,
                 )
+                # A held order is terminal at the venue: no remainder works
+                # there to cancel, and the dead order is never adopted.
+                ended = _ct_key in self._settled_fill_evidence
                 self._clear_intent_cancel_disposition_pending(
                     _ct_key,
                     outcome=CancelDispositionOutcome.ALREADY_FILLED,
                     via='order_event',
                     now_ms=self._cancel_tentative_now_ms(),
                     is_partial_fill=(t == 'partial'),
+                    remainder_dead=(t == 'partial' and ended),
+                    cancel_remainder=(t == 'partial' and not ended),
                 )
-                if t == 'partial':
-                    self._cancel_residual_after_partial_resolution(
-                        _ct_key,
-                    )
             # Reset the per-event spent-binding cache. Populated below only
             # when :meth:`BrokerPosition.record_fill` actually books this
             # event; consumed by
@@ -10469,6 +11799,8 @@ class OrderSyncEngine:
             ):
                 return
             key = self._find_key_for_order_id(event.order.id)
+            if self._defer_entry_terminal_without_fill_evidence(event, key):
+                return
             if event.order.id in self._native_cancel_all_expected_ids:
                 # A native bulk cancel (``execute_cancel_all``) removed this
                 # order; the marker armed its id in
@@ -10478,25 +11810,19 @@ class OrderSyncEngine:
                 # quarantine path below.
                 self._handle_expected_native_cancel_all(event, key)
                 return
-            if (key is not None
-                    and key in self._cancel_disposition_pending):
-                # Event-driven cancel-tentative confirm: the broker pushed
-                # a CANCELLED for a parent currently in cancel-tentative.
-                # Resolve forward (legs → aborted_parent_never_arrived,
-                # mapping / envelope / active_intents dropped) without
-                # running the eager-retire path below — the confirm helper
-                # owns the full cleanup. Idempotent against a follow-up
-                # ``reconcile()`` retry that may also see the outcome.
+            if key is not None and self._forced_cancel_parked_entry(key):
+                # The engine's own cancel of an entry the strategy dropped: not
+                # an external cancel, so no ``on_unexpected_cancel`` policy.
+                # The mapping stays for a fill of the order still to be booked;
+                # the forced-cancel retry after this drain tears the entry
+                # down once no execution of it is queued or awaiting booking
+                # (:meth:`_retry_forced_cancels`).
                 _blog_info(
-                    "cancel-tentative %r resolved by broker cancelled event",
-                    format_intent_key(key),
+                    "parked cancel of entry %s confirmed by the venue (%s); the "
+                    "forced-cancel retry retires it", format_intent_key(key), event,
                 )
-                self._clear_intent_cancel_disposition_pending(
-                    key,
-                    outcome=CancelDispositionOutcome.CANCEL_CONFIRMED,
-                    via='order_event',
-                    now_ms=self._cancel_tentative_now_ms(),
-                )
+                return
+            if self._resolve_cancel_tentative_by_terminal(event, key):
                 return
             if (key is not None
                     and event.order.id in self._modify_parked_cancel_ids):
@@ -10688,11 +12014,11 @@ class OrderSyncEngine:
                 # so deriving the id from the event would pass ``''`` and leave a
                 # DEGRADING / DEGRADED state parked under the COID. Idempotent —
                 # no-op when no state is registered (the never-filled cancel case).
-                if (isinstance(self._active_intents.get(key), EntryIntent)
+                if (self._is_entry_key(key)
                         and event.order.filled_qty <= 0.0):
                     self._retire_native_failsafe_for_entry(key)
                 self._abort_pending_partial_legs_for_dead_entry(
-                    key, reason='parent_cancelled',
+                    key, reason='parent_cancelled', filled_qty=event.order.filled_qty,
                 )
                 self._stop_limit_engine.mark_aborted(
                     key, reason='parent_cancelled',
@@ -10750,6 +12076,19 @@ class OrderSyncEngine:
             ):
                 return
             key = self._find_key_for_order_id(event.order.id)
+            if self._defer_entry_terminal_without_fill_evidence(event, key):
+                return
+            if self._resolve_cancel_tentative_by_terminal(event, key):
+                return
+            active_entry = self._active_intents.get(key) if key is not None else None
+            if (key is not None and isinstance(active_entry, EntryIntent)
+                    and event.order.filled_qty > 0.0):
+                # The venue ended a partly executed entry: it is consumed at
+                # the executed quantity like a venue cancel of its remainder,
+                # so the diff neither re-places it nor sends it afresh while
+                # that execution is still to be booked.
+                self._retire_venue_cancelled_entry(event, key, active_entry)
+                return
             if key is not None:
                 _blog_warning(
                     "order rejected for intent %s (%s)",
@@ -10770,11 +12109,11 @@ class OrderSyncEngine:
                 # and is used directly so a broker-synthesized status event
                 # lacking ``pine_id`` / ``from_entry`` does not pass ``''`` and
                 # strand a parked state under the COID. Idempotent.
-                if (isinstance(self._active_intents.get(key), EntryIntent)
+                if (self._is_entry_key(key)
                         and event.order.filled_qty <= 0.0):
                     self._retire_native_failsafe_for_entry(key)
                 self._abort_pending_partial_legs_for_dead_entry(
-                    key, reason='parent_rejected',
+                    key, reason='parent_rejected', filled_qty=event.order.filled_qty,
                 )
                 self._stop_limit_engine.mark_aborted(
                     key, reason='parent_rejected',
@@ -10786,6 +12125,1131 @@ class OrderSyncEngine:
                 _blog_warning(
                     "order rejected (%s)", event,
                 )
+
+    def _resolve_cancel_tentative_by_terminal(self, event: OrderEvent, key: str | None) -> bool:
+        """Resolve a cancel-tentative parent whose order the venue ended.
+
+        Shared by the ``cancelled`` and the ``rejected`` branch of
+        :meth:`_route_order_event`, after the execution evidence was judged
+        (:meth:`_defer_entry_terminal_without_fill_evidence`): either
+        terminal ends the order at the venue, so the tentative cancel has its
+        answer. A parent left tentative would reach the stale-grace halt of
+        :meth:`_drive_cancel_tentative` over an order that already ended (the
+        proven-zero ``rejected`` event an operator's ``--entry-not-executed``
+        stands for, :func:`_operator_not_executed_event`, is one).
+
+        A positive ``filled_qty`` means the order executed that much before it
+        ended, so its legs protect a live position, whichever of the
+        execution and the terminal event the venue delivers first. It is
+        resolved as filled, never as a confirmed cancel (that would end the
+        legs as ``parent_never_arrived`` and the execution arriving after this
+        push could not arm them). The legs go back to ``pending_entry`` and
+        the execution arms them against its price
+        (:meth:`_promote_pending_partial_bracket_legs`); one already booked
+        keeps its armed legs. Nothing rests at the venue any more, so the
+        resolution drops the residual mapping (``remainder_dead``, kept with
+        the verdict a storage failure leaves for the retry) like after a
+        residual cancel (:meth:`_cancel_residual_after_partial_resolution`);
+        the envelope stays for the open position.
+
+        A positive ``filled_qty`` the book does not hold yet put the entry in
+        ``AWAITING_EXECUTION`` before this resolution
+        (:meth:`_await_reported_execution`), so no diff sends it again before
+        that execution is booked.
+
+        Otherwise the cancel is confirmed: the parent's native fail-safe state
+        is retired (:meth:`_retire_native_failsafe_for_entry`), the legs end
+        as ``aborted_parent_never_arrived`` and the mapping, envelope and
+        active intent are dropped by the confirm helper, which owns the full
+        cleanup (idempotent against a later ``reconcile()`` retry seeing the
+        outcome).
+
+        :param event: The ``cancelled`` / ``rejected`` event.
+        :param key: The intent key its order maps to, if any.
+        :return: Whether ``key`` was a cancel-tentative parent (the caller
+            applies nothing more).
+        """
+        if key is None or key not in self._cancel_disposition_pending:
+            return False
+        if event.order.filled_qty > 0.0:
+            _blog_info(
+                "cancel-tentative %r resolved by broker %s event after %s of %s "
+                "executed: resolved as filled",
+                format_intent_key(key), event.event_type, event.order.filled_qty,
+                event.order.qty,
+            )
+            self._clear_intent_cancel_disposition_pending(
+                key,
+                outcome=CancelDispositionOutcome.ALREADY_FILLED,
+                via='order_event',
+                now_ms=self._cancel_tentative_now_ms(),
+                is_partial_fill=event.order.filled_qty < event.order.qty - 1e-9,
+                remainder_dead=True,
+            )
+            return True
+        _blog_info(
+            "cancel-tentative %r resolved by broker %s event",
+            format_intent_key(key), event.event_type,
+        )
+        # The order is proven unexecuted: retire the parent's native fail-safe
+        # state, as for an entry that was not tentative, before the confirm
+        # helper evicts the legs and the envelope its ref resolves from.
+        self._retire_native_failsafe_for_entry(key)
+        self._clear_intent_cancel_disposition_pending(
+            key,
+            outcome=CancelDispositionOutcome.CANCEL_CONFIRMED,
+            via='order_event',
+            now_ms=self._cancel_tentative_now_ms(),
+        )
+        return True
+
+    def _defer_entry_terminal_without_fill_evidence(
+            self, event: OrderEvent, key: str | None,
+    ) -> bool:
+        """Leave an entry's terminal event without execution evidence unapplied.
+
+        A ``cancelled`` / ``rejected`` event of a mapped entry (or of a
+        cancel-tentative parent) whose order shows nothing executed proves the
+        entry dead only when the venue reported the executed quantity
+        (:attr:`ExchangeOrder.proven_unexecuted`). With
+        :attr:`ExchangeOrder.filled_qty_known` ``False`` the order may have
+        executed: aborting its legs as ``parent_never_arrived``, retiring its
+        native fail-safe, confirming the tentative cancel or re-placing the
+        entry would leave an execution reported afterwards without protection,
+        or double it. Nothing changes instead: the order stays mapped, its
+        legs pending, a cancel-tentative parent tentative (its cancel-retry
+        probe, :meth:`_drive_cancel_tentative`, still resolves it), and the
+        plugin's later terminal event with the venue's quantity is applied as
+        usual. A positive ``filled_qty`` proves an execution either way and is
+        not deferred.
+
+        The entry is held in
+        :attr:`~OrderSyncEngine._entries_awaiting_fill_evidence` (persisted,
+        :meth:`_persist_fill_evidence_hold`) until execution evidence arrives:
+
+        - a fill or partial fill of the order, or a terminal event with the
+          venue's quantity (the plugin's own, or the one the
+          :class:`~pynecore.core.broker.disappearance.DisappearanceTracker`
+          synthesizes from its confirmation of the missing order)
+          (:meth:`_settle_fill_evidence`);
+        - a definitive cancel-tentative outcome of a tentative parent
+          (:meth:`_clear_intent_cancel_disposition_pending`);
+        - the retirement of the entry's envelope by any other evidence path.
+
+        Meanwhile no strategy cancel, replacement, OCA cascade or other
+        teardown retires what this deferral kept
+        (:meth:`_hold_entry_awaiting_fill_evidence`). A restart re-arms the
+        hold (:meth:`_restore_fill_evidence_holds`). A hold that outlives the
+        fill-report grace quarantines the bot with one warning naming the
+        entry and its resolution (:meth:`_expire_fill_evidence_holds`).
+
+        :param event: The ``cancelled`` / ``rejected`` event.
+        :param key: The intent key its order maps to, if any.
+        :return: Whether the event was deferred (the caller applies nothing).
+        """
+        order = event.order
+        if (key is not None and order.filled_qty > 0.0
+                and (key in self._entries_awaiting_fill_evidence
+                     or self._entry_execution_awaiting_booking(key))
+                and not isinstance(self._active_intents.get(key), EntryIntent)
+                and not self._forced_cancel_parked_entry(key)):
+            self._park_positive_evidence_until_intent(event, key)
+            return True
+        if key is None or order.filled_qty_known or order.filled_qty > 0.0:
+            executed = (order.id, order.filled_qty) if order.filled_qty > 0.0 else None
+            if executed is not None:
+                self._await_reported_execution(key, executed)
+            self._settle_fill_evidence(key, executed=executed)
+            return False
+        if (key not in self._cancel_disposition_pending
+                and key not in self._entries_awaiting_fill_evidence
+                and not isinstance(self._active_intents.get(key), EntryIntent)
+                and not self._forced_cancel_parked_entry(key)):
+            return False
+        if key not in self._entries_awaiting_fill_evidence:
+            order_ids = list(self._order_mapping.get(key, ())) or [order.id]
+            hold = _FillEvidenceHold(
+                order_ids=order_ids,
+                since_ms=int(time.time() * 1000),
+                booked_qty=self._position.fill_cursor(order_ids),
+            )
+            self._entries_awaiting_fill_evidence[key] = hold
+            self._fill_evidence_entry_keys.add(key)
+            self._refresh_fill_evidence_order_ids()
+            self._persist_fill_evidence_hold(key, hold)
+        _blog_warning(
+            "%s event for entry %s carries no venue-reported executed quantity (%s): "
+            "nothing is retired until the venue's quantity arrives — the order stays "
+            "tracked and its protection pending",
+            event.event_type, format_intent_key(key), event,
+        )
+        if self._store_ctx is not None:
+            self._log_store_event(
+                'terminal_without_fill_evidence',
+                client_order_id=order.client_order_id,
+                intent_key=key,
+                payload={'event_type': event.event_type, 'order_id': order.id,
+                         'cancel_reason': event.cancel_reason},
+            )
+        return True
+
+    def _await_reported_execution(self, key: str | None, executed: tuple[str, float]) -> None:
+        """Hold an entry whose terminal event reports an execution ahead of its fills.
+
+        The venue ended the entry's order (or a cancel-tentative parent's)
+        reporting ``executed``, more of the order than the book holds, and no
+        hold waits on the entry. The terminal event's handling retires the
+        order (it consumes the entry, or resolves the tentative cancel as
+        filled and drops the active intent), while the fill that books the
+        execution is still to come: a diff in between would send the entry
+        again next to that execution. So the entry enters ``SETTLING`` with a
+        fresh hold naming the reported quantity, which its release moves to
+        ``AWAITING_EXECUTION`` until the book holds it
+        (:meth:`_release_settled_fill_evidence`), with every guard and the
+        expiry of that state. The hold is stored here, ahead of every write
+        of the event's handling, so a restart at any point of that handling
+        re-arms it.
+
+        :param key: The intent key the event's order maps to, if any.
+        :param executed: The order's venue id and the executed quantity the
+            terminal event reported.
+        """
+        if (key is None or key in self._entries_awaiting_fill_evidence
+                or key in self._settled_fill_evidence):
+            return
+        if not (isinstance(self._active_intents.get(key), EntryIntent)
+                or key in self._cancel_disposition_pending):
+            return
+        order_id, qty = executed
+        booked = self._position.fill_cursor([order_id])
+        if booked >= qty - 1e-12:
+            return
+        order_ids = list(self._order_mapping.get(key, ())) or [order_id]
+        if order_id not in order_ids:
+            order_ids.append(order_id)
+        self._fill_evidence_entry_keys.add(key)
+        hold = _FillEvidenceHold(
+            order_ids=order_ids,
+            since_ms=int(time.time() * 1000),
+            booked_qty=self._position.fill_cursor(order_ids),
+            awaiting_execution=executed,
+        )
+        self._settled_fill_evidence[key] = hold
+        self._refresh_fill_evidence_order_ids()
+        # Stored before the terminal event's handling retires the order or
+        # the tentative cancel: a process dying in between restarts with the
+        # barrier, never with neither.
+        self._persist_fill_evidence_hold(key, hold)
+
+    def _settle_fill_evidence(
+            self, key: str | None, *, executed: tuple[str, float] | None = None,
+    ) -> None:
+        """End the hold of an entry whose execution evidence arrived.
+
+        Called for a fill of the entry's order and for a terminal event with
+        the venue's quantity, before that event is applied; the event's own
+        handling decides what the entry becomes. The hold leaves memory here
+        and the store only once that handling completed
+        (:meth:`_release_settled_fill_evidence`): the stored hold and its
+        arrival record are what a restart replays, so they must outlive every
+        consequence the event writes.
+
+        A terminal event reporting a positive executed quantity consumes the
+        entry, but the execution itself is booked only by its fill event. The
+        stored hold and arrival stay until that fill is booked
+        (``executed``): a restart in between re-arms the hold, so the script's
+        re-issued entry adopts the order instead of being sent again next to
+        the executed quantity the journal does not hold yet.
+
+        :param key: The intent key the event's order maps to, if any.
+        :param executed: The order's venue id and the executed quantity the
+            terminal event reported, ``None`` for a fill or a reported zero.
+        """
+        if key is None:
+            return
+        hold = self._entries_awaiting_fill_evidence.get(key)
+        if hold is not None:
+            if executed is not None:
+                # Whichever order of the hold the event belongs to, what it
+                # shows executed is a booking target of that order.
+                self._raise_fill_evidence_floor(hold, *executed)
+            if executed is not None and (hold.awaiting_execution is None
+                                         or hold.awaiting_execution[1] < executed[1]):
+                hold.awaiting_execution = executed
+            self._settled_fill_evidence[key] = hold
+            self._take_fill_evidence_hold(key)
+
+    def _park_positive_evidence_until_intent(self, event: OrderEvent, key: str) -> None:
+        """Keep a held entry's executed-quantity terminal event until its intent is back.
+
+        After a restart the hold re-arms the entry's mapping before the script
+        re-issues the entry (:meth:`_restore_fill_evidence_holds`). A terminal
+        event proving the order executed part of its quantity is applied
+        through the entry's active :class:`EntryIntent`, which consumes the
+        entry at its filled quantity; without that intent the generic teardown
+        would retire the mapping and the hold, and the startup adoption, which
+        takes only what the journal owns, would let the script send the entry
+        again next to the executed part. So the event waits, the hold and its
+        stored arrival stay, and :meth:`_route_positive_evidence_awaiting_intent`
+        routes it once the intent is active. A copy of the same order's event
+        replaces the waiting one. An entry the script never re-issues stays
+        held until its expiry quarantines the bot.
+
+        The same holds for an entry in ``AWAITING_EXECUTION`` without its
+        intent: a fill of the held order routed ahead of the event (both
+        received before the re-issue) settled the hold already.
+
+        :param event: The ``cancelled`` / ``rejected`` event with a positive
+            ``filled_qty``.
+        :param key: The held entry's intent key.
+        """
+        waiting = self._positive_evidence_awaiting_intent.setdefault(key, {})
+        first = event.order.id not in waiting
+        waiting[event.order.id] = event
+        hold = self._entries_awaiting_fill_evidence.get(key)
+        awaited_by: str | None = None
+        if hold is None:
+            awaited_by, (_key, hold) = next(
+                (order_id, waiting_hold)
+                for order_id, waiting_hold in self._fill_evidence_awaiting_execution.items()
+                if waiting_hold[0] == key)
+        reported = (event.order.id, event.order.filled_qty)
+        if hold.awaiting_execution is None or hold.awaiting_execution[1] < reported[1]:
+            # A fill settling the hold meanwhile leaves it awaiting the whole
+            # reported quantity, never released by the first slice.
+            hold.awaiting_execution = reported
+            if awaited_by is not None and awaited_by != reported[0]:
+                del self._fill_evidence_awaiting_execution[awaited_by]
+                self._fill_evidence_awaiting_execution[reported[0]] = (key, hold)
+            self._persist_fill_evidence_hold(key, hold)
+        if first:
+            _blog_warning(
+                "%s event for held entry %s reports %s executed (%s): it is applied once "
+                "the script issues the entry again; nothing is retired or sent on the key "
+                "until then",
+                event.event_type, format_intent_key(key), event.order.filled_qty, event,
+            )
+
+    def _route_positive_evidence_awaiting_intent(self) -> None:
+        """Queue the waiting executed-quantity events whose entry intent is active again.
+
+        Runs at the top of every drain (:meth:`_drain_events`). An event whose
+        hold ended meanwhile (the entry's envelope was retired) is dropped with
+        the key (:meth:`_drop_envelope`).
+        """
+        if not self._positive_evidence_awaiting_intent:
+            return
+        for key in list(self._positive_evidence_awaiting_intent):
+            if not isinstance(self._active_intents.get(key), EntryIntent):
+                continue
+            for event in self._positive_evidence_awaiting_intent.pop(key).values():
+                self._event_queue.put(event)
+
+    def _release_settled_fill_evidence(self) -> None:
+        """Release in the store the holds the routed event settled.
+
+        Runs after the event's routing returned, so the release queues behind
+        every write of its consequences (:meth:`_owe_store_write` keeps the
+        order).
+        """
+        while self._settled_fill_evidence:
+            key, hold = self._settled_fill_evidence.popitem()
+            # A terminal event queued behind the fill that settled the hold
+            # may report more executed than the book holds.
+            self._absorb_received_execution(hold)
+            if hold.awaiting_execution is not None:
+                # Every order of the hold that reported an execution must be
+                # booked to it, not only the one the hold names.
+                if not self._fill_evidence_booked(hold):
+                    self._fill_evidence_awaiting_execution[hold.awaiting_execution[0]] = (
+                        key, hold)
+                    # The stored hold names the reported quantity, so a
+                    # restart releases it only once the book took that in.
+                    self._persist_fill_evidence_hold(key, hold)
+                    continue
+            self._finish_fill_evidence_hold(key, hold)
+        self._refresh_fill_evidence_order_ids()
+
+    def _finish_fill_evidence_hold(self, key: str, hold: _FillEvidenceHold) -> None:
+        """End a hold whose evidence was applied: consume a booked entry, release the rows.
+
+        The hold's order is terminal at the venue. A fill of it that ended the
+        hold proves what executed, but no terminal event applied that to the
+        entry (its event came without the venue's quantity): the active
+        :class:`EntryIntent` still reads as a working order, so a strategy
+        cancel would cancel and tear down an order that already ended, and a
+        changed entry would amend it. The entry is consumed at the quantity
+        the book holds of the order instead, as the venue's cancel of a partly
+        executed entry consumes it (:meth:`_consume_entry_at_filled_qty`).
+        An entry retired by the evidence, or consumed by its terminal event
+        already, is left as it is.
+
+        An executed-quantity terminal event still waiting for the script's
+        re-issued entry (:meth:`_park_positive_evidence_until_intent`) is
+        spent with the hold: the book holds what it reported (the hold waited
+        for that quantity), and dropping the ended order's mapping below
+        keeps a later re-issue from adopting it as a working order.
+
+        :param key: The entry's intent key.
+        :param hold: The hold dropped from memory.
+        """
+        self._positive_evidence_awaiting_intent.pop(key, None)
+        active = self._active_intents.get(key)
+        booked = self._position.fill_cursor(hold.order_ids)
+        if booked > 0.0 and key in self._cancel_disposition_pending:
+            # A cancel-tentative parent whose execution the book took in
+            # without its fill being routed here (the startup adoption after a
+            # restart): the venue's answer to the tentative cancel is that the
+            # order executed and ended, as a routed fill would resolve it.
+            self._clear_intent_cancel_disposition_pending(
+                key, outcome=CancelDispositionOutcome.ALREADY_FILLED, via='fill',
+                now_ms=self._cancel_tentative_now_ms(), is_partial_fill=True,
+                remainder_dead=True,
+            )
+        if (active is None and booked > 0.0
+                and key not in self._forced_cancel_pending):
+            # A hold a restart re-armed before the script issued the entry
+            # again: the mapping it re-seeded names an order that ended and
+            # whose execution is booked. No re-issue may adopt it as a working
+            # order, and no sweep may cancel it; the book owns what it executed.
+            mapped = self._order_mapping.get(key)
+            if mapped is not None:
+                remaining = [order_id for order_id in mapped if order_id not in hold.order_ids]
+                if remaining:
+                    self._order_mapping[key] = remaining
+                else:
+                    del self._order_mapping[key]
+        if isinstance(active, EntryIntent) and not self._entry_orders_terminal(key):
+            if booked > 0.0:
+                self._stop_limit_engine.mark_aborted(key, reason='parent_cancelled')
+                self._consume_entry_at_filled_qty(key, active, booked)
+                _blog_warning(
+                    "entry %s: its order ended at the venue after %s of %s filled — the "
+                    "entry is consumed at the filled quantity, the remainder is not "
+                    "placed again", format_intent_key(key), booked, active.qty,
+                )
+        self._owe_fill_evidence_release(key, hold)
+
+    def _release_fill_evidence_awaiting_execution(self, event: OrderEvent) -> None:
+        """Release the stored hold whose reported execution a routed fill booked.
+
+        Runs after a fill event's routing (:meth:`_route_event`). The fill of
+        an order whose terminal event reported its executed quantity
+        (:attr:`~OrderSyncEngine._fill_evidence_awaiting_execution`) releases
+        the stored hold and arrival once the book took in that quantity of
+        the order (:meth:`~pynecore.core.broker.position.BrokerPosition.fill_cursor`),
+        not when the venue's cumulative quantity on the event reaches it: a
+        slice delivered out of order carries a cumulative quantity the book
+        has not taken in. The release is queued behind the book write of the
+        drain that routed the fill (:meth:`_end_fill_evidence_settlement`),
+        whether the fill was booked now, held as already journaled before
+        the restart or dropped as a duplicate of a booked one. Any routed
+        event (a fill, or a later terminal event) of any order of the hold
+        that shows more executed than the hold waits for of that order raises
+        that order's booking target, in memory and in the stored hold, before
+        a fill's release is judged (:meth:`_raise_fill_evidence_floor`). A
+        fill of any other order of the hold is judged too: an order whose
+        terminal event reported an execution is a booking target of the hold
+        (:meth:`_fill_evidence_booked`), and its fill may be the last one.
+
+        :param event: The routed event.
+        """
+        if not self._fill_evidence_awaiting_execution:
+            return
+        order_id = event.order.id
+        awaited_by = order_id
+        waiting = self._fill_evidence_awaiting_execution.get(order_id)
+        if waiting is None:
+            # A sibling order of the hold: what it reported is a booking
+            # target too (:meth:`_fill_evidence_booked`), so its fill may be
+            # the one that completes the hold.
+            awaited_by, waiting = next(
+                ((awaited_id, (waiting_key, waiting_hold))
+                 for awaited_id, (waiting_key, waiting_hold)
+                 in self._fill_evidence_awaiting_execution.items()
+                 if order_id in waiting_hold.order_ids), (order_id, None))
+            if waiting is None:
+                return
+        key, hold = waiting
+        awaited = hold.awaiting_execution
+        # The order's cumulative executed quantity on any of its events is a
+        # lower bound of what it executed, as on the event that settled the
+        # hold (:meth:`_settle_fill_evidence`): the hold waits for the larger
+        # one, of the reporting order and of a sibling alike. A later terminal
+        # event reaches only here, the first one having dropped the order's
+        # mapping.
+        raised = self._raise_fill_evidence_floor(hold, order_id, event.order.filled_qty)
+        if (awaited is not None and awaited[0] == order_id
+                and event.order.filled_qty > awaited[1]):
+            hold.awaiting_execution = (event.order.id, event.order.filled_qty)
+            raised = True
+        if raised:
+            self._persist_fill_evidence_hold(key, hold)
+        if event.event_type not in ('filled', 'partial') or not (event.fill_qty or 0.0) > 0.0:
+            return
+        if not self._fill_evidence_booked(hold):
+            return
+        del self._fill_evidence_awaiting_execution[awaited_by]
+        hold.awaiting_execution = None
+        self._settled_fill_evidence.setdefault(key, hold)
+
+    def _entry_execution_awaiting_booking(self, key: str) -> bool:
+        """Whether a terminal event reported an execution of ``key`` the book has not taken in.
+
+        The entry is in ``AWAITING_EXECUTION``
+        (:attr:`~OrderSyncEngine._fill_evidence_awaiting_execution`): no new
+        cycle of it is dispatched until that fill is booked
+        (:meth:`_maybe_redispatch_reissued_entry`).
+
+        :param key: The entry's intent key.
+        """
+        return any(waiting_key == key
+                   for waiting_key, _hold in self._fill_evidence_awaiting_execution.values())
+
+    def _entry_execution_unresolved(self, key: str) -> bool:
+        """Whether the execution of the entry ``key`` is unknown, or reported and unbooked.
+
+        The entry is ``HELD`` (its order is terminal at the venue without the
+        venue's executed quantity, :attr:`~OrderSyncEngine._entries_awaiting_fill_evidence`),
+        its executed-quantity terminal event waits for the script's re-issued
+        entry (:attr:`~OrderSyncEngine._positive_evidence_awaiting_intent`), or
+        it is in ``AWAITING_EXECUTION`` (:meth:`_entry_execution_awaiting_booking`).
+        In each, the order is terminal at the venue and what it executed is
+        not all in the book: nothing may be sent, amended or cancelled on the
+        key, and nothing of its mapping, envelope or protection retired
+        (:meth:`_hold_entry_awaiting_fill_evidence`).
+
+        :param key: The entry's intent key.
+        """
+        return (key in self._entries_awaiting_fill_evidence
+                or key in self._positive_evidence_awaiting_intent
+                or self._entry_execution_awaiting_booking(key))
+
+    def _end_fill_evidence_settlement(self, completed: bool) -> None:
+        """Release or re-arm the holds a routing or resolution settled.
+
+        :param completed: Whether every consequence was applied: the routing
+            returned, or raised only after its bookkeeping (a policy halt, a
+            follow-up write the quarantine deferred). Anything else (a storage
+            error, the process dying) keeps the stored hold and evidence for
+            the restart to replay, and the hold stands again in memory.
+        """
+        if completed:
+            self._release_settled_fill_evidence()
+        else:
+            self._rearm_settled_fill_evidence()
+
+    def _rearm_settled_fill_evidence(self) -> None:
+        """Put back the holds of an event whose routing raised.
+
+        The stored hold and arrival were not released, so a restart replays
+        the evidence; in this process the hold stands again, and the next
+        evidence, the hold's expiry or the entry's envelope retirement ends
+        it as usual.
+
+        A hold whose evidence the book already took in is released instead
+        (:meth:`_fill_evidence_booked`): the raising routing booked a fill of
+        its order, and a booked fill is never routed again
+        (:meth:`_keep_unbooked_fill_for_retry`), so nothing would end it.
+        """
+        while self._settled_fill_evidence:
+            key, hold = self._settled_fill_evidence.popitem()
+            if self._fill_evidence_booked(hold):
+                self._finish_fill_evidence_hold(key, hold)
+                continue
+            # The routing may have retired the key before it raised: the
+            # hold keeps it known as an entry with its orders mapped, as a
+            # restart re-arms it.
+            self._arm_fill_evidence_hold(key, self._entries_awaiting_fill_evidence.get(key, hold))
+        self._refresh_fill_evidence_order_ids()
+
+    def _arm_fill_evidence_hold(self, key: str, hold: _FillEvidenceHold) -> None:
+        """Put ``hold`` in the held state: held, known as an entry, its orders mapped.
+
+        The one way into ``HELD`` besides a fresh deferral, shared by the
+        restart (:meth:`_restore_fill_evidence_holds`) and the re-arm after a
+        raising routing (:meth:`_rearm_settled_fill_evidence`). The caller
+        republishes the order ids (:meth:`_refresh_fill_evidence_order_ids`).
+
+        :param key: The entry's intent key.
+        :param hold: The hold.
+        """
+        self._entries_awaiting_fill_evidence[key] = hold
+        self._fill_evidence_entry_keys.add(key)
+        if hold.order_ids:
+            current = self._order_mapping.setdefault(key, [])
+            for order_id in hold.order_ids:
+                if order_id not in current:
+                    current.append(order_id)
+
+    def _persist_fill_evidence_hold(self, key: str, hold: _FillEvidenceHold) -> None:
+        """Write the hold of ``key`` as its keyed store event.
+
+        A failed write is owed (:meth:`_owe_store_write`): the hold stands in
+        memory, the write is retried at the next sync, and a sync that ends
+        with it still owed counts toward the storage quarantine.
+
+        :param key: The held entry's intent key.
+        :param hold: The hold.
+        """
+        store_ctx = self._store_ctx
+        if store_ctx is None:
+            return
+        floors = self._fill_evidence_floors
+        queued = self._fill_evidence_queued
+        payload = {'order_ids': list(hold.order_ids), 'since_ms': hold.since_ms,
+                   'booked_qty': hold.booked_qty, 'expired': hold.expired,
+                   'awaiting_execution': (list(hold.awaiting_execution)
+                                          if hold.awaiting_execution is not None else None),
+                   'floors': {order_id: max(floors.get(order_id, 0.0),
+                                            queued.get(order_id, 0.0))
+                              for order_id in hold.order_ids
+                              if order_id in floors or order_id in queued}}
+        self._owe_store_write(
+            f"fill-evidence hold of {format_intent_key(key)}",
+            functools.partial(store_ctx.replace_keyed_events,
+                              ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {key: payload}),
+        )
+
+    def _fill_evidence_booked(self, hold: _FillEvidenceHold) -> bool:
+        """Whether the book took in the execution evidence of ``hold``.
+
+        A hold settled by a positive terminal event needs the reported
+        quantity booked of the order that reported it, and of every order of
+        the hold the most any of its events showed executed: what a received
+        terminal event of it reported
+        (:attr:`~OrderSyncEngine._fill_evidence_received`), or more on a
+        routed event of it (:attr:`~OrderSyncEngine._fill_evidence_floors`)
+        or on a received, unrouted fill of it
+        (:attr:`~OrderSyncEngine._fill_evidence_queued`). An entry can map
+        several venue orders, and the fills booked of a sibling are no
+        execution of the reporting one. Any other hold needs more of its
+        orders booked than when it began (``booked_qty``), and each order
+        booked to that target too: a fill of its order was booked, and a fill
+        of the order is evidence the hold waits for.
+
+        :param hold: The hold.
+        """
+        position = self._position
+        if hold.awaiting_execution is not None:
+            order_id, qty = hold.awaiting_execution
+            if position.fill_cursor([order_id]) < qty - 1e-12:
+                return False
+        elif position.fill_cursor(hold.order_ids) <= hold.booked_qty + 1e-12:
+            return False
+        return all(position.fill_cursor([held_id])
+                   >= self._fill_evidence_target(held_id) - 1e-12
+                   for held_id in hold.order_ids)
+
+    def _fill_evidence_target(self, order_id: str) -> float:
+        """The most an event of a held order showed it executed: what the book must hold of it.
+
+        A received terminal report, a routed event, or a received fill still
+        queued for the drain.
+
+        :param order_id: The venue order id.
+        """
+        return max(self._fill_evidence_received.get(order_id, 0.0),
+                   self._fill_evidence_floors.get(order_id, 0.0),
+                   self._fill_evidence_queued.get(order_id, 0.0))
+
+    def _raise_fill_evidence_floor(self, hold: _FillEvidenceHold, order_id: str,
+                                   executed: float) -> bool:
+        """Raise the booking target of an order of ``hold`` to what an event of it showed.
+
+        The cumulative executed quantity on any event of the order is a lower
+        bound of what it executed; a booking target only the reporting order
+        could raise would let a sibling's later slice release the hold below
+        its own execution (:meth:`_fill_evidence_booked`). The caller writes
+        the hold row (:meth:`_persist_fill_evidence_hold`) when the hold is to
+        stand, so a restart keeps the raised target. A received fill still
+        queued for the drain raises only the in-memory target
+        (:attr:`~OrderSyncEngine._fill_evidence_queued`); its routing raises
+        the stored one here, so the hold row is written for it.
+
+        :param hold: An unreleased hold.
+        :param order_id: The event's venue order id.
+        :param executed: The order's cumulative executed quantity on the event.
+        :return: Whether the stored target rose.
+        """
+        stored = max(self._fill_evidence_received.get(order_id, 0.0),
+                     self._fill_evidence_floors.get(order_id, 0.0))
+        if order_id not in hold.order_ids or executed <= stored:
+            return False
+        self._fill_evidence_floors[order_id] = executed
+        return True
+
+    def _release_booked_fill_evidence_holds(self) -> None:
+        """Release the holds whose evidence the book already took in.
+
+        A hold can stand again after its fill was booked: a restart between
+        the book write and the owed release re-arms it from the store, the
+        startup having taken in the fills the journal shows, and so does a
+        storage error raised after the booking. No routing would end it, so
+        its expiry would quarantine the bot over an execution it owns. Runs
+        on every reconcile before the expiry check
+        (:meth:`_expire_fill_evidence_holds`).
+        """
+        for key, hold in list(self._entries_awaiting_fill_evidence.items()):
+            if self._absorb_received_execution(hold):
+                self._persist_fill_evidence_hold(key, hold)
+            if not self._fill_evidence_booked(hold):
+                continue
+            self._take_fill_evidence_hold(key)
+            _log.warning(
+                "fill-evidence hold of entry %s released: the book holds a fill of its "
+                "order (%s) booked after the hold began",
+                format_intent_key(key), ', '.join(hold.order_ids),
+            )
+            self._finish_fill_evidence_hold(key, hold)
+
+    def _absorb_received_execution(self, hold: _FillEvidenceHold) -> bool:
+        """Make ``hold`` wait for the execution a received, unrouted terminal event reported.
+
+        A fill of the held order queued ahead of the terminal event reporting
+        the venue's executed quantity settles the hold first; without that
+        quantity its release would follow the first slice and a restart
+        before the rest is booked would lose the barrier. The arrival is
+        stored on receipt (:meth:`_record_fill_evidence_arrival`), so a
+        restart knows the quantity anyway (:func:`_stored_awaiting_execution`);
+        this makes the process itself know it too. A later queued fill
+        showing more executed than the one that settled the hold is such
+        evidence as well (:meth:`_fill_evidence_target`).
+
+        :param hold: A held or settling hold.
+        :return: Whether ``hold`` took a larger ``awaiting_execution``.
+        """
+        best = hold.awaiting_execution
+        for order_id in hold.order_ids:
+            qty = self._fill_evidence_target(order_id)
+            if qty > 0.0 and (best is None or qty > best[1]):
+                best = (order_id, qty)
+        if best is hold.awaiting_execution:
+            return False
+        hold.awaiting_execution = best
+        return True
+
+    def _take_fill_evidence_hold(self, key: str) -> _FillEvidenceHold | None:
+        """Drop the hold of ``key`` from memory; the store keeps it.
+
+        :param key: The intent key.
+        :return: The dropped hold, ``None`` when ``key`` was not held.
+        """
+        hold = self._entries_awaiting_fill_evidence.pop(key, None)
+        if hold is not None:
+            self._refresh_fill_evidence_order_ids()
+        return hold
+
+    def _owe_fill_evidence_release(self, key: str, hold: _FillEvidenceHold) -> None:
+        """Delete the stored hold of ``key`` and the arrivals of its orders.
+
+        Queued as owed store writes behind every earlier one, so it lands
+        after the consequences of the evidence that ended the hold.
+
+        :param key: The intent key.
+        :param hold: The hold dropped from memory.
+        """
+        for order_id in hold.order_ids:
+            self._fill_evidence_received.pop(order_id, None)
+            self._fill_evidence_floors.pop(order_id, None)
+            self._fill_evidence_queued.pop(order_id, None)
+        store_ctx = self._store_ctx
+        if store_ctx is None:
+            return
+        self._owe_store_write(
+            f"release of the fill-evidence hold of {format_intent_key(key)}",
+            functools.partial(store_ctx.replace_keyed_events,
+                              ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {}, removed=[key]),
+        )
+        if hold.order_ids:
+            # After the hold: a restart between the two writes finds an
+            # arrival without its hold, which it drops.
+            self._owe_store_write(
+                f"release of the evidence arrivals of {format_intent_key(key)}",
+                functools.partial(store_ctx.replace_keyed_events,
+                                  ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND, {},
+                                  removed=list(hold.order_ids)),
+            )
+
+    def _refresh_fill_evidence_order_ids(self) -> None:
+        """Republish the venue order ids of every unreleased hold for the broker thread.
+
+        A held hold, one the routed event settled
+        (:attr:`~OrderSyncEngine._settled_fill_evidence`) and one in
+        ``AWAITING_EXECUTION``
+        (:attr:`~OrderSyncEngine._fill_evidence_awaiting_execution`): a
+        terminal event received for any of their orders is recorded on
+        receipt (:meth:`_record_fill_evidence_arrival`), so a fill queued
+        ahead of it cannot release the hold below the execution it reports
+        (:meth:`_absorb_received_execution`). A hold moves between those
+        states with its ids still published: each transition publishes the
+        new set only once the hold stands in its next state.
+        """
+        holds = [*self._entries_awaiting_fill_evidence.values(),
+                 *self._settled_fill_evidence.values(),
+                 *(hold for _key, hold in self._fill_evidence_awaiting_execution.values())]
+        self._fill_evidence_order_ids = frozenset(
+            order_id for hold in holds for order_id in hold.order_ids)
+
+    def _forced_cancel_parked_entry(self, key: str) -> bool:
+        """Whether ``key`` names an entry whose own cancel is parked for its retry.
+
+        The strategy dropped the entry, so it has no active
+        :class:`EntryIntent`, but its cancel did not settle
+        (:meth:`_dispatch_cancel`): it did not land, or it landed with an
+        execution of the entry still queued
+        (:meth:`_entry_execution_queued`). The park keeps the entry's identity
+        (:attr:`~OrderSyncEngine._forced_cancel_pending`) and its mapping until
+        :meth:`_retry_forced_cancels` lands the cancel.
+
+        :param key: The intent key an event's order maps to.
+        """
+        return isinstance(self._forced_cancel_pending.get(key), EntryIntent)
+
+    def _is_entry_key(self, key: str) -> bool:
+        """Whether ``key`` names an entry: its active intent, or a hold, says so.
+
+        A hold re-armed by a restart (:meth:`_restore_fill_evidence_holds`)
+        has no active :class:`EntryIntent` until the script re-issues the
+        entry, and the terminal event that settles it may arrive first: its
+        teardown must still retire the entry's pending protection and native
+        fail-safe state.
+
+        :param key: The intent key an event's order maps to.
+        """
+        return (isinstance(self._active_intents.get(key), EntryIntent)
+                or key in self._fill_evidence_entry_keys)
+
+    def _record_fill_evidence_arrival(self, event: OrderEvent) -> None:
+        """Store the execution evidence of a held entry the moment it is received.
+
+        Runs where an event enters :attr:`~OrderSyncEngine._event_queue`
+        (:meth:`on_order_event`, :meth:`run_event_stream`), on the broker
+        thread, before the event is applied on the next drain. A terminal
+        event that carries the venue's executed quantity for an order a hold
+        waits on (:attr:`~OrderSyncEngine._fill_evidence_order_ids`) is
+        written as a keyed
+        :data:`~pynecore.core.broker.storage.ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND`
+        event (the venue order id is the key), so a process that dies before
+        the drain still settles the hold at its restart
+        (:meth:`_restore_fill_evidence_holds`) without the plugin delivering
+        the event again. The record leaves with the hold
+        (:meth:`_owe_fill_evidence_release`).
+
+        The record is monotonic per order: a report of less than the order's
+        highest received one (a stale repeat, or one delivered out of order)
+        is still applied, but never replaces the stored record, so a restart
+        awaits the highest reported execution.
+
+        A failed write is logged, never raised: ingestion must not stop, the
+        event is still applied by this process, and a restart before the
+        drain falls back to the hold's expiry (:meth:`_expire_fill_evidence_holds`).
+
+        A received fill of such an order keeps the cumulative executed
+        quantity it shows in memory only
+        (:attr:`~OrderSyncEngine._fill_evidence_queued`): the fill itself is
+        booked by its routing, and the hold row takes the quantity the next
+        time it is written (:meth:`_persist_fill_evidence_hold`).
+
+        :param event: The received event.
+        """
+        order = event.order
+        if (event.event_type in ('filled', 'partial')
+                and order.id in self._fill_evidence_order_ids
+                and order.filled_qty > self._fill_evidence_queued.get(order.id, 0.0)):
+            self._fill_evidence_queued[order.id] = order.filled_qty
+            return
+        if not self._is_held_order_evidence(event):
+            return
+        highest = self._fill_evidence_received.get(order.id, 0.0)
+        if order.filled_qty < highest:
+            return
+        self._fill_evidence_received[order.id] = order.filled_qty
+        store_ctx = self._store_ctx
+        if store_ctx is None:
+            return
+        try:
+            store_ctx.replace_keyed_events(
+                ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND,
+                {order.id: _fill_evidence_arrival_payload(event)},
+            )
+        except Exception as exc:  # noqa: BLE001 -- ingestion must not depend on the disk
+            _blog_warning(
+                "the execution evidence of order %s could not be stored (%s): it is "
+                "applied on the next drain, a restart before then waits for the "
+                "venue's quantity again", order.id, exc,
+            )
+
+    def _restore_fill_evidence_holds(self, store_ctx: RunContext) -> None:
+        """Re-arm the holds an earlier process of the run left, at construction.
+
+        Each hold re-seeds :attr:`~OrderSyncEngine._order_mapping` with its
+        order ids, so the evidence that arrives after the restart (a fill, the
+        terminal event with the venue's quantity) routes to the entry, and the
+        script's re-issued entry adopts the mapping instead of being dispatched
+        afresh next to an order that may have executed. The key stays known as
+        an entry (:meth:`_is_entry_key`), so evidence settling the hold before
+        the script re-issues the entry still retires its pending protection.
+
+        Evidence the earlier process received but did not apply before it
+        stopped (:meth:`_record_fill_evidence_arrival`) is queued again here
+        and settles the hold on the first drain. An arrival record without a
+        hold is spent and dropped.
+
+        A hold that already expired quarantines the bot again on the first
+        reconcile. The hold is released only by evidence or by the operator's
+        statement that the entry did not execute, recorded with a resume
+        (``pyne broker resume --entry-not-executed ENTRY_ID``,
+        :meth:`~pynecore.core.broker.storage.BrokerStore.request_quarantine_resume`):
+        the restart then judges the venue as usual, and the script may send
+        the entry again. The statement is not applied over a stored report of
+        an execution (the hold's ``awaiting_execution``, or a stored arrival
+        with a positive executed quantity): the entry did execute, and the
+        hold stands until that fill is booked. A plain resume does not release it: the venue may
+        show what the order executed while the journal holds none of it, and
+        the startup adoption takes only what the journal owns.
+
+        :param store_ctx: The run's store context.
+        """
+        released: list[str] = []
+        arrivals = store_ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND)
+        replayed: set[str] = set()
+        for key, payload in store_ctx.keyed_events_for_run_id(
+                ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND).items():
+            raw_ids = payload.get('order_ids')
+            order_ids = ([str(order_id) for order_id in raw_ids if order_id]
+                         if isinstance(raw_ids, list) else [])
+            since_ms = payload.get('since_ms')
+            booked_qty = payload.get('booked_qty')
+            expired = payload.get('expired') is True
+            operator_released = bool(payload.get(FILL_EVIDENCE_OPERATOR_RELEASE_FIELD))
+            if operator_released and not order_ids:
+                released.append(key)
+                _log.warning(
+                    "fill-evidence hold of entry %s released: the operator stated "
+                    "with the resume that its order did not execute",
+                    format_intent_key(key),
+                )
+                continue
+            awaiting_execution = _stored_awaiting_execution(
+                payload.get('awaiting_execution'), order_ids, arrivals)
+            if operator_released and awaiting_execution is not None:
+                # The venue reported an execution the store holds: the entry
+                # did execute, so the operator's statement is not applied (a
+                # proven zero would retire the mapping and protection of an
+                # execution still to be booked). The hold stands and its
+                # expiry quarantines again with the reported quantity.
+                operator_released = False
+                _log.warning(
+                    "entry %s: the resume stated its order did not execute, but the venue "
+                    "reported %s executed of order %s; the statement is not applied and "
+                    "the entry stays held until that fill is booked",
+                    format_intent_key(key), awaiting_execution[1], awaiting_execution[0],
+                )
+            hold = _FillEvidenceHold(
+                order_ids=order_ids,
+                since_ms=since_ms if isinstance(since_ms, int) else int(time.time() * 1000),
+                # Unreadable: no booked fill can release the hold, only
+                # evidence routed to it or the operator.
+                booked_qty=(float(booked_qty) if isinstance(booked_qty, (int, float))
+                            else math.inf),
+                expired=expired,
+                quarantined=operator_released,
+                awaiting_execution=awaiting_execution,
+            )
+            self._arm_fill_evidence_hold(key, hold)
+            raw_floors = payload.get('floors')
+            if isinstance(raw_floors, dict):
+                for order_id, floor in raw_floors.items():
+                    if order_id in order_ids and isinstance(floor, (int, float)) and floor > 0.0:
+                        self._fill_evidence_floors[order_id] = float(floor)
+            _log.warning(
+                "re-armed the fill-evidence hold of entry %s (orders %s) from the store: "
+                "its order is terminal at the venue without a reported executed quantity; "
+                "nothing is dispatched on the key until the evidence arrives",
+                format_intent_key(key), order_ids,
+            )
+            for order_id in order_ids:
+                arrival = arrivals.get(order_id)
+                event = (_fill_evidence_arrival_event(arrival)
+                         if arrival is not None else None)
+                if event is None:
+                    continue
+                replayed.add(order_id)
+                # What the order reported is a booking target of the hold
+                # (:meth:`_fill_evidence_booked`), and the floor a later,
+                # lower report of it cannot replace in the store.
+                self._fill_evidence_received[order_id] = event.order.filled_qty
+                self._event_queue.put(event)
+                _log.warning(
+                    "entry %s: the venue's quantity for order %s was received before "
+                    "the restart but not applied; it settles the hold on the first drain",
+                    format_intent_key(key), order_id,
+                )
+            if operator_released and not replayed.intersection(order_ids):
+                # The operator's statement is applied as the venue's proven
+                # zero would be: the first drain retires the entry's pending
+                # protection, native fail-safe state and envelope, then the
+                # hold. Venue evidence received before the restart wins.
+                self._event_queue.put(_operator_not_executed_event(order_ids[0], self._symbol))
+                _log.warning(
+                    "fill-evidence hold of entry %s released: the operator stated with the "
+                    "resume that its order (%s) did not execute; the entry is retired as "
+                    "unexecuted on the first drain",
+                    format_intent_key(key), ', '.join(order_ids),
+                )
+        self._refresh_fill_evidence_order_ids()
+        if released:
+            store_ctx.replace_keyed_events(
+                ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {}, removed=released)
+        spent = [order_id for order_id in arrivals if order_id not in replayed]
+        if spent:
+            store_ctx.replace_keyed_events(
+                ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND, {}, removed=spent)
+
+    def _expire_fill_evidence_holds(self, *, now_ms: int) -> None:
+        """Quarantine the bot over a hold whose evidence never arrived.
+
+        A plugin that reports a terminal event without the executed quantity
+        owes the venue's quantity within the fill-report grace
+        (:meth:`_fill_report_grace_s`), the same bound a fill may lag the
+        position change it explains. A hold older than that will not resolve
+        on its own: the bot enters an ``ENTRY_BLOCK`` quarantine (alive, its
+        exits, closes and cancels keep working, no new exposure) with one
+        warning naming the entry, its orders and the resolution. The hold
+        itself stays, so evidence arriving later is still applied. An expired
+        hold re-armed by a restart quarantines again here; the operator
+        releases it by stating with the resume that the entry did not execute
+        (:meth:`_restore_fill_evidence_holds`).
+
+        A hold in ``AWAITING_EXECUTION`` expires the same way: the venue
+        reported an execution and its fill is not booked within the grace.
+        Its warning names the reported quantity; the entry did execute, so
+        the hold ends only when that fill is booked (a plain resume keeps it,
+        and the restart replays the venue's report over an operator's
+        not-executed statement).
+
+        :param now_ms: Wall clock, epoch ms.
+        """
+        if not self._entries_awaiting_fill_evidence and not self._fill_evidence_awaiting_execution:
+            return
+        self._release_booked_fill_evidence_holds()
+        grace_ms = int(self._fill_report_grace_s() * 1000)
+        holds = dict(self._entries_awaiting_fill_evidence)
+        for key, hold in self._fill_evidence_awaiting_execution.values():
+            holds.setdefault(key, hold)
+        for key, hold in holds.items():
+            if hold.quarantined:
+                continue
+            if not hold.expired:
+                if now_ms - hold.since_ms < grace_ms:
+                    continue
+                hold.expired = True
+                self._persist_fill_evidence_hold(key, hold)
+            hold.quarantined = True
+            self.record_quarantine(
+                _FILL_EVIDENCE_QUARANTINE_REASON,
+                {'order_ids': list(hold.order_ids), 'since_ms': hold.since_ms,
+                 'grace_s': grace_ms / 1000.0},
+                intent_key=key,
+            )
+            if hold.awaiting_execution is not None:
+                order_id, reported = hold.awaiting_execution
+                _blog_warning(
+                    "entry %s: the venue reported %s executed of its order %s, and the "
+                    "book holds %s of it after %.0f s — the bot is quarantined (no new "
+                    "entries; exits, closes and cancels keep working). The entry did "
+                    "execute: the hold ends once the plugin delivers the missing fill; "
+                    "check the order's executions on the venue and the plugin's fill "
+                    "reporting",
+                    format_intent_key(key), reported, order_id,
+                    self._position.fill_cursor([order_id]),
+                    (now_ms - hold.since_ms) / 1000.0, single_line=True,
+                )
+                continue
+            entry_arg = key.replace("'", "'\\''")
+            _blog_warning(
+                "entry %s: its order (%s) is terminal at the venue and the venue's "
+                "executed quantity has not arrived for %.0f s — the bot is quarantined "
+                "(no new entries; exits, closes and cancels keep working). Check the "
+                "order on the venue; if it executed anything, close that on the venue "
+                "(the bot does not own it). Then resume with `%s --entry-not-executed "
+                "'%s'`: the restart releases the entry and the script may send it "
+                "again. A resume without the option keeps it held",
+                format_intent_key(key), ', '.join(hold.order_ids) or '?',
+                (now_ms - hold.since_ms) / 1000.0, self._quarantine_resume_command(),
+                entry_arg, single_line=True,
+            )
+
+    def _hold_entry_awaiting_fill_evidence(self, intent: Intent, action: str) -> bool:
+        """Refuse to retire, amend or replace an entry whose execution is unresolved.
+
+        The entry's order is terminal at the venue, and the book does not hold
+        what it executed (:meth:`_entry_execution_unresolved`): its terminal
+        event did not say how much executed
+        (:meth:`_defer_entry_terminal_without_fill_evidence`), or it reported
+        an execution whose fill is not booked yet. Nothing rests at the venue
+        to cancel or amend, and treating the strategy's cancel (or a cancel +
+        re-place amend, an OCA cascade or reduction, a short-gate cancel, the
+        close sweep) as proof the entry never filled would retire the envelope
+        and the pending protection the execution needs, or open a second order
+        next to an executed one. The mapping, the envelope and the legs stay
+        until the evidence is applied; then the event that carries it retires
+        or arms them as usual.
+
+        :param intent: The intent the caller is about to cancel, amend or replace.
+        :param action: What the caller was about to do, for the log line.
+        :return: Whether the intent is held (the caller does nothing to it).
+        """
+        if not isinstance(intent, (EntryIntent, CloseIntent)):
+            return False
+        key = intent.intent_key
+        if not self._entry_execution_unresolved(key):
+            return False
+        hold = self._entries_awaiting_fill_evidence.get(key)
+        if hold is None:
+            _blog_info(
+                "%s of entry %s held: a terminal event reported an execution of it "
+                "the book has not taken in yet", action, format_intent_key(key),
+            )
+        elif not hold.action_logged:
+            hold.action_logged = True
+            _blog_warning(
+                "%s of entry %s held: its order is terminal at the venue without "
+                "a venue-reported executed quantity — its envelope and pending "
+                "protection stay until a fill or the venue's quantity arrives",
+                action, format_intent_key(key),
+            )
+        return True
+
+    def _hold_entry_awaiting_booking(self, intent: Intent, action: str) -> bool:
+        """Refuse a fresh dispatch of an entry whose reported execution is unbooked.
+
+        A terminal event reported an execution of the entry the book has not
+        taken in (``AWAITING_EXECUTION``,
+        :meth:`_entry_execution_awaiting_booking`). The diff's fresh dispatch
+        of a key without an active intent (a removed and re-added entry) waits
+        until that fill is booked, so no exposure opens next to an execution
+        the book does not hold yet; the paths of an active key (a strategy
+        cancel, a changed-parameter re-issue, a same-parameter new cycle) are
+        held by :meth:`_hold_entry_awaiting_fill_evidence`. A ``HELD`` key
+        without an active intent is not refused here: the script's re-issued
+        entry adopts its mapping. The next sync re-diffs.
+
+        :param intent: The intent the diff is about to dispatch.
+        :param action: What the diff was about to do, for the log line.
+        :return: Whether the intent is held (the caller does nothing to it).
+        """
+        if not isinstance(intent, EntryIntent):
+            return False
+        key = intent.intent_key
+        if not self._entry_execution_awaiting_booking(key):
+            return False
+        _blog_info(
+            "%s of entry %s deferred: a terminal event reported an execution of it "
+            "the book has not taken in yet", action, format_intent_key(key),
+        )
+        return True
 
     def _retire_venue_cancelled_entry(
             self, event: OrderEvent, key: str, intent: EntryIntent,
@@ -10805,28 +13269,28 @@ class OrderSyncEngine:
           that quantity and the retained Pine order is pinned, so the diff
           neither re-places the remainder nor the whole entry; a fresh
           ``strategy.entry`` call is a new cycle that passes the pyramiding
-          gate of :meth:`_maybe_redispatch_reissued_entry`.
+          gate of :meth:`_maybe_redispatch_reissued_entry`. A ``rejected``
+          event of a partly executed entry is consumed the same way.
 
-        :param event: The ``cancelled`` event carrying the venue's reason.
+        :param event: The ``cancelled`` event carrying the venue's reason, or
+            the ``rejected`` event of a partly executed entry.
         :param key: The entry's intent key.
         :param intent: The active entry intent.
         """
         filled = event.order.filled_qty
-        self._abort_pending_partial_legs_for_dead_entry(key, reason='parent_cancelled')
+        self._abort_pending_partial_legs_for_dead_entry(
+            key, reason='parent_cancelled', filled_qty=filled,
+        )
         self._stop_limit_engine.mark_aborted(key, reason='parent_cancelled')
         self._order_mapping.pop(key, None)
         if filled > 0.0:
-            sentinel = dataclasses.replace(intent, qty=filled)
-            self._active_intents[key] = sentinel
-            self._truncated_entries[key] = (intent, sentinel)
-            pine_order = self._position.entry_orders.get(intent.pine_id)
-            if pine_order is not None:
-                self._entry_backing_orders[key] = pine_order
+            self._consume_entry_at_filled_qty(key, intent, filled)
             _blog_warning(
-                "entry %s: the venue cancelled its unfilled remainder itself (%s) "
+                "entry %s: the venue ended its unfilled remainder itself (%s) "
                 "after %s of %s filled — the entry is consumed at the filled "
                 "quantity, the remainder is not placed again, no quarantine",
-                format_intent_key(key), event.cancel_reason, filled, intent.qty,
+                format_intent_key(key), event.cancel_reason or event.event_type, filled,
+                intent.qty,
             )
         else:
             self._retire_native_failsafe_for_entry(key)
@@ -10847,6 +13311,30 @@ class OrderSyncEngine:
                 intent_key=key,
                 payload={'cancel_reason': event.cancel_reason, 'filled_qty': filled},
             )
+
+    def _consume_entry_at_filled_qty(self, key: str, intent: EntryIntent, filled: float) -> None:
+        """Keep an entry whose order is terminal at the venue as consumed at ``filled``.
+
+        Its sentinel stays in ``_active_intents`` at the filled quantity and
+        the retained Pine order is pinned, so the diff neither re-places the
+        remainder nor the whole entry
+        (:meth:`~OrderSyncEngine._entry_orders_terminal`). An entry consumed
+        already keeps the intent the script placed: a later, larger executed
+        quantity only moves the sentinel.
+
+        :param key: The entry's intent key.
+        :param intent: The active entry intent (the placed one, or its sentinel).
+        :param filled: The executed quantity.
+        """
+        truncated = self._truncated_entries.get(key)
+        placed = (truncated[0] if truncated is not None and truncated[1] is intent
+                  else intent)
+        sentinel = dataclasses.replace(intent, qty=filled)
+        self._active_intents[key] = sentinel
+        self._truncated_entries[key] = (placed, sentinel)
+        pine_order = self._position.entry_orders.get(intent.pine_id)
+        if pine_order is not None:
+            self._entry_backing_orders[key] = pine_order
 
     def _record_venue_entry_cancel(self, key: str, intent: EntryIntent) -> int:
         """Count a venue-driven cancel of an unfilled entry towards the retry cap.
@@ -11295,10 +13783,17 @@ class OrderSyncEngine:
             )
 
     def _abort_pending_partial_legs_for_dead_entry(
-            self, intent_key: str, *, reason: str,
+            self, intent_key: str, *, reason: str, filled_qty: float,
     ) -> None:
         """Cancel ``pending_entry`` partial-bracket legs when the parent
         entry never fills (cancel/reject terminal event).
+
+        An order that executed part of its quantity before the terminal event
+        (``filled_qty > 0``) is no dead entry: its legs protect what filled.
+        The venue may deliver the cancellation before the execution, so its
+        legs can still be ``pending_entry`` here; the execution promotes them
+        (:meth:`_promote_pending_partial_bracket_legs`). Nothing is aborted
+        and the exits' slots stay, like for a fully filled entry.
 
         An absolute-price ``strategy.exit`` issued before the parent fill
         persists durable ``LEG_STATE_PENDING_ENTRY`` rows
@@ -11327,9 +13822,18 @@ class OrderSyncEngine:
         position would land without partial TP / SL protection. Drop
         every ExitIntent whose ``from_entry`` matches the dying parent
         so the next sync re-dispatches its legs.
+
+        An entry a restart re-armed the fill-evidence hold of has no active
+        intent yet and is still an entry here (:meth:`_is_entry_key`).
         """
-        intent = self._active_intents.get(intent_key)
-        if not isinstance(intent, EntryIntent):
+        if not self._is_entry_key(intent_key):
+            return
+        if filled_qty > 0.0:
+            _blog_info(
+                "entry %s ended (%s) after %s executed: its partial-bracket legs "
+                "stay for the filled quantity",
+                format_intent_key(intent_key), reason, filled_qty,
+            )
             return
         self._partial_bracket_engine.abort_pending_legs_for_parent_never_arrived(
             symbol=self._symbol,
@@ -11378,6 +13882,12 @@ class OrderSyncEngine:
         """
         self._envelopes.pop(key, None)
         self._persisted_envelope_anchors.pop(key, None)
+        hold = self._entries_awaiting_fill_evidence.get(key)
+        if hold is not None:
+            self._settled_fill_evidence.setdefault(key, hold)
+            self._take_fill_evidence_hold(key)
+        self._fill_evidence_entry_keys.discard(key)
+        self._positive_evidence_awaiting_intent.pop(key, None)
         for coid in [
             coid for coid, record in self._persisted_pending_anchors.items()
             if record.key == key
@@ -11446,6 +13956,11 @@ class OrderSyncEngine:
         self._pending_flip_surplus_closes.pop(key, None)
         if self._store_ctx is not None:
             self._owe_complete(key)
+        if not self._fill_evidence_release_depth:
+            # Routing an event (or resolving a cancel-tentative entry) releases
+            # the hold once all of its consequences are written; any other
+            # retirement ends here.
+            self._release_settled_fill_evidence()
 
     def _reanchor_envelope_after_reject(self, key: str) -> None:
         """Retire a rejected dispatch but keep a bumped retry anchor.
@@ -11705,11 +14220,11 @@ class OrderSyncEngine:
         # Last mapped leg gone — retire the whole intent. Retire the native
         # fail-safe state BEFORE the teardown evicts the legs / envelope, and
         # only for an unfilled parent entry (see the unexpected-cancel branch).
-        if (isinstance(self._active_intents.get(key), EntryIntent)
+        if (self._is_entry_key(key)
                 and event.order.filled_qty <= 0.0):
             self._retire_native_failsafe_for_entry(key)
         self._abort_pending_partial_legs_for_dead_entry(
-            key, reason='native_cancel_all',
+            key, reason='native_cancel_all', filled_qty=event.order.filled_qty,
         )
         self._stop_limit_engine.mark_aborted(
             key, reason='native_cancel_all',
@@ -11897,6 +14412,17 @@ class OrderSyncEngine:
             and getattr(intent, 'oca_type', None) == OcaType.CANCEL.value
         ]
         for key, intent in siblings:
+            if (self._hold_entry_awaiting_fill_evidence(intent, 'OCA cascade cancel')
+                    or self._consumed_entry_with_open_exposure(key, intent)):
+                # The group cancelled the sibling, so its Pine order goes (the
+                # next diff must not send it again), while its venue state is
+                # kept active: the event that brings the venue's quantity
+                # retires the sibling or books and protects what executed,
+                # like after a strategy cancel of a held entry. A consumed
+                # sibling has nothing working to cancel, and its envelope is
+                # the parent ref its open position's protection resolves.
+                self._remove_pine_order_for_intent(intent)
+                continue
             _log.info(
                 "OCA cascade cancel: fill on %s cancels sibling %s in group %r",
                 format_intent_key(filled_key), format_intent_key(key), oca_name,
@@ -11935,17 +14461,41 @@ class OrderSyncEngine:
                 continue
             if not isinstance(sibling, EntryIntent):
                 continue
-            remaining = max(0.0, sibling.qty - float(event.fill_qty))
+            if self._consumed_entry_with_open_exposure(key, sibling):
+                # Its order ended at the venue: nothing works to reduce, and
+                # the open position it executed keeps its envelope.
+                continue
+            held = self._hold_entry_awaiting_fill_evidence(sibling, 'OCA cascade reduce')
+            pine_order = self._position.entry_orders.get(sibling.pine_id)
+            if held:
+                # The held sibling's venue intent keeps the quantity its order
+                # was sent with (the evidence settles that order); the group's
+                # reductions accumulate on the Pine order alone, which is what
+                # the next diff sends once the order is proven unexecuted.
+                if pine_order is None:
+                    continue
+                base_qty = abs(pine_order.size)
+            else:
+                base_qty = sibling.qty
+            remaining = max(0.0, base_qty - float(event.fill_qty))
             if remaining <= 1e-12:
-                self._active_intents.pop(key, None)
                 self._remove_pine_order_for_intent(sibling)
+                if held:
+                    # The Pine order goes with the reduction; the venue state
+                    # stays for the evidence (see the cancel cascade).
+                    continue
+                self._active_intents.pop(key, None)
                 self._dispatch_cancel(sibling)
                 continue
-            replacement = dataclasses.replace(sibling, qty=remaining)
-            pine_order = self._position.entry_orders.get(sibling.pine_id)
             if pine_order is not None:
                 pine_order.size = remaining if sibling.side == 'buy' else -remaining
                 pine_order.sign = 1.0 if sibling.side == 'buy' else -1.0
+            if held:
+                # Only the Pine order shrinks: no amend goes out for an order
+                # terminal at the venue, and the next diff sends the reduced
+                # quantity once the evidence retired the old order unexecuted.
+                continue
+            replacement = dataclasses.replace(sibling, qty=remaining)
             self._dispatch_modify(sibling, replacement)
             self._active_intents[key] = replacement
 
@@ -13251,7 +15801,21 @@ class OrderSyncEngine:
         (:meth:`_cleanup_closed_position`) and proactive paths such as
         :meth:`_handle_bracket_attach_after_fill_reject` — a follow-up
         invocation on the same id finds nothing to do.
+
+        An entry whose execution is unresolved
+        (:meth:`_entry_execution_unresolved`) is left alone: the book's flat
+        position is not the venue's while its order's execution is unknown or
+        unbooked, and the entry's native fail-safe, partial-bracket legs, exits,
+        mapping and envelope are the protection and the routing that execution
+        needs.
         """
+        if self._entry_execution_unresolved(closed_entry_id):
+            _blog_warning(
+                "position close sweep of entry %s skipped: its order's execution is not "
+                "all booked yet — its protection and tracking stay until the evidence is "
+                "applied", format_intent_key(closed_entry_id),
+            )
+            return
         # §2.6.7 retire: drop any NativeStopState parked under this entry id
         # BEFORE the partial-bracket cascade evicts the legs (the leg-walk
         # branch needs them populated). Idempotent / no-op when nothing is
@@ -14440,6 +17004,8 @@ class OrderSyncEngine:
             via: str,
             now_ms: int,
             is_partial_fill: bool = False,
+            remainder_dead: bool = False,
+            cancel_remainder: bool = False,
     ) -> None:
         """Resolve a cancel-tentative entry forward or backward.
 
@@ -14468,7 +17034,14 @@ class OrderSyncEngine:
           restore (legs → ``armed``; parent re-registered with
           ``NativeFailsafeManager`` ``pending_confirmation=True``;
           mapping retained, envelope retained, active_intents removed
-          so the next diff-loop reissues / adopts).
+          so the next diff-loop reissues / adopts). With ``remainder_dead``
+          (a ``cancelled`` event after part of the order executed: nothing
+          rests at the venue any more) the mapping is dropped too, so the
+          dead order is never adopted as a working one; the envelope stays
+          for the open position. With ``cancel_remainder`` (a ``partial``
+          event: the unfilled remainder still works at the venue) the
+          resolution ends with the one-shot cancel of that remainder
+          (:meth:`~OrderSyncEngine._cancel_residual_after_partial_resolution`).
 
         :attr:`CancelDispositionOutcome.UNKNOWN` is NOT a resolution —
         the caller handles it by bumping the retry counter and
@@ -14484,7 +17057,7 @@ class OrderSyncEngine:
         meta = self._cancel_disposition_pending.get(intent_key)
         if meta is None:
             return
-        meta.resolved = (outcome, via, is_partial_fill)
+        meta.resolved = (outcome, via, is_partial_fill, remainder_dead, cancel_remainder)
         # A storage failure can end the mark before every leg flipped; the
         # resolution acts on ``cancel_tentative`` legs only, so flip the rest.
         self._partial_bracket_engine.mark_legs_cancel_tentative(
@@ -14501,6 +17074,9 @@ class OrderSyncEngine:
             # (:meth:`_absorb_journal_retry_rows`).
             if meta.park_coid is not None and self._store_ctx is not None:
                 self._owe_unpark(meta.park_coid)
+            # The venue's word that the order executed is the evidence a hold
+            # waits for (:meth:`_defer_entry_terminal_without_fill_evidence`).
+            self._settle_fill_evidence(intent_key)
             # Restore to ``pending_entry`` rather than ``armed``: tentative
             # legs born from a pending-parent dispatch carry only
             # ``trigger_offset`` (tick distance), never an absolute
@@ -14640,6 +17216,8 @@ class OrderSyncEngine:
                 self._recompute_native_failsafe_for_parent(
                     ref, trigger_kind='lifecycle',
                 )
+            if remainder_dead:
+                self._order_mapping.pop(intent_key, None)
         else:
             self._partial_bracket_engine.confirm_cancel_tentative(
                 intent_key,
@@ -14675,6 +17253,8 @@ class OrderSyncEngine:
             via=via,
             duration_ms=duration_ms,
         ))
+        if cancel_remainder and outcome is CancelDispositionOutcome.ALREADY_FILLED:
+            self._cancel_residual_after_partial_resolution(intent_key)
 
     @staticmethod
     def _cancel_tentative_now_ms() -> int:
@@ -14703,7 +17283,11 @@ class OrderSyncEngine:
         - the stale-grace deadline has passed AND at least one retry
           already ran in this session with a confirmed broker view →
           promote to ``DEGRADED_HALT`` via
-          :meth:`_handle_cancel_tentative_stale_grace_expiry`, OR
+          :meth:`_handle_cancel_tentative_stale_grace_expiry`, except for an
+          entry whose execution is unresolved
+          (:meth:`_entry_execution_unresolved`): its order is terminal at the
+          venue, the probe stays an evidence query, and the hold's own expiry
+          quarantines the bot instead (:meth:`_expire_fill_evidence_holds`), OR
         - re-invoke :meth:`BrokerPlugin.execute_cancel_with_outcome`
           with the retained envelope and act on the outcome via
           :meth:`_clear_intent_cancel_disposition_pending` (or bump
@@ -14728,15 +17312,18 @@ class OrderSyncEngine:
             if meta.resolved is not None:
                 # A resolution a storage failure ended midway: finish it with
                 # the verdict it already has.
-                outcome, via, is_partial_fill = meta.resolved
-                self._clear_intent_cancel_disposition_pending(
+                outcome, via, is_partial_fill, remainder_dead, cancel_remainder = (
+                    meta.resolved)
+                self._resolve_cancel_tentative_on_reconcile(
                     intent_key, outcome=outcome, via=via, now_ms=now_ms,
-                    is_partial_fill=is_partial_fill,
+                    is_partial_fill=is_partial_fill, remainder_dead=remainder_dead,
+                    cancel_remainder=cancel_remainder,
                 )
                 continue
             reads_confirmed = self._read_view_confirmed
             if (now_ms - meta.since_ts_ms >= stale_grace_ms
-                    and meta.retry_count > 0 and reads_confirmed):
+                    and meta.retry_count > 0 and reads_confirmed
+                    and not self._entry_execution_unresolved(intent_key)):
                 # Halting is a last resort: it requires at least one actual
                 # ``execute_cancel_with_outcome`` attempt IN THIS SESSION
                 # that the venue could answer. A restart re-arm (journal /
@@ -14799,16 +17386,63 @@ class OrderSyncEngine:
                 meta.retry_count = 0
                 meta.last_retry_outcome = CancelDispositionOutcome.UNKNOWN
                 continue
+            if (outcome in (CancelDispositionOutcome.CANCEL_CONFIRMED,
+                            CancelDispositionOutcome.TOO_LATE_TO_CANCEL,
+                            CancelDispositionOutcome.STILL_OPEN)
+                    and self._entry_execution_queued(intent_key)):
+                # The cancel landed after an execution whose event waits for
+                # its routing: confirming it now would abort the legs that
+                # execution arms. The next drain routes the execution, which
+                # resolves the entry as filled; the retry counts toward no
+                # stale-grace halt.
+                _blog_info(
+                    "cancel-tentative retry for %s confirmed the cancel with an "
+                    "execution of it still queued; resolved after that execution "
+                    "is routed", format_intent_key(intent_key),
+                )
+                continue
             meta.retry_count = meta.retry_count + 1 if reads_confirmed else 0
             meta.last_retry_outcome = outcome
             if outcome is CancelDispositionOutcome.UNKNOWN:
                 continue
-            self._clear_intent_cancel_disposition_pending(
+            self._resolve_cancel_tentative_on_reconcile(
                 intent_key,
                 outcome=outcome,
                 via='reconcile_retry',
                 now_ms=now_ms,
             )
+
+    def _resolve_cancel_tentative_on_reconcile(
+            self,
+            intent_key: str,
+            *,
+            outcome: CancelDispositionOutcome,
+            via: str,
+            now_ms: int,
+            is_partial_fill: bool = False,
+            remainder_dead: bool = False,
+            cancel_remainder: bool = False,
+    ) -> None:
+        """Apply a cancel-tentative resolution outside the event drain.
+
+        :meth:`_clear_intent_cancel_disposition_pending`, then the store
+        release of a fill-evidence hold its ``ALREADY_FILLED`` verdict settled
+        (:meth:`_release_settled_fill_evidence`), behind the resolution's own
+        writes. A resolution that raised re-arms the hold instead: its retry
+        applies the verdict again.
+        """
+        self._fill_evidence_release_depth += 1
+        completed = False
+        try:
+            self._clear_intent_cancel_disposition_pending(
+                intent_key, outcome=outcome, via=via, now_ms=now_ms,
+                is_partial_fill=is_partial_fill, remainder_dead=remainder_dead,
+                cancel_remainder=cancel_remainder,
+            )
+            completed = True
+        finally:
+            self._fill_evidence_release_depth -= 1
+            self._end_fill_evidence_settlement(completed)
 
     def _handle_cancel_tentative_stale_grace_expiry(
             self,
@@ -14903,7 +17537,7 @@ class OrderSyncEngine:
         cancel = CancelIntent(pine_id=intent_key, symbol=self._symbol)
         envelope = self._build_cancel_envelope(cancel)
         try:
-            self._run_async_write(self._broker.execute_cancel(envelope))
+            cancelled = bool(self._run_async_write(self._broker.execute_cancel(envelope)))
         except OrderDispositionUnknownError as e:
             _blog_warning(
                 "residual cancel for %r after partial-event resolution "
@@ -14922,6 +17556,19 @@ class OrderSyncEngine:
                 "residual cancel for %r after partial-event resolution "
                 "raised %s; leaving mapping in place",
                 format_intent_key(intent_key), e,
+            )
+            return
+        if not cancelled:
+            # ``False`` is the plugin's "the cancel did not land": the
+            # remainder still rests at the venue. It stays mapped, so its
+            # later fills and its terminal event still route to the entry
+            # whose legs protect the filled part.
+            _blog_warning(
+                "residual cancel for %r after partial-event resolution did not "
+                "land; the unfilled remainder stays tracked as working — "
+                "operator intervention may be required if it fills against the "
+                "partial position's leg protection",
+                format_intent_key(intent_key),
             )
             return
         # Successful cancel — drop the order mapping so the next
@@ -14957,7 +17604,18 @@ class OrderSyncEngine:
         leg ``trigger_level`` shifted while the leg stayed armed); those
         feed the §2.6.5 trail coalesce window. Genuine state transitions
         bypass the throttle.
+
+        A held leg (``triggering`` on a recorded close) that a cascade ends
+        (its parent closed, a native stop took it) never reaches its
+        settlement, which would retire its close's spent client order id:
+        the synthetic close's envelope is re-anchored here instead, so a later
+        leg of the same exit, entry and kind never sends under that id.
         """
+        if (old_state == LEG_STATE_TRIGGERING and new_state in LEG_STATE_TERMINAL
+                and new_state != LEG_STATE_TRIGGERED and leg.close_attempt_coid is not None):
+            self._acknowledged_trigger_closes.discard(leg.close_attempt_coid)
+            self._trigger_closes_taking_parent.discard(leg.close_attempt_coid)
+            self._reanchor_envelope_after_reject(_partial_trigger_pine_id(leg))
         trigger_kind = 'trail' if old_state == new_state else 'lifecycle'
         self._recompute_native_failsafe_for_parent(
             leg.parent_entry_dispatch_ref, trigger_kind=trigger_kind,
@@ -15867,123 +18525,348 @@ class OrderSyncEngine:
             self._dispatch_partial_bracket_close(leg)
 
     def _settle_held_partial_bracket_closes(self) -> None:
-        """Settle the partial-bracket legs held on a close whose outcome is unknown.
+        """Settle the partial-bracket legs held on a close not settled yet.
 
-        A leg left ``triggering`` with its close's client order id recorded, by
-        an earlier process or by a dispatch of this one whose outcome is unknown
-        (:meth:`SoftwarePartialBracketEngine.iter_held_trigger_legs`) may have
-        sent that close, and the venue may have executed it, so it is never
-        sent again blind. Like any venue write whose outcome is unknown, it
-        waits for the evidence of that client order id
-        (:meth:`_held_trigger_close_outcome`):
+        A leg is left ``triggering`` with its close's client order id recorded
+        (:meth:`SoftwarePartialBracketEngine.iter_held_trigger_legs`) by a
+        dispatch the venue acknowledged without reporting the close executed,
+        by a dispatch whose outcome is unknown, or by an earlier process. The
+        close may execute, or may have executed, so it is never sent again
+        blind, and its OCA siblings stay reserved: they neither trigger nor
+        cascade while it is held. Each sync settles it from the evidence
+        (:meth:`_settle_held_partial_bracket_close`).
+        """
+        for leg in self._partial_bracket_engine.iter_held_trigger_legs():
+            if leg.symbol == self._symbol:
+                self._settle_held_partial_bracket_close(leg)
 
-        * ``'sent'`` — the venue executed the close: the leg settles as the
-          dispatch owed it (``triggered``, OCA cascade, exit retired); the fill
-          books through the regular fill path;
-        * ``'refused'`` — the venue refused it with nothing filled: the leg
-          re-arms, and the spent client order id is not reused;
-        * ``'pending'`` — the plugin's journal row is still live (an answer the
-          plugin's resolver owns, or an order still working): the leg stays
-          held;
+    def _settle_held_partial_bracket_close(self, leg: PartialBracketLeg) -> None:
+        """Settle one held partial-bracket leg from the evidence of its close.
+
+        The evidence (:meth:`_held_trigger_close_outcome`) decides:
+
+        * ``'sent'`` — the close executed in full: the leg settles as the
+          dispatch owed it (``triggered``, OCA cascade, exit retired); the
+          fill books through the regular fill path;
+        * ``'partial'`` — the close ended after executing part of it: the leg
+          re-arms for what is left, and its OCA siblings are sized down by
+          what executed
+          (:meth:`SoftwarePartialBracketEngine.release_held_trigger_partially`);
+        * ``'refused'`` — nothing of it executed, and nothing can: the leg
+          re-arms;
+        * ``'working'`` — the venue acknowledged it and it has not ended: the
+          leg stays held, a known state that needs nobody;
+        * ``'pending'`` — the venue's answer is still open in the plugin's
+          journal (the plugin's resolver owns it): the leg stays held;
         * ``'unknown'`` — no record shows whether the close executed, and none
-          will: the leg stays held and the bot is quarantined (new
-          entries blocked, exits and closes keep running) for the operator.
+          will: the leg stays held and the bot is quarantined (new entries
+          blocked, exits and closes keep running). The ERROR names the close's
+          client order id and the operator command that records whether it
+          executed (``pyne broker resume ... --close-executed`` /
+          ``--close-not-executed``); the restarted bot settles the leg with
+          that decision.
 
-        A held leg's OCA siblings do not trigger meanwhile. The first hold of
-        each close is reported at ERROR with what still protects the position.
+        Every spent client order id is retired (a re-armed leg sends its next
+        close under a fresh one). A hold is reported once per close and
+        outcome; one the venue acknowledged in this process only at INFO.
+
+        :param leg: The held leg.
         """
         engine = self._partial_bracket_engine
-        for leg in engine.iter_held_trigger_legs():
-            if leg.symbol != self._symbol:
-                continue
-            close_coid = leg.close_attempt_coid
-            assert close_coid is not None
-            outcome = self._held_trigger_close_outcome(close_coid)
+        close_coid = leg.close_attempt_coid
+        assert close_coid is not None
+        synth_pine_id = _partial_trigger_pine_id(leg)
+        evidence = self._held_trigger_close_outcome(close_coid)
+        outcome = evidence.outcome
+        acknowledged = close_coid in self._acknowledged_trigger_closes
+        source = "the operator decided" if evidence.operator else "the venue evidence shows"
+        if outcome in ('sent', 'partial', 'refused'):
+            log = _blog_info if acknowledged and not evidence.operator else _blog_warning
             if outcome == 'sent':
+                log("partial-bracket leg %s (%s of %r from %r): %s its close %s "
+                    "executed; settled without a second close",
+                    leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, source, close_coid)
+                self._settle_sent_partial_bracket_close(leg, synth_pine_id)
+            elif outcome == 'partial':
+                executed_qty = leg.qty * evidence.executed_fraction
                 _blog_warning(
-                    "partial-bracket leg %s (%s of %r from %r): its held close %s "
-                    "executed on the venue; settled without a second close",
+                    "partial-bracket leg %s (%s of %r from %r): its close %s ended after "
+                    "executing %s of %s; the leg re-arms for the rest and its OCA "
+                    "siblings are sized down",
                     leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid,
+                    executed_qty, leg.qty,
                 )
-                self._settle_sent_partial_bracket_close(leg, _partial_trigger_pine_id(leg))
-                continue
-            if outcome == 'refused':
-                _blog_warning(
-                    "partial-bracket leg %s (%s of %r from %r): its held close %s "
-                    "was refused by the venue; the leg re-arms",
-                    leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid,
-                )
-                engine.release_held_trigger(leg.key, reason='held_close_refused')
-                self._reanchor_envelope_after_reject(_partial_trigger_pine_id(leg))
-                continue
-            if (close_coid, outcome) in self._held_trigger_close_reported:
-                continue
-            self._held_trigger_close_reported.add((close_coid, outcome))
-            if self._native_bracket_dispatcher is not None:
-                cover = "the native fail-safe stop keeps covering the position"
+                engine.release_held_trigger_partially(
+                    leg.key, executed_qty=executed_qty,
+                    reason='held_close_partially_executed')
+                self._reanchor_envelope_after_reject(synth_pine_id)
             else:
-                cover = ("nothing on the venue covers the position for this leg and "
-                         "its OCA siblings")
-            why = ("the venue's answer for it is still open in the plugin's journal"
-                   if outcome == 'pending' else
-                   "no venue record shows whether it executed, and none will")
+                _blog_warning(
+                    "partial-bracket leg %s (%s of %r from %r): %s its close %s "
+                    "executed nothing; the leg re-arms",
+                    leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, source, close_coid,
+                )
+                engine.release_held_trigger(
+                    leg.key, reason=('operator_decided_not_executed' if evidence.operator
+                                     else 'held_close_refused'))
+                self._reanchor_envelope_after_reject(synth_pine_id)
+            self._acknowledged_trigger_closes.discard(close_coid)
+            self._trigger_closes_taking_parent.discard(close_coid)
+            if evidence.operator and self._store_ctx is not None:
+                store_ctx = self._store_ctx
+                self._owe_store_write(
+                    f"operator decision on close {close_coid} applied",
+                    functools.partial(store_ctx.mark_operator_close_decision_applied,
+                                      close_coid))
+            return
+        if (close_coid, outcome) in self._held_trigger_close_reported:
+            return
+        self._held_trigger_close_reported.add((close_coid, outcome))
+        if acknowledged and outcome in ('working', 'pending'):
+            _blog_info(
+                "partial-bracket leg %s (%s of %r from %r) held on its close %s, which "
+                "the venue acknowledged and has not executed yet; its OCA siblings "
+                "stay reserved until the close executes or ends",
+                leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid,
+            )
+            return
+        if outcome == 'working':
+            _blog_info(
+                "partial-bracket leg %s (%s of %r from %r) held on its close %s, which "
+                "the venue holds working; its OCA siblings stay reserved until the "
+                "close executes or ends",
+                leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid,
+            )
+            return
+        if self._native_bracket_dispatcher is not None:
+            cover = "the native fail-safe stop keeps covering the position"
+        else:
+            cover = ("nothing on the venue covers the position for this leg and "
+                     "its OCA siblings")
+        if outcome == 'pending':
             _blog_error(
                 "partial-bracket leg %s (%s of %r from %r) held: its close %s may "
-                "have executed and is not sent again; %s. Until "
-                "it is settled its OCA siblings do not trigger and %s",
-                leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid,
-                why, cover,
+                "have executed and is not sent again; the venue's answer for it is "
+                "still open in the plugin's journal. Until it is settled its OCA "
+                "siblings do not trigger and %s",
+                leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid, cover,
             )
-            if outcome == 'unknown':
-                self.record_quarantine(
-                    f"partial-bracket close {close_coid} of leg {leg.coid} has no "
-                    f"venue record of whether it executed: it is not sent again, and "
-                    f"the bot cannot tell whether the position was reduced",
-                    {'leg_coid': leg.coid, 'close_coid': close_coid,
-                     'pine_id': leg.pine_id, 'from_entry': leg.from_entry},
-                    intent_key=leg.intent_key,
-                    kind=QuarantineKind.ENTRY_BLOCK,
-                )
+            return
+        self.record_quarantine(
+            f"partial-bracket close {close_coid} of leg {leg.coid} has no "
+            f"venue record of whether it executed: it is not sent again, and "
+            f"the bot cannot tell whether the position was reduced",
+            {'leg_coid': leg.coid, 'close_coid': close_coid,
+             'pine_id': leg.pine_id, 'from_entry': leg.from_entry},
+            intent_key=leg.intent_key,
+            kind=QuarantineKind.ENTRY_BLOCK,
+        )
+        resume = self._quarantine_resume_command()
+        if self._store_ctx is None:
+            decide = f"no operator decision can be recorded without a broker store: {resume}"
+        elif evidence.operator_may_decide:
+            decide = (f"check the venue and record the outcome: \"{resume} --close-executed "
+                      f"{close_coid}\" if it executed, \"{resume} --close-not-executed "
+                      f"{close_coid}\" if it did not")
+        else:
+            decide = (f"a leg send of the close is not settled yet; \"{resume}\" restarts the "
+                      f"bot, whose one-way replay settles that send first")
+        _blog_error(
+            "partial-bracket leg %s (%s of %r from %r) held: its close %s may "
+            "have executed and is not sent again; no venue record shows whether "
+            "it executed, and none will. Until it is settled its OCA siblings do "
+            "not trigger and %s. To settle it, %s",
+            leg.coid, leg.leg_kind, leg.pine_id, leg.from_entry, close_coid, cover, decide,
+        )
 
-    def _held_trigger_close_outcome(self, close_coid: str) -> str:
-        """What the venue evidence says about a held partial-bracket close.
+    def _held_trigger_close_outcome(self, close_coid: str) -> _HeldCloseEvidence:
+        """What the evidence says about a held partial-bracket close.
 
-        Only an execution settles a close as ``'sent'``: the venue acknowledging
-        it does not, since an acknowledged order can still end unfilled. The
-        plugin's journal row of the close decides, over every process of the
-        run:
-
-        * a filled quantity, or the journal's ``confirmed`` completion event
-          under the client order id (the close dispatch journal writes it once
-          the venue reported the close executed) — ``'sent'``;
-        * a refused row with nothing filled — ``'refused'``;
-        * a live row (a pending dispatch whose answer the plugin's resolver
-          owns, or an acknowledged order still working) — ``'pending'``: its
-          fill or its end updates the row;
-        * an ended row with nothing filled and no completion event, or no row
-          and no completion event at all — ``'unknown'``: a zero-fill
-          cancellation and a fill not recorded look the same there, and nothing
-          will tell them apart.
+        Only an execution settles a close as sent: the venue acknowledging it
+        does not, since an acknowledged order can still end unfilled. The
+        plugin's journal decides, over every process of the run, on a venue
+        with one order per close (:meth:`_held_order_close_outcome`) or with a
+        fan of per-leg closes (:meth:`_held_fan_close_outcome`). When no venue
+        record decides (``'unknown'``), the operator's decision recorded with
+        ``pyne broker resume --close-executed`` / ``--close-not-executed``
+        (:meth:`~pynecore.core.broker.storage.RunContext.operator_close_decision`)
+        settles it as ``'sent'`` or ``'refused'``.
 
         :param close_coid: The close's client order id.
-        :return: ``'sent'``, ``'refused'``, ``'pending'`` or ``'unknown'``.
+        :return: The evidence (:class:`_HeldCloseEvidence`).
         """
         store_ctx = self._store_ctx
         if store_ctx is None:
-            return 'unknown'
+            return _HeldCloseEvidence('unknown')
+        port: PositionPort | None = getattr(self._broker, 'position_port', None)
+        if port is not None:
+            evidence = self._held_fan_close_outcome(close_coid, port)
+        else:
+            evidence = self._held_order_close_outcome(close_coid)
+        if evidence.outcome != 'unknown' or not evidence.operator_may_decide:
+            return evidence
+        decision = store_ctx.operator_close_decision(close_coid)
+        if decision is None:
+            return evidence
+        return _HeldCloseEvidence('sent' if decision else 'refused', operator=True)
+
+    def _held_order_close_outcome(self, close_coid: str) -> _HeldCloseEvidence:
+        """The evidence of a held close sent as one order, from the plugin's journal.
+
+        ==========================================================  ============
+        Journal under the close's client order id                    Outcome
+        ==========================================================  ============
+        :data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_PARTIALLY_EVENT`  ``partial``
+        (executed share of the row's ``qty``; a full share is
+        ``sent``, a row missing is ``unknown``)
+        :data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_UNFILLED_EVENT`   ``refused``
+        (``unknown`` when the row has a fill booked)
+        a ``confirmed`` completion event                               ``sent``
+        no row                                                        ``unknown``
+        a live row with the venue's order id                          ``working``
+        a live row without it (the answer is still open)               ``pending``
+        an ended row filled in full                                    ``sent``
+        an ended row the venue refused with nothing filled             ``refused``
+        (:func:`~pynecore.core.broker.store_helpers.is_proven_refusal`)
+        any other ended row (nothing or part filled, no mark, or       ``unknown``
+        rejected only on an inferred absence)
+        ==========================================================  ============
+
+        :param close_coid: The close's client order id.
+        :return: The evidence.
+        """
+        store_ctx = self._store_ctx
+        assert store_ctx is not None
         row = store_ctx.get_order_for_run_id(close_coid)
-        if row is not None and row.filled_qty > 0.0:
-            return 'sent'
+        for _key, coid, _xid, payload in store_ctx.iter_events_by_kind_for_run_id(
+                CLOSE_ENDED_PARTIALLY_EVENT):
+            if coid != close_coid:
+                continue
+            executed = payload.get(CLOSE_EXECUTED_QTY_KEY)
+            if (row is None or row.qty <= 0.0 or not isinstance(executed, (int, float))
+                    or executed <= 0.0):
+                return _HeldCloseEvidence('unknown')
+            share = float(executed) / row.qty
+            if share >= 1.0 - _HELD_CLOSE_SHARE_EPS:
+                return _HeldCloseEvidence('sent')
+            return _HeldCloseEvidence('partial', executed_fraction=share)
+        for _key, coid, _xid, _payload in store_ctx.iter_events_by_kind_for_run_id(
+                CLOSE_ENDED_UNFILLED_EVENT):
+            if coid == close_coid:
+                if row is not None and row.filled_qty > 0.0:
+                    return _HeldCloseEvidence('unknown')
+                return _HeldCloseEvidence('refused')
         for _key, coid, _xid, _payload in store_ctx.iter_events_by_kind_for_run_id('confirmed'):
             if coid == close_coid:
-                return 'sent'
+                return _HeldCloseEvidence('sent')
         if row is None:
-            return 'unknown'
-        if row.state == STATE_REJECTED:
-            return 'refused'
+            return _HeldCloseEvidence('unknown')
         if row.closed_ts_ms is None:
-            return 'pending'
-        return 'unknown'
+            return _HeldCloseEvidence('working' if row.exchange_order_id else 'pending')
+        if row.qty > 0.0 and row.filled_qty >= row.qty * (1.0 - _HELD_CLOSE_SHARE_EPS):
+            return _HeldCloseEvidence('sent')
+        if is_proven_refusal(row):
+            return _HeldCloseEvidence('refused')
+        return _HeldCloseEvidence('unknown')
+
+    def _held_fan_close_outcome(self, close_coid: str, port: PositionPort) -> _HeldCloseEvidence:
+        """The evidence of a held close a hedging venue's fan sent as per-leg closes.
+
+        The one-way emulator fanned the close out as one close per position
+        leg, each with its close-leg row (``f"{close_coid}:{leg_id}"``, every
+        send it made of it recorded on the row). What every send of every leg
+        executed is the venue's answer
+        (:meth:`~pynecore.core.plugin.broker.PositionPort.close_leg_executed`),
+        in broker-grid volume:
+
+        * a row still ``pending`` — its send is not settled, and only the
+          emulator settles it (its restart replay establishes what the send
+          executed and re-sends what is owed), so nothing is decided here. In
+          a fan this process completed (its row's finish is owed) that is
+          ``'pending'``; otherwise ``'unknown'``, which the operator cannot
+          decide: the restart the resume makes lets the replay settle the
+          send first;
+        * a leg the venue cannot answer for yet — ``'working'``;
+        * every leg executed in full — ``'sent'``; nothing executed —
+          ``'refused'``; anything between — ``'partial'``, with the executed
+          share of the volume the close was asked for
+          (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_CLOSE_REQUESTED_VOLUME`),
+          the execution capped at it: a plan clipped short of the request is
+          not complete, and a plan widened to whole legs credits the close
+          with what executed, never more than it asked for. A row without the
+          requested volume measures against the fan's whole volume
+          (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_CLOSE_FAN_VOLUME`).
+          Either way a leg the fan never reached (a crash between two sends,
+          a plugin skip that ended the fan) has no row, never went out, and
+          counts as executing nothing;
+        * no row at all — ``'unknown'``.
+
+        A failed venue read decides nothing (``'working'``); the next sync
+        asks again.
+
+        :param close_coid: The close's client order id.
+        :param port: The venue's position port.
+        :return: The evidence.
+        """
+        store_ctx = self._store_ctx
+        assert store_ctx is not None
+        rows = [row for row in store_ctx.iter_orders_in_state_for_run_id(STATE_CLOSE_LEG)
+                if (row.extras or {}).get(EXTRAS_KEY_CLOSE_PARENT_COID) == close_coid]
+        if not rows:
+            return _HeldCloseEvidence('unknown')
+        for row in rows:
+            extras = row.extras or {}
+            if (row.closed_ts_ms is None
+                    and extras.get(EXTRAS_KEY_CLOSE_LEG_STATE) == CLOSE_LEG_STATE_PENDING):
+                if close_coid in self._acknowledged_trigger_closes:
+                    return _HeldCloseEvidence('pending')
+                return _HeldCloseEvidence('unknown', operator_may_decide=False)
+        executed_total = 0
+        volume_total = 0
+        fan_volume = 0
+        requested_volume = 0
+        for row in rows:
+            extras = row.extras or {}
+            leg_id = extras.get(EXTRAS_KEY_CLOSE_LEG_ID)
+            volume = int(extras.get(EXTRAS_KEY_CLOSE_LEG_VOLUME) or 0)
+            if not leg_id or volume <= 0:
+                return _HeldCloseEvidence('unknown')
+            fan_volume = max(fan_volume, int(extras.get(EXTRAS_KEY_CLOSE_FAN_VOLUME) or 0))
+            requested_volume = max(
+                requested_volume, int(extras.get(EXTRAS_KEY_CLOSE_REQUESTED_VOLUME) or 0))
+            attempts = tuple(str(sent) for sent in
+                             extras.get(EXTRAS_KEY_CLOSE_LEG_ATTEMPTS) or ()) or (
+                row.client_order_id,)
+            since_ms = extras.get(EXTRAS_KEY_CLOSE_LEG_SINCE_MS)
+            try:
+                executed = self._run_async_read(port.close_leg_executed(
+                    row.symbol, str(leg_id), attempts,
+                    int(since_ms) if since_ms is not None else row.created_ts_ms))
+            except Exception as e:  # noqa: BLE001 -- a failed read decides nothing
+                _blog_warning(
+                    "held partial-bracket close %s: what its close of leg %s executed "
+                    "could not be read (%s: %s); asked again next sync",
+                    close_coid, leg_id, type(e).__name__, e,
+                )
+                return _HeldCloseEvidence('working')
+            if executed is None:
+                return _HeldCloseEvidence('working')
+            executed_total += min(max(int(executed), 0), volume)
+            volume_total += volume
+        if requested_volume > 0:
+            # The close's own size: a plan clipped short of it is not complete,
+            # and what a plan widened to whole legs executed beyond it is not
+            # this close's.
+            volume_total = requested_volume
+            executed_total = min(executed_total, requested_volume)
+        else:
+            # A leg the fan never reached has no row and executed nothing.
+            volume_total = max(volume_total, fan_volume)
+        if executed_total >= volume_total:
+            return _HeldCloseEvidence('sent')
+        if executed_total <= 0:
+            return _HeldCloseEvidence('refused')
+        return _HeldCloseEvidence('partial', executed_fraction=executed_total / volume_total)
 
     def _close_attempt_left_no_record(self, close_coid: str) -> bool:
         """Whether the store holds no row of a close sent under ``close_coid``.
@@ -16005,6 +18888,37 @@ class OrderSyncEngine:
             (row.extras or {}).get(EXTRAS_KEY_CLOSE_PARENT_COID) == close_coid
             for row in store_ctx.iter_orders_in_state_for_run_id(STATE_CLOSE_LEG))
 
+    def _map_close_order(self, intent: CloseIntent, order: ExchangeOrder) -> None:
+        """Map a close :meth:`_dispatch_new` sent as one order, and keep the answer.
+
+        :param intent: The close.
+        :param order: The venue's answer
+            (kept as :attr:`~OrderSyncEngine._trigger_close_ack`).
+        """
+        self._order_mapping[intent.intent_key] = [order.id]
+        self._trigger_close_ack = order
+
+    def _map_close_fan(
+            self, intent: CloseIntent, envelope: DispatchEnvelope, fan: CloseFanResult,
+    ) -> None:
+        """Map a close :meth:`_dispatch_new` fanned out as per-leg closes, and keep the fan.
+
+        Each leg close is mapped under its own composed client order id: a
+        ``leg_id``-only handle would be shared by two closes of the same leg,
+        so settling one (its handle enters the settled caches) would match the
+        other.
+
+        :param intent: The close.
+        :param envelope: The close's dispatch envelope.
+        :param fan: The hedging venue's fan
+            (kept as :attr:`~OrderSyncEngine._trigger_close_ack`).
+        """
+        parent_coid = envelope.client_order_id(KIND_CLOSE)
+        self._order_mapping[intent.intent_key] = [
+            close_leg_client_order_id(parent_coid, leg_id) for leg_id, _vol in fan.legs
+        ]
+        self._trigger_close_ack = fan
+
     def _dispatch_partial_bracket_close(self, leg) -> None:
         """Synthesise + dispatch one partial-bracket :class:`CloseIntent`.
 
@@ -16020,20 +18934,31 @@ class OrderSyncEngine:
         Outcome mapping (mirrors :meth:`_dispatch_new`'s exception
         contract):
 
-        * Clean return AND the dispatch landed (``_order_mapping``
-          populated for ``synth_pine_id``) →
+        * Clean return AND the venue reported the close executed in full with
+          its answer (an order ``FILLED``), or the plugin's journal already
+          shows it executed, or the run has no store (nothing could ever show
+          it) →
           :meth:`SoftwarePartialBracketEngine.confirm_trigger_dispatched`
           flips the leg to
           :data:`~pynecore.core.broker.store_helpers.LEG_STATE_TRIGGERED` and
-          cascades the OCA siblings.
+          cascades the OCA siblings. A fan of a hedging venue that found
+          nothing to close settles the same way.
+        * Clean return, the venue acknowledged the close but has not reported
+          it executed → the leg stays held in
+          :data:`~pynecore.core.broker.store_helpers.LEG_STATE_TRIGGERING` on
+          the close's client order id, its OCA siblings reserved, not torn
+          down: an acknowledged close can still end unfilled. Each sync
+          settles it from the evidence
+          (:meth:`_settle_held_partial_bracket_close`): executed, ended
+          unfilled or partially executed, or still working (held, a known
+          state, no quarantine).
         * Clean return but the dispatch was parked by
           :meth:`_dispatch_new` (it swallows
           :class:`OrderDispositionUnknownError` and routes it to
           :meth:`_park_pending` without re-raising) →
           :meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_unknown`
-          re-arms the leg so the next price tick re-evaluates against
-          the live snapshot; the parked close still resolves through
-          :meth:`_verify_pending_dispatches` if it actually landed.
+          holds the leg on the close's client order id until the evidence
+          settles it.
         * :class:`OrderSkippedByPlugin` →
           :meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_failed`
           re-arms the leg with the skip reason on the audit row.
@@ -16065,6 +18990,7 @@ class OrderSyncEngine:
             ),
         )
         self._trigger_close_leg = leg.key
+        self._trigger_close_ack = None
         try:
             self._dispatch_new(close_intent)
         except OrderSkippedByPlugin as e:
@@ -16158,6 +19084,7 @@ class OrderSyncEngine:
             raise
         finally:
             self._trigger_close_leg = None
+            ack, self._trigger_close_ack = self._trigger_close_ack, None
         # ``_dispatch_new`` catches :class:`OrderDispositionUnknownError`
         # internally and routes it to :meth:`_park_pending` without
         # re-raising. On the clean-return path the dispatch can therefore
@@ -16176,7 +19103,23 @@ class OrderSyncEngine:
                 leg.key, reason='dispatch_parked',
             )
             return
-        self._settle_sent_partial_bracket_close(leg, synth_pine_id)
+        close_coid = leg.close_attempt_coid
+        if (self._store_ctx is None or close_coid is None
+                or _trigger_close_executed_at_ack(ack, leg.qty)):
+            self._settle_sent_partial_bracket_close(leg, synth_pine_id)
+            return
+        # The venue acknowledged the close without reporting it executed: it
+        # can still end unfilled, so the leg stays held on it with its OCA
+        # siblings reserved until the evidence settles it. Its mapping retires
+        # as on a settled close (the leg state machine tracks the close); its
+        # envelope stays until the settlement retires or re-anchors it.
+        self._acknowledged_trigger_closes.add(close_coid)
+        held, _ = self._parent_open_exposure(leg.from_entry)
+        if held > 0.0 and leg.qty >= held * (1.0 - 1e-9):
+            self._trigger_closes_taking_parent.add(close_coid)
+        self._order_mapping.pop(synth_pine_id, None)
+        self._trigger_close_dispatched_monotonic = time.monotonic()
+        self._settle_held_partial_bracket_close(leg)
 
     def _settle_sent_partial_bracket_close(self, leg, synth_pine_id: str) -> None:
         """Settle a ``triggering`` leg whose close the venue took.
@@ -16197,9 +19140,12 @@ class OrderSyncEngine:
         # error.not-found.dealId, retried into ``degrading``, cycles 345 /
         # 362 / 369 / 378), and should the close not fill, the parent would
         # be left without the stop. The deal's disappearance retires the
-        # fail-safe.
+        # fail-safe. A close this process held from its acknowledgement
+        # settles once its fill is booked, so whether it takes the whole
+        # parent was judged at the acknowledgement.
         held, _ = self._parent_open_exposure(leg.from_entry)
-        if held > 0.0 and leg.qty >= held * (1.0 - 1e-9):
+        if (leg.close_attempt_coid in self._trigger_closes_taking_parent
+                or (held > 0.0 and leg.qty >= held * (1.0 - 1e-9))):
             self._native_failsafe_closing_parent = leg.parent_entry_dispatch_ref
         try:
             self._partial_bracket_engine.confirm_trigger_dispatched(
@@ -16207,6 +19153,7 @@ class OrderSyncEngine:
             )
         finally:
             self._native_failsafe_closing_parent = None
+            self._trigger_closes_taking_parent.discard(leg.close_attempt_coid)
         self._trigger_close_dispatched_monotonic = time.monotonic()
         # Retire the synthetic close identity now that the leg owns the
         # dispatch. ``_order_mapping`` / ``_envelopes`` keyed on
@@ -16892,12 +19839,44 @@ class OrderSyncEngine:
         :meth:`_durable_owned_signed_size`: a partially closed pyramid keeps
         one trade per entry id.
 
+        The rows themselves, with the quantity each holds, are
+        :meth:`_adopted_parent_rows`.
+
         Pure-local: read-only over the persisted journal.
+        """
+        return self._parent_trades_of_rows(
+            self._adopted_parent_rows(broker_signed, fifo_trim=fifo_trim), broker_signed)
+
+    @staticmethod
+    def _parent_trades_of_rows(
+            rows: list[tuple[OrderRow, float]], broker_signed: float,
+    ) -> list[tuple[str, float]]:
+        """The ``(entry_id, signed_size)`` parent trades of adopted rows, by entry id in fill order.
+
+        :param rows: :meth:`_adopted_parent_rows`.
+        :param broker_signed: The adopted signed size (its sign is the trades').
+        """
+        by_id: dict[str, float] = {}
+        for row, size in rows:
+            entry_id = row.pine_entry_id or ''
+            by_id[entry_id] = by_id.get(entry_id, 0.0) + (size if broker_signed > 0.0 else -size)
+        return list(by_id.items())
+
+    def _adopted_parent_rows(
+            self, broker_signed: float, *, fifo_trim: bool = False,
+    ) -> list[tuple[OrderRow, float]]:
+        """The journal rows a startup adoption attributes per entry, with what each holds.
+
+        The rows and the rules of :meth:`_recover_adopted_parent_trades`, in
+        fill order; the quantity is the row's run-owned exposure after the
+        adoption's FIFO trim, unsigned.
+
+        :return: Empty when the journal cannot account for the adopted net.
         """
         if self._store_ctx is None or broker_signed == 0.0:
             return []
         want_buy = broker_signed > 0.0
-        owned: list[tuple[str, float]] = []
+        owned: list[tuple[OrderRow, float]] = []
         total = 0.0
         places = self._position.fill_places()
 
@@ -16931,7 +19910,7 @@ class OrderSyncEngine:
                 # Durable exposure opposing the adopted net sign — a hedged
                 # both-sides book the net scalar cannot represent faithfully.
                 return []
-            owned.append((entry_id, filled))
+            owned.append((row, filled))
             total += filled
         if not owned:
             return []
@@ -16942,16 +19921,69 @@ class OrderSyncEngine:
             # caller's fills could name. Seeding per-entry trades here would
             # misplace it — let the caller seed the single aggregate.
             return []
-        by_id: dict[str, float] = {}
-        for entry_id, size in owned:
+        kept: list[tuple[OrderRow, float]] = []
+        for row, size in owned:
             if excess > 1e-9:
                 trimmed = min(size, excess)
                 excess -= trimmed
                 size -= trimmed
             if size <= 1e-12:
                 continue
-            by_id[entry_id] = by_id.get(entry_id, 0.0) + (size if want_buy else -size)
-        return list(by_id.items())
+            kept.append((row, size))
+        return kept
+
+    def _adopted_entry_commissions(self, kept: list[tuple[OrderRow, float]]) -> dict[str, float]:
+        """The commission of the entry fills an adopted position still holds, by entry id.
+
+        Every entry fill the run took has its receipt
+        (:class:`~pynecore.core.broker.storage.FillReceipt`) with its fee, its
+        entry id and the quantity it added to its order row. A row whose
+        exposure the adoption keeps (``kept``: the row and the quantity it
+        still holds, in the journal's unit) carries the fees of its order's
+        receipts in the share it still holds of what they booked: a part an
+        earlier process already closed took its share of the entry
+        commission into that closed trade. Receipts written by this process
+        and not yet stored count too.
+
+        A fill whose receipt the store lacks (its process stopped before the
+        book write) adds nothing here: the plugin delivers it again flagged
+        :attr:`~OrderEvent.journaled_before_restart`, and its fee, less what
+        a receipt accounted, is booked then (:meth:`_book_restart_held_fill_fee`).
+
+        :param kept: The rows the adopted trades are built from, each with the
+            quantity of it they hold.
+        :return: The commission per entry id; an entry without receipts is absent.
+        """
+        if self._store_ctx is None or not kept:
+            return {}
+        receipts = {receipt.fill_id: receipt
+                    for receipt in self._store_ctx.iter_entry_fill_receipts()}
+        for pending in itertools.chain(self._deferred_fill_receipts.values(),
+                                       self._pending_fill_receipts.values()):
+            if pending is not None and pending.entry_id is not None:
+                stored = receipts.get(pending.fill_id)
+                receipts[pending.fill_id] = (
+                    pending if stored is None or stored.qty <= pending.qty
+                    else dataclasses.replace(pending, qty=stored.qty))
+        by_key: dict[str, list[FillReceipt]] = {}
+        for receipt in receipts.values():
+            for key in {receipt.client_order_id, receipt.order_id}:
+                if key:
+                    by_key.setdefault(key, []).append(receipt)
+        commissions: dict[str, float] = {}
+        for row, size in kept:
+            entry_id = row.pine_entry_id or ''
+            matched = {receipt.fill_id: receipt
+                       for key in self._journal_row_keys(row)
+                       for receipt in by_key.get(key, ())
+                       if receipt.entry_id == entry_id}
+            if not matched:
+                continue
+            fee = sum(receipt.fee for receipt in matched.values())
+            booked = sum(receipt.qty for receipt in matched.values())
+            share = 1.0 if booked <= 1e-12 else min(1.0, size / booked)
+            commissions[entry_id] = commissions.get(entry_id, 0.0) + fee * share
+        return commissions
 
     def _recover_adopted_parent_entry_id(self, broker_signed: float) -> str | None:
         """Recover the single real Pine parent entry id for a startup adoption.
@@ -18451,6 +21483,24 @@ class OrderSyncEngine:
             # retry leaves the row live rather than halting the bot. A residual
             # opened here belongs to its reversal's entry intent: its order ids
             # are mapped to it, as ``run_reversal``'s own open would have been.
+            # Net the two sides a filled resting entry left on the account
+            # (:meth:`OneWayEmulator.drain_nettings`): each pass writes its two
+            # close-plan halves persist-first and sends them; the residual drain
+            # below settles them from the venue's evidence like any breadcrumb.
+            try:
+                self._run_async_recovery(
+                    self._one_way_emulator.drain_nettings(
+                        one_way_port, fill_grace_s=self._fill_report_grace_s()),
+                )
+            except BrokerManualInterventionError as e:
+                self._record_halt(e)
+                raise
+            except (OrderDispositionUnknownError,
+                    ExchangeConnectionError) as e:
+                _blog_warning(
+                    "netting filled resting entries did not confirm (%s) — "
+                    "retrying next sync", e,
+                )
             try:
                 self._run_async_recovery(
                     self._one_way_emulator.drain_residual_opens(one_way_port),
@@ -18516,9 +21566,13 @@ class OrderSyncEngine:
                     self._log_residual_hold(key)
                     continue
                 old = self._active_intents[key]
-                if (isinstance(old, EntryIntent)
-                        and self._entry_orders_terminal(key)
-                        and self._parent_open_exposure(key)[0] > 0.0):
+                if self._hold_entry_awaiting_fill_evidence(old, 'strategy cancel'):
+                    # Kept active: the event that brings the venue's quantity
+                    # (or the fill of the reported execution) is then applied
+                    # to the entry exactly as it would have been without this
+                    # sync's cancel.
+                    continue
+                if self._consumed_entry_with_open_exposure(key, old):
                     # A consumed entry whose position is still open leaves
                     # the intent list when the script re-places it and the
                     # pyramiding limit drops the new order (a second
@@ -18710,6 +21764,12 @@ class OrderSyncEngine:
                         "each sync until it lands",
                         format_intent_key(key),
                     )
+                    continue
+                if (self._hold_entry_awaiting_booking(intent, 'dispatch')
+                        or (isinstance(intent, CloseIntent)
+                            and self._hold_entry_awaiting_fill_evidence(intent, 'close'))):
+                    # A close of the key would size itself from a book that
+                    # does not hold what the entry's order executed.
                     continue
                 # Refuse-and-defer guard for cancel-tentative parents.
                 # The shadow map is keyed by the parent
@@ -19333,6 +22393,12 @@ class OrderSyncEngine:
                         self._rejected_entry_intents.pop(key, None)
                     self._active_intents[key] = intent
             elif intent != self._active_intents[key]:
+                if self._hold_entry_awaiting_fill_evidence(intent, 'replacement'):
+                    # An amend (or the cancel + re-place it falls back to, or
+                    # the fresh cycle a consumed entry's re-issue becomes)
+                    # would open a second order next to one that may have
+                    # executed; the next sync re-diffs once evidence arrived.
+                    continue
                 if (isinstance(intent, EntryIntent)
                         and intent.pine_id
                         in self._pending_defensive_close):
@@ -19657,6 +22723,21 @@ class OrderSyncEngine:
             return True
         return self._entry_orders_terminal(key)
 
+    def _consumed_entry_with_open_exposure(self, key: str, intent: Intent) -> bool:
+        """Whether ``intent`` is a consumed entry whose executed position is still open.
+
+        No venue order of it works (:meth:`_entry_orders_terminal`), so a
+        cancel or an amend has nothing to act on, while its envelope is the
+        parent ref the open position's exits and partial-bracket legs resolve:
+        a strategy cancel or an OCA cascade leaves it for the close cleanup.
+
+        :param key: The entry's intent key.
+        :param intent: The active intent of ``key``.
+        """
+        return (isinstance(intent, EntryIntent)
+                and self._entry_orders_terminal(key)
+                and self._parent_open_exposure(key)[0] > 0.0)
+
     def _entry_orders_terminal(self, key: str) -> bool:
         """Whether no venue order of the entry tracked under ``key`` still works.
 
@@ -19752,6 +22833,11 @@ class OrderSyncEngine:
             # Entry dispatch is blocked wholesale under quarantine; leave the
             # sentinel and the pin untouched so a recovered engine (operator
             # restart) re-evaluates from a clean diff.
+            return
+        if self._entry_execution_awaiting_booking(key):
+            # The venue reported what the consumed cycle executed, but its fill
+            # is not booked yet: the pyramiding gate below would count without
+            # it. The pin stays, so the next sync after the booking decides.
             return
         if not intent.is_strategy_order and self._position.size != 0.0:
             is_buy = intent.side == 'buy'
@@ -20912,6 +23998,11 @@ class OrderSyncEngine:
             old = self._active_intents.get(key)
             if not isinstance(old, EntryIntent):
                 continue
+            if self._hold_entry_awaiting_fill_evidence(old, 'short-gate cancel'):
+                # Its order is terminal at the venue: nothing rests to
+                # cancel, and its working qty stays counted against the
+                # deficit, so the loop goes on to the next candidate.
+                continue
             _blog_warning(
                 "short-gate fill-time reconcile: position %s no longer backs "
                 "the aggregate working sell qty %s; cancelling resting sell "
@@ -21095,6 +24186,13 @@ class OrderSyncEngine:
         for key, old in list(self._forced_cancel_pending.items()):
             spent_envelope = self._envelopes.get(key)
             spent_anchor = self._persisted_envelope_anchors.get(key)
+            if self._entry_execution_unresolved(key):
+                # Held for its execution evidence, or a terminal event reported
+                # an execution the book has not taken in: the cancel stays
+                # parked (no venue round-trip) until the evidence is applied,
+                # as its fill still routes through the mapping the landed
+                # cancel would drop.
+                continue
             try:
                 landed = self._dispatch_cancel_strict(old)
             except (ExchangeConnectionError, OrderDispositionUnknownError,
@@ -22491,19 +25589,11 @@ class OrderSyncEngine:
                             "open, re-deriving from the net next reconcile",
                             format_intent_key(intent.intent_key), fan.shortfall,
                         )
-                    # Each leg close is mapped under its own composed client
-                    # order id: a ``leg_id``-only handle would be shared by two
-                    # closes of the same leg, so settling one (its handle
-                    # enters the settled caches) would match the other.
-                    parent_coid = envelope.client_order_id(KIND_CLOSE)
-                    self._order_mapping[intent.intent_key] = [
-                        close_leg_client_order_id(parent_coid, leg_id)
-                        for leg_id, _vol in fan.legs
-                    ]
+                    self._map_close_fan(intent, envelope, fan)
                     self._record_defensive_close_fan(intent, fan)
                 else:
-                    order = self._run_async_write(self._broker.execute_close(envelope))
-                    self._order_mapping[intent.intent_key] = [order.id]
+                    self._map_close_order(
+                        intent, self._run_async_write(self._broker.execute_close(envelope)))
                 self._close_reject_counts.pop(intent.intent_key, None)
                 # This close is now live on the wire — reset its cumulative-fill
                 # ledger so a stale value from an earlier close cycle on the same
@@ -22660,13 +25750,24 @@ class OrderSyncEngine:
         under a re-anchored id included, so the leg always names the send that
         may be on the venue: a restart holds the leg on it instead of sending a
         second close (:meth:`_settle_held_partial_bracket_closes`). The write
-        commits first; a failure raises before anything is sent.
+        commits first; a failure raises before anything is sent. An id an
+        earlier close of the leg already went out under
+        (:meth:`SoftwarePartialBracketEngine.close_coid_spent`) is refused as
+        spent, so the dispatch re-anchors and sends under a fresh one.
         """
         leg_key = self._trigger_close_leg
         if intent.synthetic_kind != 'partial_trigger' or leg_key is None:
             return
+        close_coid = envelope.client_order_id(KIND_CLOSE)
+        if self._partial_bracket_engine.close_coid_spent(leg_key, close_coid):
+            # An earlier close of the leg went out under this id and was
+            # released (a restart lost the in-memory re-anchor): the caller
+            # re-anchors and sends under a fresh id.
+            raise ClientOrderIdSpentError(
+                f"partial-bracket close {close_coid}: an earlier close of the leg was "
+                f"sent under this client order id")
         self._partial_bracket_engine.record_trigger_close_attempt(
-            leg_key, close_coid=envelope.client_order_id(KIND_CLOSE),
+            leg_key, close_coid=close_coid,
         )
 
     def _dispatch_crossed_entry(
@@ -26677,12 +29778,13 @@ class OrderSyncEngine:
         # Returns ``True`` when the caller may treat the cancel as settled
         # (landed, benign no-op, or the unknown-disposition handling below
         # — cancel-tentative / eager-retire — now owns the ambiguity, same
-        # as it always did). Returns ``False`` ONLY when ``execute_cancel``
+        # as it always did). Returns ``False`` when ``execute_cancel``
         # returned ``False``: the working order is still live at the
         # broker, the intent has been parked in ``_forced_cancel_pending``
         # for the per-sync retry, and the caller MUST NOT arm replacement
         # state for the key (the cancel + re-execute modify path defers on
-        # this).
+        # this). Also ``False``, with nothing parked, for an entry held for
+        # its execution evidence (see below).
         #
         # Persist the cancel obligation BEFORE the broker round-trip (same
         # ordering as :meth:`_attempt_short_gate_forced_cancel`). If the
@@ -26724,6 +29826,13 @@ class OrderSyncEngine:
         # the ``'forced_cancel'`` row (whole-row native exits and non-SOFTWARE
         # entries never fill into unbacked partial protection, so the bool-only
         # retry is the correct, non-halting driver the short gate depends on).
+        #
+        # An entry whose terminal event came without the venue's executed
+        # quantity has nothing resting to cancel, and its teardown waits for
+        # that evidence: no pre-park and no venue round-trip, and ``False``
+        # so the caller keeps its state and arms no replacement for the key.
+        if self._hold_entry_awaiting_fill_evidence(old, 'cancel'):
+            return False
         is_software_parent_entry = (
             isinstance(old, EntryIntent)
             and self._partial_qty_bracket_exit_mode is CapabilityLevel.SOFTWARE
@@ -26890,8 +29999,15 @@ class OrderSyncEngine:
             swallowing :meth:`_dispatch_cancel` park the intent in
             ``_forced_cancel_pending`` for the per-sync retry; the
             remaining strict callers cancel whole-row native exits, whose
-            plugin paths never return ``False``.
+            plugin paths never return ``False``. An entry held for execution
+            evidence (:meth:`_hold_entry_awaiting_fill_evidence`) returns
+            ``False`` untouched, with no venue round-trip: its order is
+            terminal at the venue, nothing of its state may be retired or
+            replaced yet, and the event carrying the venue's quantity retires
+            or arms it.
         """
+        if self._hold_entry_awaiting_fill_evidence(old, 'cancel'):
+            return False
         # Engine-trigger partial bracket exits are engine-internal: the
         # leg rows were never sent to the broker, so a plugin
         # ``execute_cancel`` call would target nothing. Cancel through
@@ -26977,6 +30093,19 @@ class OrderSyncEngine:
         except BrokerManualInterventionError as e:
             self._record_halt(e)
             raise
+        if (cancelled and isinstance(old, EntryIntent)
+                and self._entry_execution_queued(old.intent_key)):
+            # The venue order is gone, but an execution of it waits for its
+            # routing: the cancel is not settled until that execution is
+            # booked and arms its protection. The caller keeps the entry's
+            # state and parks the cancel; its retry after the drain tears down
+            # what is left.
+            _blog_info(
+                "cancel of %s landed with an execution of it still queued; the "
+                "teardown waits until that execution is routed",
+                format_intent_key(old.intent_key),
+            )
+            cancelled = False
         if cancelled:
             # Remember the broker order ids we just cancelled: the venue's
             # follow-up ``CANCELLED`` push arrives after this teardown has

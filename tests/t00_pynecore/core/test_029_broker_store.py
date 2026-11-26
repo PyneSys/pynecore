@@ -18,6 +18,7 @@ from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import (
     BrokerStore,
     EnvelopeRecord,
+    FillReceipt,
     HEARTBEAT_INTERVAL_MS,
     OrderRow,
     PendingRecord,
@@ -993,6 +994,92 @@ def __test_retention_purge_removes_expired_rows__(tmp_path: Path) -> None:
             ("dispatch", "coid-live"),  # live-order guard
             ("fresh", None),            # inside the retention window
         }
+
+
+def __test_fill_receipts_are_seen_by_every_process_of_the_run__(tmp_path: Path) -> None:
+    """A receipt is the logical run's: the next process reads it; a fee-only one is not delivery.
+
+    A rewrite keeps ``booked`` once set and takes the new fee and order ids
+    (an order id left out keeps the stored one).
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.record_fill_receipts([
+            FillReceipt("d-1", booked=True, fee=0.5, client_order_id="c-1", order_id="o-1"),
+            FillReceipt("d-2", booked=False, fee=0.3, order_id="o-2"),
+        ])
+        assert ctx.fill_delivered("d-1") and not ctx.fill_delivered("d-2")
+        assert not ctx.fill_delivered("d-3") and ctx.fill_receipt("d-3") is None
+        ctx.close()
+        ctx2 = _open_run(store)
+        assert ctx2.fill_delivered("d-1")
+        ctx2.record_fill_receipts([
+            FillReceipt("d-1", booked=False, fee=0.7),
+            FillReceipt("d-2", booked=True, fee=0.3, client_order_id="c-2"),
+        ])
+        first = ctx2.fill_receipt("d-1")
+        assert first is not None
+        assert (first.booked, first.fee, first.client_order_id, first.order_id) == (
+            True, 0.7, "c-1", "o-1")
+        assert ctx2.fill_delivered("d-2")
+        other = _open_run(store, strategy_id="other")
+        assert other.fill_receipt("d-1") is None
+
+
+def __test_a_fill_receipt_keeps_its_entry_and_booked_quantity__(tmp_path: Path) -> None:
+    """The entry id and quantity of an entry fill's receipt survive a fee-only rewrite.
+
+    A rewrite without an entry id keeps the stored one, and the quantity never
+    shrinks; only receipts naming an entry are listed as entry receipts.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.record_fill_receipts([
+            FillReceipt("e-1", booked=True, fee=0.2, client_order_id="c-1", entry_id="L",
+                        qty=1.5),
+            FillReceipt("x-1", booked=True, fee=0.1, client_order_id="c-x", qty=1.5),
+        ])
+        ctx.record_fill_receipts([FillReceipt("e-1", booked=False, fee=0.4)])
+        receipt = ctx.fill_receipt("e-1")
+        assert receipt is not None
+        assert (receipt.booked, receipt.fee, receipt.entry_id, receipt.qty) == (
+            True, 0.4, "L", 1.5)
+        ctx.close()
+        ctx2 = _open_run(store)
+        assert [(r.fill_id, r.entry_id, r.qty) for r in ctx2.iter_entry_fill_receipts()] == [
+            ("e-1", "L", 1.5)]
+
+
+def __test_retention_purge_keeps_a_fill_receipt_while_its_order_row_exists__(
+        tmp_path: Path) -> None:
+    """A receipt goes with its journal row, and lives at least the retention window.
+
+    Old receipts whose order still has a row (live, or closed inside the
+    window, matched by client or venue order id) stay; one whose row the
+    same purge removes goes with it; one with no row goes once it is past
+    the window; a recent one stays whatever its row.
+    """
+    old_ts = _backdated_ts()
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        ctx.upsert_order("c-live", symbol="EURUSD", side="buy", qty=1.0, state="filled")
+        ctx.upsert_order("c-venue", symbol="EURUSD", side="buy", qty=1.0, state="filled",
+                         exchange_order_id="o-venue")
+        ctx.upsert_order("c-old", symbol="EURUSD", side="buy", qty=1.0, state="filled")
+        ctx.close_order("c-old")
+        store._conn.execute("UPDATE orders SET closed_ts_ms = ? WHERE client_order_id = ?",
+                            (old_ts, "c-old"))
+        ctx.record_fill_receipts([
+            FillReceipt("live", booked=True, fee=0.0, client_order_id="c-live"),
+            FillReceipt("venue", booked=True, fee=0.0, order_id="o-venue"),
+            FillReceipt("with-old-row", booked=True, fee=0.0, client_order_id="c-old"),
+            FillReceipt("rowless", booked=True, fee=0.0, order_id="o-gone"),
+        ])
+        store._conn.execute("UPDATE fill_receipts SET ts_ms = ?", (old_ts,))
+        ctx.record_fill_receipts([FillReceipt("recent", booked=True, fee=0.0)])
+        store.cleanup_old_data()
+        kept = {row[0] for row in store._conn.execute("SELECT fill_id FROM fill_receipts")}
+        assert kept == {"live", "venue", "recent"}
 
 
 def __test_retention_purge_keeps_events_of_live_intents__(tmp_path: Path) -> None:

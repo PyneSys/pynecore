@@ -5,7 +5,7 @@ title: "Broker Run Management"
 description: "Manage quarantined live broker runs with the PyneCore CLI. Understand quarantine states, inspect what a bot continues to do and resume a run when appropriate."
 icon: "shield"
 date: "2026-10-14"
-lastmod: "2026-10-15"
+lastmod: "2026-11-25"
 draft: false
 toc: true
 categories: ["CLI"]
@@ -172,3 +172,49 @@ A resume accepts the venue as it stands:
 
 Before you resume, settle the position on the venue the way you want the
 bot to continue from it.
+
+## A held partial-bracket close
+
+A software partial bracket (a partial take-profit, stop-loss or trailing exit
+the bot watches itself) closes its share of the position with a market close
+when its level is reached. The bot settles that close only from what the
+venue reports: until the close executes, ends without a fill, or ends after
+executing part of it, the exit's leg is **held**. While it is held, the
+exit's other legs (the stop-loss of a take-profit, and so on) stay in place
+but do not trigger, and no second close is sent.
+
+- An executed close retires the exit's other legs.
+- A close that ended with nothing executed re-arms the leg; the next cross
+  sends a new close under a new client order id.
+- A close that ended after executing part of the exit re-arms the leg for
+  the rest, and the exit's other legs protect only the rest.
+- A close the venue still works on stays held. This is not an error.
+
+When no venue record shows whether a close executed (its answer was lost and
+the venue keeps no record the plugin can read), the bot cannot decide. It
+keeps the leg held and enters an `entry_block` quarantine, with an ERROR that
+names the close's client order id and the commands that settle it:
+
+```
+partial-bracket leg ... held: its close my_tag-...-c1 may have executed and is not sent again; no venue record shows whether it executed, and none will. ... To settle it, check the venue and record the outcome: "pyne broker resume 'RUN_ID' 9f3a01bc --close-executed my_tag-...-c1" if it executed, "pyne broker resume 'RUN_ID' 9f3a01bc --close-not-executed my_tag-...-c1" if it did not
+```
+
+Look the close up on the venue (its client order id is the order's link id
+or label), then resume with the outcome:
+
+```bash
+pyne broker resume RUN_ID QUARANTINE_ID --close-executed CLOSE_COID
+pyne broker resume RUN_ID QUARANTINE_ID --close-not-executed CLOSE_COID
+```
+
+Both options can be repeated for several held closes. The command refuses a
+client order id that names no held close of the run and lists the held ones.
+The decision is stored with the resume request; the restarted bot settles
+the leg with it, as if the venue had reported that outcome, and journals an
+`operator_close_decision_applied` event. A plain resume without a decision
+only restarts the bot, and the same close quarantines it again.
+
+On a hedging account, a close the bot fanned out over several position legs
+may have a leg close whose send is not settled yet. The ERROR then says so
+and offers only the plain resume: the restarted bot first settles that send
+itself, then decides the close from the venue.

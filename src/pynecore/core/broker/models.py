@@ -33,6 +33,7 @@ __all__ = [
     'QuarantineKind',
     'ExchangeOrder',
     'OrderEvent',
+    'FEE_EVENT_TYPE',
     'CANCEL_REASON_VENUE_REDUCE_ONLY',
     'CANCEL_REASON_VENUE_OCA',
     'CANCEL_REASON_VENUE_POSITION_CLEARED',
@@ -237,7 +238,32 @@ class CapabilityLevel(StrEnum):
 
 @dataclass
 class ExchangeOrder:
-    """An order as it exists on the exchange."""
+    """An order as it exists on the exchange.
+
+    **filled_qty_known says whether filled_qty is the venue's word.** ``True``
+    (the default) means ``filled_qty`` is the order's cumulative executed
+    quantity as the venue (or the plugin's own record of the venue's
+    executions) reports it, so a ``0.0`` proves that nothing executed. A
+    plugin sets ``False`` when the venue did not report the executed quantity
+    for this order state (a push without the cumulative field, an unparsable
+    value): ``filled_qty`` is then only a lower bound, what the plugin has
+    seen executed so far, usually ``0.0``. A positive value still proves that
+    much executed.
+
+    It matters on terminal events (``cancelled`` / ``rejected``
+    :class:`OrderEvent`): the sync engine ends an entry's partial-bracket
+    protection, retires its native fail-safe or confirms a cancel-tentative
+    parent as cancelled only on a PROVEN zero. A terminal event of an entry
+    with ``filled_qty_known=False`` and nothing seen executed changes nothing:
+    the order stays mapped, its legs stay pending and a cancel-tentative parent
+    stays tentative (its cancel-retry probe,
+    :meth:`~pynecore.core.plugin.broker.BrokerPlugin.execute_cancel_with_outcome`,
+    resolves it). The plugin delivers the terminal event again once the
+    executed quantity is known (an order-history read, a
+    :class:`~pynecore.core.broker.disappearance.DisappearanceTracker`
+    confirmation), and the engine acts on that one. Never report a zero the
+    venue did not send as known.
+    """
     id: str
     symbol: str
     side: str  # "buy" | "sell"
@@ -257,6 +283,14 @@ class ExchangeOrder:
     # Required for post-restart bracket reconstruction — without it, open TP/SL
     # legs left on the exchange cannot be mapped back to Pine identity.
     client_order_id: str | None = None
+    # Whether ``filled_qty`` is the venue-reported cumulative execution; a
+    # ``False`` makes it a lower bound (see the class docstring).
+    filled_qty_known: bool = True
+
+    @property
+    def proven_unexecuted(self) -> bool:
+        """Whether the venue's word proves that nothing of this order executed."""
+        return self.filled_qty_known and self.filled_qty <= 0.0
 
 
 #: Venue-side cancel reasons a plugin may stamp on a ``cancelled``
@@ -286,6 +320,11 @@ VENUE_DRIVEN_CANCEL_REASONS = frozenset({
 })
 
 
+#: ``OrderEvent.event_type`` of a fee that arrives without its fill (see
+#: :class:`OrderEvent`).
+FEE_EVENT_TYPE = 'fee'
+
+
 @dataclass
 class OrderEvent:
     """
@@ -303,11 +342,14 @@ class OrderEvent:
     over-apply. The cumulative-on-the-order total lives in
     :attr:`ExchangeOrder.filled_qty`; the per-event slice lives here.
 
-    **fill_id is the canonical idempotency key.** The sync engine keeps a
-    bounded seen-set keyed on ``fill_id`` and drops a fill whose ``fill_id``
-    it has already applied, as a final defence against a broker delivering
-    the same execution twice (live-push/dispatch-response replay, poll+stream
-    race, reconnect). For this gate to work the invariant is: *the same real
+    **fill_id is the canonical idempotency key.** The sync engine drops a
+    fill whose ``fill_id`` it has already taken, as a final defence against
+    a broker delivering the same execution twice (live-push/dispatch-response
+    replay, poll+stream race, reconnect, a restart): within a process by a
+    bounded seen-set, across processes of the run by its durable receipt
+    (:class:`~pynecore.core.broker.storage.FillReceipt`, readable through
+    :meth:`~pynecore.core.broker.storage.RunContext.fill_delivered`). For
+    this gate to work the invariant is: *the same real
     broker execution MUST carry the same ``fill_id`` across every path that
     can surface it.* Use the broker-native execution/deal id whenever one
     exists. ``fill_id`` may be ``None`` only when the plugin has no
@@ -331,9 +373,58 @@ class OrderEvent:
     ``fill_qty``. ``None`` on a fill is a contract violation: the fill is
     booked, but its order's cursor does not move, so a restart cannot vouch
     for the book and adopts the position from the journal.
+
+    **A fill a restart already holds is delivered again with
+    journaled_before_restart.** A restart starts from the venue position and
+    the journal (the startup adoption), so a fill an earlier process of the
+    run journaled is already in the position this process starts with,
+    whether or not that process's engine booked it before it ended. A plugin
+    that delivers such a fill again (from its own record of fills it
+    journaled, when :meth:`~pynecore.core.broker.storage.RunContext.fill_delivered`
+    is ``False`` for it) sets ``journaled_before_restart``: the engine then
+    records its receipt and books nothing but the fee of an entry fill (a
+    fill whose receipt exists is ignored either way). The trades the startup
+    adopts carry no commission of the earlier process, so an entry fill's
+    ``fee`` (less what a fee event of it already accounted) goes to the open
+    trades of its entry by size, like a fee event of a fill this process did
+    not book. The fee of an exit-leg fill, and of an entry fill whose entry
+    holds no open trade, is not booked: the trade it belonged to was the
+    earlier process's and is not recovered. A fill whose exposure the
+    journal does NOT hold (its rows still own the exposure the fill removed,
+    e.g. a close whose retirement the earlier process never wrote) is
+    delivered as an ordinary fill. Never set the flag on a fill this process journaled: the engine
+    would not book it.
+
+    **A terminal event proves "nothing executed" only with a known quantity.**
+    On a ``cancelled`` or ``rejected`` event, ``order.filled_qty`` is the
+    order's cumulative executed quantity, and the engine reads a ``0.0`` as
+    proof that the entry never filled (its legs end as
+    ``parent_never_arrived``, a cancel-tentative parent resolves as
+    cancelled) only while :attr:`ExchangeOrder.filled_qty_known` is ``True``.
+    A plugin whose venue omitted the executed quantity sets it ``False``: the
+    engine then keeps the entry's order, legs and tentative state as they are
+    and waits for the same terminal event with the venue's quantity (see
+    :class:`ExchangeOrder`).
+
+    **event_type "fee" carries a fee without a fill.** For a commission that
+    arrives without its fill event, or after it (a fill booked from a
+    snapshot that carried no fee): ``fill_id`` names the fill the fee belongs
+    to (mandatory), ``fee`` is that fill's TOTAL commission as now known (not
+    an increment), ``fill_qty`` / ``fill_price`` are ``None``, and
+    ``pine_id`` / ``from_entry`` / ``leg_type`` / ``order`` identify the fill
+    as its fill event would. The engine books the difference between ``fee``
+    and the commission it already accounted the fill id with (its receipt's
+    :attr:`~FillReceipt.fee`) onto the trades
+    the fill opened or closed, so delivering it again, before or after a
+    restart, books nothing; a later fill event of the same ``fill_id`` is
+    booked with only the part of its fee not yet accounted, and one with a
+    ``fee`` of ``0.0`` counts as carrying no commission data (the total a fee
+    event reported stands). It never creates
+    a trade nor moves the position.
     """
     order: ExchangeOrder
-    event_type: str  # "created" | "amended" | "filled" | "partial" | "cancelled" | "rejected"
+    # "created" | "amended" | "filled" | "partial" | "cancelled" | "rejected" | "fee"
+    event_type: str
     fill_price: float | None
     fill_qty: float | None  # INCREMENTAL qty of THIS event (see class docstring)
     timestamp: float
@@ -350,6 +441,9 @@ class OrderEvent:
     # This fill's quantity in the unit of its order's journal row
     # ``filled_qty`` (see class docstring). Set on every fill event.
     journal_fill_qty: float | None = None
+    # The fill was journaled by an earlier process of the run, so the position
+    # this process started with already holds it (see class docstring).
+    journaled_before_restart: bool = False
     # Set only on ``cancelled`` events synthesised by the
     # :class:`~pynecore.core.broker.disappearance.DisappearanceTracker` after
     # it has already applied the ``on_unexpected_cancel`` policy for the

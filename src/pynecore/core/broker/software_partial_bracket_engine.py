@@ -24,7 +24,9 @@ parent close, broker-native SL), the restart replay, and the
 close-dispatch settling step
 (:meth:`SoftwarePartialBracketEngine.confirm_trigger_dispatched`,
 :meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_failed`,
-:meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_unknown`).
+:meth:`SoftwarePartialBracketEngine.mark_trigger_dispatch_unknown`, and for a
+held close :meth:`SoftwarePartialBracketEngine.release_held_trigger` /
+:meth:`SoftwarePartialBracketEngine.release_held_trigger_partially`).
 The price-tick wiring runs from
 :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._drive_partial_bracket_triggers`
 at the tail of every sync cycle for plugins that advertise
@@ -94,6 +96,21 @@ __all__ = [
 # same (pine_id, from_entry) — a tp_partial / sl_partial / trail_partial
 # trio attached to one ``strategy.exit(...)``.
 LegKey = tuple[str, str, str]
+
+# Row extras key of an OCA sibling a partially executed close of another leg
+# sized down: that close's client order id, so a retried settlement never
+# sizes the sibling twice
+# (:meth:`SoftwarePartialBracketEngine.release_held_trigger_partially`).
+_EXTRAS_KEY_SIZED_AFTER_CLOSE = 'sized_after_close'
+
+# Row extras key of a leg: the client order ids of the closes it released after
+# they may have reached the venue (refused, ended, executed in part). A send of
+# the leg never goes out under one of them again, across restarts too
+# (:meth:`SoftwarePartialBracketEngine.close_coid_spent`).
+_EXTRAS_KEY_SPENT_CLOSE_COIDS = 'spent_close_coids'
+
+# Quantity below which nothing of a leg is left.
+_QTY_EPS = 1e-12
 
 
 @dataclass
@@ -879,12 +896,14 @@ class SoftwarePartialBracketEngine:
         """The ``triggering`` legs whose recorded close is not settled.
 
         Such a leg comes from an earlier process (restored by
-        :meth:`restart_replay`) or from a dispatch whose outcome is unknown
-        (:meth:`mark_trigger_dispatch_unknown`): its close may have reached
-        the venue, so the
-        sync engine settles it from the venue evidence of
-        :attr:`PartialBracketLeg.close_attempt_coid` — sent
-        (:meth:`confirm_trigger_dispatched`), refused or never sent
+        :meth:`restart_replay`), from a dispatch whose outcome is unknown
+        (:meth:`mark_trigger_dispatch_unknown`), or from a close the venue
+        acknowledged without reporting it executed (the sync engine leaves
+        the leg ``triggering``): its close may execute, or may have executed,
+        so the sync engine settles it from the venue evidence of
+        :attr:`PartialBracketLeg.close_attempt_coid` — executed
+        (:meth:`confirm_trigger_dispatched`), executed in part
+        (:meth:`release_held_trigger_partially`), refused or never sent
         (:meth:`release_held_trigger`) — and sends nothing for it meanwhile.
         Its OCA group stays reserved while it is held.
         """
@@ -908,7 +927,79 @@ class SoftwarePartialBracketEngine:
         self._transition(
             leg, LEG_STATE_ARMED, close_row=False,
             extras_patch={EXTRAS_KEY_TRIGGER_CLOSE_COID: None,
+                          _EXTRAS_KEY_SPENT_CLOSE_COIDS: _spent_with(leg),
                           'held_close_released': reason},
+        )
+        leg.close_attempt_coid = None
+
+    def close_coid_spent(self, leg_key: LegKey, close_coid: str) -> bool:
+        """Whether ``close_coid`` names a close the leg released after it may have reached the venue.
+
+        A held close the leg released (:meth:`release_held_trigger`,
+        :meth:`release_held_trigger_partially`) spent its client order id: the
+        venue may know it, and a later send under it could be deduplicated into
+        the ended order or open a second order under the same id. The ids are
+        kept on the leg's row, so a restart that lost the engine's in-memory
+        re-anchor still knows them.
+
+        :param leg_key: The leg.
+        :param close_coid: The client order id a send of the leg is about to use.
+        """
+        leg = self._legs.get(leg_key)
+        return leg is not None and close_coid in (
+            leg.extras.get(_EXTRAS_KEY_SPENT_CLOSE_COIDS) or ())
+
+    def release_held_trigger_partially(
+            self, leg_key: LegKey, *, executed_qty: float, reason: str,
+    ) -> None:
+        """Re-arm a held leg whose close ended after executing part of it.
+
+        The leg re-arms for what is left of it (its quantity less
+        ``executed_qty``), so its next cross closes only the remainder. Its
+        OCA-cancel siblings protect the same exit, whose quantity the close
+        reduced as well: each is sized down by ``executed_qty`` (the leg
+        quantity :meth:`_safety_check` caps a close at), and one with nothing
+        left is cancelled. Every row commits first, the siblings before the
+        leg: a failed write leaves the leg held, and the next try sizes no
+        sibling twice (the close's client order id is recorded on each sibling
+        it sized).
+
+        :param leg_key: The held leg.
+        :param executed_qty: What the close executed, in the leg's quantity
+            unit; below the leg's quantity.
+        :param reason: Audit reason recorded on the leg's row.
+        """
+        leg = self._legs.get(leg_key)
+        if (leg is None or leg.leg_state != LEG_STATE_TRIGGERING
+                or leg.close_attempt_coid is None):
+            return
+        close_coid = leg.close_attempt_coid
+        if leg.oca_group is not None and leg.oca_type == OcaType.CANCEL.value:
+            for key in sorted(self._legs_by_oca_group.get(leg.oca_group, ())):
+                sibling = self._legs.get(key)
+                if (key == leg_key or sibling is None
+                        or sibling.leg_state not in LEG_STATE_ACTIVE
+                        or sibling.oca_type != OcaType.CANCEL.value
+                        or sibling.extras.get(_EXTRAS_KEY_SIZED_AFTER_CLOSE) == close_coid):
+                    continue
+                left = sibling.qty - executed_qty
+                if left <= _QTY_EPS:
+                    self._transition(
+                        sibling, LEG_STATE_CASCADED_CANCEL, close_row=True,
+                        extras_patch={'cascade_reason': 'oca_sibling_partially_closed',
+                                      _EXTRAS_KEY_SIZED_AFTER_CLOSE: close_coid},
+                    )
+                    continue
+                self._transition(
+                    sibling, sibling.leg_state, close_row=False, qty=left,
+                    extras_patch={_EXTRAS_KEY_SIZED_AFTER_CLOSE: close_coid},
+                )
+        self._transition(
+            leg, LEG_STATE_ARMED, close_row=False, qty=max(leg.qty - executed_qty, 0.0),
+            extras_patch={EXTRAS_KEY_TRIGGER_CLOSE_COID: None,
+                          _EXTRAS_KEY_SPENT_CLOSE_COIDS: _spent_with(leg),
+                          'held_close_released': reason,
+                          'held_close_executed_qty': executed_qty},
         )
         leg.close_attempt_coid = None
 
@@ -1570,6 +1661,14 @@ class TickOffsetResolver:
         if leg.leg_kind == LEG_KIND_TRAIL_PARTIAL:
             return fill_price - parent_sign * leg.trigger_offset
         return None
+
+
+def _spent_with(leg: PartialBracketLeg) -> list[str]:
+    """The leg's spent close client order ids with its recorded close added."""
+    spent = [str(coid) for coid in leg.extras.get(_EXTRAS_KEY_SPENT_CLOSE_COIDS) or ()]
+    if leg.close_attempt_coid is not None and leg.close_attempt_coid not in spent:
+        spent.append(leg.close_attempt_coid)
+    return spent
 
 
 def _leg_from_row(row: 'OrderRow') -> PartialBracketLeg | None:

@@ -26,7 +26,12 @@ module owns the rule, and a plugin supplies the lookup:
 
 A rejected row is closed through the journal and gets a ``'rejected'`` plugin
 resolution, which the engine consumes on its next sync: it drops the parked
-envelope and dispatches the intent again.
+envelope and dispatches the intent again. A rejection made from a conclusive
+absence is an inference, not the venue's answer: the row is flagged
+:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_REJECTED_ON_ABSENCE`, so a
+reader that needs proof that nothing of the dispatch executed (a held
+partial-bracket close, a cancel probe) does not take it for one
+(:func:`~pynecore.core.broker.store_helpers.is_proven_refusal`).
 
 A dispatch an earlier process of the run left pending is resolved the same
 way. Its row was adopted at startup
@@ -65,6 +70,7 @@ from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    EXTRAS_KEY_REJECTED_ON_ABSENCE,
     PENDING_DISPATCH_STATES,
     STATE_DISPOSITION_UNKNOWN,
     find_pending_dispatch,
@@ -331,6 +337,7 @@ class ParkedDispatchResolver:
                     audit_payload={'order_id': verdict.order_id or '',
                                    'order_status': verdict.status, 'found': found},
                     exchange_order_id=verdict.order_id or None,
+                    extras_patch=None if found else {EXTRAS_KEY_REJECTED_ON_ABSENCE: True},
                 ),
             )
             store_ctx.record_resolution(coid, 'rejected')

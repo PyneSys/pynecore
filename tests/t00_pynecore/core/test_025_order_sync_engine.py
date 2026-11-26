@@ -98,6 +98,16 @@ from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_BRACKET_OWN_STATE as _EXTRAS_KEY_BRACKET_OWN_STATE,
     EXTRAS_KEY_BRACKET_OWN_TP as _EXTRAS_KEY_BRACKET_OWN_TP,
     EXTRAS_KEY_CLOSE_PARENT_COID as _EXTRAS_KEY_CLOSE_PARENT_COID,
+    EXTRAS_KEY_CLOSE_FAN_VOLUME as _EXTRAS_KEY_CLOSE_FAN_VOLUME,
+    EXTRAS_KEY_CLOSE_REQUESTED_VOLUME as _EXTRAS_KEY_CLOSE_REQUESTED_VOLUME,
+    CLOSE_ENDED_PARTIALLY_EVENT as _CLOSE_ENDED_PARTIALLY_EVENT,
+    CLOSE_ENDED_UNFILLED_EVENT as _CLOSE_ENDED_UNFILLED_EVENT,
+    CLOSE_EXECUTED_QTY_KEY as _CLOSE_EXECUTED_QTY_KEY,
+    EXTRAS_KEY_REJECTED_ON_ABSENCE as _EXTRAS_KEY_REJECTED_ON_ABSENCE,
+    STATE_REJECTED as _STATE_REJECTED,
+    create_close_leg_row as _create_close_leg_row,
+    create_engine_trigger_partial_leg_row as _create_engine_trigger_partial_leg_row,
+    finish_close_leg_row as _finish_close_leg_row,
     STATE_CLOSE_LEG as _STATE_CLOSE_LEG,
     create_bracket_ownership_row as _create_bracket_ownership_row,
     iter_active_bracket_ownerships as _iter_active_bracket_ownerships,
@@ -21232,6 +21242,94 @@ def __test_a_skipped_software_leg_guard_close_keeps_the_guard_armed__():
     assert sent == [("1", 6)]
 
 
+#: Leg changes after the whole-leg stop of ``L-X`` went onto leg "7" (long
+#: 2.0), and the protection leg "7" needs once the change is in: the venue
+#: legs before the change (``None``: leg "7" alone), the change, whether it
+#: arrives as a fill of an opposite order of the script, and the expected
+#: ``(mode, quantity)`` of leg "7" with its venue stop afterwards.
+_LEG_CHANGES = {
+    'opposite_fill': (None, [("7", "buy", 2.0), ("8", "sell", 0.5)], True,
+                      ('software', 1.5), None),
+    'foreign_opposing_leg': (None, [("7", "buy", 2.0), ("8", "sell", 0.5)], False,
+                             ('software', 1.5), None),
+    'offsetting_leg_partly_closed': ([("7", "buy", 2.0), ("8", "sell", 0.5)],
+                                     [("7", "buy", 2.0), ("8", "sell", 0.2)], False,
+                                     ('software', 1.8), None),
+    'offsetting_leg_retired': ([("7", "buy", 2.0), ("8", "sell", 0.5)],
+                               [("7", "buy", 2.0)], False, ('whole', 2.0), 90.0),
+    'bracketed_leg_partly_closed': ([("7", "buy", 2.0), ("8", "sell", 0.5)],
+                                    [("7", "buy", 1.0), ("8", "sell", 0.5)], False,
+                                    ('software', 0.5), None),
+}
+
+
+@pytest.mark.parametrize("change", list(_LEG_CHANGES))
+def __test_a_leg_change_re_decides_the_leg_protection_in_the_sync_that_sees_it__(
+        tmp_path, change):
+    """Whatever changes what a bracketed leg needs, the first sync that sees it re-decides it.
+
+    A long 2.0 on leg "7" carries the whole-leg stop of ``L-X``. Then the
+    legs change: an opposite order of the script fills on a new leg, an
+    opposing leg the run did not open appears, the offsetting leg is partly
+    closed or closed, or the bracketed leg itself shrinks. The first sync
+    after the change (the fill drained by it) brings leg "7" to the
+    protection its new share asks for: the software guard over the
+    surviving quantity once a whole-leg stop would close more than the net
+    exposure (its venue stop cleared), the whole-leg stop back once nothing
+    offsets the leg any more. A later sync changes nothing.
+    """
+    before, after, by_fill, mode, stop = _LEG_CHANGES[change]
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        b.position_port = b
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        emulator = engine._one_way_emulator  # type: ignore[attr-defined]
+        ts = BAR_TS
+
+        def sync() -> None:
+            nonlocal ts
+            ts += 60_000
+            engine.sync(ts, last_price=100.0)
+
+        def legs(spec) -> list[PositionLeg]:
+            return [_pleg(leg_id, side, qty, open_time=float(index + 1))
+                    for index, (leg_id, side, qty) in enumerate(spec)]
+
+        pos.entry_orders["L"] = _entry_order("L", 2.0)
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", -2.0, "L-X", stop=90.0)
+        sync()
+        _hedge_venue(b, legs([("7", "buy", 2.0)]))
+        engine.on_order_event(replace(
+            _fill_event('buy', 2.0, 100.0, pine_id="L", xchg_id="x-L", fill_id="f-L"),
+            journal_fill_qty=2.0))
+        sync()
+        assert b.leg_brackets == {"7": (None, 90.0, None)}
+        if before is not None:
+            _hedge_venue(b, legs(before))
+            sync()
+        if by_fill:
+            pos.entry_orders["O"] = Order("O", -0.5, order_type=_order_type_normal,
+                                          limit=105.0)
+            sync()
+            _hedge_venue(b, legs(after))
+            engine.on_order_event(replace(
+                _fill_event('sell', 0.5, 105.0, pine_id="O", xchg_id="x-O", fill_id="f-O"),
+                journal_fill_qty=0.5))
+        else:
+            _hedge_venue(b, legs(after))
+        sync()
+        guards = emulator._software_guards  # type: ignore[attr-defined]
+        modes = emulator._protection_modes  # type: ignore[attr-defined]
+        assert modes[(SYMBOL, "7")] == (mode[0], pytest.approx(mode[1]))
+        assert b.leg_brackets["7"] == (None, stop, None)
+        assert ([guard.qty for key, guard in guards.items() if key == (SYMBOL, "7")]
+                == ([] if mode[0] == 'whole' else [pytest.approx(mode[1])]))
+        amends = list(b.amend_calls)
+        sync()
+        assert b.amend_calls == amends
+
+
 def __test_an_attach_without_a_verdict_is_settled_from_the_venue_and_unparked__(tmp_path):
     """A parked one-way attach is confirmed by reading the leg, and a newer modify waits for it."""
     from pynecore.core.broker.storage import BrokerStore
@@ -21478,7 +21576,10 @@ class _FaultyConnection:
     """A store connection whose ``fail_at``-th armed write statement fails once.
 
     With ``crash`` set the failing write kills the process instead
-    (:class:`_ProcessCrash`), and the uncommitted transaction is lost.
+    (:class:`_ProcessCrash`), and the uncommitted transaction is lost. A dead
+    process writes nothing more: every later write (a ``finally`` block
+    unwinding the crash, armed or not) dies too, until the harness clears
+    :attr:`dead` for the next process.
     """
 
     _WRITES = ('INSERT', 'UPDATE', 'DELETE', 'REPLAC')
@@ -21490,9 +21591,14 @@ class _FaultyConnection:
         self.fail_at: int | None = None
         self.failed_sql: str | None = None
         self.crash = False
+        self.dead = False
 
     def _count(self, sql: str) -> None:
-        if not self.armed or sql.lstrip()[:6].upper() not in self._WRITES:
+        if sql.lstrip()[:6].upper() not in self._WRITES:
+            return
+        if self.dead:
+            raise _ProcessCrash(sql)
+        if not self.armed:
             return
         index = self.writes
         self.writes += 1
@@ -21500,6 +21606,7 @@ class _FaultyConnection:
             import sqlite3
             self.failed_sql = sql
             if self.crash:
+                self.dead = True
                 raise _ProcessCrash(sql)
             raise sqlite3.OperationalError("disk I/O error (injected)")
 
@@ -21630,27 +21737,52 @@ def _journal_view(ctx) -> dict:
             'envelopes': sorted(envelopes), 'pending': sorted(pending)}
 
 
-def _run_storage_fault_scenario(tmp_path, fail_at: int | None) -> dict:
-    """Entry + bracket, amend, partial close, hedge reversal, cancel, restart.
+#: The commissions of the hedging scenario's fills that carry one
+#: (:func:`_run_storage_fault_scenario`).
+_HEDGE_FILL_FEES = {'f-C': 0.25, 'f-S': 0.1}
+
+
+def _run_storage_fault_scenario(tmp_path, fail_at: int | None, *, crash: bool = False,
+                                fees_on_fills: bool = False) -> dict:
+    """Entry + bracket, amend, partial close, hedge reversal, cancel, restart, redelivery.
 
     Every ``sync`` / ``settle_restart_state`` / event hand-over runs with the
     store armed; the ``fail_at``-th write statement among them fails once.
     Each bar syncs three times on the same bar timestamp, the cadence of a
     live run within one bar, so a write that failed lands on the same bar
-    and the run stays comparable to the fault-free one.
+    and the run stays comparable to the fault-free one. With ``crash`` that
+    write kills the first process instead: its open transaction is lost and
+    the run goes straight to the restart.
+
+    The partial close (``f-C``) and the short entry (``f-S``) have a
+    commission (:data:`_HEDGE_FILL_FEES`). With ``fees_on_fills`` their fill
+    events carry it; otherwise the fills come without it and the commission
+    follows on fee events (``event_type`` ``'fee'``), each delivered twice.
+
+    After the restart the plugin delivers again every fill the first process
+    delivered, the way the plugin contract says: a fill the run took
+    (:meth:`~pynecore.core.broker.storage.RunContext.fill_delivered`) as it
+    was, any other one with ``journaled_before_restart`` (its journal write
+    preceded the event, so the restart's position holds it), then the fee
+    events once more. The position before and after that redelivery is
+    recorded (``restart_size`` / ``redelivered_size``).
     """
     from pynecore.core.broker.storage import BrokerStore
     from pynecore.lib.strategy import _exit_order_key
-    out: dict = {'raised': []}
-    with BrokerStore(tmp_path / f"fi-{fail_at}.sqlite", plugin_name="testbroker") as store:
+    out: dict = {'raised': [], 'crashed': False}
+    path = tmp_path / f"fi-{fail_at}-{crash}-{fees_on_fills}.sqlite"
+    with BrokerStore(path, plugin_name="testbroker") as store:
         faulty = _FaultyConnection(store._conn)
         store._conn = faulty  # type: ignore[assignment]
         faulty.fail_at = fail_at
+        faulty.crash = crash
         ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
         b = _JournalingHedgeBroker(faulty=faulty, store_ctx=ctx)
         b.position_port = b
         engine, pos = _mk_engine(b, store_ctx=ctx)
         ts = BAR_TS
+        delivered: list[OrderEvent] = []
+        fee_events: list[OrderEvent] = []
 
         def call(fn, *args) -> None:
             faulty.armed = True
@@ -21668,60 +21800,99 @@ def _run_storage_fault_scenario(tmp_path, fail_at: int | None) -> dict:
                 call(engine.sync, ts)
 
         def fill(side, qty, *, pine_id, fill_id, leg=LegType.ENTRY) -> None:
+            fee = _HEDGE_FILL_FEES.get(fill_id, 0.0)
             event = replace(_fill_event(side, qty, 100.0, pine_id=pine_id, leg=leg,
                                         xchg_id=f"x-{fill_id}", fill_id=fill_id),
-                            journal_fill_qty=qty)
+                            journal_fill_qty=qty, fee=fee if fees_on_fills else 0.0)
+            if leg is LegType.ENTRY:
+                # An entry fill carries its order's client order id, the key of
+                # the journal row the plugin raised before the event.
+                row = next((row for row in ctx.iter_live_orders()
+                            if row.pine_entry_id == pine_id and row.from_entry is None
+                            and (row.extras or {}).get('kind') == 'position'), None)
+                if row is not None:
+                    event = replace(event, order=replace(
+                        event.order, client_order_id=row.client_order_id))
+            delivered.append(event)
             call(engine.on_order_event, event)
+            if fee and not fees_on_fills:
+                fee_event = replace(event, event_type='fee', fill_qty=None, fill_price=None,
+                                    journal_fill_qty=None, fee=fee)
+                fee_events.append(fee_event)
+                # Delivered twice: the second is a retry of the same report.
+                call(engine.on_order_event, fee_event)
+                call(engine.on_order_event, fee_event)
             bar()
 
-        # 1. A MARKET entry with a stop exit; its fill attaches the bracket.
-        pos.entry_orders["L"] = _entry_order("L", 2.0)
-        pos.exit_orders[("L-X", "L")] = _exit_order("L", -2.0, "L-X", stop=90.0)
-        bar()
-        _hedge_venue(b, [_pleg("7", "buy", 2.0, open_time=1.0)])
-        b.journal_fill("L", 2.0)
-        fill('buy', 2.0, pine_id="L", fill_id="f-L")
-        # 2. The stop is amended.
-        pos.exit_orders[("L-X", "L")] = _exit_order("L", -2.0, "L-X", stop=95.0)
-        bar()
-        # 3. Half the position is closed.
-        close = Order("L", -1.0, order_type=_order_type_close,
-                      exit_id="Close entry(s) order L")
-        pos.exit_orders[_exit_order_key(close)] = close
-        bar()
-        _hedge_venue(b, [_pleg("7", "buy", 1.0, open_time=1.0)])
-        b.journal_fill("L", 1.0)
-        fill('sell', 1.0, pine_id="L", fill_id="f-C", leg=LegType.CLOSE)
-        # 4. A MARKET short reverses the rest: the leg closes, then S opens.
-        pos.exit_orders.pop(("L-X", "L"), None)
-        pos.entry_orders.pop("L", None)
-        pos.entry_orders["S"] = _entry_order("S", -1.0)
-        bar()
-        marker = engine._pending_reversal_opens.get("S")  # type: ignore[attr-defined]
-        assert marker is not None or fail_at is not None
-        if marker is not None:
-            _hedge_venue(b, [])
-            b.journal_fill("L", 0.0)
-            fill('sell', 1.0, pine_id=marker.close_pine_id, fill_id="f-R",
-                 leg=LegType.CLOSE)
-        _hedge_venue(b, [_pleg("8", "sell", 1.0, open_time=2.0)])
-        if any(row.pine_entry_id == "S" for row in ctx.iter_live_orders()):
-            b.journal_fill("S", 1.0)
-        fill('sell', 1.0, pine_id="S", fill_id="f-S")
-        # 5. A resting entry, then its cancel.
-        pos.entry_orders["P"] = _entry_order("P", -1.0, limit=110.0)
-        bar()
-        pos.entry_orders.pop("P")
-        bar()
-        out['first'] = {
-            'size': pos.size, 'avg': pos.avg_price, 'netprofit': pos.netprofit,
-            'closed': [(t.entry_id, t.size, t.exit_price) for t in pos.closed_trades],
-            'open': [(t.entry_id, t.size) for t in pos.open_trades],
-            'owed': list(engine._owed_store_writes),  # type: ignore[attr-defined]
-            'journal': _journal_view(ctx),
-        }
-        # 6. Restart: a new process of the run adopts the short.
-        ctx.close()
+        def first_process() -> None:
+            # 1. A MARKET entry with a stop exit; its fill attaches the bracket.
+            pos.entry_orders["L"] = _entry_order("L", 2.0)
+            pos.exit_orders[("L-X", "L")] = _exit_order("L", -2.0, "L-X", stop=90.0)
+            bar()
+            _hedge_venue(b, [_pleg("7", "buy", 2.0, open_time=1.0)])
+            b.journal_fill("L", 2.0)
+            fill('buy', 2.0, pine_id="L", fill_id="f-L")
+            # 2. The stop is amended.
+            pos.exit_orders[("L-X", "L")] = _exit_order("L", -2.0, "L-X", stop=95.0)
+            bar()
+            # 3. Half the position is closed.
+            close = Order("L", -1.0, order_type=_order_type_close,
+                          exit_id="Close entry(s) order L")
+            pos.exit_orders[_exit_order_key(close)] = close
+            bar()
+            _hedge_venue(b, [_pleg("7", "buy", 1.0, open_time=1.0)])
+            b.journal_fill("L", 1.0)
+            fill('sell', 1.0, pine_id="L", fill_id="f-C", leg=LegType.CLOSE)
+            # 4. A MARKET short reverses the rest: the leg closes, then S opens.
+            pos.exit_orders.pop(("L-X", "L"), None)
+            pos.entry_orders.pop("L", None)
+            pos.entry_orders["S"] = _entry_order("S", -1.0)
+            bar()
+            marker = engine._pending_reversal_opens.get("S")  # type: ignore[attr-defined]
+            assert marker is not None or fail_at is not None
+            if marker is not None:
+                _hedge_venue(b, [])
+                b.journal_fill("L", 0.0)
+                fill('sell', 1.0, pine_id=marker.close_pine_id, fill_id="f-R",
+                     leg=LegType.CLOSE)
+            _hedge_venue(b, [_pleg("8", "sell", 1.0, open_time=2.0)])
+            if any(row.pine_entry_id == "S" for row in ctx.iter_live_orders()):
+                b.journal_fill("S", 1.0)
+            fill('sell', 1.0, pine_id="S", fill_id="f-S")
+            # 5. A resting entry, then its cancel.
+            pos.entry_orders["P"] = _entry_order("P", -1.0, limit=110.0)
+            bar()
+            pos.entry_orders.pop("P")
+            bar()
+            out['first'] = {
+                'size': pos.size, 'avg': pos.avg_price, 'netprofit': pos.netprofit,
+                'closed': [(t.entry_id, t.size, t.exit_price) for t in pos.closed_trades],
+                'commissions': ([t.commission for t in pos.closed_trades],
+                                [t.commission for t in pos.open_trades]),
+                'open': [(t.entry_id, t.size) for t in pos.open_trades],
+                'owed': list(engine._owed_store_writes),  # type: ignore[attr-defined]
+                'journal': _journal_view(ctx),
+            }
+            out['first_writes'] = faulty.writes
+
+        def crashed() -> None:
+            # The dead process commits nothing more: its open transaction is
+            # lost and it never closes its run.
+            out['crashed'] = True
+            faulty.crash = False
+            faulty.dead = False
+            if faulty._conn.in_transaction:
+                faulty._conn.rollback()
+            store._txn_depth = 0  # type: ignore[attr-defined]
+            if ctx._owner_lock is not None:
+                store._release_owner_lock(ctx._owner_lock)  # type: ignore[attr-defined]
+
+        try:
+            first_process()
+            ctx.close()
+        except _ProcessCrash:
+            crashed()
+        # 6. Restart: a new process of the run adopts the position.
         ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
         b.store_ctx = ctx2
         engine2, pos2 = _mk_engine(b, store_ctx=ctx2)
@@ -21731,11 +21902,29 @@ def _run_storage_fault_scenario(tmp_path, fail_at: int | None) -> dict:
         engine = engine2
         for _ in range(2):
             bar()
+        out['restart_size'] = pos2.size
+        # 7. The plugin delivers every fill of the first process again.
+        out['flagged'] = []
+        for event in delivered:
+            taken = ctx2.fill_delivered(event.fill_id or '')
+            if not taken:
+                out['flagged'].append(event.fill_id)
+            call(engine2.on_order_event, event if taken
+                 else replace(event, journaled_before_restart=True))
+        for fee_event in fee_events:
+            call(engine2.on_order_event, fee_event)
+        bar()
+        out['redelivered_size'] = pos2.size
         out['second'] = {
             'size': pos2.size, 'open': [(t.entry_id, t.size) for t in pos2.open_trades],
+            'open_commission': pos2.open_commission, 'netprofit': pos2.netprofit,
             'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
             'halted': engine2.halted, 'quarantined': engine2.quarantined,
             'journal': _journal_view(ctx2),
+            'receipts': sorted(
+                (fill_id, receipt.booked, receipt.fee)
+                for fill_id in ('f-L', 'f-C', 'f-R', 'f-S')
+                if (receipt := ctx2.fill_receipt(fill_id)) is not None),
         }
         out['port_writes'] = list(b.port_writes)
         out['writes'] = faulty.writes
@@ -21770,20 +21959,917 @@ def _storage_fault_partial_bracket_unsent_close(tmp_path, fail_at: int | None) -
     return _storage_fault_partial_bracket(tmp_path, fail_at, close_journal='journal_fail')
 
 
+def _storage_fault_partial_bracket_acked_fill(tmp_path, fail_at: int | None) -> dict:
+    """The partial-bracket run whose TP close the venue acknowledged and executed a bar later."""
+    return _storage_fault_partial_bracket(tmp_path, fail_at, close_journal='ack_then_fill')
+
+
+def _storage_fault_partial_bracket_acked_unfilled(tmp_path, fail_at: int | None) -> dict:
+    """The partial-bracket run whose acknowledged TP close ended with nothing filled."""
+    return _storage_fault_partial_bracket(tmp_path, fail_at, close_journal='ack_then_unfilled')
+
+
+def _storage_fault_partial_bracket_acked_partial(tmp_path, fail_at: int | None) -> dict:
+    """The partial-bracket run whose acknowledged TP close ended partially filled."""
+    return _storage_fault_partial_bracket(tmp_path, fail_at, close_journal='ack_then_partial')
+
+
+def _run_software_guard_trail_scenario(tmp_path, fail_at: int | None, *,
+                                       crash: bool = False) -> dict:
+    """A trailing exit under the software leg guard, across a restart.
+
+    A long 3.0 on leg "7" gets the trailing exit ``L-X`` (5 ticks of 1.0) as
+    a whole-leg venue bracket. The venue position then grows to 4.0 with
+    exposure the run does not own, so the bracket is cleared and the leg is
+    guarded in software for the run's 3.0. The guard trails from 100 over
+    110 to 112 (stop 107). The process ends (or, with ``crash``, dies at the
+    ``fail_at``-th write); the restarted process re-arms the guard, a price
+    of 108 does not reach the stop, 107 does, and the guard closes the run's
+    3.0 of the leg. Every ``sync`` / ``settle_restart_state`` / event
+    hand-over runs with the store armed; the ``fail_at``-th write fails once
+    (or kills the process). Each bar syncs three times.
+
+    Recorded: the trail extreme the store holds when the first process ends
+    (``persisted_extreme``) and the one the restarted guard trails from after
+    its first price (``restored_extreme``).
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME
+    out: dict = {'raised': [], 'crashed': False}
+    path = tmp_path / f"guard-{fail_at}-{crash}.sqlite"
+
+    def shared_leg() -> PositionLeg:
+        return replace(_pleg("7", "buy", 3.0, open_time=1.0), venue_qty=4.0)
+
+    def persisted(ctx) -> float | None:
+        values = [(row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME)
+                  for row in _iter_active_bracket_ownerships(ctx)]
+        values = [value for value in values if value is not None]
+        return max(values) if values else None
+
+    with BrokerStore(path, plugin_name="testbroker") as store:
+        faulty = _FaultyConnection(store._conn)
+        store._conn = faulty  # type: ignore[assignment]
+        faulty.fail_at = fail_at
+        faulty.crash = crash
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = _JournalingHedgeBroker(faulty=faulty, store_ctx=ctx)
+        b.position_port = b
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        ts = BAR_TS
+        executed: dict[str, int] = {}
+        journaling_close = b.close_leg
+
+        async def close_leg(symbol, leg_id, volume, coid) -> None:
+            # The venue executes the close: the leg shrinks by it.
+            await journaling_close(symbol, leg_id, volume, coid)
+            executed[coid] = volume
+            _hedge_venue(b, [replace(leg, qty=leg.qty - volume, venue_qty=(
+                None if leg.venue_qty is None else leg.venue_qty - volume))
+                for leg in b.raw_legs if leg.leg_id != leg_id or leg.qty > volume])
+
+        async def close_leg_executed(symbol, leg_id, coids, since_ms) -> int:
+            return sum(executed.get(coid, 0) for coid in coids)
+
+        b.close_leg = close_leg  # type: ignore[method-assign]
+        b.close_leg_executed = close_leg_executed  # type: ignore[method-assign]
+
+        def call(fn, *args, **kwargs) -> None:
+            faulty.armed = True
+            try:
+                fn(*args, **kwargs)
+            except Exception as exc:
+                out['raised'].append(f"{type(exc).__name__}: {exc}")
+            finally:
+                faulty.armed = False
+
+        def bar(price: float) -> None:
+            nonlocal ts
+            ts += 60_000
+            for _ in range(3):
+                call(engine.sync, ts, last_price=price)
+
+        def first_process() -> None:
+            pos.entry_orders["L"] = _entry_order("L", 3.0)
+            pos.exit_orders[("L-X", "L")] = _exit_order(
+                "L", -3.0, "L-X", trail_price=100.0, trail_offset=5.0)
+            bar(100.0)
+            _hedge_venue(b, [_pleg("7", "buy", 3.0, open_time=1.0)])
+            b.journal_fill("L", 3.0)
+            call(engine.on_order_event, replace(
+                _fill_event('buy', 3.0, 100.0, pine_id="L", xchg_id="x-f-L", fill_id="f-L"),
+                journal_fill_qty=3.0))
+            bar(100.0)
+            _hedge_venue(b, [shared_leg()])
+            bar(100.0)
+            bar(110.0)
+            bar(112.0)
+            bar(109.0)
+            out['first'] = {'size': pos.size, 'closes': list(b.close_leg_calls),
+                            'owed': list(engine._owed_store_writes)}  # type: ignore[attr-defined]
+            out['first_writes'] = faulty.writes
+
+        try:
+            first_process()
+            ctx.close()
+        except _ProcessCrash:
+            out['crashed'] = True
+            faulty.crash = False
+            faulty.dead = False
+            if faulty._conn.in_transaction:
+                faulty._conn.rollback()
+            store._txn_depth = 0  # type: ignore[attr-defined]
+            if ctx._owner_lock is not None:
+                store._release_owner_lock(ctx._owner_lock)  # type: ignore[attr-defined]
+        ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        out['persisted_extreme'] = persisted(ctx2)
+        b.store_ctx = ctx2
+        engine2, pos2 = _mk_engine(b, store_ctx=ctx2)
+        engine = engine2
+        engine2.reconcile()
+        ts += 60_000
+        call(engine2.settle_restart_state, ts)
+        bar(108.0)
+        guards = engine2._one_way_emulator._software_guards  # type: ignore[attr-defined]
+        guard = guards.get((SYMBOL, "7"))
+        out['restored_extreme'] = None if guard is None else guard.trail_extreme
+        restart_closes = len(b.close_leg_calls)
+        bar(107.0)
+        out['second'] = {
+            'size': pos2.size,
+            'restart_closes': b.close_leg_calls[:restart_closes],
+            'closes': list(b.close_leg_calls),
+            'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
+            'halted': engine2.halted, 'quarantined': engine2.quarantined,
+        }
+        out['port_writes'] = list(b.port_writes)
+        out['writes'] = faulty.writes
+        out['failed_sql'] = faulty.failed_sql
+        ctx2.close()
+    return out
+
+
+def _storage_fault_software_guard(tmp_path, fail_at: int | None) -> dict:
+    """The software-guard trail scenario's run, in the shape the fault matrix compares."""
+    run = _run_software_guard_trail_scenario(tmp_path, fail_at)
+    run['compared'] = {key: run[key] for key in (
+        'first', 'second', 'persisted_extreme', 'restored_extreme')}
+    run['sends'] = [write[1] for write in run['port_writes'] if write[0] in ('place', 'close')]
+    run['venue_writes'] = run['port_writes']
+    return run
+
+
+# === Fill-time netting of a resting reversal on a hedging account ===
+
+
+@dataclass
+class _NettingHedgeBroker(MockBroker):
+    """A hedging venue whose leg closes execute at once and report their fills.
+
+    Every ``close_leg`` takes its volume off the leg (whole units: the mock
+    quantizer is ``int``) and queues the close's fill, with ``close_fee``,
+    for the test to deliver. ``whole_legs`` makes it a port that only closes
+    whole legs.
+    """
+    close_fee: float = 0.0
+    close_price: float = 100.0
+    whole_legs: bool = False
+    fill_ids: bool = True
+    close_fills: list[OrderEvent] = field(default_factory=list)
+    sent_closes: list[tuple[str, str, int]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.whole_legs:
+            self.supports_partial_leg_close = False
+
+    async def close_leg(self, symbol, leg_id, volume, coid):
+        await super().close_leg(symbol, leg_id, volume, coid)
+        self.sent_closes.append((coid, leg_id, volume))
+        legs = []
+        for leg in self.raw_legs:
+            if leg.leg_id != leg_id:
+                legs.append(leg)
+                continue
+            closed = min(leg.qty, float(volume))
+            side = 'sell' if leg.side == 'buy' else 'buy'
+            self.close_fills.append(replace(
+                _fill_event(side, closed, self.close_price, pine_id=leg.entry_id or '',
+                            leg=LegType.CLOSE, xchg_id=f"x-{coid}",
+                            fill_id=f"fc-{coid}" if self.fill_ids else None),
+                journal_fill_qty=closed, fee=self.close_fee))
+            if leg.qty - closed > 1e-12:
+                legs.append(replace(leg, qty=leg.qty - closed))
+        _hedge_venue(self, legs)
+
+
+def _netting_leg(leg_id, side, qty, *, open_time, entry_id) -> PositionLeg:
+    return PositionLeg(leg_id=leg_id, symbol=SYMBOL, side=side, qty=qty,
+                       entry_price=100.0, open_time=open_time, unrealized_pnl=0.0,
+                       entry_id=entry_id)
+
+
+def _run_resting_reversal(tmp_path, *, hedging: bool, old: float = 2.0,
+                          slices: tuple[float, ...] = (1.0,), old_legs: tuple[float, ...] = (),
+                          whole_legs: bool = False, close_fee: float = 0.0,
+                          entry_fee: float = 0.0, deliver_close_fills: bool = True,
+                          protect: bool = False, label: str = "",
+                          fill_ids: bool = True) -> dict:
+    """A long ``old``, then a resting short ``S`` (limit) that fills in ``slices``.
+
+    ``old_legs`` splits the long into venue legs, oldest first (one leg of
+    ``old`` by default). On a hedging account (``hedging``) the short rests
+    as a leg of its own; each fill slice adds to it, the engine nets the two
+    sides, and the venue's close fills are delivered back. Without
+    ``hedging`` the same fills reach a one-way account's engine: the
+    reference books. With ``protect`` both entries carry a stop exit. Without
+    ``fill_ids`` the short's and the closes' fills carry no execution id, the
+    way a plugin that keeps single delivery by its fill cursor reports them.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    out: dict = {}
+    path = tmp_path / f"net-{hedging}-{old}-{slices}-{old_legs}-{whole_legs}-{label}.sqlite"
+    with BrokerStore(path, plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = _NettingHedgeBroker(close_fee=close_fee, whole_legs=whole_legs, fill_ids=fill_ids)
+        if hedging:
+            b.position_port = b
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        engine.reconcile()
+        ts = BAR_TS
+
+        def deliver(event: OrderEvent) -> None:
+            engine.on_order_event(event)
+            engine.apply_async_events()
+
+        def bar() -> None:
+            nonlocal ts
+            ts += 60_000
+            for _ in range(3):
+                engine.sync(ts)
+                while deliver_close_fills and b.close_fills:
+                    deliver(b.close_fills.pop(0))
+
+        legs = [_netting_leg(f"7{i}", 'buy', qty, open_time=float(i), entry_id="L")
+                for i, qty in enumerate(old_legs or (old,))]
+        _hedge_venue(b, legs if hedging else [])
+        if not hedging:
+            b.position = ExchangePosition(
+                symbol=SYMBOL, side='long', size=old, entry_price=100.0, unrealized_pnl=0.0,
+                liquidation_price=None, leverage=1.0, margin_mode='cross')
+        deliver(replace(_fill_event('buy', old, 100.0, pine_id="L", xchg_id="x-L",
+                                    fill_id="f-L"), journal_fill_qty=old))
+        if protect:
+            pos.exit_orders[("L-X", "L")] = _exit_order("L", -old, "L-X", stop=90.0)
+        pos.entry_orders["S"] = _entry_order("S", -sum(slices), limit=101.0)
+        if protect:
+            pos.exit_orders[("S-X", "S")] = _exit_order("S", sum(slices), "S-X", stop=120.0)
+        bar()
+        s_key = next(key for key in engine._order_mapping  # type: ignore[attr-defined]
+                     if 'S' in str(key) and 'X' not in str(key))
+        s_order = engine._order_mapping[s_key][0]  # type: ignore[attr-defined]
+        filled = 0.0
+        for n, qty in enumerate(slices):
+            filled += qty
+            if hedging:
+                _hedge_venue(b, [*[leg for leg in b.raw_legs if leg.side == 'buy'],
+                                 *[leg for leg in b.raw_legs if leg.side == 'sell'],
+                                 _netting_leg(f"8{n}", 'sell', qty, open_time=10.0 + n,
+                                              entry_id="S")])
+            else:
+                net = old - filled
+                b.position = None if net == 0.0 else ExchangePosition(
+                    symbol=SYMBOL, side='long' if net > 0 else 'short', size=abs(net),
+                    entry_price=100.0, unrealized_pnl=0.0, liquidation_price=None,
+                    leverage=1.0, margin_mode='cross')
+            event = replace(
+                _fill_event('sell', qty, 101.0, pine_id="S", xchg_id=s_order,
+                            fill_id=f"f-S{n}" if fill_ids else None, filled_qty=filled,
+                            event_type='filled' if n == len(slices) - 1 else 'partial'),
+                journal_fill_qty=qty, fee=entry_fee)
+            deliver(event)
+            bar()
+        bar()
+        out['size'] = pos.size
+        out['netprofit'] = pos.netprofit
+        out['closed'] = [(t.entry_id, t.size, t.exit_price, round(t.commission, 9))
+                         for t in pos.closed_trades]
+        out['open'] = [(t.entry_id, t.size, round(t.commission, 9)) for t in pos.open_trades]
+        out['legs'] = sorted((leg.leg_id, leg.side, leg.qty) for leg in b.raw_legs)
+        out['sent_closes'] = list(b.sent_closes)
+        out['nettings_live'] = engine._one_way_emulator.netting_in_flight()  # type: ignore[attr-defined]
+        out['brackets'] = dict(b.leg_brackets)
+        out['ownership'] = sorted(
+            (row.intent_key or "", (row.extras or {}).get(_EXTRAS_KEY_BRACKET_OWN_LEG_ID))
+            for row in engine._one_way_emulator.iter_bracket_ownerships())  # type: ignore[attr-defined]
+        out['guards'] = sorted(
+            leg_id for (_symbol, leg_id) in
+            engine._one_way_emulator._software_guards)  # type: ignore[attr-defined]
+        out['halted'] = engine.halted
+        out['engine'] = engine
+        ctx.close()
+    return out
+
+
+def _net_legs(legs: list[tuple[str, str, float]]) -> float:
+    return sum(qty if side == 'buy' else -qty for _leg_id, side, qty in legs)
+
+
+@pytest.mark.parametrize('old,slices', [
+    (2.0, (1.0,)), (2.0, (2.0,)), (1.0, (3.0,)), (3.0, (1.0, 1.0)), (1.0, (1.0, 2.0)),
+], ids=['smaller', 'equal', 'larger', 'partial-fills', 'partial-flip'])
+def __test_a_resting_reversal_fill_nets_the_hedging_account_to_the_one_way_books__(
+        tmp_path, old, slices):
+    """The hedging account ends one-sided and the books are the one-way account's.
+
+    A long ``old`` and a resting short filled in ``slices``: the one-way
+    account's engine closes the long with the fill and opens only what is
+    left. The hedging account's engine nets each slice (the long's leg and
+    the short's leg close by the quantity the slice closed in the book), and
+    those close fills move no book: the size, the closed and open trades and
+    the net profit are the one-way run's, and the venue holds the same net
+    on one side only.
+    """
+    one_way = _run_resting_reversal(tmp_path, hedging=False, old=old, slices=slices)
+    hedged = _run_resting_reversal(tmp_path, hedging=True, old=old, slices=slices)
+    for key in ('size', 'netprofit', 'closed', 'open'):
+        assert hedged[key] == one_way[key], key
+    net = old - sum(slices)
+    assert _net_legs(hedged['legs']) == pytest.approx(net)
+    assert len({side for _leg_id, side, _qty in hedged['legs']}) <= 1, hedged['legs']
+    assert not hedged['nettings_live'] and not hedged['halted']
+    assert len(hedged['sent_closes']) == len({coid for coid, _l, _v in hedged['sent_closes']})
+
+
+@pytest.mark.parametrize('old,slices', [
+    (2.0, (1.0,)), (2.0, (2.0,)), (3.0, (1.0, 1.0)), (1.0, (1.0, 2.0)),
+], ids=['smaller', 'equal', 'partial-fills', 'partial-flip'])
+def __test_a_resting_reversal_fill_without_an_execution_id_is_netted__(tmp_path, old, slices):
+    """A fill slice without a ``fill_id`` is netted by its slice id like one with an id."""
+    one_way = _run_resting_reversal(tmp_path, hedging=False, old=old, slices=slices,
+                                    label="noid")
+    hedged = _run_resting_reversal(tmp_path, hedging=True, old=old, slices=slices,
+                                   label="noid", fill_ids=False)
+    for key in ('size', 'netprofit', 'closed', 'open'):
+        assert hedged[key] == one_way[key], key
+    assert _net_legs(hedged['legs']) == pytest.approx(old - sum(slices))
+    assert len({side for _leg_id, side, _qty in hedged['legs']}) <= 1, hedged['legs']
+    assert not hedged['nettings_live'] and not hedged['halted']
+    assert not hedged['engine'].quarantined
+
+
+def __test_a_resting_fill_that_cannot_be_netted_quarantines_the_run__():
+    """A resting fill on a hedging account with nothing to key its netting by is not left silent."""
+    b = _NettingHedgeBroker()
+    b.position_port = b
+    engine, pos = _mk_engine(b)
+    engine.on_order_event(replace(_fill_event('buy', 2.0, 100.0, pine_id="L", xchg_id="x-L",
+                                              fill_id="f-L"), journal_fill_qty=2.0))
+    engine.apply_async_events()
+    event = _fill_event('sell', 1.0, 101.0, pine_id="S", xchg_id="", fill_id=None)
+    event = replace(event, order=replace(event.order, order_type=OrderType.LIMIT))
+
+    engine.on_order_event(event)
+    engine.apply_async_events()
+
+    assert engine.quarantined
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert not engine._one_way_emulator.netting_in_flight()  # type: ignore[attr-defined]
+
+
+def __test_the_netting_closes_book_their_fees_and_no_trade__(tmp_path):
+    """Each netting close's commission lands on the closed trade; no trade is added."""
+    one_way = _run_resting_reversal(tmp_path, hedging=False, old=2.0, slices=(1.0,),
+                                    entry_fee=0.1, label="fee")
+    hedged = _run_resting_reversal(tmp_path, hedging=True, old=2.0, slices=(1.0,),
+                                   entry_fee=0.1, close_fee=0.05, label="fee")
+    assert [t[:3] for t in hedged['closed']] == [t[:3] for t in one_way['closed']]
+    assert hedged['open'] == one_way['open']
+    assert hedged['closed'][0][3] == pytest.approx(one_way['closed'][0][3] + 2 * 0.05)
+    assert hedged['netprofit'] == pytest.approx(one_way['netprofit'] - 2 * 0.05)
+
+
+def __test_a_netting_closes_several_opposing_legs_oldest_first_in_the_engine__(tmp_path):
+    hedged = _run_resting_reversal(tmp_path, hedging=True, old=3.0, slices=(2.0,),
+                                   old_legs=(1.0, 2.0), label="fifo")
+    one_way = _run_resting_reversal(tmp_path, hedging=False, old=3.0, slices=(2.0,),
+                                    label="fifo")
+    assert sorted((leg_id, volume) for _coid, leg_id, volume in hedged['sent_closes']) == [
+        ("70", 1), ("71", 1), ("80", 2)]
+    assert hedged['legs'] == [("71", "buy", 1.0)]
+    for key in ('size', 'netprofit', 'closed', 'open'):
+        assert hedged[key] == one_way[key], key
+
+
+@pytest.mark.parametrize('old,slices,old_legs,net_after', [
+    (2.0, (1.0,), (1.0, 1.0), 1.0),
+    (3.0, (1.0,), (2.0, 1.0), 1.0),
+    (1.0, (2.0,), (), 0.0),
+    (2.0, (2.0,), (), 0.0),
+], ids=['exact-legs', 'oldest-leg-larger', 'fill-larger', 'equal'])
+def __test_a_whole_leg_port_nets_without_ever_holding_more_than_the_books__(
+        tmp_path, old, slices, old_legs, net_after):
+    """A port that closes only whole legs nets with whole legs; the books follow the venue.
+
+    Where the one-way net needs a partial close the port cannot do, the
+    risk-reducing side is widened: the venue ends smaller than the one-way
+    net, and the close fill beyond the netted quantity moves the book like
+    any close, so the book holds what the venue holds.
+    """
+    hedged = _run_resting_reversal(tmp_path, hedging=True, old=old, slices=slices,
+                                   old_legs=old_legs, whole_legs=True, label="whole")
+    assert _net_legs(hedged['legs']) == pytest.approx(net_after)
+    assert len({side for _leg_id, side, _qty in hedged['legs']}) <= 1, hedged['legs']
+    assert hedged['size'] == pytest.approx(net_after)
+    assert abs(net_after) <= abs(old - sum(slices)) + 1e-9
+    assert not hedged['nettings_live'] and not hedged['halted']
+
+
+def __test_a_netting_close_fill_is_told_from_other_closes_by_its_close_id__():
+    """A close fill is a netting fill only when it can be one of the netting's closes.
+
+    A resting short nets a long leg (the record expects a sell and a buy close
+    fill of 1). A strategy close of the long goes out meanwhile on the sell
+    side and its fill arrives first: its client order id names it, so the
+    netting does not take it. The netting's own fills are the record's by
+    their ids, also once the record's wait is over. A fill without a known id
+    is taken by its side only where no other close shared that side; where one
+    did, it is booked as an ordinary close and the run is quarantined.
+    """
+    from pynecore.core.broker.store_helpers import EXTRAS_KEY_NETTING_EXPECTED
+    b = _NettingHedgeBroker()
+    b.position_port = b
+    engine, _pos = _mk_engine(b)
+    emulator = engine._one_way_emulator  # type: ignore[attr-defined]
+    journal = emulator._close_journal  # type: ignore[attr-defined]
+    record = emulator.record_netting(
+        entry_coid='S-coid', fill_key='f-S0', symbol=SYMBOL, side='sell', qty=1.0,
+        intent_key='S', entry_id='S', fill_grace_s=120.0)
+    assert record is not None
+    row = journal.get_order(record)
+    journal.upsert_order(record, extras={**(row.extras or {}),
+                                         EXTRAS_KEY_NETTING_EXPECTED: {'buy': 1.0, 'sell': 1.0}})
+    for parent, leg_id, side in ((f"{record}:p1a", '70', 'sell'),
+                                 (f"{record}:p1b", '80', 'buy'),
+                                 ('cl-L', '70', 'sell')):
+        _create_close_leg_row(journal, coid=f"{parent}:{leg_id}", symbol=SYMBOL, side=side,
+                              qty=1.0, intent_key='k', pine_entry_id='L',
+                              parent_close_coid=parent, leg_id=leg_id, leg_volume=1,
+                              leg_pre_volume=1)
+    emulator._mark_netting_contention(SYMBOL, 'sell', 'cl-L')  # type: ignore[attr-defined]
+    emulator._mark_netting_contention(SYMBOL, 'sell', f"{record}:p1a")  # type: ignore[attr-defined]
+    assert emulator.netting_contended_sides(record) == {'sell'}
+
+    def close_fill(side: str, coid: str | None) -> OrderEvent:
+        event = _fill_event(side, 1.0, 105.0, pine_id='L', leg=LegType.CLOSE,
+                            xchg_id='x', fill_id=f"fc-{coid}")
+        return replace(event, order=replace(event.order, client_order_id=coid))
+
+    assert engine._netting_share(close_fill('sell', 'cl-L:70')) == {}  # type: ignore[attr-defined]
+    assert engine._netting_share(  # type: ignore[attr-defined]
+        close_fill('sell', f"{record}:p1a:70#r1")) == {record: 1.0}
+    assert engine._netting_share(close_fill('buy', None)) == {record: 1.0}  # type: ignore[attr-defined]
+    assert not engine.quarantined
+
+    journal.close_order(record)
+    assert engine._netting_share(  # type: ignore[attr-defined]
+        close_fill('buy', f"{record}:p1b:80")) == {record: 1.0}
+    assert engine._netting_share(close_fill('buy', None)) == {}  # type: ignore[attr-defined]
+    journal.reopen_order(record)
+
+    assert engine._netting_share(close_fill('sell', None)) == {}  # type: ignore[attr-defined]
+    assert engine.quarantined
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+
+
+def __test_a_close_in_flight_before_the_netting_record_contends_its_side__():
+    """A close sent before the netting record was written contends the record's side.
+
+    An ordinary sell close of the long goes out and stays in flight (its
+    close-leg row live); then a resting short fills and its netting record is
+    written. The sell fill that comes back without a client order id cannot be
+    told from the netting's own sell close: it is booked as an ordinary close
+    and the run is quarantined, never silently taken as netting. A finished
+    close (its row closed longer than the fill-report grace ago, here a grace
+    of zero) or a netting half contends nothing.
+    """
+    from pynecore.core.broker.store_helpers import EXTRAS_KEY_NETTING_EXPECTED
+    b = _NettingHedgeBroker()
+    b.position_port = b
+    engine, _pos = _mk_engine(b)
+    emulator = engine._one_way_emulator  # type: ignore[attr-defined]
+    journal = emulator._close_journal  # type: ignore[attr-defined]
+    for parent, leg_id, side in (('cl-L', '70', 'sell'), ('cl-done', '71', 'buy')):
+        _create_close_leg_row(journal, coid=f"{parent}:{leg_id}", symbol=SYMBOL, side=side,
+                              qty=1.0, intent_key='k', pine_entry_id='L',
+                              parent_close_coid=parent, leg_id=leg_id, leg_volume=1,
+                              leg_pre_volume=1)
+    journal.close_order('cl-done:71')
+
+    record = emulator.record_netting(
+        entry_coid='S-coid', fill_key='f-S0', symbol=SYMBOL, side='sell', qty=1.0,
+        intent_key='S', entry_id='S', fill_grace_s=0.0)
+    assert record is not None
+    assert emulator.netting_contended_sides(record) == {'sell'}
+    row = journal.get_order(record)
+    journal.upsert_order(record, extras={**(row.extras or {}),
+                                         EXTRAS_KEY_NETTING_EXPECTED: {'buy': 1.0, 'sell': 1.0}})
+    _create_close_leg_row(journal, coid=f"{record}:p1a:70", symbol=SYMBOL, side='sell',
+                          qty=1.0, intent_key='k', pine_entry_id='S',
+                          parent_close_coid=f"{record}:p1a", leg_id='70', leg_volume=1,
+                          leg_pre_volume=1)
+
+    def close_fill(side: str) -> OrderEvent:
+        event = _fill_event(side, 1.0, 105.0, pine_id='L', leg=LegType.CLOSE,
+                            xchg_id='x', fill_id=f"fc-{side}")
+        return replace(event, order=replace(event.order, client_order_id=None))
+
+    assert engine._netting_share(close_fill('buy')) == {record: 1.0}  # type: ignore[attr-defined]
+    assert not engine.quarantined
+    assert engine._netting_share(close_fill('sell')) == {}  # type: ignore[attr-defined]
+    assert engine.quarantined
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+
+    other = emulator.record_netting(
+        entry_coid='S2-coid', fill_key='f-S1', symbol=SYMBOL, side='sell', qty=1.0,
+        intent_key='S2', entry_id='S2', fill_grace_s=0.0)
+    assert other is not None
+    # The netting half of the first record is in flight, the ordinary close too.
+    assert emulator.netting_contended_sides(other) == {'sell'}
+    journal.close_order('cl-L:70')
+    third = emulator.record_netting(
+        entry_coid='S3-coid', fill_key='f-S2', symbol=SYMBOL, side='sell', qty=1.0,
+        intent_key='S3', entry_id='S3', fill_grace_s=0.0)
+    assert third is not None
+    assert emulator.netting_contended_sides(third) == set()
+
+
+def __test_a_close_settled_before_the_netting_record_contends_its_side_within_the_grace__():
+    """A close whose row closed before the netting record still contends the side for the grace.
+
+    An ordinary sell close of the long went out and the position read already
+    showed the leg shrink, which closed its close-leg row; its fill report has
+    not arrived yet. A resting short then fills and its netting record is
+    written. Within the fill-report grace the ordinary close's fill can still
+    come, so the record is contended on the sell side: the ordinary fill
+    arriving without a client order id is booked as an ordinary close and the
+    run is quarantined, never taken as the netting's own sell close.
+    """
+    from pynecore.core.broker.store_helpers import EXTRAS_KEY_NETTING_EXPECTED
+    b = _NettingHedgeBroker()
+    b.position_port = b
+    engine, _pos = _mk_engine(b)
+    emulator = engine._one_way_emulator  # type: ignore[attr-defined]
+    journal = emulator._close_journal  # type: ignore[attr-defined]
+    _create_close_leg_row(journal, coid="cl-L:70", symbol=SYMBOL, side='sell',
+                          qty=1.0, intent_key='k', pine_entry_id='L',
+                          parent_close_coid='cl-L', leg_id='70', leg_volume=1,
+                          leg_pre_volume=1)
+    journal.close_order('cl-L:70')
+
+    record = emulator.record_netting(
+        entry_coid='S-coid', fill_key='f-S0', symbol=SYMBOL, side='sell', qty=1.0,
+        intent_key='S', entry_id='S', fill_grace_s=120.0)
+    assert record is not None
+    assert emulator.netting_contended_sides(record) == {'sell'}
+    row = journal.get_order(record)
+    journal.upsert_order(record, extras={**(row.extras or {}),
+                                         EXTRAS_KEY_NETTING_EXPECTED: {'buy': 1.0, 'sell': 1.0}})
+
+    event = _fill_event('sell', 1.0, 105.0, pine_id='L', leg=LegType.CLOSE, xchg_id='x',
+                        fill_id='fc-sell')
+    event = replace(event, order=replace(event.order, client_order_id=None))
+    assert engine._netting_share(event) == {}  # type: ignore[attr-defined]
+    assert engine.quarantined
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+
+
+@pytest.mark.parametrize('reference', ['entry_row', 'minted', 'minted_wire'])
+def __test_a_close_fill_naming_an_entry_is_never_taken_as_netting__(reference):
+    """A close fill under an entry's client order id moves the book as an ordinary close.
+
+    The Capital.com shape: a close the plugin cannot attribute to a leg close
+    of the run (a manual close of the entry's position) comes back under the
+    entry's own client order id. A netting record expecting a sell close fill
+    is open, and nothing contends its side. The id names an order of the run
+    that is no close-leg row: an entry row of the journal, or, on a run whose
+    entries have no row there, an id the run minted (canonical or wire form):
+    the fill is no netting fill and the run is not quarantined. A fill under a
+    foreign id is still taken by its side.
+    """
+    from pynecore.core.broker.idempotency import (
+        build_client_order_id, encode_wire_client_order_id,
+    )
+    from pynecore.core.broker.store_helpers import EXTRAS_KEY_NETTING_EXPECTED
+    b = _NettingHedgeBroker()
+    b.position_port = b
+    engine, _pos = _mk_engine(b)
+    emulator = engine._one_way_emulator  # type: ignore[attr-defined]
+    journal = emulator._close_journal  # type: ignore[attr-defined]
+    record = emulator.record_netting(
+        entry_coid='S-coid', fill_key='f-S0', symbol=SYMBOL, side='sell', qty=1.0,
+        intent_key='S', entry_id='S', fill_grace_s=120.0)
+    assert record is not None
+    row = journal.get_order(record)
+    journal.upsert_order(record, extras={**(row.extras or {}),
+                                         EXTRAS_KEY_NETTING_EXPECTED: {'buy': 1.0, 'sell': 1.0}})
+    entry_coid = build_client_order_id(run_tag=RUN_TAG, pine_id='L', bar_ts_ms=BAR_TS,
+                                       kind=KIND_ENTRY)
+    if reference == 'entry_row':
+        entry_coid = 'L-entry-row'
+        journal.upsert_order(entry_coid, symbol=SYMBOL, side='buy', qty=1.0,
+                             state='confirmed', pine_entry_id='L')
+    elif reference == 'minted_wire':
+        entry_coid = encode_wire_client_order_id(entry_coid, 20)
+
+    def close_fill(coid: str) -> OrderEvent:
+        event = _fill_event('sell', 1.0, 105.0, pine_id='L', leg=LegType.CLOSE,
+                            xchg_id='x', fill_id=f"fc-{coid}")
+        return replace(event, order=replace(event.order, client_order_id=coid))
+
+    assert engine._netting_share(close_fill(entry_coid)) == {}  # type: ignore[attr-defined]
+    assert not engine.quarantined
+    assert engine._netting_share(close_fill('manual-42')) == {record: 1.0}  # type: ignore[attr-defined]
+
+
+def __test_a_netting_close_fill_keeps_its_identity_across_a_restart__(tmp_path):
+    """A netting close fill that names its close is the record's after a restart too.
+
+    The first process wrote the record and its two halves, took the sell
+    half's fill as netting and then closed the record and every row (its wait
+    ran out without the buy fill). A restart moves only live rows, so the
+    restarted process finds none of them by its own lookups. The buy half's
+    fill arriving then still names the netting's close: it is the record's,
+    the count continues from the one the first process left (in a closed row
+    of the new process), and nothing more is expected afterwards.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import (
+        EXTRAS_KEY_NETTING_EXPECTED, absorb_netting_fills as _absorb,
+        netting_absorbed_row_coid,
+    )
+    b = _NettingHedgeBroker()
+    b.position_port = b
+    with BrokerStore(tmp_path / "netting-restart.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        engine, _pos = _mk_engine(b, store_ctx=ctx)
+        emulator = engine._one_way_emulator  # type: ignore[attr-defined]
+        record = emulator.record_netting(
+            entry_coid='S-coid', fill_key='f-S0', symbol=SYMBOL, side='sell', qty=1.0,
+            intent_key='S', entry_id='S', fill_grace_s=120.0)
+        assert record is not None
+        row = ctx.get_order(record)
+        assert row is not None
+        ctx.upsert_order(record, extras={**(row.extras or {}),
+                                         EXTRAS_KEY_NETTING_EXPECTED: {'buy': 1.0, 'sell': 1.0}})
+        legs = ((f"{record}:p1a", '70', 'sell'), (f"{record}:p1b", '80', 'buy'))
+        for parent, leg_id, side in legs:
+            _create_close_leg_row(ctx, coid=f"{parent}:{leg_id}", symbol=SYMBOL, side=side,
+                                  qty=1.0, intent_key='k', pine_entry_id='L',
+                                  parent_close_coid=parent, leg_id=leg_id, leg_volume=1,
+                                  leg_pre_volume=1)
+        _absorb(ctx, {record: {'sell': 1.0}})
+        for coid in (record, netting_absorbed_row_coid(record),
+                     *(f"{parent}:{leg_id}" for parent, leg_id, _side in legs)):
+            ctx.close_order(coid)
+        ctx.close()
+
+        ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        engine2, _pos2 = _mk_engine(b, store_ctx=ctx2)
+        assert ctx2.get_order(record) is None
+        emulator2 = engine2._one_way_emulator  # type: ignore[attr-defined]
+
+        def close_fill(side: str, coid: str) -> OrderEvent:
+            event = _fill_event(side, 1.0, 105.0, pine_id='L', leg=LegType.CLOSE,
+                                xchg_id='x', fill_id=f"fc-{coid}")
+            return replace(event, order=replace(event.order, client_order_id=coid))
+
+        assert emulator2.netting_close_owner(f"{record}:p1b:80") == (True, record)
+        assert engine2._netting_share(  # type: ignore[attr-defined]
+            close_fill('buy', f"{record}:p1b:80")) == {record: 1.0}
+        assert engine2._netting_share(  # type: ignore[attr-defined]
+            close_fill('sell', f"{record}:p1a:70")) == {}
+        _absorb(ctx2, {record: {'buy': 1.0}})
+        assert emulator2.netting_expectation_of(record) == {'buy': 0.0, 'sell': 0.0}
+        counted = ctx2.get_order(netting_absorbed_row_coid(record))
+        assert counted is not None and counted.closed_ts_ms is not None
+        assert not engine2.quarantined
+        ctx2.close()
+
+
+def __test_a_replayed_fill_does_not_recreate_a_closed_netting_record__(tmp_path):
+    """A netting record an earlier process closed is the slice's pass, after a restart too.
+
+    The first process wrote the netting record of a fill slice and closed it
+    (its netting done) while the fill's receipt was never written. The fill
+    is delivered again after the restart: the record of the same fill id is
+    found in the earlier process instance, so no live record is written again
+    (nothing would net the two sides a second time).
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    b = _NettingHedgeBroker()
+    b.position_port = b
+    with BrokerStore(tmp_path / "netting-replay.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        engine, _pos = _mk_engine(b, store_ctx=ctx)
+        record = engine._one_way_emulator.record_netting(  # type: ignore[attr-defined]
+            entry_coid='S-coid', fill_key='f-S0', symbol=SYMBOL, side='sell', qty=1.0,
+            intent_key='S', entry_id='S', fill_grace_s=120.0)
+        assert record is not None
+        ctx.close_order(record)
+        ctx.close()
+
+        ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        engine2, _pos2 = _mk_engine(b, store_ctx=ctx2)
+        emulator2 = engine2._one_way_emulator  # type: ignore[attr-defined]
+        assert ctx2.get_order(record) is None
+        assert emulator2.record_netting(
+            entry_coid='S-coid', fill_key='f-S0', symbol=SYMBOL, side='sell', qty=1.0,
+            intent_key='S', entry_id='S', fill_grace_s=120.0) is None
+        assert ctx2.get_order(record) is None
+        assert emulator2.netting_expectations() == []
+        ctx2.close()
+
+
+def __test_a_netting_hands_the_protection_to_the_surviving_leg__(tmp_path):
+    """No protection is left on a netted-away leg; the surviving exposure stays protected."""
+    hedged = _run_resting_reversal(tmp_path, hedging=True, old=1.0, slices=(2.0,),
+                                   protect=True, label="protect")
+    assert hedged['legs'] == [("80", "sell", 1.0)]
+    assert hedged['size'] == -1.0
+    owners = hedged['ownership']
+    assert all(leg_id == "80" for _key, leg_id in owners), owners
+    assert any(leg_id == "80" for _key, leg_id in owners), "the short's leg is protected"
+    assert "70" not in hedged['guards'] and "80" not in hedged['guards'], hedged['guards']
+    assert hedged['brackets'].get("80") == (None, 120.0, None)
+
+
+def _run_netting_fault_scenario(tmp_path, fail_at: int | None, *,
+                                crash: bool = False) -> dict:
+    """A long 2, a resting short 1 that fills on a hedging account, its netting, a restart.
+
+    Every ``sync`` / ``settle_restart_state`` / event hand-over runs with the
+    store armed; the ``fail_at``-th write statement among them fails once
+    (with ``crash`` it kills the first process instead). The plugin's journal
+    rows are written unarmed before each fill event, the way a plugin
+    journals a fill before it reports it. After the restart every fill the
+    first process was delivered is delivered again (a taken one as it was,
+    any other with ``journaled_before_restart``), and the venue's close fills
+    still queued are delivered as they come.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    out: dict = {'raised': [], 'crashed': False}
+    path = tmp_path / f"netting-fi-{fail_at}-{crash}.sqlite"
+    with BrokerStore(path, plugin_name="testbroker") as store:
+        faulty = _FaultyConnection(store._conn)
+        store._conn = faulty  # type: ignore[assignment]
+        faulty.fail_at = fail_at
+        faulty.crash = crash
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = _NettingHedgeBroker(close_fee=0.05)
+        b.position_port = b
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        ts = BAR_TS
+        delivered: list[OrderEvent] = []
+
+        def unarmed(write) -> None:
+            armed, faulty.armed = faulty.armed, False
+            try:
+                write()
+            finally:
+                faulty.armed = armed
+
+        def call(fn, *args) -> None:
+            faulty.armed = True
+            try:
+                fn(*args)
+            except Exception as exc:
+                out['raised'].append(f"{type(exc).__name__}: {exc}")
+            finally:
+                faulty.armed = False
+
+        def deliver(event: OrderEvent, record: bool = True) -> None:
+            if record:
+                delivered.append(event)
+            call(engine.on_order_event, event)
+
+        def bar() -> None:
+            nonlocal ts
+            ts += 60_000
+            for _ in range(3):
+                call(engine.sync, ts)
+                while b.close_fills:
+                    deliver(b.close_fills.pop(0))
+
+        def first_process() -> None:
+            engine.reconcile()
+            unarmed(lambda: ctx.upsert_order(
+                "row-L", symbol=SYMBOL, side="buy", qty=2.0, state="confirmed",
+                intent_key="L", pine_entry_id="L", exchange_order_id="x-L",
+                filled_qty=2.0, extras={'kind': 'position'}))
+            _hedge_venue(b, [_netting_leg("70", 'buy', 2.0, open_time=0.0, entry_id="L")])
+            deliver(replace(_fill_event('buy', 2.0, 100.0, pine_id="L", xchg_id="x-L",
+                                        fill_id="f-L"), journal_fill_qty=2.0))
+            pos.entry_orders["S"] = _entry_order("S", -1.0, limit=101.0)
+            bar()
+            s_key = next(key for key in engine._order_mapping  # type: ignore[attr-defined]
+                         if 'S' in str(key))
+            s_order = engine._order_mapping[s_key][0]  # type: ignore[attr-defined]
+            unarmed(lambda: ctx.upsert_order(
+                "row-S", symbol=SYMBOL, side="sell", qty=1.0, state="confirmed",
+                intent_key=s_key, pine_entry_id="S", exchange_order_id=s_order,
+                filled_qty=1.0, extras={'kind': 'position'}))
+            _hedge_venue(b, [*b.raw_legs,
+                             _netting_leg("80", 'sell', 1.0, open_time=10.0, entry_id="S")])
+            s_fill = _fill_event('sell', 1.0, 101.0, pine_id="S", xchg_id=s_order,
+                                 fill_id="f-S")
+            deliver(replace(s_fill, order=replace(s_fill.order, order_type=OrderType.LIMIT),
+                            journal_fill_qty=1.0))
+            bar()
+            bar()
+            out['first'] = {
+                'size': pos.size, 'netprofit': round(pos.netprofit, 9),
+                'closed': [(t.entry_id, t.size, round(t.commission, 9))
+                           for t in pos.closed_trades],
+                'legs': sorted((leg.leg_id, leg.side, leg.qty) for leg in b.raw_legs),
+                'owed': list(engine._owed_store_writes),  # type: ignore[attr-defined]
+                'nettings': engine._one_way_emulator.netting_in_flight(),  # type: ignore[attr-defined]
+            }
+            out['first_writes'] = faulty.writes
+
+        try:
+            first_process()
+            ctx.close()
+        except _ProcessCrash:
+            out['crashed'] = True
+            faulty.crash = False
+            faulty.dead = False
+            if faulty._conn.in_transaction:
+                faulty._conn.rollback()
+            store._txn_depth = 0  # type: ignore[attr-defined]
+            if ctx._owner_lock is not None:
+                store._release_owner_lock(ctx._owner_lock)  # type: ignore[attr-defined]
+        ctx2 = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        engine2, pos2 = _mk_engine(b, store_ctx=ctx2)
+        engine = engine2
+        engine2.reconcile()
+        ts += 60_000
+        call(engine2.settle_restart_state, ts)
+        bar()
+        for event in list(delivered):
+            taken = ctx2.fill_delivered(event.fill_id or '')
+            deliver(event if taken else replace(event, journaled_before_restart=True),
+                    record=False)
+        bar()
+        bar()
+        out['second'] = {
+            'size': pos2.size,
+            'legs': sorted((leg.leg_id, leg.side, leg.qty) for leg in b.raw_legs),
+            'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
+            'nettings': engine2._one_way_emulator.netting_in_flight(),  # type: ignore[attr-defined]
+            'halted': engine2.halted, 'quarantined': engine2.quarantined,
+        }
+        out['sent_closes'] = list(b.sent_closes)
+        out['writes'] = faulty.writes
+        out['failed_sql'] = faulty.failed_sql
+        ctx2.close()
+    return out
+
+
+def _storage_fault_netting(tmp_path, fail_at: int | None) -> dict:
+    """The netting scenario's run, in the shape the fault matrix compares."""
+    run = _run_netting_fault_scenario(tmp_path, fail_at)
+    run['compared'] = {'first': run['first'], 'second': run['second']}
+    run['sends'] = [coid for coid, _leg_id, _volume in run['sent_closes']]
+    run['venue_writes'] = [(leg_id, volume) for _coid, leg_id, volume in run['sent_closes']]
+    return run
+
+
 @pytest.mark.parametrize('scenario,writes', [
-    (_storage_fault_hedging, 63),
-    (_storage_fault_partial_bracket, 69),
-    (_storage_fault_partial_bracket_unsent_close, 66),
-], ids=['hedging', 'partial_bracket', 'partial_bracket_unsent_close'])
+    (_storage_fault_hedging, 73),
+    (_storage_fault_partial_bracket, 72),
+    (_storage_fault_partial_bracket_unsent_close, 69),
+    (_storage_fault_partial_bracket_acked_fill, 72),
+    (_storage_fault_partial_bracket_acked_unfilled, 80),
+    (_storage_fault_partial_bracket_acked_partial, 81),
+    (_storage_fault_software_guard, 20),
+    (_storage_fault_netting, 61),
+], ids=['hedging', 'partial_bracket', 'partial_bracket_unsent_close',
+        'partial_bracket_acked_fill', 'partial_bracket_acked_unfilled',
+        'partial_bracket_acked_partial', 'software_guard', 'netting'])
 def __test_every_single_store_write_failure_keeps_the_storage_contract__(
         tmp_path, scenario, writes):
     """Each write of a whole scenario fails once in turn; the run ends as without faults.
 
-    Two scenarios: a hedging run (:func:`_run_storage_fault_scenario`: entry
-    and bracket, amend, partial close, reversal, cancel, restart) and a
+    Three scenarios: a hedging run (:func:`_run_storage_fault_scenario`: entry
+    and bracket, amend, partial close, reversal, cancel, fees reported without
+    their fills and delivered twice, restart, every fill and fee delivered
+    again), a
     software partial-bracket run (:func:`_run_partial_bracket_fault_scenario`:
     pending legs, promotion, trail, trigger and OCA cascade, a cancel-tentative
-    resolution, restart). Each is run fault-free, then once per write
+    resolution, restart) and a software leg guard run
+    (:func:`_run_software_guard_trail_scenario`: a whole-leg trailing bracket
+    moved to the guard, the guard's trail, restart, the resumed trail
+    firing). Each is run fault-free, then once per write
     statement the Core makes in it (the restart's included), that one write
     failing. Every run keeps the storage failure contract: nothing raises out
     of ``sync`` / ``settle_restart_state`` / the event hand-over, nothing is
@@ -21799,6 +22885,14 @@ def __test_every_single_store_write_failure_keeps_the_storage_contract__(
     assert base['first']['owed'] == [] and base['second']['owed'] == []
     if scenario is _storage_fault_hedging:
         assert base['first']['size'] == -1.0 and base['second']['size'] == -1.0
+        # The redelivery after the restart books nothing a second time.
+        assert base['restart_size'] == base['redelivered_size'] == -1.0
+        assert base['second']['receipts'] == [
+            ('f-C', True, 0.25), ('f-L', True, 0.0), ('f-R', True, 0.0), ('f-S', True, 0.1)]
+    if scenario is _storage_fault_software_guard:
+        # The restarted guard trails on from the persisted 112 and fires at 107.
+        assert base['persisted_extreme'] == base['restored_extreme'] == 112.0
+        assert base['second']['restart_closes'] == [] and base['second']['closes'] == [("7", 3)]
     total = base['writes']
     assert total == writes
     for index in range(total):
@@ -21813,7 +22907,450 @@ def __test_every_single_store_write_failure_keeps_the_storage_contract__(
             assert run['compared'][key] == value, f"{where}: {key}"
 
 
-@pytest.mark.parametrize('crash_at', range(71))
+def __test_a_fee_event_books_only_the_fee_and_its_fill_only_the_rest__(tmp_path):
+    """A fee event moves no position and opens no trade; a later fill of its id books the rest.
+
+    The fee of a fill this process has not booked (yet) goes to the open
+    trades of its entry; the fill event that follows with the same id and its
+    whole fee books only what the fee event did not. A fee event without a
+    fill id is not booked. The receipts land with the next book write; a fee
+    alone does not make the fill delivered.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "fee.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        engine.reconcile()
+
+        def deliver(event: OrderEvent) -> None:
+            engine.on_order_event(event)
+            engine.apply_async_events()
+
+        deliver(replace(_fill_event('buy', 1.0, 100.0, pine_id="L", fill_id="f-1"),
+                        journal_fill_qty=1.0))
+        fee = replace(_fill_event('buy', 1.0, 100.0, pine_id="L", fill_id="f-2"),
+                      event_type='fee', fill_qty=None, fill_price=None, fee=0.4)
+        deliver(fee)
+        deliver(replace(fee, fill_id=None, fee=9.0))
+        assert pos.size == 1.0 and len(pos.open_trades) == 1
+        assert pos.open_commission == pytest.approx(0.4)
+        receipt = ctx.fill_receipt("f-2")
+        assert receipt is not None and receipt.fee == pytest.approx(0.4)
+        assert not ctx.fill_delivered("f-2")
+        deliver(replace(_fill_event('buy', 1.0, 101.0, pine_id="L", fill_id="f-2"),
+                        journal_fill_qty=1.0, fee=0.4))
+        deliver(fee)
+        assert pos.size == 2.0
+        assert [trade.commission for trade in pos.open_trades] == pytest.approx([0.4, 0.0])
+        assert ctx.fill_delivered("f-2") and ctx.fill_delivered("f-1")
+        ctx.close()
+
+
+def __test_a_fill_without_fee_data_keeps_the_commission_a_fee_event_reported__(tmp_path):
+    """A fill event of ``fee`` 0.0 after a fee event of its id carries no commission data.
+
+    The fee event booked 0.4 onto the entry's open trade; the fill that
+    follows from a fee-less source books its trade with nothing more and
+    reverses nothing, and its receipt keeps the 0.4 total.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "fee-less.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        engine.reconcile()
+
+        def deliver(event: OrderEvent) -> None:
+            engine.on_order_event(event)
+            engine.apply_async_events()
+
+        deliver(replace(_fill_event('buy', 1.0, 100.0, pine_id="L", fill_id="f-1"),
+                        journal_fill_qty=1.0))
+        deliver(replace(_fill_event('buy', 1.0, 100.0, pine_id="L", fill_id="f-2"),
+                        event_type='fee', fill_qty=None, fill_price=None, fee=0.4))
+        deliver(replace(_fill_event('buy', 1.0, 101.0, pine_id="L", fill_id="f-2"),
+                        journal_fill_qty=1.0))
+        assert pos.size == 2.0
+        assert [trade.commission for trade in pos.open_trades] == pytest.approx([0.4, 0.0])
+        assert pos.open_commission == pytest.approx(0.4)
+        engine.sync(BAR_TS)
+        receipt = ctx.fill_receipt("f-2")
+        assert receipt is not None and receipt.booked and receipt.fee == pytest.approx(0.4)
+        ctx.close()
+
+
+def _run_late_fee_books(tmp_path, *, entry_fee_on: str, label: str,
+                        reverse: bool = False, entry_fee: float = 2.0) -> dict:
+    """An entry ``L`` of 2 with a commission of ``entry_fee``, then a close of 1 (or a reversal).
+
+    ``entry_fee_on`` is where the commission is reported: ``'fill'`` on the
+    entry fill itself, ``'fee_before'`` on a fee event before the close,
+    ``'fee_after'`` on a fee event after it. With ``reverse`` the second fill
+    is a short entry ``S`` of 3 with a commission of 3 (reported the same
+    way) that closes the long and opens a short of 1.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / f"late-fee-{label}.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        engine.reconcile()
+
+        def deliver(event: OrderEvent) -> None:
+            engine.on_order_event(event)
+            engine.apply_async_events()
+
+        def fee_event(fill: OrderEvent, fee: float) -> OrderEvent:
+            return replace(fill, event_type='fee', fill_qty=None, fill_price=None,
+                           journal_fill_qty=None, fee=fee)
+
+        on_fill = entry_fee_on == 'fill'
+        entry = replace(_fill_event('buy', 2.0, 100.0, pine_id="L", xchg_id="x-L",
+                                    fill_id="f-L"), journal_fill_qty=2.0)
+        if reverse:
+            second = replace(_fill_event('sell', 3.0, 101.0, pine_id="S", xchg_id="x-S",
+                                         fill_id="f-S"), journal_fill_qty=3.0)
+            second_fee = 3.0
+        else:
+            second = replace(_fill_event('sell', 1.0, 101.0, pine_id="L", leg=LegType.CLOSE,
+                                         xchg_id="x-C", fill_id="f-C"),
+                             from_entry="L", journal_fill_qty=1.0)
+            second_fee = 0.0
+        deliver(replace(entry, fee=entry_fee) if on_fill else entry)
+        if entry_fee_on == 'fee_before':
+            deliver(fee_event(entry, entry_fee))
+        deliver(replace(second, fee=second_fee) if on_fill or not second_fee else second)
+        if entry_fee_on == 'fee_after':
+            deliver(fee_event(entry, entry_fee))
+        if not on_fill and second_fee:
+            deliver(fee_event(second, second_fee))
+        out = {
+            'netprofit': pos.netprofit,
+            'open_commission': pos.open_commission,
+            'closed': [(t.entry_id, t.size, round(t.commission, 9)) for t in pos.closed_trades],
+            'open': [(t.entry_id, t.size, round(t.commission, 9)) for t in pos.open_trades],
+            'gross': (round(pos.grossprofit, 9), round(pos.grossloss, 9)),
+            'counters': (pos.wintrades, pos.losstrades, pos.eventrades),
+        }
+        ctx.close()
+    return out
+
+
+@pytest.mark.parametrize('reverse', [False, True], ids=['partial_close', 'reversal'])
+def __test_a_fee_ends_the_books_alike_whenever_it_is_reported__(tmp_path, reverse):
+    """Where a fill's commission ends does not depend on when it was reported.
+
+    A partial close splits the entry's trade: an entry commission reported
+    after the split is shared by the closed piece and the open remainder as
+    the on-time commission was. A reversal's commission is shared by the
+    closed trade and the new side by quantity; reported later through the fee
+    channel it lands the same way.
+    """
+    runs = {when: _run_late_fee_books(tmp_path, entry_fee_on=when, reverse=reverse,
+                                      label=f"{when}-{reverse}")
+            for when in ('fill', 'fee_before', 'fee_after')}
+    reference = runs['fill']
+    if reverse:
+        assert reference['closed'] == [("L", 2.0, pytest.approx(2.0 + 2.0))]
+        assert reference['open'] == [("S", -1.0, pytest.approx(1.0))]
+    else:
+        assert reference['closed'] == [("L", 1.0, pytest.approx(1.0))]
+        assert reference['open'] == [("L", 1.0, pytest.approx(1.0))]
+    for when, run in runs.items():
+        assert run['closed'] == reference['closed'], when
+        assert run['open'] == reference['open'], when
+        assert run['netprofit'] == pytest.approx(reference['netprofit']), when
+        assert run['open_commission'] == pytest.approx(reference['open_commission']), when
+
+
+def __test_a_late_entry_fee_that_turns_a_win_into_a_loss_recounts_the_close__(tmp_path):
+    """A late entry fee re-counts the fill that closed the trade, like an on-time fee.
+
+    The close of 1 makes 1 before the entry commission of 4 and loses 1 after
+    its half of it: reported after the close, the fee moves the close from the
+    wins and the gross profit to the losses and the gross loss.
+    """
+    runs = {when: _run_late_fee_books(tmp_path, entry_fee_on=when, entry_fee=4.0,
+                                      label=f"sign-{when}")
+            for when in ('fill', 'fee_before', 'fee_after')}
+    reference = runs['fill']
+    assert reference['counters'] == (0, 1, 0)
+    for when, run in runs.items():
+        assert run['counters'] == reference['counters'], when
+        assert run['gross'] == pytest.approx(reference['gross']), when
+        assert run['netprofit'] == pytest.approx(reference['netprofit']), when
+        assert run['closed'] == reference['closed'], when
+
+
+def __test_a_redelivered_entry_fill_books_its_fee_onto_the_adopted_trade_only__(tmp_path):
+    """The fee of a fill the restart holds goes to the entry's adopted open trade, once.
+
+    An earlier process journaled the long's two entry fills and a partial
+    close, then died before its engine took them: the restart adopts the
+    long 1.5 with no commission. The plugin delivers the three fills again
+    with ``journaled_before_restart``. The entry fills' fees are booked onto
+    the adopted trade; the close fill's fee belonged to a trade of the dead
+    process and is booked nowhere. Delivering the fills, or a fee event of
+    them, again books nothing, and the receipts carry the fees.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    with BrokerStore(tmp_path / "fee-restart.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        ctx.upsert_order("coid-L", symbol=SYMBOL, side="buy", qty=2.0, state="confirmed",
+                         intent_key="L", pine_entry_id="L", exchange_order_id="x-L",
+                         filled_qty=1.5, extras={'kind': 'position'})
+        ctx.close()
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        b.position = ExchangePosition(
+            symbol=SYMBOL, side='long', size=1.5, entry_price=100.0, unrealized_pnl=0.0,
+            liquidation_price=None, leverage=1.0, margin_mode='cross',
+        )
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        engine.reconcile()
+        assert [(t.entry_id, t.size, t.commission) for t in pos.open_trades] == [("L", 1.5, 0.0)]
+
+        def deliver(event: OrderEvent) -> None:
+            engine.on_order_event(event)
+            engine.apply_async_events()
+
+        fills = [
+            replace(_fill_event('buy', 1.0, 100.0, pine_id="L", xchg_id="x-L", fill_id="f-1"),
+                    journal_fill_qty=1.0, fee=0.3, journaled_before_restart=True),
+            replace(_fill_event('buy', 1.0, 100.0, pine_id="L", xchg_id="x-L", fill_id="f-2"),
+                    journal_fill_qty=1.0, fee=0.2, journaled_before_restart=True),
+            replace(_fill_event('sell', 0.5, 101.0, pine_id="L", leg=LegType.CLOSE,
+                                xchg_id="x-C", fill_id="f-3"),
+                    from_entry="L", journal_fill_qty=0.5, fee=0.4,
+                    journaled_before_restart=True),
+        ]
+        for event in fills:
+            deliver(event)
+        assert pos.size == 1.5 and pos.open_commission == pytest.approx(0.5)
+        for event in fills:
+            deliver(event)
+            deliver(replace(event, event_type='fee', fill_qty=None, fill_price=None,
+                            journal_fill_qty=None, journaled_before_restart=False))
+        assert pos.size == 1.5 and pos.open_commission == pytest.approx(0.5)
+        assert len(pos.closed_trades) == 0 and pos.netprofit == 0.0
+        engine.sync(BAR_TS)
+        assert [(fill_id, receipt.booked, receipt.fee) for fill_id in ("f-1", "f-2", "f-3")
+                if (receipt := ctx.fill_receipt(fill_id)) is not None] == [
+            ("f-1", True, 0.3), ("f-2", True, 0.2), ("f-3", True, 0.4)]
+        ctx.close()
+
+
+def _run_adopted_commission_restart(tmp_path, *, receipted: tuple[str, ...],
+                                    venue: float, retired: float = 0.0) -> dict:
+    """An entry ``L`` of two fills (``f-1`` fee 0.3, ``f-2`` fee 0.2), then a restart.
+
+    The first process journals both fills on the entry's row (2.0 filled) and
+    takes the ``receipted`` ones (its engine books them, their receipts land
+    with the book write); it dies before taking the others. The plugin nets
+    ``retired`` off the row for a close the dead process booked. The restart
+    adopts the venue's ``venue`` long, then the plugin delivers every fill
+    again (a taken one as it was, any other with ``journaled_before_restart``),
+    and the adopted trade is closed at 101.
+    """
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.types.strategy import JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY
+    out: dict = {}
+    with BrokerStore(tmp_path / f"adopt-{'-'.join(receipted)}-{venue}-{retired}.sqlite",
+                     plugin_name="testbroker") as store:
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        engine.reconcile()
+        ctx.upsert_order("coid-L", symbol=SYMBOL, side="buy", qty=2.0, state="confirmed",
+                         intent_key="L", pine_entry_id="L", exchange_order_id="x-L",
+                         filled_qty=2.0, extras={'kind': 'position'})
+        fills = [
+            replace(_fill_event('buy', 1.0, 100.0, pine_id="L", xchg_id="x-L", fill_id=fill_id),
+                    journal_fill_qty=1.0, fee=fee)
+            for fill_id, fee in (("f-1", 0.3), ("f-2", 0.2))
+        ]
+        for event in fills:
+            if event.fill_id in receipted:
+                engine.on_order_event(event)
+                engine.apply_async_events()
+        engine.sync(BAR_TS)
+        if retired:
+            ctx.upsert_order("coid-L", extras={'kind': 'position',
+                                               JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY: retired})
+        ctx.close()
+
+        ctx = store.open_run(_restart_identity(), script_source="src", script_path="t.py")
+        b = MockBroker()
+        b.position = ExchangePosition(
+            symbol=SYMBOL, side='long', size=venue, entry_price=100.0, unrealized_pnl=0.0,
+            liquidation_price=None, leverage=1.0, margin_mode='cross',
+        )
+        engine, pos = _mk_engine(b, store_ctx=ctx)
+        engine.reconcile()
+        out['adopted'] = [(t.entry_id, t.size, t.commission) for t in pos.open_trades]
+        for event in fills:
+            taken = ctx.fill_delivered(event.fill_id or '')
+            engine.on_order_event(event if taken
+                                  else replace(event, journaled_before_restart=True))
+            engine.on_order_event(replace(event, event_type='fee', fill_qty=None,
+                                          fill_price=None, journal_fill_qty=None))
+            engine.apply_async_events()
+        out['open_commission'] = pos.open_commission
+        engine.on_order_event(replace(
+            _fill_event('sell', venue, 101.0, pine_id="L", leg=LegType.CLOSE, xchg_id="x-C",
+                        fill_id="f-C"), from_entry="L", journal_fill_qty=venue))
+        engine.apply_async_events()
+        out['netprofit'] = pos.netprofit
+        out['closed'] = [(t.entry_id, t.size, t.commission) for t in pos.closed_trades]
+        ctx.close()
+    return out
+
+
+def __test_a_clean_restart_keeps_the_entry_commission_of_the_adopted_trade__(tmp_path):
+    """The adopted trade carries the receipted entry fees, and the closed trade's profit nets them.
+
+    Both entry fills were taken before the restart: the adoption restores
+    their 0.5 from the receipts, a redelivery of the fills or of fee events
+    books nothing on top, and the closed trade's net profit is the 2.0 gain
+    less the 0.5 entry commission.
+    """
+    run = _run_adopted_commission_restart(tmp_path, receipted=("f-1", "f-2"), venue=2.0)
+    assert run['adopted'] == [("L", 2.0, pytest.approx(0.5))]
+    assert run['open_commission'] == pytest.approx(0.5)
+    assert run['closed'] == [("L", 2.0, pytest.approx(0.5))]
+    assert run['netprofit'] == pytest.approx(2.0 - 0.5)
+
+
+def __test_a_crash_before_a_receipt_ends_at_the_clean_restart_commission__(tmp_path):
+    """A fill the dead process journaled but never took adds its fee on the flagged redelivery.
+
+    The restart restores the receipted ``f-1``'s 0.3; the flagged ``f-2``
+    brings its 0.2: the same 0.5 as a clean restart, booked once.
+    """
+    clean = _run_adopted_commission_restart(tmp_path, receipted=("f-1", "f-2"), venue=2.0)
+    crashed = _run_adopted_commission_restart(tmp_path, receipted=("f-1",), venue=2.0)
+    assert crashed['adopted'] == [("L", 2.0, pytest.approx(0.3))]
+    assert crashed['open_commission'] == pytest.approx(clean['open_commission'])
+    assert crashed['netprofit'] == pytest.approx(clean['netprofit'])
+    nothing = _run_adopted_commission_restart(tmp_path, receipted=(), venue=2.0)
+    assert nothing['adopted'] == [("L", 2.0, 0.0)]
+    assert nothing['open_commission'] == pytest.approx(clean['open_commission'])
+
+
+@pytest.mark.parametrize('retired,venue', [(0.5, 1.5), (0.0, 1.0)],
+                         ids=['netted-by-the-plugin', 'trimmed-by-the-adoption'])
+def __test_an_adopted_entry_closed_in_part_keeps_its_share_of_the_commission__(
+        tmp_path, retired, venue):
+    """The part of the entry an earlier process closed took its share of the fee with it.
+
+    The row booked 2.0 for 0.5 of commission; the adoption holds ``venue`` of
+    it (the plugin netted the rest off the row, or the adoption trims a
+    reduction no fill attributes): the adopted trade carries 0.5 * venue / 2.
+    """
+    run = _run_adopted_commission_restart(tmp_path, receipted=("f-1", "f-2"), venue=venue,
+                                          retired=retired)
+    assert run['adopted'] == [("L", venue, pytest.approx(0.5 * venue / 2.0))]
+    assert run['open_commission'] == pytest.approx(0.5 * venue / 2.0)
+    assert run['netprofit'] == pytest.approx(venue * 1.0 - 0.5 * venue / 2.0)
+
+
+def __test_a_fee_reported_without_its_fill_books_like_the_fill_carrying_it__(tmp_path):
+    """Fees on fee events end the books where the same fees on the fill events do.
+
+    The hedging scenario (:func:`_run_storage_fault_scenario`) once with the
+    commissions of its partial close and its short entry on their fill
+    events, once with fee-free fills and the commissions on fee events
+    delivered twice, and again after the restart. The net profit, every
+    trade's commission, the restarted books and the receipts match: the fee
+    event was booked once, where the fill's own fee goes, created no trade
+    and moved no position.
+    """
+    baseline = _run_storage_fault_scenario(tmp_path, None, fees_on_fills=True)
+    run = _run_storage_fault_scenario(tmp_path, None)
+    assert baseline['raised'] == [] and run['raised'] == []
+    assert baseline['first']['netprofit'] == pytest.approx(-0.25)
+    assert baseline['first']['commissions'] == ([0.25, 0.0], [0.1])
+    for key in ('size', 'avg', 'closed', 'open', 'owed'):
+        assert run['first'][key] == baseline['first'][key], key
+    assert run['first']['netprofit'] == pytest.approx(baseline['first']['netprofit'])
+    assert run['first']['commissions'] == baseline['first']['commissions']
+    assert run['second'] == baseline['second']
+    assert run['redelivered_size'] == run['restart_size'] == -1.0
+
+
+@pytest.mark.parametrize('fees_on_fills,crash_at', [
+    *((False, crash_at) for crash_at in range(73)),
+    *((True, crash_at) for crash_at in range(71)),
+])
+def __test_a_crash_at_any_hedging_store_write_redelivers_every_fill_once__(
+        tmp_path, fees_on_fills, crash_at):
+    """The first process of the hedging scenario dies at each of its writes in turn.
+
+    :func:`_run_storage_fault_scenario` with ``crash``, once with the
+    commissions on fee events and once on the fills themselves: whatever was
+    in flight, the fills the dead process journaled are in the position the
+    restart adopts, and the plugin's redelivery of every fill (a taken one as
+    it was, any other one with ``journaled_before_restart``) and of every fee
+    event moves nothing: each fill is in the books once. Afterwards every
+    delivered fill has its receipt, nothing is owed and the run goes on.
+
+    The commission of a redelivered entry fill the restart holds
+    (``f-S``, 0.1) is on the short's adopted open trade, whichever way it was
+    reported; the partial close's commission (``f-C``, 0.25) belonged to a
+    trade of the dead process and is on no trade of this one.
+    """
+    base = _run_storage_fault_scenario(tmp_path, None, crash=True,
+                                       fees_on_fills=fees_on_fills)
+    assert base['first_writes'] == (71 if fees_on_fills else 73) and not base['crashed']
+    run = _run_storage_fault_scenario(tmp_path, crash_at, crash=True,
+                                      fees_on_fills=fees_on_fills)
+    assert run['crashed'] and run['raised'] == []
+    assert run['redelivered_size'] == run['restart_size']
+    second = run['second']
+    assert second['owed'] == [] and not second['halted']
+    assert [fill_id for fill_id, booked, _ in second['receipts'] if booked] == [
+        fill_id for fill_id, _, _ in second['receipts']]
+    if 'f-S' in run['flagged'] and second['open'] == [('S', -1.0)]:
+        assert second['open_commission'] == pytest.approx(0.1)
+    assert second['open_commission'] in (0.0, pytest.approx(0.1))
+    if second['open'] == [('S', -1.0)]:
+        # The short's entry commission survives the restart whichever way the
+        # restart learnt it: from the receipt the dead process wrote (the
+        # adoption), or from the flagged redelivery of a fill it had none of.
+        assert second['open_commission'] == pytest.approx(0.1)
+    assert all(fee == _HEDGE_FILL_FEES.get(fill_id, 0.0) or not fees_on_fills
+               for fill_id, _, fee in second['receipts'])
+
+
+@pytest.mark.parametrize('crash_at', range(14))
+def __test_a_crash_at_any_software_guard_store_write_never_loosens_the_trail__(
+        tmp_path, crash_at):
+    """The process of the software-guard scenario dies at each of its writes in turn.
+
+    :func:`_run_software_guard_trail_scenario` with ``crash``: whatever was in
+    flight, the restarted guard trails from no less favourable an extreme
+    than the store held when the process died, so its stop is never looser
+    than the last persisted one. The restart fires (at 107, once) exactly
+    when the store held the final 112 extreme; nothing is sent twice, nothing
+    is owed and the run goes on.
+    """
+    base = _run_software_guard_trail_scenario(tmp_path, None, crash=True)
+    assert base['first_writes'] == 14 and not base['crashed']
+    run = _run_software_guard_trail_scenario(tmp_path, crash_at, crash=True)
+    assert run['crashed'] and run['raised'] == []
+    sends = [write[1] for write in run['port_writes'] if write[0] in ('place', 'close')]
+    assert len(sends) == len(set(sends)), sends
+    persisted = run['persisted_extreme']
+    if persisted is not None:
+        assert run['restored_extreme'] is not None and run['restored_extreme'] >= persisted
+    assert (run['second']['closes'] == [("7", 3)]) == (persisted == 112.0)
+    assert run['second']['closes'] in ([], [("7", 3)])
+    second = run['second']
+    assert second['owed'] == [] and not second['halted'] and not second['quarantined']
+
+
+@pytest.mark.parametrize('crash_at', range(72))
 def __test_a_crash_at_any_partial_bracket_store_write_restarts_to_a_settled_end__(
         tmp_path, crash_at):
     """The process dies at each write of the partial-bracket scenario in turn.
@@ -21822,6 +23359,10 @@ def __test_a_crash_at_any_partial_bracket_store_write_restarts_to_a_settled_end_
     (:func:`_run_partial_bracket_fault_scenario` with ``crash``): its open
     transaction is lost and the next process restarts from the journal and
     the venue (the position the first process opened, its fill replayed).
+    The plugin journals the entry's fill before its event and delivers it
+    again after the restart (with ``journaled_before_restart`` when the dead
+    process journaled it and the run has no receipt of it), and the
+    restarted book holds it once.
     Whatever was in flight, the restart sends no exit's close twice (neither
     again under its client order id nor as a second close under a new one),
     settles a leg whose close the venue took from the plugin's journal row of
@@ -21833,9 +23374,12 @@ def __test_a_crash_at_any_partial_bracket_store_write_restarts_to_a_settled_end_
         LEG_STATE_CANCEL_TENTATIVE, LEG_STATE_TRIGGERED_FAILED, LEG_STATE_TRIGGERED_UNKNOWN,
     )
     base = _run_partial_bracket_fault_scenario(tmp_path, None, crash=True)
-    assert base['writes'] == 71 and not base['crashed']
+    assert base['writes'] == 72 and not base['crashed']
     run = _run_partial_bracket_fault_scenario(tmp_path, crash_at, crash=True)
     assert run['crashed'] and run['raised'] == []
+    if 'restart_size' in run:
+        # The entry's fill delivered again is in the books once.
+        assert run['restart_size'] == 2.0
     closed_exits = collections.Counter(
         pine_id.split('__', 2)[2].split('\0')[0] for pine_id in run['accepted_closes'])
     assert all(count == 1 for count in closed_exits.values()), closed_exits
@@ -21848,6 +23392,145 @@ def __test_a_crash_at_any_partial_bracket_store_write_restarts_to_a_settled_end_
         LEG_STATE_CANCEL_TENTATIVE)]
     assert second['tentative'] == [] and second['owed'] == []
     assert not second['halted'] and not second['quarantined']
+
+
+@pytest.mark.parametrize('executed', [True, False], ids=['executed', 'not_executed'])
+def __test_the_operator_settles_a_held_close_no_venue_record_can_settle__(
+        tmp_path, caplog, executed):
+    """An undecidable hold names its close and the command that settles it.
+
+    The process dies right after the venue took the TP's close, and nothing
+    journals the close: the restart holds the leg and quarantines, and the
+    ERROR names the close's client order id with the exact resume command for
+    either outcome. The operator records the outcome with the resume; the
+    restarted bot settles the leg with it and journals that it did: executed
+    -> the leg ends ``triggered`` and its SL sibling cascades, with no second
+    TP close; not executed -> the leg re-arms, and its next cross sends a TP
+    close under a fresh client order id. Nothing quarantines again.
+    """
+    import logging
+    caplog.set_level(logging.WARNING)
+    run = _run_partial_bracket_fault_scenario(
+        tmp_path, None, crash_after_tp_close=True, close_journal='none',
+        operator_decision=executed)
+    assert run['crashed'] and run['raised'] == []
+    tp_closes = _tp_close_coids(run)
+    decided = run['decided']
+    # The refused first send, then the send the process died after.
+    held_coid = tp_closes[1]
+    assert decided['quarantined'] and decided['held_coids'] == [held_coid]
+    errors = _held_partial_bracket_errors(caplog)
+    assert errors and all(held_coid in error for error in errors)
+    resume = f"pyne broker resume '{_restart_identity().run_id}' {decided['quarantine_id']}"
+    assert f'"{resume} --close-executed {held_coid}"' in errors[0]
+    assert f'"{resume} --close-not-executed {held_coid}"' in errors[0]
+    second = run['second']
+    assert second['legs'] == second['leg_rows']
+    assert _LEG_STATE_TRIGGERING not in [leg[1] for leg in second['legs']]
+    assert ('operator_close_decision_applied', held_coid) in second['journal']['events']
+    assert not second['quarantined'] and not second['halted'] and second['owed'] == []
+    closed = collections.Counter(pine_id.split('\0')[2] for pine_id in run['accepted_closes'])
+    if executed:
+        assert closed == {'tp_partial': 1, 'trail_partial': 1}
+        assert len(tp_closes) == 2
+    else:
+        assert closed == {'tp_partial': 2, 'trail_partial': 1}
+        assert len(tp_closes) == len(set(tp_closes)) == 3
+
+
+#: The partial-bracket scenario's modes whose first TP close the venue
+#: acknowledges and settles only a bar later, with the store writes of their
+#: fault-free run (:func:`_run_partial_bracket_fault_scenario`).
+_ACKED_CLOSE_MODES = {'ack_then_fill': 72, 'ack_then_unfilled': 80, 'ack_then_partial': 81}
+
+
+@pytest.mark.parametrize('close_journal,crash_at', [
+    (mode, crash_at) for mode, writes in _ACKED_CLOSE_MODES.items() for crash_at in range(writes)
+])
+def __test_a_crash_at_any_write_around_an_acknowledged_partial_close_never_over_closes__(
+        tmp_path, close_journal, crash_at):
+    """The process dies at each write of a run whose TP close the venue acknowledged first.
+
+    The venue acknowledges the first TP close it takes without executing it,
+    and a bar later executes it in full, ends it with nothing filled, or ends
+    it after executing 0.2 of 0.5 (:func:`_run_partial_bracket_fault_scenario`
+    with ``crash``). Whatever was in flight when the process died, the
+    restart settles the held leg from the plugin's journal: the venue
+    executes no more of any exit than its quantity, no client order id goes
+    out twice, no leg is left half-way or differing from its row, nothing is
+    owed and the bot neither quarantines nor halts.
+    """
+    from pynecore.core.broker.store_helpers import (
+        LEG_STATE_CANCEL_TENTATIVE, LEG_STATE_TRIGGERED_FAILED, LEG_STATE_TRIGGERED_UNKNOWN,
+    )
+    base = _run_partial_bracket_fault_scenario(
+        tmp_path / 'base', None, crash=True, close_journal=close_journal)
+    assert base['writes'] == _ACKED_CLOSE_MODES[close_journal] and not base['crashed']
+    run = _run_partial_bracket_fault_scenario(
+        tmp_path, crash_at, crash=True, close_journal=close_journal)
+    assert run['crashed'] and run['raised'] == []
+    executed = collections.defaultdict(float)
+    for pine_id, qty in run['executed']:
+        executed[pine_id.split('__', 2)[2].split('\0')[0]] += qty
+    assert all(qty <= 0.5 + 1e-9 for qty in executed.values()), dict(executed)
+    close_coids = run['calls']['close_coids']
+    assert len(close_coids) == len(set(close_coids)), close_coids
+    second = run['second']
+    assert second['legs'] == second['leg_rows']
+    assert not [leg for leg in second['legs'] if leg[1] in (
+        _LEG_STATE_TRIGGERING, LEG_STATE_TRIGGERED_FAILED, LEG_STATE_TRIGGERED_UNKNOWN,
+        LEG_STATE_CANCEL_TENTATIVE)]
+    assert second['tentative'] == [] and second['owed'] == []
+    assert not second['halted'] and not second['quarantined']
+
+
+@pytest.mark.parametrize('close_journal', list(_ACKED_CLOSE_MODES))
+def __test_an_acknowledged_partial_close_holds_its_leg_until_the_venue_settles_it__(
+        tmp_path, caplog, close_journal):
+    """An acknowledged close does not tear the leg's protection down before it executes.
+
+    The venue acknowledges the TP's close without executing it: the leg stays
+    held (``triggering``) and its SL sibling stays armed, neither cancelled nor
+    allowed to trigger. A bar later the venue settles the close and the leg
+    follows the evidence: executed -> ``triggered`` with the SL cascaded; ended
+    with nothing filled -> re-armed, and its next cross closes under a fresh
+    client order id; ended after 0.2 of 0.5 -> the leg and its SL sibling are
+    sized to 0.3 and the next close takes exactly that. Every exit closes its
+    quantity once in total, nothing is reported as an undecidable hold, and the
+    bot is never quarantined.
+    """
+    import logging
+    caplog.set_level(logging.INFO)
+    run = _run_partial_bracket_fault_scenario(tmp_path, None, close_journal=close_journal)
+    base = _run_partial_bracket_fault_scenario(tmp_path / 'base', None)
+    assert run['raised'] == []
+    held = {leg[0]: leg[1] for leg in run['triggered'][0]}
+    base_after = {leg[0]: leg[1] for leg in base['triggered'][0]}
+    tp_coid = next(coid for coid in held if coid not in base_after and held[coid] == 'triggering')
+    assert sorted(held.values()) == ['armed', 'armed', _LEG_STATE_TRIGGERING], held
+    assert len(held) == len(base_after) + 2
+    executed = collections.defaultdict(float)
+    for pine_id, qty in run['executed']:
+        executed[pine_id.split('\0')[2]] += qty
+    assert executed == pytest.approx({'tp_partial': 0.5, 'trail_partial': 0.5})
+    close_coids = run['calls']['close_coids']
+    assert len(close_coids) == len(set(close_coids))
+    tp_closes = [qty for pine_id, qty in zip(
+        [pine_id for pine_id, _coid in run['close_sends']], run['calls']['close'])
+        if '\0tp_partial' in pine_id]
+    # The refused first send, then the acknowledged one, then what is left.
+    assert tp_closes == {'ack_then_fill': [0.5, 0.5], 'ack_then_unfilled': [0.5, 0.5, 0.5],
+                         'ack_then_partial': [0.5, 0.5, 0.3]}[close_journal]
+    if close_journal == 'ack_then_partial':
+        rows = {coid: (state, qty) for coid, state, qty in run['all_leg_rows']}
+        sl_coid = next(coid for coid in held if coid not in base_after and coid != tp_coid)
+        assert rows[tp_coid] == ('triggered', pytest.approx(0.3))
+        assert rows[sl_coid] == ('cascaded_cancel', pytest.approx(0.3))
+    for key in ('first', 'second'):
+        assert run[key]['legs'] == run[key]['leg_rows'] == base[key]['legs'], key
+        assert run[key]['owed'] == [], key
+    assert _held_partial_bracket_errors(caplog) == []
+    assert not run['second']['quarantined'] and not run['second']['halted']
 
 
 def _partial_bracket_view(engine) -> list[tuple]:
@@ -21875,7 +23558,8 @@ def _partial_bracket_rows(ctx) -> list[tuple]:
 def _run_partial_bracket_fault_scenario(
         tmp_path, fail_at: int | None, *, crash: bool = False,
         crash_after_tp_close: bool = False, close_journal: str = 'row',
-        after_first_restart_bar: Callable[[Any], None] | None = None) -> dict:
+        after_first_restart_bar: Callable[[Any], None] | None = None,
+        operator_decision: bool | None = None) -> dict:
     """Partial brackets (pending, armed, trail, trigger, cascade), a cancel-tentative, restart.
 
     With ``crash`` the ``fail_at``-th write kills the first process instead of
@@ -21897,11 +23581,25 @@ def _run_partial_bracket_fault_scenario(
     the close's first leg (its close-leg row is in the journal),
     ``'event'`` no row but a ``close_dispatched`` event once the venue
     acknowledged it (cTrader), ``'none'`` nothing.
+    Three modes have the venue acknowledge the first TP close it takes without
+    executing it, and settle it only at the start of the next bar (its row
+    stays live meanwhile, the leg held): ``'ack_then_fill'`` it then executes
+    in full, ``'ack_then_unfilled'`` it ends with nothing filled (the core's
+    ended-unfilled mark; the leg re-arms and a second close executes),
+    ``'ack_then_partial'`` it ends after executing 0.2 of 0.5 (the core's
+    ended-partially mark; the leg and its SL sibling are sized to 0.3, and the
+    next close executes that). ``executed`` lists ``(pine id, quantity)`` of
+    every close the venue executed.
     ``after_first_restart_bar`` runs with the restarted run's store after its
-    first bar.
+    first bar. With ``operator_decision`` the operator then resumes the
+    restarted run's quarantine, recording for every held close that it
+    executed (``True``) or did not (``False``), and the run restarts once more
+    (``decided`` records the state the operator saw).
     """
     out: dict = {'raised': [], 'crashed': False, 'tp_ack_lost': False,
-                 'journal_failed': None}
+                 'journal_failed': None, 'executed': []}
+    acked_modes = ('ack_then_fill', 'ack_then_unfilled', 'ack_then_partial')
+    acked_outcomes: list[tuple[str, str, float]] = []
     restart_bars = crash or crash_after_tp_close or close_journal == 'lost_ack'
     path = tmp_path / f"pb-{fail_at}-{crash}-{crash_after_tp_close}-{close_journal}.sqlite"
     with BrokerStore(path, plugin_name="testbroker") as store:
@@ -21927,7 +23625,8 @@ def _run_partial_bracket_fault_scenario(
         async def _close(envelope):
             coid = envelope.client_order_id('c')
             intent = envelope.intent
-            rows = close_journal in ('row', 'pending', 'cancelled', 'lost_ack', 'journal_fail')
+            rows = close_journal in ('row', 'pending', 'cancelled', 'lost_ack', 'journal_fail',
+                                     *acked_modes)
             if (close_journal in ('journal_fail', 'journal_fail_fanned')
                     and '\0tp_partial' in intent.pine_id and out['journal_failed'] is None):
                 # The plugin's persist-first row does not commit: no venue call.
@@ -21959,13 +23658,29 @@ def _run_partial_bracket_fault_scenario(
                 out['tp_ack_lost'] = True
                 journal_close(lambda c: c.set_order_state(coid, 'disposition_unknown'))
                 raise OrderDispositionUnknownError("close answer lost", client_order_id=coid)
+            # The close the process dies after is journaled the way
+            # ``close_journal`` says; every other market close executes in
+            # full and its venue's plugin shows it (a filled row, a
+            # ``confirmed`` event, or a filled answer where nothing is
+            # journaled).
+            scenario_close = False
+            if (close_journal in acked_modes and tp_close
+                    and not any(pid == intent.pine_id for pid, _c, _q in acked_outcomes)):
+                # Acknowledged and working; the venue settles it next bar.
+                journal_close(lambda c: c.upsert_order(coid, state='confirmed',
+                                                       exchange_order_id=order.id))
+                acked_outcomes.append((intent.pine_id, coid, intent.qty))
+                return order
             if crash_after_tp_close and tp_close and not out['crashed']:
+                scenario_close = True
                 faulty.fail_at = faulty.writes
                 faulty.crash = True
                 if close_journal == 'pending':
                     return order
-            if close_journal in ('row', 'lost_ack', 'journal_fail'):
+            if close_journal in ('row', 'lost_ack', 'journal_fail', *acked_modes) or (
+                    not scenario_close and close_journal in ('pending', 'cancelled')):
                 # The market close executed in full.
+                out['executed'].append((intent.pine_id, intent.qty))
                 journal_close(lambda c: (c.upsert_order(coid, state='confirmed',
                                                         exchange_order_id=order.id,
                                                         filled_qty=intent.qty),
@@ -21979,7 +23694,35 @@ def _run_partial_bracket_fault_scenario(
                 journal_close(lambda c: c.log_event(
                     'close_dispatched', client_order_id=coid,
                     exchange_order_id=order.id, intent_key=intent.intent_key))
+                if not scenario_close:
+                    journal_close(lambda c: c.log_event(
+                        'confirmed', client_order_id=coid,
+                        exchange_order_id=order.id, intent_key=intent.intent_key))
+            elif not scenario_close:
+                out['executed'].append((intent.pine_id, intent.qty))
+                return replace(order, status=OrderStatus.FILLED, filled_qty=intent.qty,
+                               remaining_qty=0.0)
             return order
+
+        def settle_acked_closes() -> None:
+            # The venue settles the acknowledged close: the plugin journals it.
+            for index, (pine_id, coid, qty) in enumerate(acked_outcomes):
+                if not coid:
+                    continue
+                acked_outcomes[index] = (pine_id, '', qty)
+                if close_journal == 'ack_then_fill':
+                    out['executed'].append((pine_id, qty))
+                    journal_close(lambda c: (c.upsert_order(coid, filled_qty=qty),
+                                             c.close_order(coid)))
+                elif close_journal == 'ack_then_unfilled':
+                    journal_close(lambda c: (c.log_event(_CLOSE_ENDED_UNFILLED_EVENT,
+                                                         client_order_id=coid),
+                                             c.close_order(coid)))
+                else:
+                    out['executed'].append((pine_id, 0.2))
+                    journal_close(lambda c: (c.log_event(
+                        _CLOSE_ENDED_PARTIALLY_EVENT, client_order_id=coid,
+                        payload={_CLOSE_EXECUTED_QTY_KEY: 0.2}), c.close_order(coid)))
 
         b.execute_close = _close  # type: ignore[method-assign]
 
@@ -22013,13 +23756,32 @@ def _run_partial_bracket_fault_scenario(
         def bar(price: float | None = None) -> None:
             nonlocal ts
             ts += 60_000
+            settle_acked_closes()
             for _ in range(3):
                 call(engine.sync, ts, last_price=price)
 
-        def fill(side, qty, price, *, pine_id, fill_id, leg=LegType.ENTRY) -> None:
-            call(engine.on_order_event, _fill_event(
+        def journal_entry_fill(pine_id: str, qty: float) -> bool:
+            """Journal an entry's fill on its row, as a plugin does before the event.
+
+            :return: Whether the row already held the fill.
+            """
+            coid = next(e.client_order_id('e') for e in b.entry_calls
+                        if e.intent.pine_id == pine_id)
+            row = journal['ctx'].get_order_for_run_id(coid)
+            if row is not None and row.filled_qty >= qty:
+                return True
+            journal_close(lambda c: c.upsert_order(
+                coid, symbol=SYMBOL, side='buy', qty=qty, state='confirmed',
+                intent_key=pine_id, pine_entry_id=pine_id, exchange_order_id=f"x-{coid}",
+                filled_qty=qty))
+            return False
+
+        def fill(side, qty, price, *, pine_id, fill_id, leg=LegType.ENTRY,
+                 journaled_before_restart: bool = False) -> None:
+            call(engine.on_order_event, replace(_fill_event(
                 side, qty, price, pine_id=pine_id, leg=leg, xchg_id=f"x-{fill_id}",
-                fill_id=fill_id))
+                fill_id=fill_id), journal_fill_qty=qty,
+                journaled_before_restart=journaled_before_restart))
             call(engine.apply_async_events)
 
         def first_process() -> None:
@@ -22030,11 +23792,14 @@ def _run_partial_bracket_fault_scenario(
                 "L", -0.5, "T", trail_price=105.0, trail_offset=3.0)
             bar()
             out['pending'] = (_partial_bracket_view(engine), _partial_bracket_rows(ctx))
-            # 2. Its fill arms the legs; the trail activates and moves.
-            fill('buy', 2.0, 100.0, pine_id="L", fill_id="f-L")
+            # 2. Its fill arms the legs; the trail activates and moves. The
+            # venue holds the position and the plugin journaled the fill
+            # before the event arrives.
             b.position = ExchangePosition(
                 symbol=SYMBOL, side='long', size=2.0, entry_price=100.0, unrealized_pnl=0.0,
                 liquidation_price=None, leverage=1.0, margin_mode='cross')
+            journal_entry_fill("L", 2.0)
+            fill('buy', 2.0, 100.0, pine_id="L", fill_id="f-L")
             bar(101.0)
             out['armed'] = (_partial_bracket_view(engine), _partial_bracket_rows(ctx))
             bar(106.0)
@@ -22072,6 +23837,7 @@ def _run_partial_bracket_fault_scenario(
             # lost and it never closes its run.
             out['crashed'] = True
             faulty.crash = False
+            faulty.dead = False
             if faulty._conn.in_transaction:
                 faulty._conn.rollback()
             store._txn_depth = 0  # type: ignore[attr-defined]
@@ -22099,12 +23865,19 @@ def _run_partial_bracket_fault_scenario(
                 if (restart_bars
                         and any(e.intent.pine_id == "L" for e in b.entry_calls)):
                     # The venue holds the position the first process opened,
-                    # and its fill feed replays the entry's fill.
+                    # and the plugin delivers the entry's fill again: one the
+                    # dead process journaled is in the position this one
+                    # started with (``journaled_before_restart`` unless the
+                    # run took it), one it did not is journaled now.
                     b.position = ExchangePosition(
                         symbol=SYMBOL, side='long', size=2.0, entry_price=100.0,
                         unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
                         margin_mode='cross')
-                    fill('buy', 2.0, 100.0, pine_id="L", fill_id="f-L")
+                    journaled = journal_entry_fill("L", 2.0)
+                    fill('buy', 2.0, 100.0, pine_id="L", fill_id="f-L",
+                         journaled_before_restart=(journaled
+                                                   and not ctx2.fill_delivered("f-L")))
+                    out['restart_size'] = engine2._position.size  # type: ignore[attr-defined]
                 if restart_bars:
                     bar(121.0)
                     out['held'] = {
@@ -22118,9 +23891,23 @@ def _run_partial_bracket_fault_scenario(
                 bar(110.0)
                 if restart_bars:
                     bar(110.0)
+                if operator_decision is not None and 'decided' not in out:
+                    held_coids = sorted(store.held_trigger_close_coids(ctx2.run_id))
+                    out['decided'] = {'quarantine_id': engine2.quarantine_id,
+                                      'quarantined': engine2.quarantined,
+                                      'held_coids': held_coids}
+                    assert engine2.quarantine_id is not None
+                    store.request_quarantine_resume(
+                        ctx2.run_id, engine2.quarantine_id,
+                        {coid: operator_decision for coid in held_coids})
+                    ctx2.close()
+                    continue
                 break
             except _ProcessCrash:
                 crashed(ctx2)
+        out['all_leg_rows'] = sorted(
+            (row.client_order_id, (row.extras or {}).get('leg_state'), row.qty)
+            for row in ctx2.iter_orders_in_state_for_run_id('partial_bracket_leg'))
         out['second'] = {
             'legs': _partial_bracket_view(engine2),
             'leg_rows': _partial_bracket_rows(ctx2),
@@ -22358,3 +24145,275 @@ def __test_a_partial_close_whose_fan_out_journal_failed_after_a_sent_leg_stays_h
     errors = _held_partial_bracket_errors(caplog)
     assert len(errors) == 2 and all(failed_coid in error for error in errors)
     assert second['quarantined'] and not second['halted'] and second['owed'] == []
+
+
+
+def _held_close_evidence_double(tmp_path, *, port=None, acknowledged=()):
+    """An engine double whose held-close evidence reads a real store; ``(ctx, outcome_of)``."""
+    store = BrokerStore(tmp_path / 'broker.sqlite', plugin_name='testbroker')
+    ctx = store.open_run(RunIdentity(strategy_id='held', symbol='BTCUSDT', timeframe='60',
+                                     account_id='test', label=None),
+                         script_source='src', script_path='t.py')
+    engine = SimpleNamespace(
+        _store_ctx=ctx, _broker=SimpleNamespace(position_port=port),
+        _acknowledged_trigger_closes=set(acknowledged), _run_async_read=asyncio.run)
+    engine._held_order_close_outcome = (
+        lambda coid: OrderSyncEngine._held_order_close_outcome(engine, coid))
+    engine._held_fan_close_outcome = (
+        lambda coid, p: OrderSyncEngine._held_fan_close_outcome(engine, coid, p))
+    return ctx, lambda coid: OrderSyncEngine._held_trigger_close_outcome(engine, coid)
+
+
+@pytest.mark.parametrize(('absent', 'expected'), [(True, 'unknown'), (False, 'refused')],
+                         ids=['rejected_on_absence', 'venue_refusal'])
+def __test_a_close_rejected_only_on_its_absence_settles_nothing__(tmp_path, absent, expected):
+    """A held close whose row the parked-dispatch resolver rejected because the
+    venue lookups did not find it is no proof the close executed nothing (it
+    can still show up executed), so the leg is not re-armed: ``'unknown'``
+    (quarantine, the operator decides). A refusal the venue stated is proof:
+    ``'refused'`` (the leg re-arms)."""
+    ctx, outcome_of = _held_close_evidence_double(tmp_path)
+    ctx.upsert_order('close-1', symbol='BTCUSDT', side='sell', qty=0.5, state=_STATE_REJECTED,
+                     extras={_EXTRAS_KEY_REJECTED_ON_ABSENCE: True} if absent else {})
+    ctx.close_order('close-1')
+    evidence = outcome_of('close-1')
+    assert evidence.outcome == expected
+    assert evidence.operator_may_decide
+    ctx.close()
+
+
+class _FanPort:
+    """A position port that answers ``close_leg_executed`` from a table (``None``: not yet)."""
+
+    def __init__(self, executed: dict[str, int | None]) -> None:
+        self.executed = executed
+        self.asked: list[tuple[str, tuple[str, ...]]] = []
+
+    async def close_leg_executed(self, symbol, leg_id, client_order_ids, since_ms):
+        self.asked.append((leg_id, tuple(client_order_ids)))
+        answer = self.executed[leg_id]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+@pytest.mark.parametrize(('executed', 'expected', 'fraction'), [
+    ({'L1': 100, 'L2': 300}, 'sent', None),
+    ({'L1': 0, 'L2': 0}, 'refused', None),
+    ({'L1': 100, 'L2': 0}, 'partial', 0.25),
+    ({'L1': 100, 'L2': None}, 'working', None),
+    ({'L1': 100, 'L2': ConnectionError('down')}, 'working', None),
+], ids=['all', 'none', 'mixed', 'not_answered', 'read_failed'])
+def __test_a_held_fan_close_settles_from_what_each_leg_close_executed__(
+        tmp_path, executed, expected, fraction):
+    """On a hedging venue the held close is the fan's per-leg closes: the
+    venue's answer for every send of every leg decides it, in broker-grid
+    volume. A leg it cannot answer for yet, or a failed read, decides nothing."""
+    port = _FanPort(executed)
+    ctx, outcome_of = _held_close_evidence_double(tmp_path, port=port)
+    for leg_id, volume in (('L1', 100), ('L2', 300)):
+        _create_close_leg_row(ctx, coid=f'close-1:{leg_id}', symbol='BTCUSDT', side='sell',
+                              qty=volume / 1000, intent_key='X', pine_entry_id='X',
+                              parent_close_coid='close-1', leg_id=leg_id, leg_volume=volume,
+                              leg_pre_volume=volume)
+        _finish_close_leg_row(ctx, f'close-1:{leg_id}')
+    evidence = outcome_of('close-1')
+    assert evidence.outcome == expected
+    if fraction is not None:
+        assert evidence.executed_fraction == pytest.approx(fraction)
+    assert ('L1', ('close-1:L1',)) in port.asked
+    ctx.close()
+
+
+@pytest.mark.parametrize(('acknowledged', 'expected', 'operator_may_decide'), [
+    (True, 'pending', True), (False, 'unknown', False),
+], ids=['this_process', 'inherited'])
+def __test_a_fan_leg_whose_send_is_unsettled_leaves_the_close_to_the_emulator__(
+        tmp_path, acknowledged, expected, operator_may_decide):
+    """A close-leg row still pending is the emulator's to settle: in a fan this
+    process completed the close is ``'pending'``; an inherited one is
+    ``'unknown'`` without an operator decision (the resume's restart lets the
+    replay settle the send first), and an operator decision on record is not
+    applied to it."""
+    port = _FanPort({'L1': 100})
+    ctx, outcome_of = _held_close_evidence_double(
+        tmp_path, port=port, acknowledged=('close-1',) if acknowledged else ())
+    _create_close_leg_row(ctx, coid='close-1:L1', symbol='BTCUSDT', side='sell', qty=0.1,
+                          intent_key='X', pine_entry_id='X', parent_close_coid='close-1',
+                          leg_id='L1', leg_volume=100, leg_pre_volume=100)
+    ctx.operator_close_decision = lambda _coid: True
+    evidence = outcome_of('close-1')
+    assert (evidence.outcome, evidence.operator_may_decide) == (expected, operator_may_decide)
+    assert not evidence.operator
+    assert port.asked == []
+    ctx.close()
+
+
+def __test_a_held_fan_close_without_any_leg_row_is_unknown__(tmp_path):
+    """No close-leg row of the close: nothing tells what it executed."""
+    ctx, outcome_of = _held_close_evidence_double(tmp_path, port=_FanPort({}))
+    assert outcome_of('close-1').outcome == 'unknown'
+    ctx.close()
+
+
+@pytest.mark.parametrize(('executed', 'expected', 'fraction'), [
+    (100, 'partial', 0.25), (0, 'refused', None),
+], ids=['first_leg_filled', 'first_leg_unfilled'])
+def __test_a_held_fan_close_that_stopped_before_its_last_leg_is_not_complete__(
+        tmp_path, executed, expected, fraction):
+    """A fan of two legs (100 + 300) that stopped after the first send (a crash
+    between the sends, a plugin skip that ended the fan) left one row. The
+    unreached leg never went out and executed nothing: the first leg filling
+    in full is a partial close of the whole fan, never the whole close."""
+    port = _FanPort({'L1': executed})
+    ctx, outcome_of = _held_close_evidence_double(tmp_path, port=port)
+    _create_close_leg_row(ctx, coid='close-1:L1', symbol='BTCUSDT', side='sell', qty=0.1,
+                          intent_key='X', pine_entry_id='X', parent_close_coid='close-1',
+                          leg_id='L1', leg_volume=100, leg_pre_volume=100,
+                          extra_payload={_EXTRAS_KEY_CLOSE_FAN_VOLUME: 400})
+    _finish_close_leg_row(ctx, 'close-1:L1')
+    evidence = outcome_of('close-1')
+    assert evidence.outcome == expected
+    if fraction is not None:
+        assert evidence.executed_fraction == pytest.approx(fraction)
+    ctx.close()
+
+
+@pytest.mark.parametrize(('requested', 'fan', 'executed', 'expected', 'fraction'), [
+    (200, 300, 100, 'partial', 0.5),
+    (200, 300, 200, 'sent', None),
+    (200, 300, 300, 'sent', None),
+    (400, 100, 100, 'partial', 0.25),
+], ids=['widened_part', 'widened_request_met', 'widened_whole', 'clipped'])
+def __test_a_held_fan_close_measures_execution_against_its_request__(
+        tmp_path, requested, fan, executed, expected, fraction):
+    """The close's execution is measured against the volume it was asked for,
+    capped at it. A whole-leg plan widened a 200 close to a 300 send: 100
+    executed is half of the close (so the leg re-arms for the other half, not
+    for more), and 200 or more completes it. A plan clipped to 100 of a 400
+    request stays partial when its one leg fills."""
+    port = _FanPort({'L1': executed})
+    ctx, outcome_of = _held_close_evidence_double(tmp_path, port=port)
+    _create_close_leg_row(ctx, coid='close-1:L1', symbol='BTCUSDT', side='sell',
+                          qty=fan / 1000, intent_key='X', pine_entry_id='X',
+                          parent_close_coid='close-1', leg_id='L1', leg_volume=fan,
+                          leg_pre_volume=fan,
+                          extra_payload={_EXTRAS_KEY_CLOSE_FAN_VOLUME: fan,
+                                         _EXTRAS_KEY_CLOSE_REQUESTED_VOLUME: requested})
+    _finish_close_leg_row(ctx, 'close-1:L1')
+    evidence = outcome_of('close-1')
+    assert evidence.outcome == expected
+    if fraction is not None:
+        assert evidence.executed_fraction == pytest.approx(fraction)
+    ctx.close()
+
+
+@pytest.mark.parametrize(('new_state', 'reanchored'), [
+    ('cascaded_cancel', True), ('triggered', False),
+], ids=['cascaded', 'settled'])
+def __test_a_held_leg_a_cascade_ends_re_anchors_its_close__(new_state, reanchored):
+    """A held leg (``triggering`` on a recorded close) that a cascade ends never
+    reaches its settlement, so the engine bumps the synthetic close's retry
+    anchor itself: a later leg of the same exit, entry and kind never sends
+    under the spent client order id. A leg its settlement ends (``triggered``)
+    is retired by the settlement."""
+    reanchors: list[str] = []
+    engine = SimpleNamespace(
+        _acknowledged_trigger_closes={'close-1'}, _trigger_closes_taking_parent={'close-1'},
+        _reanchor_envelope_after_reject=reanchors.append,
+        _recompute_native_failsafe_for_parent=lambda *_a, **_k: None)
+    leg = PartialBracketLeg(
+        coid="leg-tp", symbol=SYMBOL, pine_id="L-X1", from_entry="L",
+        leg_kind=_LEG_KIND_TP_PARTIAL, leg_state=new_state, side='sell',
+        qty=0.4, intent_key=f"L-X1{INTENT_KEY_SEP}L", parent_pine_entry_id="L",
+        parent_entry_dispatch_ref="ref-L", intent_partial_qty=0.4,
+        trigger_level=50_200.0, oca_group=None, oca_type=None, close_attempt_coid='close-1',
+    )
+    OrderSyncEngine._on_partial_bracket_leg_state_change(  # type: ignore[arg-type]
+        engine, leg, _LEG_STATE_TRIGGERING, new_state)
+    assert reanchors == ([f"__pyne_partial_trigger__L-X1\0L\0{_LEG_KIND_TP_PARTIAL}"]
+                         if reanchored else [])
+    assert (engine._acknowledged_trigger_closes == set()) is reanchored
+
+
+def __test_a_held_close_of_the_whole_parent_leaves_its_native_stop_once_it_fills__(tmp_path):
+    """A close for the parent's whole position that the venue acknowledged
+    without a fill is held; by the time its fill settles it, the book holds
+    nothing under the parent any more. Whether it takes the whole parent was
+    judged at the acknowledgement, so the settlement's sibling cascade does
+    not move the native stop of the deal the close took."""
+    store = BrokerStore(tmp_path / 'broker.sqlite', plugin_name='testbroker')
+    ctx = store.open_run(RunIdentity(strategy_id='t025', symbol=SYMBOL, timeframe='60',
+                                     account_id='testbroker-demo', label=None),
+                         script_source='src', script_path='t.py')
+    b = MockBroker()
+    engine, pos = _mk_engine(b, store_ctx=ctx)
+    pos.record_fill(_fill_event('sell', 0.01, 75_600.0, pine_id="S", xchg_id="seed-S"))
+    ref = "ref-S"
+    engine._native_failsafe_manager.register_parent(  # type: ignore[attr-defined]
+        parent_entry_dispatch_ref=ref, symbol=SYMBOL, parent_side='short', mintick=1.0,
+    )
+    sent: list = []
+    engine.set_native_bracket_dispatcher(sent.append)
+    partial_engine = engine._partial_bracket_engine  # type: ignore[attr-defined]
+    for kind, level in ((_LEG_KIND_TP_PARTIAL, 75_400.0), (_LEG_KIND_SL_PARTIAL, 76_000.0)):
+        _create_engine_trigger_partial_leg_row(
+            ctx, coid=f"leg-{kind}", symbol=SYMBOL, side="buy", qty=0.01,
+            intent_key=f"S-X2{INTENT_KEY_SEP}S", pine_entry_id="S-X2", from_entry="S",
+            leg_kind=kind, leg_state=_LEG_STATE_ARMED, parent_pine_entry_id="S",
+            parent_entry_dispatch_ref=ref, intent_partial_qty=0.01, trigger_level=level,
+            oca_group="S-X2-oca", oca_type=OcaType.CANCEL.value,
+        )
+    partial_engine.restart_replay()
+    engine._recompute_native_failsafe_for_parent(ref)  # type: ignore[attr-defined]
+    engine.drive_native_failsafe(now_ms=1.0)
+    assert [snapshot.stop_level for snapshot in sent] == [76_000.0]
+
+    tp = partial_engine.get_leg(("S-X2", "S", _LEG_KIND_TP_PARTIAL))
+    assert tp is not None
+    partial_engine._transition(tp, _LEG_STATE_TRIGGERING, close_row=False)
+    engine._dispatch_partial_bracket_close(tp)  # type: ignore[attr-defined]
+    assert len(b.close_calls) == 1
+    held = engine._partial_bracket_engine.get_leg(tp.key)  # type: ignore[attr-defined]
+    assert held is not None and held.leg_state == _LEG_STATE_TRIGGERING
+    close_coid = held.close_attempt_coid
+    assert close_coid is not None
+
+    pos.record_fill(_fill_event('buy', 0.01, 75_400.0, pine_id="S", leg=LegType.CLOSE,
+                                xchg_id="close-S"))
+    ctx.upsert_order(close_coid, symbol=SYMBOL, side='buy', qty=0.01, state='confirmed',
+                     filled_qty=0.01)
+    ctx.close_order(close_coid)
+    engine._settle_held_partial_bracket_closes()  # type: ignore[attr-defined]
+    engine.drive_native_failsafe(now_ms=2.0)
+    assert engine._partial_bracket_engine.get_leg(tp.key) is None  # type: ignore[attr-defined]
+    assert sent[1:] == []
+    ctx.close()
+    store.close()
+
+
+@pytest.mark.parametrize('crash_at', range(61))
+def __test_a_crash_at_any_netting_store_write_restarts_to_one_netted_side__(
+        tmp_path, crash_at):
+    """The first process of the netting scenario dies at each of its writes in turn.
+
+    :func:`_run_netting_fault_scenario` with ``crash``: whatever was in flight
+    (the netting record, a half planned, one close sent, its fill taken), the
+    restarted process finishes the netting from the store and the venue's
+    evidence: no close goes out twice, the venue ends on one side holding
+    what the book holds, nothing is owed or left in flight, and the run goes
+    on. A crash before the resting entry was placed restarts with the long 2
+    alone; once its fill reached the journal, the restart ends at the one-way
+    net of 1.
+    """
+    base = _run_netting_fault_scenario(tmp_path, None, crash=True)
+    assert base['first_writes'] == 61 and not base['crashed']
+    run = _run_netting_fault_scenario(tmp_path, crash_at, crash=True)
+    assert run['crashed'] and run['raised'] == []
+    sends = [coid for coid, _leg_id, _volume in run['sent_closes']]
+    assert len(sends) == len(set(sends)), sends
+    second = run['second']
+    assert second['owed'] == [] and not second['nettings']
+    assert not second['halted'] and not second['quarantined']
+    assert second['legs'] in ([('70', 'buy', 1.0)], [('70', 'buy', 2.0)]), second['legs']
+    assert second['size'] == sum(qty for _leg_id, _side, qty in second['legs'])

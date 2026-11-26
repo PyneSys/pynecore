@@ -37,6 +37,7 @@ from pynecore.core.broker.models import (
     CancelDispositionOutcome,
     CancelIntent,
     DispatchEnvelope,
+    QuarantineKind,
 )
 
 if TYPE_CHECKING:
@@ -538,7 +539,18 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     process-exiting halt, which is fail-safe, never fail-open.
 
     Signature: ``sink(reason: str, context: dict | None = None, *,
-    kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK)``.
+    kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK) -> bool``. It returns
+    ``False`` only when the request repeats an intervention already recorded
+    under the held latch (the caller skips its own audit event), ``True``
+    otherwise.
+
+    Returning proves the latch holds in THIS process, not that it survives a
+    restart: the engine latches in memory first and retries a failed store
+    write on its own, and an ``ENTRY_BLOCK`` latch never survives a restart.
+    A plugin that retires state on the strength of an
+    ``EXTERNAL_INTERVENTION`` latch (a row whose retirement only the latch
+    guards) requests it through :meth:`request_durable_intervention_quarantine`
+    and retires only on ``True``.
     """
 
     venue_writes_blocked: Callable[[], bool] | None = None
@@ -707,6 +719,42 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         if hook is not None and hook():
             raise VenueWritesQuarantinedError(what)
 
+    def request_durable_intervention_quarantine(
+            self, reason: str, context: dict | None = None,
+    ) -> bool:
+        """Latch the external-intervention quarantine; whether it will still block after a restart.
+
+        Requests the ``EXTERNAL_INTERVENTION`` latch through
+        :attr:`quarantine_sink`, then asks the store whether a latch that
+        survives a restart is held
+        (:meth:`~pynecore.core.broker.storage.RunContext.intervention_latch_stored`).
+        ``False`` means the latch holds in this process only (its store write
+        failed and the engine keeps retrying it) or nothing latched: state
+        whose retirement only the latch guards stays live, and the caller asks
+        again on a later pass. Called outside every store transaction, so the
+        latch write commits on its own.
+
+        :param reason: The quarantine reason, shown to the operator.
+        :param context: Structured details for the quarantine record.
+        :return: ``True`` when the latch is stored, or when the run has no
+            store (nothing of the run survives a restart); ``False`` without
+            a wired sink, when the sink raised, or when the latch is not
+            stored yet.
+        """
+        sink = self.quarantine_sink
+        if sink is None:
+            return False
+        # noinspection PyBroadException
+        try:
+            sink(reason, context, kind=QuarantineKind.EXTERNAL_INTERVENTION)
+        except Exception:
+            logger.exception("the external-intervention quarantine could not be requested")
+            return False
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return True
+        return store_ctx.intervention_latch_stored()
+
     def report_external_intervention(
             self,
             reason: str,
@@ -836,6 +884,19 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
 
         Maps to ``strategy.close()`` / ``strategy.close_all()``. Use
         ``envelope.client_order_id(KIND_CLOSE)`` for the exchange-side id.
+
+        Return the order as the venue answered it: ``FILLED`` only when the
+        answer reports the close executed. A software partial-bracket close
+        (``synthetic_kind='partial_trigger'``) answered otherwise is held by
+        the engine and settled from the journal under that client order id:
+        a filled row or a ``confirmed`` event (executed), the
+        :data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_PARTIALLY_EVENT`
+        mark with the executed quantity, the uniform "ended with zero fill"
+        mark :data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_UNFILLED_EVENT`
+        (the venue's own final executed quantity is zero; the row keeps its
+        state), or a venue refusal
+        (:func:`~pynecore.core.broker.store_helpers.is_proven_refusal`).
+        Journal each ending once, from the venue's terminal figures.
         """
 
     @abstractmethod

@@ -21,7 +21,7 @@ import asyncio
 import logging
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,7 +48,14 @@ from pynecore.core.broker.protection_guard import (
     ProtectionLevels,
 )
 from pynecore.core.broker.run_identity import RunIdentity
-from pynecore.core.broker.storage import BrokerStore, OrderRow, RunContext
+from pynecore.core.broker.storage import (
+    ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND,
+    ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND,
+    FILL_EVIDENCE_OPERATOR_RELEASE_FIELD,
+    BrokerStore,
+    OrderRow,
+    RunContext,
+)
 from pynecore.core.broker import sync_engine as sync_engine_module
 from pynecore.core.broker.sync_engine import OrderSyncEngine
 from pynecore.cli.app import app_state
@@ -72,9 +79,13 @@ from pynecore.core.broker.software_partial_bracket_engine import (
 )
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
+    EXTRAS_KEY_LEG_STATE,
+    EXTRAS_KEY_TRIGGER_CLOSE_COID,
     LEG_KIND_SL_PARTIAL,
     LEG_STATE_ARMED,
+    LEG_STATE_TRIGGERING,
     STATE_DISPOSITION_UNKNOWN,
+    STATE_PARTIAL_BRACKET_LEG,
     create_entry_order_row,
 )
 from pynecore.lib.strategy import Order, _order_type_entry
@@ -3076,6 +3087,124 @@ def __test_the_resume_command_stamps_the_request_and_lists_open_latches_on_a_mis
         assert row is not None and row.resume_requested_ts_ms is not None
 
 
+def __test_the_resume_command_records_a_decision_only_on_a_held_close__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--close-executed`` / ``--close-not-executed`` name a close the run
+    holds: an unknown one fails listing the held ones, one named both ways
+    fails, and neither records anything or stamps the resume. A valid
+    decision is recorded with the resume request, and only on an open latch."""
+    monkeypatch.setattr(app_state, '_workdir', tmp_path)
+    store_path = tmp_path / "output" / "logs" / "broker.sqlite"
+    with BrokerStore(store_path, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.upsert_order("leg-tp", symbol=SYMBOL, side="sell", qty=0.5,
+                         state=STATE_PARTIAL_BRACKET_LEG,
+                         extras={EXTRAS_KEY_LEG_STATE: LEG_STATE_TRIGGERING,
+                                 EXTRAS_KEY_TRIGGER_CLOSE_COID: "close-held"})
+        ctx.upsert_order("leg-sl", symbol=SYMBOL, side="sell", qty=0.5,
+                         state=STATE_PARTIAL_BRACKET_LEG,
+                         extras={EXTRAS_KEY_LEG_STATE: LEG_STATE_ARMED,
+                                 EXTRAS_KEY_TRIGGER_CLOSE_COID: "close-armed"})
+        assert store.held_trigger_close_coids(ctx.run_id) == {"close-held"}
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        quarantine_id = _latch_external(engine)
+
+        with pytest.raises(Exit):
+            cli_resume(ctx.run_id, quarantine_id, close_executed=["close-armed"])
+        assert "close-held" in capsys.readouterr().err
+        with pytest.raises(Exit):
+            cli_resume(ctx.run_id, quarantine_id, close_executed=["close-held"],
+                       close_not_executed=["close-held"])
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.resume_requested_ts_ms is None
+        assert ctx.operator_close_decision("close-held") is None
+
+        assert store.request_quarantine_resume(
+            ctx.run_id, "deadbeef", {"close-held": True}) is None
+        assert ctx.operator_close_decision("close-held") is None
+
+        cli_resume(ctx.run_id, quarantine_id, close_not_executed=["close-held"])
+        assert ctx.operator_close_decision("close-held") is False
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.resume_requested_ts_ms is not None
+
+
+def __test_the_resume_command_releases_only_a_held_entry__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--entry-not-executed`` names an entry the run holds for its execution evidence.
+
+    An unknown entry fails listing the held ones and records nothing, nor
+    stamps the resume. A held one is marked released on its hold event, with
+    the resume request.
+    """
+    monkeypatch.setattr(app_state, '_workdir', tmp_path)
+    store_path = tmp_path / "output" / "logs" / "broker.sqlite"
+    with BrokerStore(store_path, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND,
+                                 {"Long": {'order_ids': ['x-1'], 'since_ms': 1,
+                                           'expired': True}})
+        assert store.held_fill_evidence_entries(ctx.run_id) == {"Long"}
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        quarantine_id = _latch_external(engine)
+
+        with pytest.raises(Exit):
+            cli_resume(ctx.run_id, quarantine_id, entry_not_executed=["Short"])
+        assert "Long" in capsys.readouterr().err
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.resume_requested_ts_ms is None
+        assert FILL_EVIDENCE_OPERATOR_RELEASE_FIELD not in ctx.keyed_events_for_run_id(
+            ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND)["Long"]
+
+        cli_resume(ctx.run_id, quarantine_id, entry_not_executed=["Long"])
+        hold = ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND)["Long"]
+        assert hold[FILL_EVIDENCE_OPERATOR_RELEASE_FIELD] == quarantine_id
+        assert hold['order_ids'] == ['x-1']
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.resume_requested_ts_ms is not None
+
+
+@pytest.mark.parametrize("evidence", ["awaiting-execution", "stored-arrival"])
+def __test_the_resume_command_refuses_an_entry_the_venue_reported_executed__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        evidence: str,
+) -> None:
+    """``--entry-not-executed`` is refused once the store holds the venue's report of an execution.
+
+    The hold names the reported quantity (``awaiting_execution``), or a
+    stored arrival of its order reports a positive executed quantity: the
+    entry did execute. The command fails naming the quantity, records
+    nothing and does not stamp the resume.
+    """
+    monkeypatch.setattr(app_state, '_workdir', tmp_path)
+    store_path = tmp_path / "output" / "logs" / "broker.sqlite"
+    with BrokerStore(store_path, plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, _pos = _mk_engine(_MockBroker(), ctx)
+        quarantine_id = _latch_external(engine)
+        # Written by the earlier process of the run (the arrival only as far
+        # as the store's read of it goes).
+        hold = {'order_ids': ['x-1'], 'since_ms': 1, 'expired': True}
+        if evidence == "awaiting-execution":
+            hold['awaiting_execution'] = ['x-1', 0.4]
+        else:
+            ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND,
+                                     {'x-1': {'event_type': 'cancelled',
+                                              'order': {'id': 'x-1', 'filled_qty': 0.4}}})
+        ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {"Long": hold})
+        assert store.fill_evidence_entries_reported_executed(ctx.run_id) == {"Long": 0.4}
+
+        with pytest.raises(Exit):
+            cli_resume(ctx.run_id, quarantine_id, entry_not_executed=["Long"])
+        assert "0.4" in capsys.readouterr().err
+        row = ctx.get_quarantine(quarantine_id)
+        assert row is not None and row.resume_requested_ts_ms is None
+        assert FILL_EVIDENCE_OPERATOR_RELEASE_FIELD not in ctx.keyed_events_for_run_id(
+            ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND)["Long"]
+
+
 
 @pytest.mark.parametrize(
     "case", ["first-absence", "stamped-before-the-resume", "past-the-window", "plain-restart",
@@ -3356,6 +3485,48 @@ def __test_a_storage_failure_before_a_fill_is_booked_keeps_the_fill__(
         assert coid not in ctx.replay()[1]
         # The broker's redelivery of the same execution is still a duplicate.
         engine.on_order_event(_entry_fill_event(coid, "EXEC-1"))
+        engine.sync(BAR_TS + 180_000)
+        assert pos.size == 1.0
+        ctx.close()
+
+
+def __test_a_storage_failure_before_a_slice_id_fill_is_booked_keeps_the_fill__(
+        tmp_path: Path,
+) -> None:
+    """A fill without an execution id that the engine gives a slice id
+    (:meth:`OrderSyncEngine._slice_fill_id`) is kept for the retry under that
+    same id: a failed write before it is booked leaves no booked receipt, and
+    the next drain books it exactly once."""
+    import sqlite3
+    slice_id = "slice:entry:buy:test@1.0"
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine, pos, coid = _park_entry(_MockBroker(), ctx)
+        engine._slice_fill_id = lambda _event: slice_id  # type: ignore[method-assign]
+        real_unpark = ctx.record_unpark
+        failed: list[str] = []
+
+        def record_unpark(c: str) -> None:
+            if not failed:
+                failed.append(c)
+                raise sqlite3.OperationalError("disk I/O error")
+            real_unpark(c)
+
+        ctx.record_unpark = record_unpark  # type: ignore[method-assign]
+        fill = replace(_entry_fill_event(coid, "unused"), fill_id=None)
+        engine.on_order_event(fill)
+        engine.sync(BAR_TS + 60_000)
+        assert failed == [coid]
+        assert pos.size == 0.0
+        receipt = ctx.fill_receipt(slice_id)
+        assert receipt is None or not receipt.booked
+        assert not engine.halted
+
+        engine.sync(BAR_TS + 120_000)
+        assert pos.size == 1.0
+        receipt = ctx.fill_receipt(slice_id)
+        assert receipt is not None and receipt.booked
+        engine.on_order_event(fill)
         engine.sync(BAR_TS + 180_000)
         assert pos.size == 1.0
         ctx.close()

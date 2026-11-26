@@ -202,6 +202,29 @@ venue respectively):
    when the held latch already noted the same intervention (the same
    order, protection key or reason); the tracker then skips its audit
    event, and a plugin that calls the sink itself can do the same.
+
+   The sink returning says the latch holds in this process, not that it
+   survives a restart: the engine latches in memory first and retries a
+   failed store write on its own, and an `ENTRY_BLOCK` latch never survives
+   a restart. When your plugin retires state on the strength of an
+   external-intervention latch alone (a row whose retirement only the latch
+   guards), request the latch with
+   `BrokerPlugin.request_durable_intervention_quarantine(reason, context)`
+   and retire only when it returns `True`: the store then holds an open
+   external-intervention latch whose resume nobody requested yet
+   (`RunContext.intervention_latch_stored()`, the one query for it). On
+   `False` keep the state and ask again on a later pass; the engine's own
+   retry stores the latch meanwhile. Call it outside your store
+   transactions, so the latch write commits on its own. Without a wired
+   sink it returns `False` (nothing latched).
+
+   The tracker follows the same rule for its own unexpected cancels: under
+   `stop` it requests the latch before it retires the row, and retires it
+   only once `intervention_latch_stored()` answers `True`; until then the row
+   keeps its stamp and is confirmed again on the next pass. A sink you wire
+   into the tracker (and every test double of one paired with a real store)
+   must therefore store the latch in the run's store, as the engine's sink
+   does.
 5. When the evidence shows the **venue** terminated the order itself
    (a reduce-only squeeze, an OCA sibling trigger, a cleared position),
    return `CANCELLED` with `cancel_reason` set to one of
@@ -219,6 +242,15 @@ venue respectively):
    the entry reject-retry cap, so the engine stops re-placing it until
    the script changes or re-issues it. Leave `cancel_reason` at `None`
    when the venue does not name the cause.
+
+The tracker's `sibling_coids` hook (the live rows that share a `CLOSED`
+row's position) runs **inside** the store transaction that retires the
+row, after the row's terminal close and its audit event. This is a
+guarantee you may build on: a journal write you make in it (a redelivery
+record of the close that ended the position, for example) commits with
+the retirement and rolls back with it, and an exception you raise there
+rolls the whole retirement back and propagates. Never call the venue from
+it.
 
 The engine's stop-coverage guard depends on these verdicts. A missing
 stop leg whose journal row is still live is not re-armed while its fate
@@ -368,6 +400,188 @@ the broker-native execution/deal id. A `None` `fill_id` bypasses the gate,
 so it is only allowed on paths where your own persisted `filled_qty`
 cursor guarantees no other path re-emits the same execution.
 
+A `cancelled` event of an order that executed part of its quantity first
+must carry that executed quantity in `ExchangeOrder.filled_qty`, whichever
+of the cancellation and the execution the venue delivers first. The core
+keeps the entry's protection for the filled part on such a cancel (it never
+retires the partial-bracket legs as `parent_never_arrived`), and the
+execution, when it comes after the cancel, arms them. A `cancelled` or
+`rejected` event of an entry reporting more executed than the fills you
+delivered of that order so far puts the entry on hold until those fills are
+booked: nothing is dispatched on its key, the hold is persisted and listed
+in `store_ctx.fill_evidence_holds()`, and it falls under the same
+`fill_report_grace_s` expiry as the hold described below. Deliver the
+missing fills as usual.
+
+**A zero proves "nothing executed" only when the venue said so.** On a
+`cancelled` or `rejected` event the core reads `filled_qty == 0.0` as proof
+that the entry never filled: it aborts the entry's pending legs, retires its
+native fail-safe, confirms a cancel-tentative parent as cancelled and lets
+the strategy place the entry again. When the venue did not report the
+executed quantity for that event (the cumulative field is missing from the
+push, or unparsable), set `ExchangeOrder.filled_qty_known=False`; never
+substitute `0.0` as a known value. `filled_qty` is then a lower bound (what
+you have seen executed, usually `0.0`).
+
+| Terminal event of an entry                           | Core behaviour                                                                                    |
+|------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| `filled_qty > 0` (known or not)                      | execution proven: legs stay for the filled part, a tentative parent resolves as filled            |
+| `filled_qty == 0`, `filled_qty_known=True` (default) | proven unfilled: legs aborted, mapping and intent retired, tentative cancel confirmed             |
+| `filled_qty == 0`, `filled_qty_known=False`          | nothing applied: order stays mapped, legs pending, tentative parent tentative, no policy, no halt |
+
+In the last case you owe the core the evidence: deliver the same terminal
+event again with the venue's quantity once you know it (an order-history
+read), or keep the order's journal row live so your `DisappearanceTracker`
+resolves it (its `confirm_missing` returns `INCONCLUSIVE` until the executed
+quantity is known, and `CANCELLED` / `FILLED` with it). A cancel-tentative
+parent is also resolved by the core's cancel-retry probe,
+`execute_cancel_with_outcome`, which must itself answer `UNKNOWN` while the
+executed quantity is unreadable. Executions reported in between are booked
+and arm the legs as usual.
+
+Until that evidence arrives the core holds the entry: no strategy cancel,
+amend, OCA cascade or position cleanup retires its mapping, envelope or
+pending legs, and nothing new is dispatched on its key. The hold is
+persisted, so a restart re-arms it together with the order mapping your
+later events route through. Deliver the evidence within your
+`fill_report_grace_s`: a hold older than that puts the bot into an
+`ENTRY_BLOCK` quarantine with one warning naming the entry and its orders.
+The operator checks the order on the venue, closes there anything it
+executed (the journal owns none of it, so the restart would not adopt it),
+and resumes with `pyne broker resume RUN_ID QUARANTINE_ID
+--entry-not-executed ENTRY_ID`; the restart after that resume applies the
+statement like the venue's proven zero (pending legs aborted, mapping and
+envelope retired), then releases the hold, and the script may send the
+entry again. A plain resume keeps the hold, and the restart quarantines
+again. Once the venue reported an executed quantity for the entry (a
+terminal event of yours with a positive `filled_qty`), the entry did
+execute: the command refuses `--entry-not-executed` for it, the restart
+does not apply such a statement recorded earlier, and the hold ends only
+when you deliver the missing fill.
+
+The core stores the evidence the moment it receives it: a terminal event
+with the venue's quantity for an order a hold waits on is written to the
+store before it is queued, so a process that stops before applying it
+settles the hold at its restart. The stored hold and that record are
+deleted only after the event's consequences were written, so a process
+that dies while applying it replays it too. A terminal event reporting a
+positive executed quantity for an entry held across a restart waits, with
+the hold, until the script issues the entry again, and is then applied
+through it.
+
+Read the holds with `store_ctx.fill_evidence_holds()`: intent key -> the
+venue order ids the hold names, scoped to the logical run. A hold listed
+there names an order whose terminal event the core has not applied yet;
+once the hold is gone, the core applied it or booked a fill of the order,
+which is evidence of its own. A terminal event reporting a
+positive executed quantity keeps the hold listed until a fill event of the
+order showing that quantity is routed, so deliver that fill as usual. Do
+not read the underlying store event kind directly.
+
+After a restart you do not need to deliver an owed terminal event again:
+once you delivered it, the core holds it, and replays it itself. Doing so
+anyway is harmless. A copy that arrives while the replayed event is still
+queued is applied after it and finds the order mapped to no intent any
+more, so it is only logged; a copy that arrives after the hold was settled
+does the same. An event the earlier process never yielded is still owed:
+deliver it.
+
+The default is `filled_qty_known=True`, so a plugin that always reads the
+executed quantity from the venue (or from its own execution ledger) needs no
+change; every constructor of a terminal `ExchangeOrder` that does not have
+that quantity must set the flag.
+
+The gate is durable. Every fill the engine takes gets a **fill receipt**
+(`FillReceipt`, table `fill_receipts`, keyed by `fill_id` on the logical
+run), written in the same store transaction as the binding-book write that
+follows the fill's routing. A receipt therefore exists exactly when the
+store holds the engine's books with the fill in them. A fill whose receipt
+exists is dropped in every later process of the run too. Read it with
+`store_ctx.fill_delivered(fill_id)` (`True` once the engine took the fill)
+or `store_ctx.fill_receipt(fill_id)` (the receipt, with the commission the
+engine accounted the fill id with in `fee`). The receipt lands after the
+engine drained the event (the next sync at the latest, later only while a
+storage failure delays the book write), and a fill held for the venue's
+verdict (an exit fill that does not reduce the book, or one that may be an
+adopted reduction reported late) gets it when the verdict settles it.
+
+How to deliver a fill again safely:
+
+- **Inside one process** re-yielding a fill with the same `fill_id` is
+  always safe: the engine drops the second copy.
+- **After a restart** the engine starts from the venue position and your
+  journal. A fill whose journal write an earlier process made (its row's
+  `filled_qty` raised, or the exposure it closed netted off your rows) is
+  already in that position, whether or not the dead process's engine
+  booked it. Keep your own durable record of every fill you journaled and
+  yielded (written in the same transaction as the journal write). At
+  startup, for each one: if `fill_delivered(fill_id)` is `True`, drop the
+  record (yielding it again is ignored); otherwise yield it again with
+  `OrderEvent.journaled_before_restart=True`, and drop the record once
+  `fill_delivered` turns `True`. The engine gives such a fill its receipt
+  and books nothing, because the startup already holds it, except the fee
+  of an entry fill (see 2a).
+- A fill your journal does **not** hold yet (the dead process never wrote
+  its row or its netting, e.g. a close whose retirement it never
+  committed) is a new fill to this process: journal it and yield it as an
+  ordinary event, without the flag.
+- Never set `journaled_before_restart` on a fill this process journaled:
+  the engine would not book it.
+
+Retention: a receipt lives as long as a journal row of the run carries the
+fill's order (matched by the event's `ExchangeOrder.client_order_id` or its
+venue order id `ExchangeOrder.id`), and at least `RETENTION_DAYS` after it
+was written; the retention purge removes it together with that row. Keep
+your redelivery records no longer than the row they belong to: once the
+row is purged, so is the receipt, and a fill delivered again after that is
+booked as a new one.
+
+### 2a. A fee without its fill: `event_type='fee'`
+
+When a fill's commission arrives without the fill, or after you already
+delivered the fill without it (a fill booked from a snapshot that carried
+no fee), deliver an `OrderEvent` with `event_type='fee'`:
+
+- `fill_id`: the fill the fee belongs to (mandatory; an event without one
+  is not booked).
+- `fee`: that fill's **total** commission as now known, not an increment;
+  `fee_currency` as on a fill.
+- `fill_qty` / `fill_price`: `None`.
+- `order`, `pine_id`, `from_entry`, `leg_type`: as the fill event would
+  carry them.
+
+The engine books the difference between `fee` and the commission it has
+already accounted the fill id with (the receipt's `fee`, `0` without a
+receipt) onto the trades the fill opened or closed, in the shares the
+fill's own fee would have taken: an open trade carries it into its profit
+at close, a closed trade takes it at once (net profit included). When this
+process did not book the fill itself, it goes to the open trades of the
+entry (`pine_id` of an entry leg), or to the latest closed trade of the
+entry (`from_entry` of an exit leg). The fee event creates no trade and
+moves no position. Delivering the same total again, before or after a
+restart, books nothing; a fill event that later arrives with the same
+`fill_id` books only the part of its own fee the fee event did not; one
+whose `fee` is `0.0` counts as carrying no commission data, and the total
+the fee event reported stands. To
+know whether the fee is durably booked, compare `fill_receipt(fill_id).fee`
+with your total. A fee of a fill the engine holds for the venue's verdict
+is not booked (logged at WARNING); deliver it again once
+`fill_delivered(fill_id)` is `True`.
+
+The fee of a fill delivered again with `journaled_before_restart` takes
+the same channel. The trades a restart adopts carry no commission of the
+earlier process, so the fee of such an **entry** fill (its `fee`, less
+what a fee event of it already accounted) is booked onto the open trades
+of its entry by size, and the receipt records it, so delivering the fill
+or its fee again books nothing. Two limits follow from what a restart can
+recover. The fee of an **exit-leg** fill (a close, TP, SL or trailing
+stop) is not booked: it belonged to the trade that fill closed, which the
+earlier process held, and a restart does not rebuild that trade. Nor is
+the fee of an entry fill whose entry has no open trade any more (the
+position was closed meanwhile). In both cases the commission is missing
+from this process's trade history; the receipt still counts it as
+accounted.
+
 `journal_fill_qty` is the same slice in the unit your journal counts the
 order's `filled_qty` in: the amount this execution raises that row's
 `filled_qty` by. Set it on **every** fill event (`fill_qty` set), whether or
@@ -416,6 +630,16 @@ silently breaks and the bot can double-open.
   answer `FILLED_AND_CLOSED` instead: the engine resolves the cancel
   without restoring anything, booking a fill or re-arming it on restart.
   `UNKNOWN` for that case is retried until the stale grace halts the bot.
+- `execute_cancel()` may answer `True` once the venue order is gone, even
+  when it executed part of its quantity first: deliver that execution's
+  event (and a terminal event with the executed quantity) to the engine
+  before returning. The engine does not tear an entry down on a landed
+  cancel while an execution of its orders is still queued: it keeps the
+  mapping and the pending protection, routes the execution with the next
+  drain and retires what is left afterwards. The same holds for a
+  confirming `execute_cancel_with_outcome()` answer. Gating `True` on the
+  engine's receipt of the fill (`store_ctx.fill_delivered`) is not needed,
+  and stays correct.
 - Override `modify_entry()` / `modify_exit()` with the venue's in-place
   amend whenever one exists. The inherited defaults are cancel+recreate;
   for `modify_exit` that opens a window with **no protection live**.
@@ -463,6 +687,57 @@ So the plugin must: honour the declared reduce-only semantics on every
 exit path; label a fill `LegType.ENTRY` whenever it opened exposure, never
 as an exit leg; and report the venue's net size with its side from
 `get_position()`.
+
+### 6a. Journal how a close ended
+
+The software partial-bracket engine (`partial_qty_bracket_exit =
+SOFTWARE`) closes a leg's share with an `execute_close` (a `CloseIntent`
+with `synthetic_kind='partial_trigger'`). It does not retire the exit's
+other legs when the venue acknowledges that close: an acknowledged market
+order can still end unfilled. The leg stays held until your journal shows
+how the close ended, and it is settled only from that journal, under the
+close's client order id (`envelope.client_order_id(KIND_CLOSE)`), across
+every process of the run:
+
+| Journal under the close's client order id                                   | Engine verdict                                                |
+|-----------------------------------------------------------------------------|---------------------------------------------------------------|
+| `execute_close` returns the order `FILLED` (or with its whole `qty` filled) | executed at once                                              |
+| a `confirmed` event, or a closed row with `filled_qty` equal to its `qty`   | executed: the other legs cancel                               |
+| `CLOSE_ENDED_PARTIALLY_EVENT` with `CLOSE_EXECUTED_QTY_KEY`                 | partly executed: the leg re-arms for the rest                 |
+| `CLOSE_ENDED_UNFILLED_EVENT`                                                | nothing executed: the leg re-arms                             |
+| a closed `rejected` row with nothing filled (`is_proven_refusal`)           | refused: the leg re-arms                                      |
+| a live row with the venue's order id                                        | working: held, no alarm                                       |
+| a live row without it                                                       | the answer is open: held                                      |
+| anything else, or no row                                                    | undecidable: held, `entry_block` quarantine, operator decides |
+
+The constants live in `pynecore.core.broker.store_helpers`:
+
+- `CLOSE_ENDED_UNFILLED_EVENT` (`'close_ended_unfilled'`): the close's venue
+  order ended (cancelled, expired, deactivated, or rejected after the venue
+  accepted it) and the **venue's own** final cumulative executed quantity
+  is zero. This is the uniform "ended with zero fill" mark. It is not a
+  venue refusal: leave the row's state as it is (do not bend it to
+  `rejected`) and close the row. Never write it from the absence of a fill
+  in your own records: a fill your stream missed would then be closed a
+  second time.
+- `CLOSE_ENDED_PARTIALLY_EVENT` (`'close_ended_partially'`): the order ended
+  with a final executed quantity above zero and below the row's `qty`. The
+  payload carries it under `CLOSE_EXECUTED_QTY_KEY` (`'executed_qty'`), in
+  the unit of the row's `qty` (your wire unit; the engine only uses the
+  share). Write a `confirmed` event instead when the whole close executed.
+- A `rejected` row proves a refusal only when the venue answered it. The
+  parked-dispatch resolver also rejects a dispatch it did not find on the
+  venue on enough lookups; it flags that row with
+  `EXTRAS_KEY_REJECTED_ON_ABSENCE`, and `is_proven_refusal(row)` is `False`
+  for it, because an order that did land can still show up executed. Use
+  `is_proven_refusal` wherever your own code reads a `rejected` row as
+  "nothing of it executed" (a cancel probe, a close-leg settlement).
+
+Write each mark once, in the transaction that records the ending on the
+row. A plugin without a journal row per close leaves every acknowledged
+close undecidable once its process stops. On a hedging account the engine
+settles the close from the close-leg rows and `close_leg_executed` instead
+(see "Hedging-mode accounts").
 
 **Declare `fill_report_grace_s`.** The same window decides when a venue
 position that differs from the book counts as an external flatten or
@@ -806,6 +1081,43 @@ the opposing legs gone. So `fetch_raw_positions()` must report a leg as
 long as the venue still holds any of it: a leg dropped from the read
 before its close executed opens the residual beside it.
 
+A resting LIMIT or STOP entry is placed with `place_leg` as it is, with no
+close: it rests as a leg of its own. When it fills against opposing legs,
+the core nets the account afterwards: it closes the opposing legs (oldest
+first) and the new leg by the quantity the fill closed in the book, with
+`close_leg` calls under the same persist-first close-leg rows and
+`close_leg_executed` settlement as a reversal. The net position stays as
+it is, so the core books the fills of these closes as no position move
+(only their fee reaches the books): deliver them like any other close-leg
+fill (`LegType.CLOSE`, the close's side and quantity, a `fill_id`).
+
+Put the `coid` your `close_leg` received on the close fill's
+`ExchangeOrder.client_order_id`, in the core's form (map a wire form such
+as a sanitized or shortened venue label back to it). The core tells a
+netting close's fill from a strategy close's fill on the same side by that
+id, also when the fill comes late. A close fill whose id names no close of
+the run is taken by its side; when another close of the run went out on
+that side while the netting was in flight, the core cannot tell the two
+apart: it books the fill as an ordinary close and quarantines the run
+(`ENTRY_BLOCK`, reason `netting_close_fill_unidentified`) so the operator
+checks the books against the venue.
+
+A fill on a position port that carries no `fill_id` (allowed where your
+persisted `filled_qty` cursor guarantees single delivery) is keyed by the
+core from its leg type, side, order reference (`client_order_id`, else
+`id`) and the order's cumulative `ExchangeOrder.filled_qty` after the
+slice: report that cumulative quantity on every such fill, never the
+slice. A resting entry fill the core cannot key that way (no `fill_id` and
+no order reference) cannot be netted: the core quarantines the run
+(`ENTRY_BLOCK`, reason `netting_fill_without_id`) and the operator nets the
+sides. On a port without partial
+leg closes the netting closes whole legs; where that cannot keep the net
+position on its side and no larger, nothing is sent and both sides stay
+open (logged at WARNING). A restart while a netting is in flight adopts
+the journal's net, not the venue's (which is off until both closes have
+landed), so journal a close fill on your rows the same way you journal
+any other close of the run.
+
 ### Tell the restart replay what a leg close executed
 
 A crash between a `close_leg` call and its return, a timeout, or a guard
@@ -859,6 +1171,12 @@ Obligations that follow from these answers:
 - A re-send's `coid` carries a suffix after the leg close's own id; map it
   back with `close_leg_row_client_order_id` when you look up the core's
   close-leg row in `close_leg`.
+
+The same answer settles a software partial-bracket close fanned out over
+the legs: the engine holds the leg until `close_leg_executed` answers for
+every close-leg row of the fan (all executed: done; none: the leg re-arms;
+anything between: the leg re-arms for the rest). Answer `None` while a send
+can still execute, never a guess.
 
 ### Report the outcome of `amend_bracket` truthfully
 
@@ -959,9 +1277,10 @@ its venue position protected depends on `sized_leg_bracket`:
   protected quantity with `close_leg`. `qty` in your `amend_bracket` is
   then always the whole venue position, and you may ignore it.
 
-The software guard runs only while the bot runs, and its trailing stop
-starts again from the current price after a restart; the core logs each
-guarded leg once at WARNING. On a port with
+The software guard runs only while the bot runs. Its trailing stop is
+persisted on the leg's ownership rows each time it moves, so a restart
+resumes it from the last persisted extreme, never looser; it trails on from
+there with the next prices. The core logs each guarded leg once at WARNING. On a port with
 `supports_partial_leg_close = False` the guard cannot close a part of a
 leg either, so a partly offset leg there carries no protection until the
 opposing leg is closed (logged once at ERROR). Declare `NATIVE` only for

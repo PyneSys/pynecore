@@ -51,6 +51,11 @@ __all__ = [
     'STATE_SERVER_REF_SEEN',
     'STATE_CONFIRMED',
     'STATE_REJECTED',
+    'EXTRAS_KEY_REJECTED_ON_ABSENCE',
+    'CLOSE_ENDED_UNFILLED_EVENT',
+    'CLOSE_ENDED_PARTIALLY_EVENT',
+    'CLOSE_EXECUTED_QTY_KEY',
+    'is_proven_refusal',
     'STATE_DISPOSITION_UNKNOWN',
     'STATE_CLOSING',
     'STATE_CANCEL_PENDING',
@@ -117,6 +122,8 @@ __all__ = [
     'EXTRAS_KEY_CLOSE_LEG_ID',
     'EXTRAS_KEY_CLOSE_PARENT_COID',
     'EXTRAS_KEY_CLOSE_LEG_VOLUME',
+    'EXTRAS_KEY_CLOSE_FAN_VOLUME',
+    'EXTRAS_KEY_CLOSE_REQUESTED_VOLUME',
     'EXTRAS_KEY_CLOSE_LEG_PRE_VOLUME',
     'EXTRAS_KEY_CLOSE_LEG_ATTEMPTS',
     'EXTRAS_KEY_CLOSE_LEG_SINCE_MS',
@@ -141,6 +148,21 @@ __all__ = [
     'advance_residual_open_attempt',
     'iter_active_residual_opens',
     'clear_residual_open_row',
+    'EXTRAS_KEY_RESIDUAL_OPEN_NETTING',
+    'STATE_NETTING',
+    'STATE_NETTING_ABSORBED',
+    'EXTRAS_KEY_NETTING_FILL_ID',
+    'EXTRAS_KEY_NETTING_ENTRY_ID',
+    'EXTRAS_KEY_NETTING_SINCE_MS',
+    'EXTRAS_KEY_NETTING_PASSES',
+    'EXTRAS_KEY_NETTING_EXPECTED',
+    'EXTRAS_KEY_NETTING_SETTLED_MS',
+    'EXTRAS_KEY_NETTING_CONTENDED',
+    'create_netting_row',
+    'iter_active_nettings',
+    'netting_absorbed_row_coid',
+    'netting_expected',
+    'absorb_netting_fills',
     'STATE_BRACKET_OWN',
     'BRACKET_OWN_STATE_ACTIVE',
     'BRACKET_OWN_STATE_CLEARING',
@@ -158,6 +180,8 @@ __all__ = [
     'EXTRAS_KEY_BRACKET_OWN_OCA_NAME',
     'EXTRAS_KEY_BRACKET_OWN_OCA_TYPE',
     'EXTRAS_KEY_BRACKET_OWN_SOFTWARE',
+    'EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME',
+    'EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_OFFSET',
     'create_bracket_ownership_row',
     'update_bracket_ownership_state',
     'iter_active_bracket_ownerships',
@@ -255,6 +279,37 @@ STATE_CONFIRMED = 'confirmed'
 # Exchange rejected the dispatch synchronously (confirm REJECTED, or a
 # 4xx response with a known reject reason). Terminal.
 STATE_REJECTED = 'rejected'
+
+# ``extras`` flag of a :data:`STATE_REJECTED` row whose rejection is an
+# inference, not the venue's answer: the parked-dispatch resolver did not find
+# the order on the venue on enough consecutive lookups
+# (:class:`~pynecore.core.broker.parked_dispatch.ParkedDispatchResolver`). An
+# order that did land can still show up later, so such a row does not prove
+# that nothing of the dispatch executed (:func:`is_proven_refusal`).
+EXTRAS_KEY_REJECTED_ON_ABSENCE = 'rejected_on_absence'
+
+# Event kind a plugin journals under a close's client order id once the venue
+# order of that close ended (cancelled, expired, deactivated, or rejected after
+# the venue accepted it) and the venue's final cumulative executed quantity of
+# it is zero: nothing of the close reduced the position, and nothing of it can
+# any more. It is the uniform "ended with zero fill" mark, distinct from a
+# venue refusal (a :data:`STATE_REJECTED` row): the row keeps its own state.
+# The sync engine settles a held partial-bracket close carrying it as refused
+# (the leg re-arms). Write it only from the venue's own terminal figure, never
+# from the absence of a fill.
+CLOSE_ENDED_UNFILLED_EVENT = 'close_ended_unfilled'
+
+# Event kind a plugin journals under a close's client order id once the venue
+# order of that close ended with a final cumulative executed quantity above
+# zero and below the close row's ``qty``. The payload carries that quantity
+# under :data:`CLOSE_EXECUTED_QTY_KEY`, in the unit of the close row's ``qty``
+# (the plugin's wire unit). The sync engine settles a held partial-bracket close
+# carrying it as partially executed: the leg re-arms for what is left.
+CLOSE_ENDED_PARTIALLY_EVENT = 'close_ended_partially'
+
+# Payload key of :data:`CLOSE_ENDED_PARTIALLY_EVENT`: the close's final executed
+# quantity, in the unit of the close row's ``qty``.
+CLOSE_EXECUTED_QTY_KEY = 'executed_qty'
 
 # Submission outcome unknown — typically a network timeout between the
 # POST and the response, or a successful POST without a server
@@ -562,6 +617,19 @@ EXTRAS_KEY_CLOSE_LEG_ID = 'close_leg_id'
 EXTRAS_KEY_CLOSE_PARENT_COID = 'close_parent_coid'
 # Broker-grid integer volume dispatched for this leg (audit + replay residual).
 EXTRAS_KEY_CLOSE_LEG_VOLUME = 'close_leg_volume'
+# Broker-grid integer volume of the WHOLE fan the leg's close belongs to (every
+# leg the plan meant to send), written on each leg row before its send. A leg
+# the fan never reached (a crash between two sends, a plugin skip that ended the
+# fan) has no row, so what the rows hold does not show the close's full size;
+# this does.
+EXTRAS_KEY_CLOSE_FAN_VOLUME = 'close_fan_volume'
+# Broker-grid integer volume the close was ASKED for (a strategy or trigger
+# close), written on each leg row next to the fan volume. The plan can differ
+# from it both ways: clipped to the net exposure or short of a leg it cannot
+# close, or widened to whole legs on a venue that closes a leg only in full.
+# What the close executed is measured against this, capped at it, so neither a
+# short plan reads as complete nor a widened one under-credits the close.
+EXTRAS_KEY_CLOSE_REQUESTED_VOLUME = 'close_requested_volume'
 # Broker-grid size of the leg when its close was dispatched: the replay reads
 # how much the leg lost since then as evidence of what the close executed.
 EXTRAS_KEY_CLOSE_LEG_PRE_VOLUME = 'close_leg_pre_volume'
@@ -628,6 +696,56 @@ EXTRAS_KEY_RESIDUAL_OPEN_CLOSE_PLAN = 'residual_open_close_plan'
 # drain sends because an earlier close of another intent executed less than it
 # held is counted just like the reversal's own planned ones.
 EXTRAS_KEY_RESIDUAL_OPEN_COUNTED_CLOSES = 'residual_open_counted_closes'
+# The netting record (:data:`STATE_NETTING`) a close-plan breadcrumb belongs to:
+# one of the two halves of a fill-time netting pass. Its closes are paired, not
+# a reduction of the net position, so a restart's close-leg budget does not cap
+# them.
+EXTRAS_KEY_RESIDUAL_OPEN_NETTING = 'residual_open_netting'
+
+
+# === One-way emulation fill-time netting constants =========================
+
+# ``orders.state`` marker of a fill-time netting record. A resting LIMIT / STOP
+# entry on a hedging account rests as a leg of its own; once it fills against
+# opposing legs, the venue holds both sides where a one-way account would hold
+# only the net. The sync engine writes one record per such fill slice
+# (PERSIST-FIRST, before any venue write, keyed by the fill id), and the
+# :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator` nets it: it
+# closes the opposing legs FIFO and the new leg by the same quantity, through
+# two close-plan breadcrumbs (:data:`STATE_RESIDUAL_OPEN`, flagged
+# :data:`EXTRAS_KEY_RESIDUAL_OPEN_NETTING`). Like the other ledger rows it owns
+# no exchange order. ``qty`` is the quantity still to net; ``side`` the fill's.
+STATE_NETTING = 'netting'
+# The fill id of the slice the record nets (its idempotency key).
+EXTRAS_KEY_NETTING_FILL_ID = 'netting_fill_id'
+# The Pine entry id of the filled entry; its legs are reduced first.
+EXTRAS_KEY_NETTING_ENTRY_ID = 'netting_entry_id'
+# Epoch ms the record was written at.
+EXTRAS_KEY_NETTING_SINCE_MS = 'netting_since_ms'
+# How many netting passes planned closes for the record so far; the breadcrumbs
+# of pass ``n`` are keyed by it.
+EXTRAS_KEY_NETTING_PASSES = 'netting_passes'
+# The close fills the record's planned closes are expected to bring that move no
+# book: ``{'buy': qty, 'sell': qty}`` (Pine units, by fill side), the quantity
+# each side nets. The fills of the closes are book-neutral up to it.
+EXTRAS_KEY_NETTING_EXPECTED = 'netting_expected'
+# Epoch ms since the record has nothing left to plan or close; the expectation
+# then waits at most the fill-report grace for its fills.
+EXTRAS_KEY_NETTING_SETTLED_MS = 'netting_settled_ms'
+# Close fill sides (``['buy', 'sell']``) on which a close that is not the
+# record's own could still fill when the record was written (its close-leg row
+# live, or closed less than the fill-report grace before), or was fanned out
+# while the record was live. A close fill of such a
+# side that names no close the run sent cannot be told from the record's own
+# fills (:meth:`~pynecore.core.broker.one_way_emulator.OneWayEmulator.netting_close_owner`).
+EXTRAS_KEY_NETTING_CONTENDED = 'netting_contended'
+
+# ``orders.state`` marker of the sync engine's count of a netting record's
+# expected close fills it booked as netting (``{'buy': qty, 'sell': qty}`` under
+# :data:`EXTRAS_KEY_NETTING_EXPECTED`). Keyed ``{record}:absorbed`` and written
+# by the engine only, in the transaction of the fills' receipts, so a fill
+# counts toward it exactly when it is in the books.
+STATE_NETTING_ABSORBED = 'netting_absorbed'
 
 
 # === One-way emulation bracket-ownership constants =========================
@@ -673,6 +791,8 @@ LEDGER_ROW_STATES: frozenset[str] = frozenset({
     STATE_STOP_LIMIT_WATCH,
     STATE_CLOSE_LEG,
     STATE_RESIDUAL_OPEN,
+    STATE_NETTING,
+    STATE_NETTING_ABSORBED,
     STATE_BRACKET_OWN,
 })
 
@@ -718,6 +838,17 @@ EXTRAS_KEY_BRACKET_OWN_OCA_TYPE = 'bracket_own_oca_type'
 # The flag is set only after that clear is confirmed and dropped before a venue
 # bracket is written again, so a crash in between leaves the conservative state.
 EXTRAS_KEY_BRACKET_OWN_SOFTWARE = 'bracket_own_software'
+# The trailing stop of the leg's software guard: the most favourable price the
+# guard has trailed from (a long's highest, a short's lowest; its stop lies the
+# trailing distance behind it), and the merged trailing offset in Pine ticks it
+# trails at. Written on every live ownership row of the leg before the guard
+# takes a new extreme, so a restart resumes the trail from it instead of from
+# the current price and the restored stop is never looser than the last
+# persisted one. Absent while the guard has seen no price (not armed), and
+# dropped once the leg gets a venue bracket again; an offset that differs from
+# the guard's current one is not resumed.
+EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME = 'bracket_own_guard_trail_extreme'
+EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_OFFSET = 'bracket_own_guard_trail_offset'
 
 
 # === Entry order row lifecycle =============================================
@@ -930,6 +1061,21 @@ def mark_disposition_unknown(
     """
     store.await_park_row(coid)
     store.set_order_state(coid, STATE_DISPOSITION_UNKNOWN)
+
+
+def is_proven_refusal(row: 'OrderRow') -> bool:
+    """Whether a journal row proves that its dispatch executed nothing, ever.
+
+    A :data:`STATE_REJECTED` row with nothing filled does, unless its rejection
+    is the parked-dispatch resolver's inference from the order's absence on the
+    venue (:data:`EXTRAS_KEY_REJECTED_ON_ABSENCE`): an order that did land can
+    show up executed after that verdict.
+
+    :param row: The dispatch's journal row.
+    :return: ``True`` for a venue refusal with nothing filled.
+    """
+    return (row.state == STATE_REJECTED and row.filled_qty <= 0.0
+            and not (row.extras or {}).get(EXTRAS_KEY_REJECTED_ON_ABSENCE))
 
 
 def mark_rejected(
@@ -2137,6 +2283,7 @@ def create_residual_open_row(
         bar_ts_ms: int,
         retry_seq: int,
         close_plan: Sequence[tuple[str, float]] | None = None,
+        netting: str | None = None,
 ) -> None:
     """Persist a reversal's residual-OPEN breadcrumb (PERSIST-FIRST).
 
@@ -2172,6 +2319,8 @@ def create_residual_open_row(
     :param close_plan: ``(leg_id, pine_qty)`` of every close of a cut-short
         reduction or flatten (:data:`EXTRAS_KEY_RESIDUAL_OPEN_CLOSE_PLAN`);
         ``None`` for a reversal, which closes every opposing leg.
+    :param netting: The coid of the fill-time netting record the breadcrumb is
+        a half of (:data:`EXTRAS_KEY_RESIDUAL_OPEN_NETTING`), or ``None``.
     """
     extras: dict[str, Any] = {
         EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID: entry_coid,
@@ -2182,6 +2331,8 @@ def create_residual_open_row(
     if close_plan is not None:
         extras[EXTRAS_KEY_RESIDUAL_OPEN_CLOSE_PLAN] = [
             [leg_id, qty] for leg_id, qty in close_plan]
+    if netting is not None:
+        extras[EXTRAS_KEY_RESIDUAL_OPEN_NETTING] = netting
     # One write: a breadcrumb reopened but not re-persisted would replay the
     # close plan and the open of its earlier lifecycle.
     with store.transaction():
@@ -2253,6 +2404,124 @@ def count_residual_open_close(
 def clear_residual_open_row(store: 'OwnershipJournal', coid: str) -> None:
     """Finalise a residual-open breadcrumb once the open is durable / replayed."""
     store.close_order(coid)
+
+
+def create_netting_row(
+        store: 'OwnershipJournal',
+        *,
+        coid: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        intent_key: str | None,
+        entry_id: str | None,
+        fill_id: str,
+        contended: Iterable[str] = (),
+) -> None:
+    """Persist a fill-time netting record (:data:`STATE_NETTING`, PERSIST-FIRST).
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    :param coid: The record's deterministic client-order-id (the filled entry's
+        coid and the fill's sequence).
+    :param symbol: Exchange-side symbol.
+    :param side: The fill's side (the new leg's side).
+    :param qty: The Pine quantity the fill closed of the opposite position:
+        what the venue must net.
+    :param intent_key: The filled entry's diff key, when known.
+    :param entry_id: The filled entry's Pine id.
+    :param fill_id: The fill slice's id.
+    :param contended: The close fill sides on which another close of the run is
+        still in flight as the record is written
+        (:data:`EXTRAS_KEY_NETTING_CONTENDED`).
+    """
+    extras: dict[str, Any] = {
+        EXTRAS_KEY_NETTING_FILL_ID: fill_id,
+        EXTRAS_KEY_NETTING_ENTRY_ID: entry_id,
+        EXTRAS_KEY_NETTING_SINCE_MS: int(epoch_time() * 1000),
+        EXTRAS_KEY_NETTING_PASSES: 0,
+        EXTRAS_KEY_NETTING_EXPECTED: {'buy': 0.0, 'sell': 0.0},
+    }
+    if contended:
+        extras[EXTRAS_KEY_NETTING_CONTENDED] = sorted(set(contended))
+    with store.transaction():
+        store.reopen_order(coid)
+        store.upsert_order(
+            coid,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            state=STATE_NETTING,
+            intent_key=intent_key,
+            pine_entry_id=entry_id,
+            extras=extras,
+        )
+
+
+def iter_active_nettings(store: 'OwnershipJournal') -> Iterator['OrderRow']:
+    """Iterate the live fill-time netting records (:data:`STATE_NETTING`), oldest first.
+
+    :param store: The active run context, or the emulator's in-memory journal.
+    """
+    rows = [row for row in store.iter_live_orders() if row.state == STATE_NETTING]
+    rows.sort(key=lambda row: (row.created_ts_ms, row.client_order_id))
+    yield from rows
+
+
+def netting_absorbed_row_coid(coid: str) -> str:
+    """The client-order-id of the engine's absorbed-fill count of netting record ``coid``."""
+    return f"{coid}:absorbed"
+
+
+def netting_expected(store: 'OwnershipJournal', row: 'OrderRow') -> dict[str, float]:
+    """What of a netting record's expected close fills has not been booked as netting yet.
+
+    :param store: The journal the record lives in.
+    :param row: The netting record.
+    :return: ``{'buy': qty, 'sell': qty}``, never negative.
+    """
+    expected = (row.extras or {}).get(EXTRAS_KEY_NETTING_EXPECTED) or {}
+    # The count of a record an earlier process closed stays with that process.
+    absorbed_row = store.get_order_for_run_id(netting_absorbed_row_coid(row.client_order_id))
+    absorbed = ((absorbed_row.extras or {}).get(EXTRAS_KEY_NETTING_EXPECTED) or {}
+                if absorbed_row is not None else {})
+    return {side: max(0.0, round(float(expected.get(side) or 0.0)
+                                 - float(absorbed.get(side) or 0.0), 12))
+            for side in ('buy', 'sell')}
+
+
+def absorb_netting_fills(
+        store: 'OwnershipJournal', absorbed: Mapping[str, Mapping[str, float]],
+) -> None:
+    """Count close fills the engine booked as netting toward their records.
+
+    Engine-only, in the transaction of the fills' receipts. A record an
+    earlier process of the run closed (its late fill identified by its close
+    id) is counted too: the count continues from the one that process left,
+    in a row of this process, closed like the record.
+
+    :param store: The journal the records live in.
+    :param absorbed: Per netting record coid, the Pine quantity booked as
+        netting by fill side.
+    """
+    with store.transaction():
+        for coid, by_side in absorbed.items():
+            key = netting_absorbed_row_coid(coid)
+            existing = store.get_order_for_run_id(key)
+            counted = dict((existing.extras or {}).get(EXTRAS_KEY_NETTING_EXPECTED) or {}
+                           if existing is not None else {})
+            for side, qty in by_side.items():
+                counted[side] = round(float(counted.get(side) or 0.0) + float(qty), 12)
+            if store.get_order(key) is None:
+                record = store.get_order_for_run_id(coid)
+                store.upsert_order(
+                    key, symbol=record.symbol if record is not None else '', side='buy',
+                    qty=0.0, state=STATE_NETTING_ABSORBED,
+                    extras={EXTRAS_KEY_NETTING_EXPECTED: counted},
+                )
+                if record is not None and record.closed_ts_ms is not None:
+                    store.close_order(key)
+            else:
+                store.upsert_order(key, extras={EXTRAS_KEY_NETTING_EXPECTED: counted})
 
 
 def iter_active_residual_opens(

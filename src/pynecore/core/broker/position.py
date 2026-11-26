@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import copy
 import math
-from collections import deque
-from dataclasses import dataclass
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 from pynecore import lib
@@ -33,6 +33,11 @@ if TYPE_CHECKING:
     from pynecore.core.broker.models import OrderEvent
 
 __all__ = ['BrokerPosition', 'EntryBookSnapshot', 'ProvisionalClose']
+
+#: How many fills the position remembers the trades of, for a fee reported
+#: after them (:meth:`BrokerPosition.book_fill_fee`). A fee arrives close
+#: behind its fill, so fills thousands old need no exact attribution.
+_FEE_TARGETS_CAP = 8192
 
 # Legs that only ever reduce exposure: the plugin contract requires reduce-only
 # delivery for them (``ExchangeCapabilities.reduce_only``)
@@ -68,6 +73,23 @@ class EntryBookSnapshot:
     bindings: tuple[_EntryBinding, ...]
     order_bindings: dict[str, int]
     fill_cursors: dict[str, float]
+
+
+@dataclass(slots=True)
+class _FeeTarget:
+    """The trades one booked fill charged its fee to (:meth:`BrokerPosition.book_fill_fee`).
+
+    :ivar trades: Each trade the fill opened or closed, with the share of the
+        fill's fee it took and whether the fill opened it (an entry, or the
+        new side of a reversal) rather than closed it, in the order the fill
+        booked them. A trade the fill opened that a later fill closes in part
+        is split here as well (:meth:`BrokerPosition._split_fee_targets`), so
+        the closed piece keeps its share.
+    :ivar close_profit: The realized profit the closing fill is counted with
+        in the win / loss counters; ``None`` for a fill that closed nothing.
+    """
+    trades: list[tuple[Trade, float, bool]] = field(default_factory=list)
+    close_profit: float | None = None
 
 
 @dataclass(slots=True)
@@ -136,6 +158,8 @@ class BrokerPosition(PositionBase):
         # The binding book (see :class:`~pynecore.lib.strategy._EntryBinding`):
         '_entry_book', '_entry_seq', '_order_bindings', 'last_spent_entry_ids',
         'book_faithful', '_fill_cursors', '_fill_places', '_fill_place_seq', 'book_moves',
+        # Fill id -> the trades its fee went to (see :meth:`book_fill_fee`):
+        '_fee_targets',
         # Per-evaluation set of close keys already seen this script run, so a
         # second same-key ``strategy.close()`` THIS evaluation nets onto the
         # first while a next-tick re-issue (calc_on_every_tick) replaces it.
@@ -224,6 +248,10 @@ class BrokerPosition(PositionBase):
         # book in this process: a reading of the venue taken at one count is
         # comparable with the book only while the count stays the same.
         self.book_moves: int = 0
+        # Fill id -> the trades the booked fill charged its fee to, newest
+        # last, so a fee reported after the fill lands where the fill's own
+        # fee did (:meth:`book_fill_fee`). Bounded by :data:`_FEE_TARGETS_CAP`.
+        self._fee_targets: OrderedDict[str, _FeeTarget] = OrderedDict()
         # The venue's least tradable quantity at a price, in the book's units
         # (``BrokerPlugin.least_tradable_qty``); ``None`` keeps every remainder.
         self.least_tradable_qty: Callable[[float], float] | None = None
@@ -569,6 +597,7 @@ class BrokerPosition(PositionBase):
             entry_id: str,
             size: float,
             entry_price: float,
+            commission: float = 0.0,
     ) -> None:
         """Seed one open :class:`~pynecore.lib.strategy.Trade` for an adopted parent.
 
@@ -589,6 +618,9 @@ class BrokerPosition(PositionBase):
         :param entry_id: The parent entry id (``from_entry``).
         :param size: Signed parent open size (positive long, negative short).
         :param entry_price: Parent average entry price.
+        :param commission: The entry commission the parent's open exposure
+            paid in earlier processes; it reaches the trade's profit when the
+            trade closes, like the commission of an entry this process booked.
         """
         if self.size > self.max_contracts_held_long:
             self.max_contracts_held_long = self.size
@@ -607,9 +639,10 @@ class BrokerPosition(PositionBase):
             entry_bar_index=int(getattr(lib, 'bar_index', 0)),
             entry_time=0,
             entry_price=entry_price,
-            commission=0.0,
+            commission=commission,
             entry_equity=0.0,
         ))
+        self.open_commission = float(sum(t.commission for t in self.open_trades))
         if not any(binding.entry_id == entry_id for binding in self._entry_book):
             self._bind_fill(entry_id, None, size, entry_price)
             self.book_faithful = False
@@ -725,6 +758,7 @@ class BrokerPosition(PositionBase):
                 entry_equity=self.equity,
             )
             self.open_trades.append(trade)
+            self._note_fee_target(event, _FeeTarget([(trade, 1.0, True)]))
             if self._bind_fill(event.pine_id, event.order.id, signed_delta, fill_price):
                 self._place_fill(event)
             self.open_commission += fee
@@ -742,12 +776,14 @@ class BrokerPosition(PositionBase):
         remaining = fill_qty
         closed_profit = 0.0
         closed_fee = 0.0
+        fee_target = _FeeTarget()
         while remaining > 0.0 and self.open_trades:
             trade = self.open_trades[0]
             trade_abs = abs(trade.size)
             if trade_abs <= remaining + 1e-12:
                 # Close this trade fully
                 self._close_trade(trade, fill_price, event, fee_share=fee * (trade_abs / fill_qty))
+                fee_target.trades.append((trade, trade_abs / fill_qty, False))
                 closed_profit += trade.profit
                 closed_fee += trade.commission
                 remaining -= trade_abs
@@ -772,14 +808,17 @@ class BrokerPosition(PositionBase):
                     closed_piece, fill_price, event,
                     fee_share=fee * (remaining / fill_qty),
                 )
+                fee_target.trades.append((closed_piece, remaining / fill_qty, False))
                 closed_profit += closed_piece.profit
                 if absorb:
                     self.open_trades.remove(trade)
                     self._spread_residue(trade, residue, floor)
+                    self._split_fee_targets(trade, closed_piece, 1.0)
                 else:
                     # Shrink the remaining open trade
                     trade.size -= closed_piece.size
                     trade.commission -= closed_entry_commission
+                    self._split_fee_targets(trade, closed_piece, remaining / trade_abs)
                 remaining = 0.0
         # A trade within 1e-12 of the remainder closes in full, so the
         # subtraction can leave float residue behind: no leftover exposure
@@ -856,17 +895,21 @@ class BrokerPosition(PositionBase):
                 elif -self.size > self.max_contracts_held_short:
                     self.max_contracts_held_short = -self.size
                 self.avg_price = fill_price
+                # The fill's fee is shared by quantity: the closed trades took
+                # the closed part's share, the new side takes the rest.
+                opened_share = remaining / fill_qty
                 flipped = Trade(
                     size=new_size,
                     entry_id=event.pine_id,
                     entry_bar_index=int(getattr(lib, 'bar_index', 0)),
                     entry_time=int(event.timestamp * 1000.0),
                     entry_price=fill_price,
-                    commission=0.0,
+                    commission=fee * opened_share,
                     entry_comment=None,
                     entry_equity=self.equity,
                 )
                 self.open_trades.append(flipped)
+                fee_target.trades.append((flipped, opened_share, True))
                 # Every trade row is closed, so the flipped trade is the whole
                 # position and its binding the whole book.
                 self.clear_entry_book()
@@ -877,10 +920,196 @@ class BrokerPosition(PositionBase):
             self.clear_entry_book()
 
         self._count_close_profit(closed_profit, 1)
+        if fee_target.trades:
+            fee_target.close_profit = closed_profit
+            self._note_fee_target(event, fee_target)
 
         self.open_commission = float(sum(t.commission for t in self.open_trades))
 
         return self.sign != old_sign
+
+    def _note_fee_target(self, event: 'OrderEvent', target: _FeeTarget) -> None:
+        """Remember the trades a booked fill charged its fee to, by its fill id.
+
+        :param event: The booked fill; one without a ``fill_id`` is not remembered.
+        :param target: The trades and their shares.
+        """
+        if not event.fill_id:
+            return
+        self._fee_targets[event.fill_id] = target
+        self._fee_targets.move_to_end(event.fill_id)
+        while len(self._fee_targets) > _FEE_TARGETS_CAP:
+            self._fee_targets.popitem(last=False)
+
+    def _split_fee_targets(self, trade: Trade, closed_piece: Trade, closed_share: float) -> None:
+        """Hand the closed piece of a split open trade its share of the fees aimed at the trade.
+
+        A partial close splits an open trade into a closed piece and the open
+        remainder, and moves ``closed_share`` of the trade's commission onto
+        the piece. A fee of a fill that opened the trade, reported after the
+        split, is shared the same way: the piece takes ``closed_share`` of the
+        trade's part, the remainder keeps the rest, so the commission does not
+        depend on whether the fee came before or after the close.
+
+        :param trade: The open trade that was split (``closed_share`` of 1
+            when it is gone and the piece took its whole commission).
+        :param closed_piece: The closed piece.
+        :param closed_share: The share of the trade's commission the piece took.
+        """
+        for target in self._fee_targets.values():
+            if not any(held is trade for held, _share, _opened in target.trades):
+                continue
+            split: list[tuple[Trade, float, bool]] = []
+            for held, share, opened in target.trades:
+                if held is not trade:
+                    split.append((held, share, opened))
+                    continue
+                split.append((closed_piece, share * closed_share, opened))
+                if closed_share < 1.0:
+                    split.append((trade, share * (1.0 - closed_share), opened))
+            target.trades = split
+
+    def book_fill_fee(self, fill_id: str, amount: float, *, entry_id: str | None,
+                      opening: bool) -> bool:
+        """Book a commission of an already booked fill that arrived without the fill.
+
+        The fee goes where the fill's own fee went, in the same shares: when
+        this process booked the fill, onto the trades it opened or closed; a
+        trade still open carries it into its profit when it closes, like an
+        entry commission, and a trade already closed takes it at once (its
+        commission, profit, profit percent, exit equity and those of every
+        trade closed after it, the net profit, the gross profit or loss and
+        the percent sums move with it). A fill this process did not book (a
+        restart, or a fill the plugin booked under another id or none) falls
+        back to the trades of ``entry_id``: for an opening fill its open
+        trades by size (its latest closed trade when none is open), for a
+        closing fill its latest closed trade (the latest closed trade of all
+        with no ``entry_id``). A closed trade the fee reached that the fill
+        itself did not close (one in the fallback, or a trade the fill opened
+        that a later fill closed, whole or in part) moves the realized profit
+        of the fill that closed it, while that fill is remembered
+        (:meth:`_closing_fee_target`): the fill's net, gross and win / loss
+        counters are re-counted with the new profit, as if the fee had come
+        before the close. A trade whose closing fill is not remembered moves
+        the gross profit or loss by the trade's own profit, and the counters
+        stay as they are. The closed-trade statistics are rebuilt when every
+        closed trade is still kept.
+
+        Nothing else moves: no trade is created, the position size, the
+        binding book and the fill cursors stay as they are.
+
+        :param fill_id: The fill the fee belongs to.
+        :param amount: The commission to add (negative for a rebate).
+        :param entry_id: The fill's entry id (``pine_id`` of an entry,
+            ``from_entry`` of an exit), for the fallback.
+        :param opening: Whether the fill opened exposure (an entry leg), for
+            the fallback.
+        :return: ``False`` when no trade can take the fee: nothing was booked.
+        """
+        target = self._fee_targets.get(fill_id)
+        if target is not None:
+            parts = [(trade, amount * share, opened) for trade, share, opened in target.trades]
+        else:
+            parts = [(trade, part, opening)
+                     for trade, part in self._fallback_fee_parts(amount, entry_id, opening)]
+        if not parts:
+            return False
+        closed_amount = 0.0
+        counted: list[tuple[_FeeTarget, float]] = []
+        for trade, part, opened in parts:
+            if any(open_trade is trade for open_trade in self.open_trades):
+                trade.commission += part
+                continue
+            closed_amount += part
+            self._charge_closed_trade(trade, part, entry_fee=opened)
+            closing = (target if target is not None and target.close_profit is not None
+                       and not opened else self._closing_fee_target(trade))
+            if closing is not None:
+                # Its profit is in the counter of the fill that closed it.
+                counted.append((closing, part))
+                continue
+            self.netprofit -= part
+            if trade.profit + part > 0.0:
+                self.grossprofit -= part
+            else:
+                self.grossloss -= part
+        for closing in {id(closing): closing for closing, _part in counted}.values():
+            assert closing.close_profit is not None
+            amount_for = sum(part for held, part in counted if held is closing)
+            self._count_close_profit(closing.close_profit, -1)
+            closing.close_profit -= amount_for
+            self._count_close_profit(closing.close_profit, 1)
+        if closed_amount:
+            self._rebuild_closed_trade_stats()
+        self.open_commission = float(sum(t.commission for t in self.open_trades))
+        return True
+
+    def _closing_fee_target(self, trade: Trade) -> _FeeTarget | None:
+        """The remembered fill that closed ``trade``, whose counter holds its profit.
+
+        :param trade: A closed trade.
+        :return: The closing fill's target, ``None`` when it is not remembered
+            any more (or the trade was closed without a fill of its own).
+        """
+        for target in reversed(self._fee_targets.values()):
+            if target.close_profit is None:
+                continue
+            if any(held is trade and not opened for held, _share, opened in target.trades):
+                return target
+        return None
+
+    def _fallback_fee_parts(self, amount: float, entry_id: str | None,
+                            opening: bool) -> list[tuple[Trade, float]]:
+        """The trades a fee of a fill the position did not book goes to (:meth:`book_fill_fee`)."""
+        if opening:
+            held = [trade for trade in self.open_trades if trade.entry_id == entry_id]
+            total = sum(abs(trade.size) for trade in held)
+            if held and total > 0.0:
+                return [(trade, amount * abs(trade.size) / total) for trade in held]
+        for trade in reversed(self.closed_trades):
+            if entry_id is None and not opening or trade.entry_id == entry_id:
+                return [(trade, amount)]
+        return []
+
+    def _charge_closed_trade(self, trade: Trade, part: float, *, entry_fee: bool) -> None:
+        """Add a commission to a closed trade: its profit, percent and the exit equities after it.
+
+        :param trade: A closed trade.
+        :param part: The commission to add.
+        :param entry_fee: Whether it is an entry commission, which is part of
+            the trade's entry cost (the percent's denominator).
+        """
+        if trade.profit_percent:
+            entry_cost = trade.profit / (trade.profit_percent / 100.0)
+        else:
+            entry_cost = abs(trade.size) * trade.entry_price + trade.commission
+        if entry_fee:
+            entry_cost += part
+        self._book_profit_ratio(trade, -1)
+        trade.commission += part
+        trade.profit -= part
+        trade.profit_percent = (trade.profit / entry_cost * 100.0) if entry_cost else 0.0
+        self._book_profit_ratio(trade, 1)
+        shifting = False
+        for closed in self.closed_trades:
+            if closed is trade:
+                shifting = True
+            if shifting:
+                closed.exit_equity -= part
+
+    def _rebuild_closed_trade_stats(self) -> None:
+        """Rebuild the cumulative closed-trade statistics from the kept closed trades."""
+        if self.closed_trades_count != len(self.closed_trades):
+            _blog_error(
+                "a fee booked onto a closed trade: %s trades closed, %s kept — the "
+                "cumulative closed-trade statistics keep the fee out",
+                self.closed_trades_count, len(self.closed_trades),
+            )
+            return
+        stats = ClosedTradeStats()
+        for trade in self.closed_trades:
+            stats.add(trade)
+        self._closed_trade_stats = stats
 
     def _untradable_floor(self, residue: float, price: float, holders: int) -> float | None:
         """The venue's least tradable quantity, when a remainder falls below it.
@@ -1164,6 +1393,18 @@ class BrokerPosition(PositionBase):
             self.book_moves += 1
             self._settle_bindings(entry_id, qty, price)
         return list(self.last_spent_entry_ids)
+
+    def take_in_fill(self, event: 'OrderEvent') -> None:
+        """Count a fill the book takes in without booking it (a netting close).
+
+        A close that nets a hedging account's two sides moves no Pine
+        position, yet the plugin journals it on its order like any fill: the
+        fill cursor of its order counts it, so a restart does not read it as
+        a fill the book never saw (:meth:`_advance_fill_cursor`).
+
+        :param event: The fill, with the journal quantity the book takes in.
+        """
+        self._advance_fill_cursor(event)
 
     def _advance_fill_cursor(self, event: 'OrderEvent') -> None:
         """Note how much of the fill's order the book has now taken in.

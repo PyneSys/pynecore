@@ -58,6 +58,7 @@ from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_CLEARING,
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     EXTRAS_KEY_BRACKET_OWN_SOFTWARE,
     EXTRAS_KEY_BRACKET_OWN_STATE,
@@ -4297,6 +4298,145 @@ def __test_a_software_guard_trails_from_the_first_price_and_only_in_favour__():
     assert trigger.reason == "trailing_stop" and trigger.level == pytest.approx(1.15)
 
 
+#: Per protected side: the legs (the guarded leg "10" partly offset by "20"),
+#: the exit side, and the prices of the run. The trail (5 ticks of 0.01)
+#: arms at the first price and moves to the second; after the restart the
+#: first price does not reach the stop, the second does.
+_TRAIL_SIDES = {
+    'long': ("buy", "sell", (1.10, 1.20), (1.16, 1.15), 1.15),
+    'short': ("sell", "buy", (1.10, 1.00), (1.04, 1.05), 1.05),
+}
+
+
+@pytest.mark.parametrize("fault", [None, "move_retried", "move_lost", "reattach"])
+@pytest.mark.parametrize("side", list(_TRAIL_SIDES))
+def __test_a_software_guard_trail_resumes_after_a_restart_never_looser__(
+        tmp_path, side, fault):
+    """A restarted software guard trails on from the last persisted extreme, not from the price.
+
+    The guard's trail moved to its extreme before the process stopped. The
+    restarted emulator re-arms the guard in the replay and resumes the
+    trailing stop where the store left it, so a price that no longer reaches
+    a trail started afresh still triggers it. Variants:
+
+    * ``move_retried``: the write of the move fails once; the guard keeps the
+      price in memory, and the next evaluation (a less favourable price)
+      writes it before the restart.
+    * ``move_lost``: the write of the move fails and the process stops before
+      another evaluation: the restart resumes the last PERSISTED stop (the
+      armed one), never a looser one.
+    * ``reattach``: the exit is attached again (a modify of its take-profit)
+      after the move; its rewritten ownership row keeps the trail.
+    """
+    leg_side, exit_side, (arm, move), (near, reach), level = _TRAIL_SIDES[side]
+    opposing = "sell" if leg_side == "buy" else "buy"
+    store, ctx = _make_store(tmp_path)
+
+    def port() -> _FakePort:
+        return _FakePort([_leg("10", leg_side, 1.0, open_time=0.0),
+                          _leg("20", opposing, 0.4, open_time=1.0)])
+
+    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    _run(eng.run_exit_bracket(
+        _exit_env("X", "Long", side=exit_side, qty=0.6, trail=5.0), port()))
+    assert eng.software_guard_triggers("EURUSD", arm) == []
+    if fault in ("move_retried", "move_lost"):
+        _fail_storage_once(ctx, 'upsert_order')
+        with pytest.raises(sqlite3.OperationalError):
+            eng.software_guard_triggers("EURUSD", move)
+    else:
+        assert eng.software_guard_triggers("EURUSD", move) == []
+    if fault == "move_retried":
+        assert eng.software_guard_triggers("EURUSD", near) == []
+    if fault == "reattach":
+        _run(eng.run_exit_bracket(_exit_env(
+            "X", "Long", side=exit_side, qty=0.6, trail=5.0,
+            tp=2.0 if leg_side == "buy" else 0.5), port()))
+    if fault != "move_lost":
+        # The memory guard trails from the moved extreme (and writes it now if
+        # the move's write failed).
+        assert eng.software_guard_triggers("EURUSD", near) == []
+
+    restarted = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    assert _run(restarted.restart_replay(port())) is True
+    if fault == "move_lost":
+        # The last persisted stop is the armed one, 5 ticks behind ``arm``.
+        armed_stop = arm - 0.05 if leg_side == "buy" else arm + 0.05
+        inside = armed_stop + 0.01 if leg_side == "buy" else armed_stop - 0.01
+        assert restarted.software_guard_triggers("EURUSD", inside) == []
+        (trigger,) = restarted.software_guard_triggers("EURUSD", armed_stop)
+        assert trigger.level == pytest.approx(armed_stop)
+    else:
+        assert restarted.software_guard_triggers("EURUSD", near) == []
+        (trigger,) = restarted.software_guard_triggers("EURUSD", reach)
+        assert trigger.reason == "trailing_stop" and trigger.level == pytest.approx(level)
+    store.close()
+
+
+def __test_a_leg_back_under_a_venue_bracket_drops_the_guard_trail__(tmp_path):
+    """A guard trail is the guard's own: a venue bracket in between ends it, also across a restart.
+
+    The opposing leg closes, the guarded leg gets its venue bracket back and
+    its rows lose the trail. When an opposing leg returns, the new guard
+    trails from the next price, in this process and after a restart.
+    """
+    store, ctx = _make_store(tmp_path)
+    mixed = [_leg("10", "buy", 1.0, open_time=0.0), _leg("20", "sell", 0.4, open_time=1.0)]
+    port = _FakePort(list(mixed))
+    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, trail=5.0), port))
+    eng.software_guard_triggers("EURUSD", 1.10)
+    eng.software_guard_triggers("EURUSD", 1.20)
+    assert [row.extras.get(EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME)
+            for row in iter_active_bracket_ownerships(ctx)] == [pytest.approx(1.20)]
+    port.set_legs([_leg("10", "buy", 1.0, open_time=0.0)])
+    _run(eng.settle_leg_writes("EURUSD", port, 0.0))
+    assert not eng.has_software_guards()
+    assert [EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME in row.extras
+            for row in iter_active_bracket_ownerships(ctx)] == [False]
+    port.set_legs(list(mixed))
+    _run(eng.settle_leg_writes("EURUSD", port, 1.0))
+    assert eng.software_guard_triggers("EURUSD", 1.10) == []  # arms afresh at 1.10
+    assert eng.software_guard_triggers("EURUSD", 1.06) == []
+    restarted = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    assert _run(restarted.restart_replay(_FakePort(list(mixed)))) is True
+    assert restarted.software_guard_triggers("EURUSD", 1.06) == []
+    (trigger,) = restarted.software_guard_triggers("EURUSD", 1.05)
+    assert trigger.level == pytest.approx(1.05)
+    store.close()
+
+
+def __test_a_trigger_is_never_held_back_by_a_trail_write__(tmp_path):
+    """A pass on which the guard triggers writes no trail, so a store fault cannot cost the trigger.
+
+    The price jumps past the take-profit, which would also move the trail.
+    The trigger comes back although the store fails every write; the moved
+    extreme waits in memory. The close is retried: the next pass trails from
+    that extreme and its write fails (raised, nothing triggers); once the
+    store is back the write lands and the trail stop is where the jump left it.
+    """
+    store, ctx = _make_store(tmp_path)
+    port = _FakePort([_leg("10", "buy", 1.0, open_time=0.0),
+                      _leg("20", "sell", 0.4, open_time=1.0)])
+    eng = OneWayEmulator(store_ctx=ctx, mintick=0.01)
+    _run(eng.run_exit_bracket(_exit_env("X", "Long", qty=0.6, trail=5.0, tp=1.30), port))
+    assert eng.software_guard_triggers("EURUSD", 1.10) == []
+    failing = {'on': True}
+    _fail_storage_once(ctx, 'upsert_order', when=lambda *a, **f: failing['on'], times=100)
+    (trigger,) = eng.software_guard_triggers("EURUSD", 1.31)
+    assert trigger.reason == "take_profit"
+    eng.software_guard_settled("EURUSD", "10", outcome="retry")
+    with pytest.raises(sqlite3.OperationalError):
+        eng.software_guard_triggers("EURUSD", 1.29)
+    failing['on'] = False
+    assert eng.software_guard_triggers("EURUSD", 1.27) == []
+    assert [row.extras.get(EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME)
+            for row in iter_active_bracket_ownerships(ctx)] == [pytest.approx(1.31)]
+    (trigger,) = eng.software_guard_triggers("EURUSD", 1.26)
+    assert trigger.reason == "trailing_stop" and trigger.level == pytest.approx(1.26)
+    store.close()
+
+
 def __test_a_partly_offset_leg_on_a_whole_leg_only_venue_is_reported_unprotectable__(
         journal, monkeypatch):
     """Neither a sized bracket nor a partial close: the leg gets no bracket, loudly."""
@@ -4422,6 +4562,30 @@ def __test_a_close_larger_than_the_net_never_flips_it__():
     with pytest.raises(OrderSkippedByPlugin):
         _run(eng.run_close(_close_env("sell", 4.0), port))
     assert port.closed == []
+
+
+def __test_a_close_the_plan_cut_short_records_the_volume_it_was_asked_for__():
+    """The leg rows record the close's request next to the clipped plan.
+
+    A close of four against a net of one sends one unit. Its rows record four
+    units as the volume the close was asked for (and one as the fan's), so a
+    held trigger close settled from them reads one of four executed
+    (``'partial'``), never complete.
+    """
+    from pynecore.core.broker.store_helpers import (
+        EXTRAS_KEY_CLOSE_FAN_VOLUME, EXTRAS_KEY_CLOSE_REQUESTED_VOLUME,
+    )
+    legs = [_leg("10", "buy", 4.0, open_time=0.0), _leg("11", "buy", 6.0, open_time=1.0),
+            _leg("20", "sell", 9.0, open_time=2.0)]
+    port = _FakePort(legs)
+    eng = OneWayEmulator(store_ctx=None)
+    _run(eng.run_close(_close_env("sell", 4.0), port))
+    assert _dispatched(port) == [("10", 1)]
+    rows = [row for _sym, _leg_id, _volume, coid in port.closed
+            if (row := eng._close_journal.get_order(coid)) is not None]  # noqa
+    assert rows
+    assert {(row.extras or {})[EXTRAS_KEY_CLOSE_REQUESTED_VOLUME] for row in rows} == {4}
+    assert {(row.extras or {})[EXTRAS_KEY_CLOSE_FAN_VOLUME] for row in rows} == {1}
 
 
 def __test_a_whole_position_close_of_a_shared_venue_position_is_not_sent__():
@@ -4901,4 +5065,220 @@ def __test_a_failed_release_of_an_unsent_re_send_is_settled_from_the_venue__(
     assert _dispatched(port) == [("10", 2)]
     assert _run(eng.restart_replay(port)) is True
     assert _dispatched(port) == [("10", 2)]
+    store.close()
+
+
+# === Fill-time netting of a filled resting entry (drain_nettings) =======
+
+def _netting_port(legs: list[PositionLeg], *, whole_legs: bool = False) -> _FakePort:
+    port = _FakePort(legs)
+    port.closes_execute = True
+    if whole_legs:
+        port.supports_partial_leg_close = False  # type: ignore[attr-defined]
+    return port
+
+
+def _net(eng: OneWayEmulator, port: _FakePort, *, qty: float, side: str = "sell",
+         fill_key: str = "f-1", entry_id: str = "S") -> str | None:
+    coid = eng.record_netting(
+        entry_coid="t000-entry-x-e0", fill_key=fill_key, symbol="EURUSD", side=side,
+        qty=qty, intent_key=entry_id, entry_id=entry_id, fill_grace_s=120.0,
+    )
+    _run(eng.drain_nettings(port, fill_grace_s=120.0))
+    return coid
+
+
+def _closes(port: _FakePort) -> list[tuple[str, int]]:
+    return sorted(_dispatched(port))
+
+
+def _net_qty(port: _FakePort) -> float:
+    return sum(leg.qty if leg.side == "buy" else -leg.qty for leg in port._legs)
+
+
+def __test_a_filled_resting_short_nets_the_long_it_closed__(journal):
+    """Long 2 and a resting short of 1 filled: one of each side is closed, the long 1 stays."""
+    port = _netting_port([_leg("10", "buy", 2.0, open_time=0.0),
+                          _leg("20", "sell", 1.0, open_time=5.0, entry_id="S")])
+    eng = journal.emulator()
+    _net(eng, port, qty=1.0)
+    assert _closes(port) == [("10", 1), ("20", 1)]
+    assert [(leg.leg_id, leg.side, leg.qty) for leg in port._legs] == [("10", "buy", 1.0)]
+    # The fills of both closes are expected, book-neutral, one per side.
+    assert eng.netting_expectations()[0][1] == {"buy": 1.0, "sell": 1.0}
+    _run(eng.drain_nettings(port, fill_grace_s=120.0))
+    _run(eng.drain_residual_opens(port))
+    assert _closes(port) == [("10", 1), ("20", 1)], "nothing is sent twice"
+    assert list(iter_active_residual_opens(eng._close_journal)) == []
+
+
+def __test_a_resting_fill_larger_than_the_opposite_nets_only_the_opposite__(journal):
+    """Long 1 and a filled short of 2: the long and 1 of the short close, short 1 stays."""
+    port = _netting_port([_leg("10", "buy", 1.0, open_time=0.0),
+                          _leg("20", "sell", 2.0, open_time=5.0, entry_id="S")])
+    eng = journal.emulator()
+    _net(eng, port, qty=2.0)
+    assert _closes(port) == [("10", 1), ("20", 1)]
+    assert [(leg.leg_id, leg.side, leg.qty) for leg in port._legs] == [("20", "sell", 1.0)]
+
+
+def __test_a_netting_closes_several_opposing_legs_oldest_first__(journal):
+    port = _netting_port([_leg("11", "buy", 1.0, open_time=1.0),
+                          _leg("10", "buy", 1.0, open_time=0.0),
+                          _leg("20", "sell", 1.5, open_time=5.0, entry_id="S")])
+    port.volume_scale = 10
+    eng = journal.emulator()
+    _net(eng, port, qty=1.5)
+    assert _closes(port) == [("10", 10), ("11", 5), ("20", 15)]
+    assert [(leg.leg_id, leg.qty) for leg in port._legs] == [("11", 0.5)]
+    assert _net_qty(port) == pytest.approx(0.5)
+
+
+def __test_partial_fills_net_each_slice_on_its_own_record__(journal):
+    port = _netting_port([_leg("10", "buy", 2.0, open_time=0.0),
+                          _leg("20", "sell", 0.5, open_time=5.0, entry_id="S")])
+    port.volume_scale = 10
+    eng = journal.emulator()
+    first = _net(eng, port, qty=0.5, fill_key="f-1")
+    assert _closes(port) == [("10", 5), ("20", 5)]
+    # The second slice adds to the entry's leg; its own record nets it.
+    port.set_legs([*port._legs, _leg("21", "sell", 0.5, open_time=6.0, entry_id="S")])
+    second = _net(eng, port, qty=0.5, fill_key="f-2")
+    assert first is not None and second is not None and first != second
+    assert _closes(port) == [("10", 5), ("10", 5), ("20", 5), ("21", 5)]
+    assert [(leg.leg_id, leg.qty) for leg in port._legs] == [("10", 1.0)]
+    # The same fill delivered again writes no second record.
+    assert eng.record_netting(entry_coid="t000-entry-x-e0", fill_key="f-2", symbol="EURUSD",
+                              side="sell", qty=0.5, intent_key="S", entry_id="S",
+                              fill_grace_s=120.0) is None
+
+
+def __test_a_netting_waits_for_the_fill_side_to_show__(journal, monkeypatch):
+    """The entry's leg not in the read yet: nothing is sent; past the grace the record stops."""
+    port = _netting_port([_leg("10", "buy", 1.0, open_time=0.0)])
+    eng = journal.emulator()
+    coid = _net(eng, port, qty=1.0)
+    assert port.closed == []
+    assert eng.netting_in_flight()
+    row = eng._close_journal.get_order(coid or '')
+    assert row is not None
+    extras = dict(row.extras)
+    extras['netting_since_ms'] -= int((BOOK_INCOMPLETE_GRACE_S + 1) * 1000)
+    eng._close_journal.upsert_order(coid or '', extras=extras)
+    _run(eng.drain_nettings(port, fill_grace_s=120.0))
+    assert port.closed == []
+    _run(eng.drain_nettings(port, fill_grace_s=120.0))
+    assert not eng.netting_in_flight(), "nothing expected: the record is done"
+
+
+def __test_the_quarantine_withholds_a_netting_pass__(journal):
+    port = _netting_port([_leg("10", "buy", 1.0, open_time=0.0),
+                          _leg("20", "sell", 1.0, open_time=5.0, entry_id="S")])
+    quarantined = [True]
+    eng = journal.emulator(block_exposure_reopens=lambda: quarantined[0])
+    _net(eng, port, qty=1.0)
+    assert port.closed == [] and eng.netting_in_flight()
+    quarantined[0] = False
+    _run(eng.drain_nettings(port, fill_grace_s=120.0))
+    assert _closes(port) == [("10", 1), ("20", 1)]
+
+
+def __test_a_netting_record_waits_for_its_fills_then_ends__(journal):
+    """The record lives until the expected close fills are counted, at most the fill grace."""
+    port = _netting_port([_leg("10", "buy", 1.0, open_time=0.0),
+                          _leg("20", "sell", 1.0, open_time=5.0, entry_id="S")])
+    eng = journal.emulator()
+    coid = _net(eng, port, qty=1.0)
+    assert coid is not None
+    _run(eng.drain_residual_opens(port))
+    _run(eng.drain_nettings(port, fill_grace_s=120.0))
+    assert eng.netting_in_flight()
+    eng.absorb_netting_fills({coid: {"sell": 1.0, "buy": 1.0}})
+    assert eng.netting_expectations() == []
+    _run(eng.drain_nettings(port, fill_grace_s=120.0))
+    assert not eng.netting_in_flight()
+    # A record whose fills never come ends after the grace, with a warning.
+    port.set_legs([_leg("12", "buy", 1.0, open_time=0.0),
+                   _leg("22", "sell", 1.0, open_time=5.0, entry_id="S")])
+    _net(eng, port, qty=1.0, fill_key="f-9")
+    _run(eng.drain_residual_opens(port))
+    _run(eng.drain_nettings(port, fill_grace_s=0.0))
+    _run(eng.drain_nettings(port, fill_grace_s=0.0))
+    assert not eng.netting_in_flight()
+
+
+@pytest.mark.parametrize("legs,fill,closes,net_after,warned", [
+    # The opposing legs FIFO add up to the fill exactly: the one-way result.
+    ([("10", "buy", 1.0, 0.0), ("11", "buy", 1.0, 1.0), ("20", "sell", 1.0, 5.0)],
+     1.0, [("10", 1), ("20", 1)], 1.0, False),
+    # The oldest opposing leg is larger than the fill: closed whole, net below one-way.
+    ([("10", "buy", 2.0, 0.0), ("11", "buy", 1.0, 1.0), ("20", "sell", 1.0, 5.0)],
+     1.0, [("10", 2), ("20", 1)], 1.0, True),
+    # The fill is larger than the opposite: the new leg closes whole, flat.
+    ([("10", "buy", 1.0, 0.0), ("20", "sell", 2.0, 5.0)],
+     1.0, [("10", 1), ("20", 2)], 0.0, True),
+    # Fill equals the opposite: both close whole, flat as on one-way.
+    ([("10", "buy", 1.0, 0.0), ("20", "sell", 1.0, 5.0)],
+     1.0, [("10", 1), ("20", 1)], 0.0, False),
+], ids=["exact", "oldest-leg-larger", "fill-larger", "equal"])
+def __test_a_whole_leg_port_nets_with_whole_legs_never_more_exposure__(
+        journal, caplog, legs, fill, closes, net_after, warned):
+    port = _netting_port([_leg(leg_id, side, qty, open_time=t,
+                               entry_id="S" if side == "sell" else None)
+                          for leg_id, side, qty, t in legs], whole_legs=True)
+    eng = journal.emulator()
+    caplog.clear()
+    _net(eng, port, qty=fill)
+    assert _closes(port) == closes
+    assert _net_qty(port) == pytest.approx(net_after)
+    widened = [r for r in caplog.records if "closes legs" in r.getMessage()]
+    assert len(widened) == (1 if warned else 0)
+    # Each side's fills are book-neutral only up to the netted quantity.
+    assert eng.netting_expectations()[0][1] == {"buy": fill, "sell": fill}
+
+
+def __test_a_whole_leg_port_never_nets_a_leg_it_does_not_own_whole__(journal, caplog):
+    port = _netting_port([_leg("10", "buy", 2.0, open_time=0.0, venue_qty=3.0),
+                          _leg("20", "sell", 1.0, open_time=5.0, entry_id="S")],
+                         whole_legs=True)
+    eng = journal.emulator()
+    _net(eng, port, qty=1.0)
+    assert port.closed == []
+    assert any("not sent" in r.getMessage() for r in caplog.records)
+    _run(eng.drain_nettings(port, fill_grace_s=0.0))
+    assert not eng.netting_in_flight()
+
+
+def __test_a_restart_mid_netting_sends_only_the_half_still_owed__(tmp_path):
+    """The process dies after the first half's close went out: the restart sends the other only."""
+    store, ctx = _make_store(tmp_path)
+    port = _netting_port([_leg("10", "buy", 2.0, open_time=0.0),
+                          _leg("20", "sell", 1.0, open_time=5.0, entry_id="S")])
+    eng = OneWayEmulator(store_ctx=ctx)
+
+    sent: list[str] = []
+    original = port.close_leg
+
+    async def die_after_the_first(symbol, leg_id, volume, coid):
+        if sent:
+            raise KeyboardInterrupt("process dies")
+        sent.append(coid)
+        await original(symbol, leg_id, volume, coid)
+
+    port.close_leg = die_after_the_first  # type: ignore[method-assign]
+    eng.record_netting(entry_coid="t000-entry-x-e0", fill_key="f-1", symbol="EURUSD",
+                       side="sell", qty=1.0, intent_key="S", entry_id="S", fill_grace_s=120.0)
+    with pytest.raises(KeyboardInterrupt):
+        _run(eng.drain_nettings(port, fill_grace_s=120.0))
+    assert len(port.closed) == 1
+    port.close_leg = original  # type: ignore[method-assign]
+    port.executed_by_coid = {coid: volume for _s, _leg_id, volume, coid in port.closed}
+
+    restarted = OneWayEmulator(store_ctx=ctx)
+    assert _run(restarted.restart_replay(port))
+    _run(restarted.drain_nettings(port, fill_grace_s=120.0))
+    _run(restarted.drain_residual_opens(port))
+    assert _closes(port) == [("10", 1), ("20", 1)], "no close is sent twice"
+    assert [(leg.leg_id, leg.qty) for leg in port._legs] == [("10", 1.0)]
+    assert list(iter_active_residual_opens(ctx)) == []
     store.close()

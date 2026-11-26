@@ -371,3 +371,120 @@ def __test_a_trail_write_failure_keeps_the_observed_high_for_every_trail_of_the_
 
     assert triggering == legs
     assert [leg.trigger_level for leg in legs] == [105.0, 105.0]
+
+
+def __test_helper_held_bracket(tmp_path, *, sl_qty: float = 0.5):
+    """A stored TP/SL bracket whose TP is held on close ``close-1``; returns ``(store, ctx, engine)``."""
+    from pynecore.core.broker.run_identity import RunIdentity
+    from pynecore.core.broker.storage import BrokerStore
+    from pynecore.core.broker.store_helpers import create_engine_trigger_partial_leg_row
+    identity = RunIdentity(strategy_id="t028", symbol=SYMBOL, timeframe="60",
+                           account_id="testbroker-demo", label=None)
+    store = BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker")
+    ctx = store.open_run(identity, script_source="src", script_path="t.py")
+    for coid, kind, qty, level in (('leg-tp', LEG_KIND_TP_PARTIAL, 0.5, 120.0),
+                                   ('leg-sl', LEG_KIND_SL_PARTIAL, sl_qty, 90.0)):
+        create_engine_trigger_partial_leg_row(
+            ctx, coid=coid, symbol=SYMBOL, side='sell', qty=qty,
+            intent_key="X\x00parent", pine_entry_id='X', from_entry='parent',
+            leg_kind=kind, leg_state=LEG_STATE_ARMED, parent_pine_entry_id='parent',
+            parent_entry_dispatch_ref='parent-coid', intent_partial_qty=0.5,
+            trigger_level=level, oca_group='__partial_exit_X_parent__',
+            oca_type=OcaType.CANCEL.value,
+        )
+    engine = SoftwarePartialBracketEngine(store_ctx=ctx)
+    engine.restart_replay()
+    tp_key = ('X', 'parent', LEG_KIND_TP_PARTIAL)
+    engine._transition(engine.get_leg(tp_key), LEG_STATE_TRIGGERING, close_row=False)
+    engine.record_trigger_close_attempt(tp_key, close_coid='close-1')
+    return store, ctx, engine
+
+
+def _leg_rows(ctx) -> dict:
+    from pynecore.core.broker.store_helpers import STATE_PARTIAL_BRACKET_LEG
+    return {row.client_order_id: (row.extras.get('leg_state'), row.qty, row.closed_ts_ms is None)
+            for row in ctx.iter_orders_in_state_for_run_id(STATE_PARTIAL_BRACKET_LEG)}
+
+
+def __test_a_partially_executed_close_re_arms_the_rest_and_sizes_its_sibling__(tmp_path):
+    """The held TP's close ended after 0.2 of 0.5: the TP re-arms for 0.3 and
+    its OCA sibling is sized down to 0.3 too, in the rows and in memory. The
+    spent close id is kept on the leg's row and survives a restart."""
+    store, ctx, engine = __test_helper_held_bracket(tmp_path)
+    try:
+        tp_key = ('X', 'parent', LEG_KIND_TP_PARTIAL)
+        engine.release_held_trigger_partially(
+            tp_key, executed_qty=0.2, reason='held_close_partially_executed')
+        tp = engine.get_leg(tp_key)
+        sl = engine.get_leg(('X', 'parent', LEG_KIND_SL_PARTIAL))
+        assert tp is not None and sl is not None
+        assert (tp.leg_state, tp.close_attempt_coid) == (LEG_STATE_ARMED, None)
+        assert tp.qty == pytest.approx(0.3) and sl.qty == pytest.approx(0.3)
+        assert _leg_rows(ctx) == {'leg-tp': (LEG_STATE_ARMED, pytest.approx(0.3), True),
+                                  'leg-sl': (LEG_STATE_ARMED, pytest.approx(0.3), True)}
+        assert engine.close_coid_spent(tp_key, 'close-1')
+        restarted = SoftwarePartialBracketEngine(store_ctx=ctx)
+        restarted.restart_replay()
+        assert restarted.close_coid_spent(tp_key, 'close-1')
+        assert not restarted.close_coid_spent(tp_key, 'close-2')
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_a_partial_settlement_retried_after_a_failed_write_sizes_no_sibling_twice__(
+        tmp_path, monkeypatch):
+    """The leg's own row write fails after its sibling was sized: the leg stays
+    held, and the retried settlement leaves the sibling at 0.3."""
+    store, ctx, engine = __test_helper_held_bracket(tmp_path)
+    try:
+        tp_key = ('X', 'parent', LEG_KIND_TP_PARTIAL)
+        real_write = spbe_mod.update_engine_trigger_partial_leg_state
+
+        def _write(store_ctx, **kwargs):
+            if kwargs['coid'] == 'leg-tp' and kwargs['new_leg_state'] == LEG_STATE_ARMED:
+                raise sqlite3.OperationalError("disk I/O error")
+            real_write(store_ctx, **kwargs)
+
+        monkeypatch.setattr(spbe_mod, 'update_engine_trigger_partial_leg_state', _write)
+        with pytest.raises(sqlite3.OperationalError):
+            engine.release_held_trigger_partially(tp_key, executed_qty=0.2, reason='r')
+        assert engine.get_leg(tp_key).leg_state == LEG_STATE_TRIGGERING
+        monkeypatch.setattr(spbe_mod, 'update_engine_trigger_partial_leg_state', real_write)
+        engine.release_held_trigger_partially(tp_key, executed_qty=0.2, reason='r')
+        assert _leg_rows(ctx) == {'leg-tp': (LEG_STATE_ARMED, pytest.approx(0.3), True),
+                                  'leg-sl': (LEG_STATE_ARMED, pytest.approx(0.3), True)}
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_a_partial_close_that_used_up_a_sibling_cancels_it__(tmp_path):
+    """A sibling holding no more than the executed quantity has nothing left to
+    protect: it is cancelled, and the leg re-arms for its own rest."""
+    store, ctx, engine = __test_helper_held_bracket(tmp_path, sl_qty=0.2)
+    try:
+        engine.release_held_trigger_partially(
+            ('X', 'parent', LEG_KIND_TP_PARTIAL), executed_qty=0.2, reason='r')
+        assert engine.get_leg(('X', 'parent', LEG_KIND_SL_PARTIAL)) is None
+        rows = _leg_rows(ctx)
+        assert rows['leg-sl'][0] == 'cascaded_cancel' and not rows['leg-sl'][2]
+        assert rows['leg-tp'] == (LEG_STATE_ARMED, pytest.approx(0.3), True)
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_a_refused_close_is_spent_for_the_leg_across_a_restart__(tmp_path):
+    """A released close's id stays spent on the leg's row; a later send of the
+    leg is refused that id even when a restart lost the in-memory re-anchor."""
+    store, ctx, engine = __test_helper_held_bracket(tmp_path)
+    try:
+        tp_key = ('X', 'parent', LEG_KIND_TP_PARTIAL)
+        engine.release_held_trigger(tp_key, reason='held_close_refused')
+        restarted = SoftwarePartialBracketEngine(store_ctx=ctx)
+        restarted.restart_replay()
+        assert restarted.close_coid_spent(tp_key, 'close-1')
+    finally:
+        ctx.close()
+        store.close()

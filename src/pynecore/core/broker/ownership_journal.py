@@ -46,6 +46,14 @@ class OwnershipJournal(Protocol):
         """The row ``client_order_id``, live or closed, or ``None``."""
         ...
 
+    def get_order_for_run_id(self, client_order_id: str) -> OrderRow | None:
+        """The row ``client_order_id`` of any process instance of the run, or ``None``.
+
+        A restart moves only the live rows into the new instance; a row an
+        earlier instance closed is found here, not by :meth:`get_order`.
+        """
+        ...
+
     def upsert_order(self, client_order_id: str, **fields: Any) -> None:
         """Insert the row, or write the given fields of the existing one."""
         ...
@@ -60,6 +68,10 @@ class OwnershipJournal(Protocol):
 
     def iter_live_orders(self, *, from_entry: str | None = None) -> Iterator[OrderRow]:
         """The live rows, optionally only those of one parent entry."""
+        ...
+
+    def iter_orders_in_state_for_run_id(self, state: str) -> Iterator[OrderRow]:
+        """Every row in ``state`` of any process instance of the run, live or closed."""
         ...
 
     def transaction(self) -> contextlib.AbstractContextManager[Any]:
@@ -96,6 +108,10 @@ class MemoryOwnershipJournal:
         """The row ``client_order_id``, live or closed, or ``None``."""
         row = self._rows.get(client_order_id)
         return self._copy(row) if row is not None else None
+
+    def get_order_for_run_id(self, client_order_id: str) -> OrderRow | None:
+        """The row ``client_order_id``: a run in process memory has one instance."""
+        return self.get_order(client_order_id)
 
     def upsert_order(self, client_order_id: str, **fields: Any) -> None:
         """Insert the row, or write the given fields of the existing one.
@@ -167,6 +183,13 @@ class MemoryOwnershipJournal:
             row for row in self._rows.values()
             if row.closed_ts_ms is None and (from_entry is None or row.from_entry == from_entry)
         ]
+        for row in rows:
+            yield self._copy(row)
+
+    def iter_orders_in_state_for_run_id(self, state: str) -> Iterator[OrderRow]:
+        """Every row in ``state``, live or closed, oldest first: a run in memory has one instance."""
+        rows = sorted((row for row in self._rows.values() if row.state == state),
+                      key=lambda row: row.created_ts_ms)
         for row in rows:
             yield self._copy(row)
 

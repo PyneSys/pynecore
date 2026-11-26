@@ -60,6 +60,9 @@ emulator serializes per entity, not with ad-hoc flags per path:
   (:meth:`OneWayEmulator._reserved_view`). The reservations are recorded on
   the close-leg rows, which stay live while one is held, so they outlast a
   restart.
+* **A fill-time netting record** is planned by one pass at a time
+  (``_netting_rows_busy``), from its read to its breadcrumb write, and only
+  while none of its earlier halves is live.
 * **A reversal's residual open** (one breadcrumb) is owned by one pass at a
   time (``_residual_rows_busy``). It follows its closes only through a fresh
   read that shows the opposing legs gone, never on a close's dispatch alone,
@@ -83,6 +86,9 @@ defensive and software-guard closes)    ``_close_rows_busy``
 ``drain_residual_opens`` and the        ``_residual_rows_busy`` and
 restart's residual replay               ``_closing_symbols``; per leg
                                         ``_close_rows_busy``
+``drain_nettings`` (a filled resting    planning: ``_netting_rows_busy`` and
+entry's fill-time netting)              ``_closing_symbols``; its two halves
+                                        then as the residual drain
 restart close-leg replay                ``_closing_symbols``; per row
                                         ``_close_rows_busy``
 ``run_exit_bracket``,                   per leg ``_unsettled_writes`` (one
@@ -98,6 +104,7 @@ unknown-write settlement)               ``_unsettled_writes`` and
 A software guard firing is no entry point of its own: its close goes out
 through ``run_close``.
 """
+import hashlib
 import sqlite3
 from dataclasses import dataclass, field, replace
 from time import time_ns
@@ -146,6 +153,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 from pynecore.lib.log import broker_error as _blog_error
+from pynecore.lib.log import broker_info as _blog_info
 from pynecore.lib.log import broker_warning as _blog_warning
 from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_ACTIVE,
@@ -155,6 +163,8 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     EXTRAS_KEY_BRACKET_OWN_ATTACH_COID,
     EXTRAS_KEY_BRACKET_OWN_CLEAR_COID,
+    EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME,
+    EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_OFFSET,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     EXTRAS_KEY_BRACKET_OWN_SL,
     EXTRAS_KEY_BRACKET_OWN_SOFTWARE,
@@ -163,28 +173,42 @@ from pynecore.core.broker.store_helpers import (
     EXTRAS_KEY_BRACKET_OWN_TRAIL_OFFSET,
     EXTRAS_KEY_BRACKET_OWN_TRAIL_PRICE,
     EXTRAS_KEY_CLOSE_LEG_ATTEMPTS,
+    EXTRAS_KEY_CLOSE_FAN_VOLUME,
     EXTRAS_KEY_CLOSE_LEG_ID,
     EXTRAS_KEY_CLOSE_LEG_PRE_VOLUME,
     EXTRAS_KEY_CLOSE_LEG_SINCE_MS,
     EXTRAS_KEY_CLOSE_LEG_VOLUME,
     EXTRAS_KEY_CLOSE_PARENT_COID,
+    EXTRAS_KEY_CLOSE_REQUESTED_VOLUME,
     EXTRAS_KEY_RESIDUAL_OPEN_BAR_TS_MS,
     EXTRAS_KEY_RESIDUAL_OPEN_CLOSE_PLAN,
     EXTRAS_KEY_RESIDUAL_OPEN_COUNTED_CLOSES,
     EXTRAS_KEY_RESIDUAL_OPEN_ENTRY_COID,
+    EXTRAS_KEY_RESIDUAL_OPEN_NETTING,
     EXTRAS_KEY_RESIDUAL_OPEN_RETRY_SEQ,
     EXTRAS_KEY_RESIDUAL_OPEN_RUN_TAG,
+    EXTRAS_KEY_NETTING_CONTENDED,
+    EXTRAS_KEY_NETTING_EXPECTED,
+    EXTRAS_KEY_NETTING_PASSES,
+    EXTRAS_KEY_NETTING_SETTLED_MS,
+    EXTRAS_KEY_NETTING_SINCE_MS,
     STATE_CLOSE_LEG,
+    STATE_NETTING,
     advance_residual_open_attempt,
+    absorb_netting_fills,
     clear_residual_open_row,
     count_residual_open_close,
     create_bracket_ownership_row,
     create_close_leg_row,
+    create_netting_row,
     create_residual_open_row,
     finish_close_leg_row,
     iter_active_bracket_ownerships,
     iter_active_close_legs,
+    iter_active_nettings,
     iter_active_residual_opens,
+    netting_absorbed_row_coid,
+    netting_expected,
     iter_close_leg_sends,
     lower_close_leg_send_pre_volume,
     release_close_leg_send,
@@ -291,6 +315,18 @@ def _translate_port_read_fault(exc: Exception) -> Exception:
     return exc
 
 
+def _more_favourable(long_side: bool, current: float | None, price: float | None) -> float | None:
+    """The more favourable of two trail prices for a long (the higher) or a short (the lower).
+
+    ``None`` stands for no price; the other one wins.
+    """
+    if current is None:
+        return price
+    if price is None:
+        return current
+    return max(current, price) if long_side else min(current, price)
+
+
 def _shrink_overlap(credit: int, credited_pre: int, pre: int) -> int:
     """How much of a shrink credited to one close send lies in another send's window.
 
@@ -370,6 +406,29 @@ def close_leg_row_client_order_id(coid: str) -> str:
     if sep and tail.isdigit():
         return head
     return coid
+
+
+def _grid_qty(qty: float, quantize: 'Callable[[float], int]') -> float:
+    """The Pine quantity ``qty`` comes to once snapped onto the broker grid.
+
+    The smallest quantity the quantizer maps to the volume ``qty`` snaps to,
+    found by bisection (a quantizer is monotone): what a close of ``qty``
+    sends, and so what its fill reports.
+
+    :param qty: A Pine-unit quantity.
+    :param quantize: The port's Pine-units to broker-grid quantizer.
+    """
+    volume = quantize(qty)
+    if volume <= 0:
+        return 0.0
+    low, high = 0.0, qty
+    for _ in range(80):
+        mid = (low + high) / 2.0
+        if quantize(mid) >= volume:
+            high = mid
+        else:
+            low = mid
+    return high
 
 
 __all__ = [
@@ -470,15 +529,22 @@ class _SoftwareGuard:
     :ivar exit_side: The exit side (``"sell"`` protects a long).
     :ivar levels: The merged levels of the leg's owning exits.
     :ivar qty: The Pine-unit quantity a trigger closes.
-    :ivar trail_stop: The current trailing stop price, ``None`` until the
-        first price arms it.
+    :ivar trail_extreme: The most favourable price the trailing stop trails
+        from (a long's highest, a short's lowest), as the leg's ownership rows
+        hold it; ``None`` until the first price arms the trail. The stop lies
+        the trailing distance behind it.
+    :ivar unapplied_trail_price: Memory only: the most favourable price a
+        tick observed whose persist-first write of a new extreme failed. The
+        guard trails from it as if it had landed, and the next tick writes it
+        first, so the observed extreme is never lost.
     :ivar firing: ``True`` between a trigger and the engine's verdict on the
         close it dispatched.
     """
     exit_side: str
     levels: _LegLevels
     qty: float
-    trail_stop: float | None = None
+    trail_extreme: float | None = None
+    unapplied_trail_price: float | None = None
     firing: bool = False
 
 
@@ -683,6 +749,12 @@ class OneWayEmulator:
         #: bridge stopped waiting for may still run when the next starts, and
         #: two passes must never open the same residual.
         self._residual_rows_busy: set[str] = set()
+        #: Fill-time netting records (coids) a pass is planning right now
+        #: (:meth:`drain_nettings`): two passes must never plan the same
+        #: record's closes twice.
+        self._netting_rows_busy: set[str] = set()
+        #: Netting records already told that the quarantine withholds them.
+        self._netting_quarantine_reported: set[str] = set()
         #: Attempt moves (:meth:`_abandon_residual_attempt`) whose journal
         #: write failed, by breadcrumb coid, with the envelope and entry coid
         #: of the abandoned attempt. The next pass over the breadcrumb writes
@@ -911,6 +983,7 @@ class OneWayEmulator:
             intent_key=intent.intent_key, pine_id=intent.pine_id,
             parent_coid=parent_coid, port=port,
             skippable=intent.synthetic_kind in (None, 'partial_trigger', 'leg_guard'),
+            requested_qty=intent.qty,
         )
         if not dispatched:
             # Every slice rounded below the broker grid — skip, do not halt.
@@ -962,6 +1035,10 @@ class OneWayEmulator:
     ) -> ReversalFanResult:
         """Decompose a Pine reversal/add entry over the hedging legs.
 
+        A resting LIMIT / STOP entry is placed as it is, with no read and no
+        close: its fill is netted against the opposing legs afterwards
+        (:meth:`drain_nettings`).
+
         Pine folds a reversal into one combined-size :class:`EntryIntent`
         assuming a netting auto-flip. On a hedging account that single order
         would open a separate opposing leg, so it is split: FIFO-close the
@@ -998,13 +1075,13 @@ class OneWayEmulator:
         assert isinstance(intent, EntryIntent)
         if intent.order_type is not OrderType.MARKET:
             # A resting LIMIT / STOP entry is not Pine's combined-size market
-            # auto-flip: it rests as a fresh working order and is decomposed
-            # (if it is still a reversal when it triggers) only at FILL time.
-            # Place it full-size now with NO opposing-leg close — retiring the
-            # opposing exposure here would flatten the position before the entry
-            # ever fires. (Fill-time decomposition of a resting reversal is a
-            # follow-up.) ``place_leg`` runs the broker's own volume-bounds
-            # pre-flight, so an out-of-range resting order still skips cleanly.
+            # auto-flip: it rests as a fresh working order and is netted
+            # against the opposing legs only at FILL time
+            # (:meth:`drain_nettings`). Place it full-size now with NO
+            # opposing-leg close — retiring the opposing exposure here would
+            # flatten the position before the entry ever fires. ``place_leg``
+            # runs the broker's own volume-bounds pre-flight, so an
+            # out-of-range resting order still skips cleanly.
             opened = tuple(await port.place_leg(envelope, intent.qty))
             return ReversalFanResult(
                 closes=(), open_qty=intent.qty, opened_orders=opened,
@@ -1470,6 +1547,7 @@ class OneWayEmulator:
             parent_coid: str, port: 'PositionPort', skippable: bool,
             progress: list[tuple[str, int]] | None = None,
             residual_coid: str | None = None,
+            requested_qty: float | None = None,
     ) -> tuple[list[tuple[str, int]], float]:
         """Snap a FIFO close plan to the broker grid and dispatch it per leg.
 
@@ -1483,14 +1561,26 @@ class OneWayEmulator:
         whole plan rounded below the grid) and the Pine-unit quantity they
         carry. Each row also records the leg's broker-grid size from ``legs``
         (the snapshot the plan was made from), the measure
-        :meth:`_settle_close_row` reads of what the close executed.
+        :meth:`_settle_close_row` reads of what the close executed, and the
+        broker-grid volume of the whole plan
+        (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_CLOSE_FAN_VOLUME`),
+        so a fan that stopped before its last leg is not read as complete,
+        and with ``requested_qty`` (a :meth:`run_close`) the broker-grid
+        volume the close was asked for
+        (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_CLOSE_REQUESTED_VOLUME`),
+        before the plan clipped it, dropped a leg it cannot close or widened it
+        to whole legs: what the close executed is measured against that.
+        A fan that is no netting half first marks the live netting records of
+        the symbol contended on its side (:meth:`_mark_netting_contention`).
 
         A leg whose close id already has a row (a software guard re-firing
         after an unknown outcome, a reversal's residual drain re-planning its
         closes) is settled through :meth:`_settle_close_row` instead: only the
         part the earlier sends provably did not execute is sent, capped by
         this plan's volume for the leg, which the caller sized to what is safe
-        to close now.
+        to close now. A close an earlier process of the run already settled
+        (its row closed there) sends nothing
+        (:meth:`_close_settled_by_earlier_instance`).
 
         A leg the plugin declines with
         :class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin` (the
@@ -1517,8 +1607,16 @@ class OneWayEmulator:
         row in the same write as the row itself, an existing one before its
         settlement can send anything.
         """
+        self._mark_netting_contention(symbol, side, parent_coid)
         quantize = await _read_quantizer(port, symbol)
         planned = plan_leg_close_volumes(closes, quantize)
+        fan_volume = sum(volume for _leg_id, volume in planned)
+        fan_payload: dict[str, int] = {EXTRAS_KEY_CLOSE_FAN_VOLUME: fan_volume}
+        if requested_qty is not None:
+            # What the close was asked for, before the plan clipped it to the
+            # net exposure, dropped a leg it cannot close or widened it to
+            # whole legs.
+            fan_payload[EXTRAS_KEY_CLOSE_REQUESTED_VOLUME] = quantize(requested_qty)
         pre_volumes = {leg.leg_id: quantize(leg.qty) for leg in legs}
         live_by_id = {leg.leg_id: leg for leg in legs}
         pine_by_leg = {close.leg_id: close.qty for close in closes}
@@ -1556,6 +1654,13 @@ class OneWayEmulator:
                 dispatched.append((leg_id, sent))
                 sent_qty += pine_by_leg.get(leg_id, 0.0) * sent / volume
                 continue
+            if existing is None and self._close_settled_by_earlier_instance(leg_coid):
+                # An earlier process of the run sent this close and settled it
+                # (its row closed there, and a restart moves only live rows):
+                # nothing of it is owed, and a send under its id again could
+                # close the leg twice.
+                dispatched.append((leg_id, 0))
+                continue
             if leg_coid in self._close_rows_busy:
                 raise OrderDispositionUnknownError(
                     f"{symbol} close of leg {leg_id}: the close {leg_coid} is being "
@@ -1581,6 +1686,7 @@ class OneWayEmulator:
                         leg_id=leg_id,
                         leg_volume=volume,
                         leg_pre_volume=pre_volumes.get(leg_id, volume),
+                        extra_payload=fan_payload,
                     )
                     self._reserve_close(
                         leg_coid, leg_coid, volume, pre_volumes.get(leg_id, volume))
@@ -1636,6 +1742,21 @@ class OneWayEmulator:
             dispatched.append((leg_id, volume))
             sent_qty += pine_by_leg.get(leg_id, 0.0)
         return dispatched, round(sent_qty, 12)
+
+    def _close_settled_by_earlier_instance(self, leg_coid: str) -> bool:
+        """Whether an earlier process of the run settled the leg close ``leg_coid``.
+
+        A restart moves only the live rows into the new process instance, so
+        a close-leg row an earlier process closed is not found by this
+        instance's lookups; the run's own record of it still is.
+
+        :param leg_coid: The leg close's own id.
+        """
+        store = self._store_ctx
+        if store is None:
+            return False
+        row = store.get_order_for_run_id(leg_coid)
+        return row is not None and row.state == STATE_CLOSE_LEG and row.closed_ts_ms is not None
 
     def _owe_close_row_finish(self, coid: str, attempts: list[str]) -> None:
         """Owe the finish of a close-leg row whose send went out (storage contract).
@@ -1925,6 +2046,11 @@ class OneWayEmulator:
                     EXTRAS_KEY_BRACKET_OWN_SOFTWARE:
                         (co_owned or prior_row is not None)
                         and not venue_bracket_possible,
+                    # A re-attach keeps the software guard's persisted trail.
+                    **{key: value for key, value in (
+                        (prior_row.extras or {}) if prior_row is not None else {}).items()
+                       if key in (EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME,
+                                  EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_OFFSET)},
                 },
             )
             try:
@@ -2369,13 +2495,26 @@ class OneWayEmulator:
             self, key: tuple[str, str], leg: PositionLeg, side: str, levels: _LegLevels,
             protected: float, venue_qty: float,
     ) -> None:
-        """Put ``leg`` under the software leg guard over ``protected``, reported once per leg."""
+        """Put ``leg`` under the software leg guard over ``protected``, reported once per leg.
+
+        A guard re-armed with the same side and trailing offset keeps its
+        trail. A guard armed afresh (a restart, or a leg the guard left) resumes
+        the trail its ownership rows persisted for that offset
+        (:meth:`_persisted_guard_trail`), so its stop is never looser than the
+        last one written; without one the trail arms at the next price.
+        """
         previous = self._software_guards.get(key)
         keeps_trail = (previous is not None and previous.exit_side == side
                        and previous.levels.trail_offset == levels.trail_offset)
+        if previous is not None and keeps_trail:
+            extreme, unapplied = previous.trail_extreme, previous.unapplied_trail_price
+        else:
+            extreme = self._persisted_guard_trail(
+                leg.symbol, leg.leg_id, side, levels.trail_offset)
+            unapplied = None
         self._software_guards[key] = _SoftwareGuard(
             exit_side=side, levels=levels, qty=protected,
-            trail_stop=previous.trail_stop if previous is not None and keeps_trail else None,
+            trail_extreme=extreme, unapplied_trail_price=unapplied,
         )
         if key not in self._software_guard_reported:
             self._software_guard_reported.add(key)
@@ -2410,19 +2549,68 @@ class OneWayEmulator:
     def _flag_leg_rows_software(self, symbol: str, leg_id: str, software: bool) -> None:
         """Set the software flag of every live ownership row of ``leg_id`` to ``software``.
 
-        One write: a failure leaves every row as it was.
+        Dropping the flag (the leg gets a venue bracket again) also drops the
+        guard's persisted trail: a later guard of the leg starts a trail of its
+        own. One write: a failure leaves every row as it was.
         """
         with self._ownership.transaction():
             for row in list(iter_active_bracket_ownerships(self._ownership)):
                 extras = row.extras or {}
-                if (row.symbol != symbol
-                        or extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID) != leg_id
-                        or bool(extras.get(EXTRAS_KEY_BRACKET_OWN_SOFTWARE)) == software):
+                if row.symbol != symbol or extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID) != leg_id:
                     continue
-                self._ownership.upsert_order(
-                    row.client_order_id,
-                    extras={**extras, EXTRAS_KEY_BRACKET_OWN_SOFTWARE: software},
-                )
+                trail = not software and (
+                    EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME in extras
+                    or EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_OFFSET in extras)
+                if bool(extras.get(EXTRAS_KEY_BRACKET_OWN_SOFTWARE)) == software and not trail:
+                    continue
+                patched = {**extras, EXTRAS_KEY_BRACKET_OWN_SOFTWARE: software}
+                if trail:
+                    patched.pop(EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME, None)
+                    patched.pop(EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_OFFSET, None)
+                self._ownership.upsert_order(row.client_order_id, extras=patched)
+
+    def _persisted_guard_trail(
+            self, symbol: str, leg_id: str, side: str, trail_offset: float | None,
+    ) -> float | None:
+        """The trail extreme the live ownership rows of ``leg_id`` hold for ``trail_offset``.
+
+        The most favourable one for the protected side (an exit side ``"sell"``
+        protects a long, whose extreme is the highest price) among the rows
+        that persisted one at that offset; ``None`` when none did, or the
+        guard does not trail.
+        """
+        if trail_offset is None:
+            return None
+        long_side = side == 'sell'
+        extreme: float | None = None
+        for row in self._leg_rows(symbol, leg_id):
+            extras = row.extras or {}
+            stored = extras.get(EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME)
+            if (extras.get(EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_OFFSET) != trail_offset
+                    or not isinstance(stored, (int, float)) or isinstance(stored, bool)):
+                continue
+            extreme = _more_favourable(long_side, extreme, float(stored))
+        return extreme
+
+    def _persist_guard_trails(self, symbol: str, extremes: Mapping[str, float]) -> None:
+        """Write the new trail extreme of each guarded leg onto its live ownership rows.
+
+        PERSIST-FIRST: the guards take the extremes only once this returned.
+        One write: a failure leaves every row as it was.
+
+        :param symbol: The legs' symbol.
+        :param extremes: The new extreme per leg id.
+        :raises sqlite3.Error: When the store write fails.
+        """
+        with self._ownership.transaction():
+            for leg_id, extreme in extremes.items():
+                guard = self._software_guards[(symbol, leg_id)]
+                for row in self._leg_rows(symbol, leg_id):
+                    self._ownership.upsert_order(row.client_order_id, extras={
+                        **(row.extras or {}),
+                        EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_EXTREME: extreme,
+                        EXTRAS_KEY_BRACKET_OWN_GUARD_TRAIL_OFFSET: guard.levels.trail_offset,
+                    })
 
     async def _amend_leg(
             self, port: 'PositionPort', symbol: str, leg_id: str, side: str,
@@ -2905,7 +3093,10 @@ class OneWayEmulator:
 
         ``True`` while any leg carries a protection this process decided on
         (:meth:`_protection_mode`): the engine then runs the pass every sync,
-        so a leg that starts or stops sharing its venue position is re-driven.
+        so a leg that starts or stops sharing its venue position, or that an
+        opposing leg starts, stops or changes offsetting (an opposite fill, a
+        leg the run did not open, a partial close of either leg), is re-driven
+        in the first sync whose read shows the change.
         """
         return bool(self._protection_modes)
 
@@ -3174,6 +3365,19 @@ class OneWayEmulator:
         emulation has no deferred activation), and from then on only moves in
         the position's favour.
 
+        The trail is persisted. Its extreme (the most favourable price it
+        trails from; the stop lies ``trail_offset`` behind it) is written onto
+        the leg's live ownership rows before the guard takes it, one write for
+        every guard the price moved (:meth:`_persist_guard_trails`), so a
+        restart resumes the trail instead of arming it again at the current,
+        possibly less favourable price. A failed write raises the storage
+        error; each guard keeps the price it was moved to in memory
+        (:attr:`~_SoftwareGuard.unapplied_trail_price`) and trails from it as
+        if it had landed, so the next evaluation writes it and the observed
+        extreme is never lost. A pass on which a guard triggers writes
+        nothing: the moved extremes wait in memory the same way, so a store
+        failure can never hold back a trigger.
+
         A triggered guard is marked firing and is not evaluated again until
         the engine reports the fate of the close it dispatched
         (:meth:`software_guard_settled`).
@@ -3181,8 +3385,10 @@ class OneWayEmulator:
         :param symbol: The symbol the price belongs to.
         :param last_price: The last observed price.
         :return: One trigger per guard whose level the price reached.
+        :raises sqlite3.Error: When the trail write fails; no guard triggered.
         """
-        triggers: list[SoftwareLegTrigger] = []
+        hits: list[tuple[str, _SoftwareGuard, tuple[str, float]]] = []
+        moves: dict[str, float] = {}
         for (guard_symbol, leg_id), guard in self._software_guards.items():
             if guard_symbol != symbol or guard.firing:
                 continue
@@ -3191,15 +3397,18 @@ class OneWayEmulator:
             hit: tuple[str, float] | None = None
             distance = self._trail_price_distance(levels.trail_offset)
             if distance is not None:
-                candidate = last_price - distance if long_side else last_price + distance
-                if guard.trail_stop is None:
-                    guard.trail_stop = candidate
-                elif (last_price <= guard.trail_stop if long_side
-                      else last_price >= guard.trail_stop):
-                    hit = ('trailing_stop', guard.trail_stop)
+                extreme = _more_favourable(
+                    long_side, guard.trail_extreme, guard.unapplied_trail_price)
+                if extreme is None:
+                    moves[leg_id] = last_price
                 else:
-                    guard.trail_stop = (max(guard.trail_stop, candidate) if long_side
-                                        else min(guard.trail_stop, candidate))
+                    stop = extreme - distance if long_side else extreme + distance
+                    if last_price <= stop if long_side else last_price >= stop:
+                        hit = ('trailing_stop', stop)
+                    else:
+                        extreme = _more_favourable(long_side, extreme, last_price)
+                    if extreme != guard.trail_extreme:
+                        moves[leg_id] = extreme
             if levels.sl_price is not None and (
                     last_price <= levels.sl_price if long_side
                     else last_price >= levels.sl_price):
@@ -3208,8 +3417,24 @@ class OneWayEmulator:
                     last_price >= levels.tp_price if long_side
                     else last_price <= levels.tp_price):
                 hit = ('take_profit', levels.tp_price)
-            if hit is None:
-                continue
+            if hit is not None:
+                hits.append((leg_id, guard, hit))
+        if moves and not hits:
+            try:
+                self._persist_guard_trails(symbol, moves)
+            except BaseException:
+                for leg_id, extreme in moves.items():
+                    self._software_guards[(symbol, leg_id)].unapplied_trail_price = extreme
+                raise
+            for leg_id, extreme in moves.items():
+                guard = self._software_guards[(symbol, leg_id)]
+                guard.trail_extreme = extreme
+                guard.unapplied_trail_price = None
+        else:
+            for leg_id, extreme in moves.items():
+                self._software_guards[(symbol, leg_id)].unapplied_trail_price = extreme
+        triggers: list[SoftwareLegTrigger] = []
+        for leg_id, guard, (reason, level) in hits:
             guard.firing = True
             owners = [
                 row for row in self._leg_rows(symbol, leg_id)
@@ -3219,7 +3444,7 @@ class OneWayEmulator:
             entries = {row.from_entry for row in owners}
             triggers.append(SoftwareLegTrigger(
                 symbol=symbol, leg_id=leg_id, side=guard.exit_side, qty=guard.qty,
-                reason=hit[0], level=hit[1],
+                reason=reason, level=level,
                 from_entry=next(iter(entries)) if len(entries) == 1 else None,
                 exit_ids=tuple(sorted({row.pine_entry_id or '' for row in owners})),
             ))
@@ -3307,6 +3532,528 @@ class OneWayEmulator:
         """
         opened, self._opened_residuals = self._opened_residuals, []
         return opened
+
+    async def drain_nettings(self, port: 'PositionPort', *, fill_grace_s: float) -> None:
+        """Net every fill-time netting record (:data:`~pynecore.core.broker.store_helpers.STATE_NETTING`).
+
+        A resting LIMIT / STOP entry on a hedging account rests as a leg of
+        its own (:meth:`run_reversal`). Once it fills against opposing legs,
+        the venue holds both sides where a one-way account holds only the
+        net; the sync engine then writes a netting record for the fill slice
+        before anything is sent. A pass over a record reads the legs and
+        nets ``min(record qty, opposing exposure, exposure on the fill's
+        side)``: it writes two close-plan breadcrumbs in one transaction with
+        the record's update (one closing the opposing legs FIFO, one closing
+        the filled entry's legs, its own first, by the same quantity) and
+        then sends them through :meth:`_replay_residual_one`, the path the
+        residual drain and the restart replay settle every breadcrumb by
+        (reserved views, unknown outcomes, re-sends only of what provably did
+        not execute). The net position is the same before and after; the
+        fills of these closes are expected by the engine as book-neutral up
+        to the netted quantity (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_NETTING_EXPECTED`).
+
+        A record is planned again only once its breadcrumbs are discharged,
+        so a record whose fill side the read did not show in full yet is
+        netted over several passes; a fill side that stays unlisted for
+        :data:`BOOK_INCOMPLETE_GRACE_S` ends the record's planning with a
+        warning. Once nothing is left to plan or close, the record waits for
+        its expected close fills at most ``fill_grace_s`` and is then closed
+        (with a warning when part of them never came).
+
+        A port that closes only whole legs (``supports_partial_leg_close =
+        False``) gets whole-leg plans (:meth:`_widen_netting_closes`).
+
+        Under the quarantine latch no new pass is planned (the record stays
+        live); halves already planned keep going through the residual drain,
+        which never lets one half of a pair stand alone longer than needed.
+
+        One pass at a time owns a record (``_netting_rows_busy``), and the
+        planning pass owns the symbol's closes from its read to its
+        breadcrumb write (``_closing_symbols``).
+
+        :param port: The position port.
+        :param fill_grace_s: Seconds a close fill may follow the venue's
+            position change (the engine's fill-report grace).
+        """
+        for row in list(iter_active_nettings(self._close_journal)):
+            halves = await self._plan_netting_one(row, port, fill_grace_s)
+            for half in halves:
+                await self._replay_residual_one(half, port)
+
+    def record_netting(
+            self, *, entry_coid: str, fill_key: str, symbol: str, side: str, qty: float,
+            intent_key: str | None, entry_id: str | None, fill_grace_s: float,
+    ) -> str | None:
+        """Write the netting record of one fill slice of a resting entry (PERSIST-FIRST).
+
+        Called by the sync engine before the fill moves the book and before
+        anything is sent (:meth:`drain_nettings` nets it). The record's coid
+        is the entry's coid and a digest of the fill's id, so the same fill
+        maps onto the same record in every process: a fill whose record
+        exists already (live or done) writes nothing. The record is looked up
+        in every process instance of the run: a restart moves only the live
+        rows, and a record an earlier process closed proves the slice already
+        had its netting pass (a fill redelivered after restart, its receipt
+        never written, must not net the two sides again).
+
+        A close of the symbol that is no netting half and whose fills can
+        still come back (:meth:`_ordinary_close_sides_in_flight`) marks the
+        new record contended on its side
+        (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_NETTING_CONTENDED`),
+        exactly like a close fanned out while the record is live
+        (:meth:`_mark_netting_contention`): its fill can come back after the
+        record's own closes went out on the same side, and one that names no
+        close of the run cannot be told from theirs.
+
+        :param entry_coid: The filled entry order's client order id (its venue
+            order id when the fill carries none).
+        :param fill_key: The fill's id (its idempotency key).
+        :param symbol: Exchange-side symbol.
+        :param side: The fill's side.
+        :param qty: The Pine quantity of the fill the venue must net.
+        :param intent_key: The filled entry's diff key, when known.
+        :param entry_id: The filled entry's Pine id.
+        :param fill_grace_s: Seconds a close fill may follow the venue's
+            position change (the engine's fill-report grace).
+        :return: The record's coid, or ``None`` when it existed already.
+        :raises sqlite3.Error: When the store cannot be written; nothing was
+            written then.
+        """
+        coid = f"{entry_coid}:n{hashlib.sha256(fill_key.encode('utf-8')).hexdigest()[:8]}"
+        if self._close_journal.get_order_for_run_id(coid) is not None:
+            return None
+        create_netting_row(
+            self._close_journal, coid=coid, symbol=symbol, side=side, qty=qty,
+            intent_key=intent_key, entry_id=entry_id, fill_id=fill_key,
+            contended=self._ordinary_close_sides_in_flight(
+                symbol, now_ms=time_ns() // 1_000_000, fill_grace_s=fill_grace_s),
+        )
+        return coid
+
+    def _ordinary_close_sides_in_flight(
+            self, symbol: str, *, now_ms: int, fill_grace_s: float,
+    ) -> set[str]:
+        """The sides of the closes of ``symbol`` that are no netting half and may still fill.
+
+        A close-leg row stays live until its close is accounted for (every
+        reserved send dropped), so a live row is a close whose fills can still
+        come back. Its row closes once the position read (or the venue's
+        record of the send) shows what the close took, and the fill report
+        can come later than that read: up to the fill-report grace after the
+        venue's position changed, as a netting record's own close fills
+        (:meth:`_settle_netting_record`). A row closed less than
+        ``fill_grace_s`` ago, in any process instance of the run, is
+        therefore still in flight.
+
+        :param symbol: Exchange-side symbol.
+        :param now_ms: Epoch milliseconds now.
+        :param fill_grace_s: Seconds a close fill may follow the venue's
+            position change.
+        :raises sqlite3.Error: When the store cannot be read.
+        """
+        journal = self._close_journal
+        rows = list(journal.iter_live_orders())
+        if fill_grace_s > 0.0:
+            since_ms = now_ms - fill_grace_s * 1000.0
+            rows.extend(row for row in journal.iter_orders_in_state_for_run_id(STATE_CLOSE_LEG)
+                        if row.closed_ts_ms is not None and row.closed_ts_ms > since_ms)
+        sides: set[str] = set()
+        for row in rows:
+            if row.state != STATE_CLOSE_LEG or row.symbol != symbol or not row.side:
+                continue
+            parent = str((row.extras or {}).get(EXTRAS_KEY_CLOSE_PARENT_COID) or '')
+            if self._netting_record_of_close(parent) is None:
+                sides.add(row.side)
+        return sides
+
+    def netting_expectations(self) -> list[tuple[str, dict[str, float]]]:
+        """The close fills the live netting records still expect, oldest record first.
+
+        :return: ``(record coid, {'buy': qty, 'sell': qty})`` per record with
+            a positive expectation on a side.
+        :raises sqlite3.Error: When the store cannot be read.
+        """
+        out: list[tuple[str, dict[str, float]]] = []
+        for row in iter_active_nettings(self._close_journal):
+            left = netting_expected(self._close_journal, row)
+            if any(qty > _QTY_EPS for qty in left.values()):
+                out.append((row.client_order_id, left))
+        return out
+
+    def absorb_netting_fills(self, absorbed: Mapping[str, Mapping[str, float]]) -> None:
+        """Count close fills booked as netting on a run without a store.
+
+        With a store the engine writes the count itself, in the transaction of
+        the fills' receipts (:func:`~pynecore.core.broker.store_helpers.absorb_netting_fills`).
+
+        :param absorbed: Per record coid, the quantity booked as netting by side.
+        """
+        absorb_netting_fills(self._close_journal, absorbed)
+
+    def _netting_record_of_close(self, parent_close_coid: str) -> str | None:
+        """The netting record a close fan belongs to, when it is a netting half.
+
+        A netting pass fans its two halves under ``{record}:p{pass}{a|b}``
+        (:meth:`_plan_netting_pass`).
+
+        :param parent_close_coid: The fan's own client order id.
+        :return: The record's coid, or ``None`` for any other close.
+        """
+        head, sep, tail = parent_close_coid.rpartition(':p')
+        if not sep or len(tail) < 2 or tail[-1] not in 'ab' or not tail[:-1].isdigit():
+            return None
+        record = self._close_journal.get_order_for_run_id(head)
+        return head if record is not None and record.state == STATE_NETTING else None
+
+    def netting_close_owner(
+            self, client_order_id: str | None, *, run_tag: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Which close of the run a close fill reports, by its client order id.
+
+        A close fill that carries the id :meth:`PositionPort.close_leg`
+        received (the leg close's own id or a re-send's attempt id) names the
+        close-leg row it belongs to, and with it whether it is one of a
+        netting record's closes. The row is looked up whether or not it is
+        still live, in any process instance of the run (a restart moves only
+        the live rows), so the answer depends neither on how long the fill
+        took nor on a restart in between.
+
+        A close fill whose id names any other order of the run is no netting
+        close either: a netting close always goes out under its close-leg
+        row's id. That is the id of another row of the run (an entry's own
+        id, which a plugin reports for a close of the entry's position it
+        cannot attribute to a leg close of the run, such as a manual one), or
+        a client order id the run minted
+        (:func:`~pynecore.core.broker.idempotency.parse_client_order_id`, or
+        its wire form under the run's tag on a run without a store, where an
+        entry has no row in this journal). A leg-close id never has either
+        shape.
+
+        :param client_order_id: The fill's client order id.
+        :param run_tag: The run's tag, to recognise its wire-form ids.
+        :return: ``(True, record coid)`` for a netting close, ``(True, None)``
+            for any other order of the run, ``(False, None)`` when the id
+            names nothing the run sent.
+        :raises sqlite3.Error: When the store cannot be read.
+        """
+        if not client_order_id:
+            return False, None
+        row = self._close_journal.get_order_for_run_id(
+            close_leg_row_client_order_id(client_order_id))
+        if row is not None and row.state == STATE_CLOSE_LEG:
+            parent = str((row.extras or {}).get(EXTRAS_KEY_CLOSE_PARENT_COID) or '')
+            return True, self._netting_record_of_close(parent)
+        if row is not None or parse_client_order_id(client_order_id) is not None:
+            return True, None
+        wire = parse_wire_client_order_id(client_order_id) if run_tag else None
+        if wire is not None and wire.run_tag == run_tag:
+            return True, None
+        return False, None
+
+    def netting_expectation_of(self, coid: str) -> dict[str, float]:
+        """What of netting record ``coid``'s close fills is not booked as netting yet.
+
+        Read whether or not the record is still live, in any process instance
+        of the run: a fill identified as one of its closes
+        (:meth:`netting_close_owner`) is the record's however late it comes,
+        across a restart too.
+
+        :return: ``{'buy': qty, 'sell': qty}``; empty when the record is gone.
+        :raises sqlite3.Error: When the store cannot be read.
+        """
+        row = self._close_journal.get_order_for_run_id(coid)
+        if row is None or row.state != STATE_NETTING:
+            return {}
+        return netting_expected(self._close_journal, row)
+
+    def netting_contended_sides(self, coid: str) -> set[str]:
+        """The close fill sides of netting record ``coid`` that another close shares.
+
+        See :data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_NETTING_CONTENDED`.
+
+        :raises sqlite3.Error: When the store cannot be read.
+        """
+        row = self._close_journal.get_order_for_run_id(coid)
+        if row is None:
+            return set()
+        return {str(side) for side in (row.extras or {}).get(EXTRAS_KEY_NETTING_CONTENDED) or ()}
+
+    def _mark_netting_contention(self, symbol: str, side: str, parent_coid: str) -> None:
+        """Note on every live netting record of ``symbol`` that a close of ``side`` goes out.
+
+        Called by :meth:`_fan_out_closes` before anything of a close that is
+        no netting half is written or sent: its fills share a side with the
+        records' own close fills, and a fill that names no close of the run
+        could be either.
+
+        :raises sqlite3.Error: When the store cannot be written; nothing was
+            sent then.
+        """
+        if self._netting_record_of_close(parent_coid) is not None:
+            return
+        journal = self._close_journal
+        rows = [row for row in iter_active_nettings(journal) if row.symbol == symbol]
+        if not rows:
+            return
+        with journal.transaction():
+            for row in rows:
+                extras = dict(row.extras or {})
+                sides = sorted({*(extras.get(EXTRAS_KEY_NETTING_CONTENDED) or ()), side})
+                if sides != list(extras.get(EXTRAS_KEY_NETTING_CONTENDED) or ()):
+                    extras[EXTRAS_KEY_NETTING_CONTENDED] = sides
+                    journal.upsert_order(row.client_order_id, extras=extras)
+
+    def netting_in_flight(self) -> bool:
+        """Whether a fill-time netting still has closes to plan, send or receive fills of.
+
+        A failed read answers ``True``: the caller then holds its verdict.
+        """
+        try:
+            return any(True for _ in iter_active_nettings(self._close_journal))
+        except sqlite3.Error:
+            return True
+
+    def _netting_halves(self, coid: str) -> list['OrderRow']:
+        """The live close-plan breadcrumbs of netting record ``coid``."""
+        return [row for row in iter_active_residual_opens(self._close_journal)
+                if (row.extras or {}).get(EXTRAS_KEY_RESIDUAL_OPEN_NETTING) == coid]
+
+    async def _plan_netting_one(
+            self, row: 'OrderRow', port: 'PositionPort', fill_grace_s: float,
+    ) -> list['OrderRow']:
+        """Plan one netting pass of a record, or move the record on in its lifecycle.
+
+        :return: The breadcrumbs the pass wrote, for the caller to send once
+            the claims are released; empty when nothing was planned.
+        """
+        coid = row.client_order_id
+        symbol = row.symbol
+        if coid in self._netting_rows_busy or symbol in self._closing_symbols:
+            return []
+        self._netting_rows_busy.add(coid)
+        self._closing_symbols.add(symbol)
+        try:
+            current = self._close_journal.get_order(coid)
+            if current is None or current.closed_ts_ms is not None:
+                return []
+            if self._netting_halves(coid):
+                return []
+            now_ms = time_ns() // 1_000_000
+            if current.qty <= _QTY_EPS:
+                self._settle_netting_record(current, now_ms, fill_grace_s)
+                return []
+            if self._block_exposure_reopens is not None and self._block_exposure_reopens():
+                if coid not in self._netting_quarantine_reported:
+                    self._netting_quarantine_reported.add(coid)
+                    _blog_warning(
+                        "%s: netting %r of %s is withheld while the bot is quarantined; "
+                        "both sides stay open until the operator resume",
+                        symbol, coid, current.qty,
+                    )
+                return []
+            self._netting_quarantine_reported.discard(coid)
+            return await self._plan_netting_pass(current, port, now_ms)
+        finally:
+            self._netting_rows_busy.discard(coid)
+            self._closing_symbols.discard(symbol)
+
+    def _settle_netting_record(self, row: 'OrderRow', now_ms: int, fill_grace_s: float) -> None:
+        """Close a netting record whose closes are done once its expected fills came.
+
+        :param row: The record, with nothing left to plan and no live half.
+        :param now_ms: Epoch milliseconds now.
+        :param fill_grace_s: Seconds the expected close fills are waited for.
+        """
+        journal = self._close_journal
+        coid = row.client_order_id
+        left = netting_expected(journal, row)
+        extras = dict(row.extras or {})
+        if any(qty > _QTY_EPS for qty in left.values()):
+            settled = extras.get(EXTRAS_KEY_NETTING_SETTLED_MS)
+            if settled is None:
+                extras[EXTRAS_KEY_NETTING_SETTLED_MS] = now_ms
+                journal.upsert_order(coid, extras=extras)
+                return
+            if now_ms - int(settled) < fill_grace_s * 1000.0:
+                return
+            _blog_warning(
+                "%s: netting %r ends with close fills of %s never reported; a later "
+                "close fill that names one of its closes is still the netting's, any "
+                "other moves the book as usual",
+                row.symbol, coid, {side: qty for side, qty in left.items() if qty > _QTY_EPS},
+            )
+        with journal.transaction():
+            journal.close_order(coid)
+            journal.close_order(netting_absorbed_row_coid(coid))
+
+    async def _plan_netting_pass(
+            self, row: 'OrderRow', port: 'PositionPort', now_ms: int,
+    ) -> list['OrderRow']:
+        """Read the legs and write the two halves of one netting pass of ``row``.
+
+        Run while the pass owns the record and the symbol's closes
+        (:meth:`_plan_netting_one`).
+
+        :return: The breadcrumbs written; empty when nothing could be netted.
+        """
+        journal = self._close_journal
+        coid = row.client_order_id
+        symbol = row.symbol
+        fill_side = row.side
+        opposing_side = 'sell' if fill_side == 'buy' else 'buy'
+        extras = dict(row.extras or {})
+        raw_legs = await _read_legs(port, symbol)
+        view = await self._reserved_view(port, symbol, raw_legs, own_parent=None)
+        opposing = sum(leg.qty for leg in view if leg.side == opposing_side and leg.qty > 0.0)
+        own_side = sum(leg.qty for leg in view if leg.side == fill_side and leg.qty > 0.0)
+        qty = min(row.qty, opposing, own_side)
+        if qty <= _QTY_EPS:
+            since = int(extras.get(EXTRAS_KEY_NETTING_SINCE_MS) or now_ms)
+            if opposing > _QTY_EPS and now_ms - since < BOOK_INCOMPLETE_GRACE_S * 1000.0:
+                # The fill's own leg is not in the read yet.
+                return []
+            if opposing > _QTY_EPS:
+                _blog_warning(
+                    "%s: netting %r stops with %s left: the read shows no exposure on "
+                    "the fill's side (%s) %.0fs after the fill; the opposing legs stay",
+                    symbol, coid, row.qty, fill_side, (now_ms - since) / 1000.0,
+                )
+            journal.upsert_order(coid, qty=0.0)
+            return []
+        opposing_closes, _ = select_legs_for_close(qty, view, opposing_side)
+        own_closes, _ = select_legs_for_close(qty, view, fill_side, entry_id=row.pine_entry_id)
+        quantize = await _read_quantizer(port, symbol)
+        if not getattr(port, 'supports_partial_leg_close', True):
+            widened = self._widen_netting_closes(
+                opposing_closes, own_closes, view, quantize, symbol=symbol, coid=coid,
+                netted=qty, opposing=opposing, own_side=own_side,
+            )
+            if widened is None:
+                journal.upsert_order(coid, qty=0.0)
+                return []
+            opposing_closes, own_closes = widened
+        # The fills come back on the broker grid: what each half nets is the
+        # netted quantity as far as its snapped closes carry it.
+        netted = {
+            fill_side: min(qty, _grid_qty(sum(close.qty for close in opposing_closes), quantize)),
+            opposing_side: min(qty, _grid_qty(sum(close.qty for close in own_closes), quantize)),
+        }
+        if min(netted.values()) <= _QTY_EPS:
+            journal.upsert_order(coid, qty=0.0)
+            return []
+        passes = int(extras.get(EXTRAS_KEY_NETTING_PASSES) or 0) + 1
+        expected = dict(extras.get(EXTRAS_KEY_NETTING_EXPECTED) or {})
+        for side, part in netted.items():
+            expected[side] = round(float(expected.get(side) or 0.0) + part, 12)
+        extras[EXTRAS_KEY_NETTING_PASSES] = passes
+        extras[EXTRAS_KEY_NETTING_EXPECTED] = expected
+        extras.pop(EXTRAS_KEY_NETTING_SETTLED_MS, None)
+        halves: list[str] = []
+        intent_key = row.intent_key or coid
+        with journal.transaction():
+            # A close fanned while the legs were read may have marked the
+            # record contended since.
+            latest = journal.get_order(coid)
+            contended = (latest.extras or {}).get(EXTRAS_KEY_NETTING_CONTENDED) \
+                if latest is not None else None
+            if contended:
+                extras[EXTRAS_KEY_NETTING_CONTENDED] = contended
+            for tag, side, closes in (('a', fill_side, opposing_closes),
+                                      ('b', opposing_side, own_closes)):
+                parent = f"{coid}:p{passes}{tag}"
+                create_residual_open_row(
+                    journal, coid=f"{parent}:residual", symbol=symbol, side=side, qty=0.0,
+                    intent_key=intent_key, pine_entry_id=row.pine_entry_id or '',
+                    entry_coid=parent, run_tag='', bar_ts_ms=0, retry_seq=0,
+                    close_plan=[(close.leg_id, close.qty) for close in closes],
+                    netting=coid,
+                )
+                halves.append(f"{parent}:residual")
+            journal.upsert_order(
+                coid, qty=round(max(0.0, row.qty - min(netted.values())), 12), extras=extras)
+        _blog_info(
+            "%s: netting %s of the filled %s entry %r against the opposing legs "
+            "(closes %s and %s)",
+            symbol, qty, fill_side, row.pine_entry_id,
+            [(close.leg_id, close.qty) for close in opposing_closes],
+            [(close.leg_id, close.qty) for close in own_closes],
+        )
+        written = [journal.get_order(half) for half in halves]
+        return [half for half in written if half is not None]
+
+    @staticmethod
+    def _widen_netting_closes(
+            opposing_closes: tuple[LegClose, ...], own_closes: tuple[LegClose, ...],
+            legs: list[PositionLeg], quantize, *, symbol: str, coid: str, netted: float,
+            opposing: float, own_side: float,
+    ) -> tuple[tuple[LegClose, ...], tuple[LegClose, ...]] | None:
+        """Turn a netting pass into whole-leg closes on a port that cannot reduce a leg.
+
+        Every sliced leg of either half is closed whole: a close is a
+        risk-reducing request, so where it cannot be met exactly it is met in
+        full. The pass keeps the net position on its side and never larger
+        (the venue may end smaller than the book, and the close fills beyond
+        the netted quantity then move the book like any close); a widening
+        that would leave a larger net, or the other side, is not sent and the
+        record stops with a warning, leaving both sides open. A leg whose
+        venue position also holds exposure the run does not own
+        (:attr:`~PositionLeg.venue_qty`) cannot be closed whole either. A
+        widened pass is reported in one warning with the legs it closes and
+        the net it leaves.
+
+        :return: The two halves, or ``None`` when the pass cannot be sent.
+        """
+        live_by_id = {leg.leg_id: leg for leg in legs}
+
+        def whole(closes: tuple[LegClose, ...]) -> tuple[LegClose, ...] | None:
+            out: list[LegClose] = []
+            for close in closes:
+                leg = live_by_id.get(close.leg_id)
+                if leg is None:
+                    return None
+                venue_size = leg.venue_qty if leg.venue_qty is not None else leg.qty
+                if quantize(venue_size) > quantize(leg.qty):
+                    return None
+                out.append(close if quantize(close.qty) >= quantize(leg.qty)
+                           else LegClose(leg_id=close.leg_id, qty=leg.qty))
+            return tuple(out)
+
+        whole_opposing = whole(opposing_closes)
+        whole_own = whole(own_closes)
+        intended = opposing - own_side
+        if whole_opposing is None or whole_own is None:
+            _blog_warning(
+                "%s: netting %r is not sent: this broker only closes a whole position "
+                "on a hedging account, and a leg to net also holds exposure this run "
+                "does not own; both sides stay open (net %s)",
+                symbol, coid, intended,
+            )
+            return None
+        closed_opposing = sum(close.qty for close in whole_opposing)
+        closed_own = sum(close.qty for close in whole_own)
+        after = intended - (closed_opposing - closed_own)
+        tolerance = _QTY_EPS * max(1.0, abs(intended))
+        if (abs(after) > abs(intended) + tolerance
+                or (after * intended < 0.0 and abs(after) > tolerance)
+                or (abs(intended) <= tolerance < abs(after))):
+            _blog_warning(
+                "%s: netting %r is not sent: this broker only closes a whole leg on a "
+                "hedging account, and closing legs %s and %s whole would leave the net "
+                "at %s instead of %s; both sides stay open",
+                symbol, coid, [c.leg_id for c in whole_opposing],
+                [c.leg_id for c in whole_own], after, intended,
+            )
+            return None
+        if closed_opposing > netted + tolerance or closed_own > netted + tolerance:
+            _blog_warning(
+                "%s: netting %r closes legs %s and %s whole (%s and %s for the %s to "
+                "net): this broker only closes a whole leg on a hedging account, so "
+                "the net position ends at %s instead of %s",
+                symbol, coid, [c.leg_id for c in whole_opposing],
+                [c.leg_id for c in whole_own], closed_opposing, closed_own, netted,
+                after, intended,
+            )
+        return whole_opposing, whole_own
 
     @staticmethod
     def _ownership_coid(intent_key: str, leg_id: str) -> str:
@@ -3540,8 +4287,10 @@ class OneWayEmulator:
         residual-open breadcrumb with a positive quantity under the same
         parent close) is exempt: the reversal closes the opposing exposure
         whole by design and opens the residual only once those closes are
-        gone. A cut-short reduction or flatten owes no open and stays within
-        the budget.
+        gone. So is a half of a fill-time netting pass
+        (:meth:`drain_nettings`): its closes come in pairs that leave the net
+        position as it is. A cut-short reduction or flatten owes no open and
+        stays within the budget.
 
         :return: ``True`` when every pending row was settled, ``False`` when the
             exchange refused at least one re-dispatch or the evidence could not
@@ -3559,7 +4308,7 @@ class OneWayEmulator:
         reversals = {
             row.client_order_id.removesuffix(':residual')
             for row in iter_active_residual_opens(self._store_ctx)
-            if row.qty > 0.0
+            if row.qty > 0.0 or (row.extras or {}).get(EXTRAS_KEY_RESIDUAL_OPEN_NETTING)
         }
         settled = True
         for symbol, rows in by_symbol.items():
@@ -4303,8 +5052,8 @@ class OneWayEmulator:
         venue state is not trusted after a restart, so it is never skipped as
         unchanged. The protection covers the leg's surviving quantity only, so
         a leg the venue bracket cannot be sized for goes back under the
-        software leg guard (:meth:`_protect_leg`); its trailing stop starts
-        again from the current price.
+        software leg guard (:meth:`_protect_leg`); its trailing stop resumes
+        from the extreme its rows persisted (:meth:`software_guard_triggers`).
 
         :return: ``False`` when the venue refused the re-assert because the
             market is closed or throttled the call, ``True`` otherwise.

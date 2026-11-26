@@ -473,6 +473,72 @@ def __test_a_reduction_found_at_a_plain_startup_is_an_error_once__(
         further.close()
 
 
+@dataclass
+class _RecoveringBroker(_Broker):
+    """A broker whose plugin reports a pending fill recovery while ``recovering`` is set."""
+    recovering: bool = True
+    asked: list[frozenset] = field(default_factory=list)
+
+    def fill_recovery_pending(self, entry_ids) -> bool:
+        self.asked.append(frozenset(entry_ids))
+        return self.recovering
+
+
+def __test_a_startup_reduction_a_recovered_fill_explains_is_not_an_error__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The close the plugin recovers after the startup reconcile explains the reduction."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        _entry_row(ctx, "row-l", "L", 1.0)
+        broker = _RecoveringBroker(position=_long(0.7))
+        engine, pos = _engine(broker, ctx)
+        engine.reconcile()
+
+        assert broker.asked == [frozenset({"L"})]
+        assert not _errors(caplog, "startup:")
+        assert _events(ctx, 'startup_unattributed_reduce') == []
+        _go_periodic(engine)
+        engine.reconcile()
+        assert not _errors(caplog, "startup:"), "held while the plugin still recovers"
+
+        # The plugin books the recovered close against its row, then settles.
+        ctx.upsert_order("row-l", symbol=SYMBOL, side="buy", qty=1.0, state="confirmed",
+                         pine_entry_id="L", filled_qty=1.0,
+                         extras={"kind": "position", JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY: 0.3})
+        broker.recovering = False
+        engine.reconcile()
+        engine.reconcile()
+
+        assert not _errors(caplog, "startup:")
+        assert _events(ctx, 'startup_unattributed_reduce') == []
+        ctx.close()
+
+
+def __test_a_startup_reduction_no_recovered_fill_explains_is_an_error_once__(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        _entry_row(ctx, "row-l", "L", 1.0)
+        broker = _RecoveringBroker(position=_long(0.7))
+        engine, pos = _engine(broker, ctx)
+        engine.reconcile()
+        _go_periodic(engine)
+        engine.reconcile()
+        assert not _errors(caplog, "startup:")
+
+        broker.recovering = False
+        engine.reconcile()
+        engine.reconcile()
+
+        assert len(_errors(caplog, "startup: the venue holds 0.7")) == 1
+        audit = _events(ctx, 'startup_unattributed_reduce')
+        assert len(audit) == 1
+        assert (audit[0]['journal_owned'], audit[0]['venue_signed']) == (1.0, 0.7)
+        ctx.close()
+
+
 @pytest.mark.parametrize("resumed", [False, True], ids=["plain", "resumed"])
 def __test_a_later_reduction_of_the_same_size_is_reported_again__(
         tmp_path: Path, caplog: pytest.LogCaptureFixture, resumed: bool,

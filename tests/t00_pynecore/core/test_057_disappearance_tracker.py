@@ -107,6 +107,25 @@ def _confirm_const(
     return _confirm
 
 
+def _storing_sink(
+        ctx: RunContext, record: Callable[[str, dict, QuarantineKind], None],
+) -> Callable[..., None]:
+    """A quarantine sink that stores the latch in ``ctx``, as the engine's sink does.
+
+    ``record`` receives every request; the latch is written with
+    :meth:`~pynecore.core.broker.storage.RunContext.record_quarantine`, so
+    :meth:`~pynecore.core.broker.storage.RunContext.intervention_latch_stored`
+    answers ``True`` after the first request.
+    """
+    def _sink(reason: str, context: dict, *, kind: QuarantineKind) -> None:
+        record(reason, context, kind)
+        ctx.record_quarantine(
+            "dt-test-quarantine", kind=str(kind), reason=reason, intent_key=None,
+            context=context, entered_ts_ms=int(T0 * 1000),
+        )
+    return _sink
+
+
 def _make_tracker(
         ctx: RunContext, *,
         policy: str = 'stop',
@@ -385,7 +404,8 @@ def __test_policy_stop_with_quarantine_hook_does_not_halt__(
         latched: list[tuple[str, dict, QuarantineKind]] = []
         tracker = _make_tracker(
             ctx, policy='stop',
-            request_quarantine=lambda r, c, *, kind: latched.append((r, c, kind)),
+            request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c, kind))),
         )
         events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
         assert [ev.event_type for ev in events] == ['cancelled']
@@ -403,6 +423,46 @@ def __test_policy_stop_with_quarantine_hook_does_not_halt__(
         # re-fires the already-latched quarantine for the retired row.
         assert _run(_drain(tracker, {'working': set()}, T_EXPIRED + 1.0)) == []
         assert len(latched) == 1
+
+
+def __test_an_unexpected_cancel_stays_live_until_its_latch_is_stored__(
+        tmp_path: Path,
+) -> None:
+    """``stop`` retires the row only after the latch is stored: a sink whose
+    store write failed (the latch holds in memory only) leaves the row live and
+    stamped, a restart still finds it live, and the pass after the write
+    landed retires it with the cancelled event."""
+    path = tmp_path / "broker.sqlite"
+    requests: list[QuarantineKind] = []
+    with BrokerStore(path, plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
+        tracker = _make_tracker(
+            ctx, policy='stop',
+            request_quarantine=lambda r, c, *, kind: requests.append(kind),
+        )
+        assert _run(_drain(tracker, {'working': set()}, T_EXPIRED)) == []
+        assert requests == [QuarantineKind.EXTERNAL_INTERVENTION]
+        assert tracker.pending_halt is None
+        row = ctx.get_order("c1")
+        assert row is not None and row.closed_ts_ms is None
+        assert (row.extras or {}).get(MISSING_PENDING_EXTRA) == T0
+        assert _read_events(ctx, 'unexpected_cancel') == []
+        assert len(_read_events(ctx, 'missing_pending_latch_not_stored')) == 1
+    with BrokerStore(path, plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        row = ctx.get_order("c1")
+        assert row is not None and row.closed_ts_ms is None
+        tracker = _make_tracker(
+            ctx, policy='stop',
+            request_quarantine=_storing_sink(ctx, lambda r, c, kind: requests.append(kind)),
+        )
+        events = _run(_drain(tracker, {'working': set()}, T_EXPIRED + 1.0))
+        assert [ev.event_type for ev in events] == ['cancelled']
+        assert ctx.intervention_latch_stored()
+        row = ctx.get_order("c1")
+        assert row is not None and row.closed_ts_ms is not None
+        assert len(_read_events(ctx, 'unexpected_cancel')) == 1
 
 
 def __test_venue_driven_cancel_retires_with_reason_and_no_policy__(
@@ -428,7 +488,7 @@ def __test_venue_driven_cancel_retires_with_reason_and_no_policy__(
                     MissingResolution.CANCELLED,
                     cancel_reason=CANCEL_REASON_VENUE_REDUCE_ONLY,
                 )),
-                request_quarantine=lambda r, c, *, kind: latched.append(kind),
+                request_quarantine=_storing_sink(ctx, lambda r, c, kind: latched.append(kind)),
             )
             events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
             assert [ev.event_type for ev in events] == ['cancelled']
@@ -466,7 +526,7 @@ def __test_retire_hook_keeps_a_partially_filled_row_live__(tmp_path: Path) -> No
         latched: list[QuarantineKind] = []
         tracker = _make_tracker(
             ctx, policy='stop', retire_cancelled_row=_keep_live,
-            request_quarantine=lambda r, c, *, kind: latched.append(kind),
+            request_quarantine=_storing_sink(ctx, lambda r, c, kind: latched.append(kind)),
         )
         events = _run(_drain(tracker, {'working': set()}, T_EXPIRED))
         assert [ev.event_type for ev in events] == ['cancelled']
@@ -646,6 +706,50 @@ def __test_confirm_closed_retires_row_and_siblings_without_event__(
         assert sibling is not None and sibling.closed_ts_ms is not None
         retired = _read_events(ctx, 'reconcile_filled_then_closed_retired')
         assert len(retired) == 1
+
+
+@pytest.mark.parametrize('callback_fails', [False, True], ids=['commits', 'rolls_back'])
+def __test_the_sibling_callback_runs_inside_the_retiring_transaction__(
+        tmp_path: Path, callback_fails: bool,
+) -> None:
+    """``sibling_coids`` runs inside the store transaction that retires the row.
+
+    A guarantee plugins build on: a journal write the callback makes (a
+    record of the vanished close, say) commits with the row's retirement, and
+    rolls back with it when the retirement does not complete. The callback
+    sees the row already retired.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_run(store)
+        _seed_row(ctx, "c1", filled=1.0,
+                  extras={MISSING_PENDING_EXTRA: T0, 'position_id': 'P1'})
+
+        def _siblings(origin: OrderRow, _conf: MissingConfirmation) -> list[str]:
+            assert store._conn.in_transaction
+            retired = ctx.get_order(origin.client_order_id)
+            assert retired is not None and retired.closed_ts_ms is not None
+            ctx.log_event('plugin_vanished_record', client_order_id=origin.client_order_id)
+            if callback_fails:
+                raise RuntimeError("the plugin's own write failed")
+            return []
+
+        tracker = _make_tracker(
+            ctx,
+            confirm=_confirm_const(MissingConfirmation(
+                MissingResolution.CLOSED, position_ref='P1')),
+            sibling_coids=_siblings,
+        )
+        if callback_fails:
+            with pytest.raises(RuntimeError):
+                _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        else:
+            _run(_drain(tracker, {'working': set()}, T_EXPIRED))
+        row = ctx.get_order("c1")
+        assert row is not None
+        assert (row.closed_ts_ms is None) is callback_fails
+        assert len(_read_events(ctx, 'plugin_vanished_record')) == (0 if callback_fails else 1)
+        assert len(_read_events(ctx, 'reconcile_filled_then_closed_retired')) == (
+            0 if callback_fails else 1)
 
 
 def _close_event(deal_id: str, qty: float, price: float) -> OrderEvent:
@@ -1213,7 +1317,8 @@ def __test_a_cancel_stamped_before_a_resume_is_retired_without_the_policy__(
         _seed_row(ctx, "c1")
         latched: list = []
         tracker = _make_tracker(
-            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+            ctx, request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c))))
         _run(_drain(tracker, {'working': set()}, T0))
         assert accept_missing_before_resume(ctx) == 1
 
@@ -1235,7 +1340,8 @@ def __test_a_cancel_stamped_again_after_a_resume_applies_the_policy__(
         _seed_row(ctx, "c1")
         latched: list = []
         tracker = _make_tracker(
-            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+            ctx, request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c))))
         _run(_drain(tracker, {'working': set()}, T0))
         accept_missing_before_resume(ctx)
         # The order comes back, then vanishes again after the resume.
@@ -1257,7 +1363,8 @@ def __test_a_cancel_first_seen_after_a_resume_is_accepted__(tmp_path: Path) -> N
         _seed_row(ctx, "c1")
         latched: list = []
         tracker = _make_tracker(
-            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+            ctx, request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c))))
         assert accept_missing_before_resume(ctx) == 1
 
         _run(_drain(tracker, {'working': set()}, T0))
@@ -1275,7 +1382,8 @@ def __test_a_row_seen_after_a_resume_loses_the_acceptance__(tmp_path: Path) -> N
         _seed_row(ctx, "c1")
         latched: list = []
         tracker = _make_tracker(
-            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+            ctx, request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c))))
         accept_missing_before_resume(ctx)
         # An incomplete snapshot proves nothing: the acceptance survives it.
         _run(_drain(tracker, {}, T0))
@@ -1315,7 +1423,8 @@ def __test_a_plugin_stamp_right_after_a_resume_is_the_accepted_first_absence__(
         _seed_row(ctx, "c1", eoid=None)
         latched: list = []
         tracker = _make_tracker(
-            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+            ctx, request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c))))
         accept_missing_before_resume(ctx, resumed_at=T0)
         _plugin_stamp(ctx, "c1", T0 + 20.0)
 
@@ -1334,7 +1443,8 @@ def __test_a_plugin_stamp_long_after_a_resume_is_judged_as_usual__(tmp_path: Pat
         _seed_row(ctx, "c1", eoid=None)
         latched: list = []
         tracker = _make_tracker(
-            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+            ctx, request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c))))
         accept_missing_before_resume(ctx, resumed_at=T0)
         _run(_drain(tracker, {'working': None}, T0 + 1.0))
         row = ctx.get_order("c1")
@@ -1360,7 +1470,8 @@ def __test_a_late_plugin_stamp_within_an_unexpired_mark_is_judged_as_usual__(
         _seed_row(ctx, "c1", eoid=None)
         latched: list = []
         tracker = _make_tracker(
-            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+            ctx, request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c))))
         accept_missing_before_resume(ctx, resumed_at=T0)
         late = T0 + RESUME_FIRST_ABSENCE_WINDOW_S + 1.0
         _plugin_stamp(ctx, "c1", late)
@@ -1379,7 +1490,8 @@ def __test_an_accepted_stamp_the_plugin_cleared_loses_the_acceptance__(
         _seed_row(ctx, "c1", eoid=None, extras={MISSING_PENDING_EXTRA: T0})
         latched: list = []
         tracker = _make_tracker(
-            ctx, request_quarantine=lambda *a, **k: latched.append(a))
+            ctx, request_quarantine=_storing_sink(
+                ctx, lambda r, c, kind: latched.append((r, c))))
         accept_missing_before_resume(ctx, resumed_at=T0 + 1.0)
         _plugin_clear(ctx, "c1")
         _run(_drain(tracker, {'working': None}, T0 + 2.0))

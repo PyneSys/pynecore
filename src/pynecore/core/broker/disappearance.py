@@ -53,7 +53,10 @@ that core:
   raising here instead would tear down the very event stream the
   quarantine invariant requires to keep running. Only the explicit
   ``halt`` policy (or a quarantining policy with no hook wired — the
-  fail-safe fallback) arms the process-exiting halt. Persistence and
+  fail-safe fallback) arms the process-exiting halt. ``stop`` latches
+  before the row is retired, and a row whose latch is not stored yet stays
+  live (stamped) until it is: a closed row must never outlive, across a
+  restart, the latch that blocks the venue writes. Persistence and
   policy application run BEFORE the event is yielded, so neither depends
   on the consumer pulling another element from the generator; a pending
   halt survives an abandoned generator and re-raises on the next
@@ -183,6 +186,12 @@ _QTY_EPS = 1e-9
 def _is_fully_filled(row: 'OrderRow') -> bool:
     """``True`` when the row's cumulative fill consumed its full quantity."""
     return row.qty > 0.0 and row.filled_qty >= row.qty - _QTY_EPS
+
+
+def _usable_fill_price(confirmation: 'MissingConfirmation') -> bool:
+    """``True`` when the confirmation's fill price can book a slice (finite, positive)."""
+    price = confirmation.fill_price
+    return price is not None and math.isfinite(price) and price > 0.0
 
 
 def _is_stamp(value: Any) -> TypeGuard[float]:
@@ -551,14 +560,23 @@ class DisappearanceTracker:
         as naturally closed). Checked on every pass, both phases.
     :param request_quarantine: Sink that latches the engine's quarantine
         state (``(reason, context, *, kind)``); the runner wires it to
-        ``OrderSyncEngine.record_quarantine``. Used by the ``stop`` policy.
-        When it is missing (or raises), the policy falls back to arming the
-        process-exiting halt — fail-safe, never fail-open into continued
-        trading.
+        ``OrderSyncEngine.record_quarantine``. Used by the ``stop`` policy,
+        which requests the latch BEFORE it retires the row and retires it only
+        once :meth:`~pynecore.core.broker.storage.RunContext.intervention_latch_stored`
+        answers ``True``; until then the row keeps its stamp and is confirmed
+        again on the next pass. A sink must therefore store the latch in
+        ``store_ctx`` (the engine's sink does). When it is missing (or
+        raises), the policy falls back to arming the process-exiting halt —
+        fail-safe, never fail-open into continued trading.
     :param sibling_coids: Maps a :data:`MissingResolution.CLOSED` row to
         the client-order-ids of live sibling rows sharing its position
         (a netting account merges pyramid entries onto one position id);
-        they are retired in the same transaction.
+        they are retired in the same transaction. Guaranteed: the callback
+        runs inside the store transaction that retires the row, after the
+        row's terminal close and its audit event, so a journal write it makes
+        commits with the retirement and rolls back with it, and an exception
+        it raises rolls the whole retirement back and propagates. It must not
+        call the venue.
     :param register_executions: Called with the confirmation's
         ``execution_ids`` after a fill slice was actually booked or the
         row was retired on a terminal resolution, so the plugin can seed
@@ -690,6 +708,16 @@ class DisappearanceTracker:
             if (now_ts - since_ts) < self._grace_s:
                 continue
             confirmation = await self._confirm_missing(row)
+            latched_first = self._latches_before_retirement(row, since_ts, confirmation)
+            if latched_first:
+                # The latch is what blocks the venue writes once the row is
+                # closed, so it must survive a restart before the row is
+                # retired: a closed row and a latch lost with the process
+                # would let the script re-send the cancelled order.
+                self._apply_policy(row)
+                if self._pending_halt is None and not self._store.intervention_latch_stored():
+                    self._defer_until_latch_stored(row)
+                    continue
             events, applied, register_ids, applied_row = self._apply_confirmation(
                 row, since_ts, confirmation, now_ts,
             )
@@ -709,6 +737,7 @@ class DisappearanceTracker:
                         row.client_order_id,
                     )
             if (applied
+                    and not latched_first
                     and confirmation.resolution is MissingResolution.CANCELLED
                     and confirmation.cancel_reason not in VENUE_DRIVEN_CANCEL_REASONS
                     and not _is_fully_filled(hook_row)
@@ -921,10 +950,7 @@ class DisappearanceTracker:
             cumulative = self._clamped_cumulative(fresh, confirmation)
             new_qty = 0.0 if cumulative is None else cumulative - fresh.filled_qty
             has_new_fill = new_qty > _QTY_EPS
-            if has_new_fill and not (
-                    confirmation.fill_price is not None
-                    and math.isfinite(confirmation.fill_price)
-                    and confirmation.fill_price > 0.0):
+            if has_new_fill and not _usable_fill_price(confirmation):
                 # Fail-closed: a fill we cannot price (missing, non-finite,
                 # or non-positive) would be dropped by the engine's
                 # record_fill yet still advance the store and seed dedup.
@@ -1208,6 +1234,67 @@ class DisappearanceTracker:
         }
 
     # --- Policy ---------------------------------------------------------------
+
+    def _latches_before_retirement(
+            self, row: 'OrderRow', since: float, confirmation: MissingConfirmation,
+    ) -> bool:
+        """Whether the confirmation retires an unexpected cancel the ``stop`` latch must guard.
+
+        ``True`` for a :data:`MissingResolution.CANCELLED` verdict that
+        :meth:`_apply_confirmation` would retire as an intervention under the
+        ``stop`` policy with a wired sink: no venue-driven cause, no operator
+        resume accepting it, a priced (or no) fill slice, and a row the slice
+        does not fill completely. The prediction reads the row as it stands
+        now; a fill that lands before the retirement can only make the row
+        fully filled, so a wrong prediction latches a quarantine the operator
+        resumes, never retires a row unguarded.
+        """
+        if (self._policy != 'stop'
+                or self._request_quarantine is None
+                or confirmation.resolution is not MissingResolution.CANCELLED
+                or confirmation.cancel_reason in VENUE_DRIVEN_CANCEL_REASONS):
+            return False
+        fresh = self._store.get_order(row.client_order_id)
+        if (fresh is None or fresh.closed_ts_ms is not None
+                or (fresh.extras or {}).get(MISSING_PENDING_EXTRA) != since
+                or _accepted_by_resume(fresh, since)):
+            return False
+        cumulative = self._clamped_cumulative(fresh, confirmation)
+        filled = fresh.filled_qty if cumulative is None else cumulative
+        if filled - fresh.filled_qty > _QTY_EPS and not _usable_fill_price(confirmation):
+            return False
+        return not (fresh.qty > 0.0 and filled >= fresh.qty - _QTY_EPS)
+
+    def _defer_until_latch_stored(self, row: 'OrderRow') -> None:
+        """Keep a confirmed unexpected cancel's row live until its latch is stored.
+
+        The quarantine was requested and holds in this process, but its store
+        write failed (the engine retries it). Retiring the row now would leave
+        nothing blocking the venue writes after a restart, so the row keeps its
+        stamp, like an inconclusive re-check, and the next pass confirms it
+        again. Never raises: the audit write runs on the store that just
+        failed.
+        """
+        coid = row.client_order_id
+        key = (coid, 'missing_pending_latch_not_stored')
+        if key in self._warned_deferred:
+            return
+        logger.warning(
+            "grace-expired row %r left un-retired: the external-intervention "
+            "quarantine is not stored yet, retiring the row now would leave the "
+            "venue writes unblocked after a restart", coid,
+        )
+        # noinspection PyBroadException
+        try:
+            self._store.log_event(
+                'missing_pending_latch_not_stored',
+                client_order_id=coid,
+                exchange_order_id=row.exchange_order_id,
+            )
+        except Exception:
+            logger.exception("the deferred retirement of %r could not be audited", coid)
+            return
+        self._warned_deferred.add(key)
 
     def _apply_policy(self, row: 'OrderRow') -> None:
         """Apply the ``on_unexpected_cancel`` policy for a confirmed cancel.

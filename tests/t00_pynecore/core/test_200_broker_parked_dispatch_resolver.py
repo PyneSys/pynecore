@@ -29,6 +29,7 @@ from pynecore.core.broker.store_helpers import (
     STATE_REJECTED,
     STATE_SUBMITTED,
     create_entry_order_row,
+    is_proven_refusal,
 )
 
 COID = 'coid-parked'
@@ -294,3 +295,26 @@ def __test_a_failed_inherited_park_parks_none_and_the_next_call_parks_all__(
 
         assert sorted(park_inherited_dispatches(ctx)) == sorted([INHERITED, second])
         assert park_inherited_dispatches(ctx) == []
+
+
+@pytest.mark.parametrize(('outcome', 'proven'), [
+    (ParkedOutcome.ABSENT, False), (ParkedOutcome.REFUSED, True),
+], ids=['absent', 'refused'])
+def __test_a_rejection_inferred_from_absence_is_not_a_proven_refusal__(
+        tmp_path: Path, outcome: ParkedOutcome, proven: bool) -> None:
+    """A row rejected because the venue lookups did not find it carries the
+    absence mark, so a reader that needs proof the order never executed
+    (:func:`~pynecore.core.broker.store_helpers.is_proven_refusal`) does not
+    take it for one; a refusal the venue stated is proof."""
+    with BrokerStore(tmp_path / 'broker.sqlite', plugin_name='Test') as store:
+        ctx = _open_ctx(store)
+        _park(ctx)
+
+        async def lookup(_row: OrderRow) -> ParkedVerdict:
+            return ParkedVerdict(outcome)
+
+        assert asyncio.run(_resolver().resolve(ctx, lookup)) == [COID]
+        row = ctx.get_order(COID)
+        assert row is not None
+        assert row.state == STATE_REJECTED
+        assert is_proven_refusal(row) is proven

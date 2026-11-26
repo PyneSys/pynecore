@@ -12,6 +12,7 @@ import asyncio
 import io
 import logging
 import re
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker.sync_engine import OrderSyncEngine
+from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.lib import log as log_module
 from pynecore.lib.log import DURABLE_LOG_WIDTH
 
@@ -324,3 +326,48 @@ def __test_a_failed_audit_of_a_further_intervention_never_stops_the_process__(
         assert engine.venue_writes_blocked and engine.quarantine_id == quarantine_id
         assert any("could not be audited" in line for line in _lines(durable_sink))
         ctx.close()
+
+
+def __test_a_durable_intervention_request_answers_whether_the_latch_survives_a_restart__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The plugin-facing request reports ``False`` until the store holds the latch.
+
+    The latch's store write fails: the engine holds the latch in memory and
+    owes the write, and the request answers ``False``, so a plugin keeps the
+    state only the latch guards. Once the owed write lands the same request
+    answers ``True``. A latch whose resume the operator requested blocks
+    nothing across a restart and answers ``False`` again.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine = _engine(ctx)
+        plugin = SimpleNamespace(quarantine_sink=engine.record_quarantine, store_ctx=ctx)
+        original = ctx.record_quarantine
+
+        def _locked(*_args, **_kwargs) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(ctx, 'record_quarantine', _locked)
+        assert BrokerPlugin.request_durable_intervention_quarantine(
+            plugin, "bot position closed by someone else", {'deal_id': 'd1'}) is False  # type: ignore[arg-type]
+        assert engine.venue_writes_blocked
+        assert ctx.intervention_latch_stored() is False
+
+        monkeypatch.setattr(ctx, 'record_quarantine', original)
+        engine._persist_quarantine()
+        assert BrokerPlugin.request_durable_intervention_quarantine(
+            plugin, "bot position closed by someone else", {'deal_id': 'd1'}) is True  # type: ignore[arg-type]
+
+        quarantine_id = engine.quarantine_id
+        assert quarantine_id is not None
+        store.request_quarantine_resume(ctx.run_id, quarantine_id)
+        assert ctx.intervention_latch_stored() is False
+        ctx.close()
+
+
+def __test_a_durable_intervention_request_without_a_sink_latches_nothing__() -> None:
+    """Without a wired sink nothing latches, so nothing may be retired on it."""
+    plugin = SimpleNamespace(quarantine_sink=None, store_ctx=None)
+    assert BrokerPlugin.request_durable_intervention_quarantine(
+        plugin, "manual close", None) is False  # type: ignore[arg-type]
