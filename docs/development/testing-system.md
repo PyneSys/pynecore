@@ -5,7 +5,7 @@ title: "Testing System"
 description: "Understand PyneCore's testing system, where test scripts run as Pyne code. Review the test structure and how the framework checks behavior in its own runtime."
 icon: "science"
 date: "2025-03-31"
-lastmod: "2026-06-10"
+lastmod: "2026-11-26"
 draft: false
 toc: true
 categories: ["Development"]
@@ -168,6 +168,41 @@ def __test_strat_barupdown__(csv_reader, runner, strat_equity_comparator, log):
 ```
 
 These tests often use CSV reference data that contains expected trading signals, entry/exit points, and strategy performance metrics.
+
+## Default and Exhaustive Runs
+
+`pytest.ini` deselects two markers from every run unless the command line asks for them:
+
+| Marker       | What it marks                                                         | Run it with      |
+|--------------|-----------------------------------------------------------------------|------------------|
+| `live`       | Tests that connect to live exchange websockets                        | `-m live`        |
+| `exhaustive` | The full product of a generated test matrix, beyond its default slice | `-m exhaustive`  |
+
+A `-m` on the command line replaces the default `-m "not live and not exhaustive"`, so `-m exhaustive` runs only the exhaustive cases and `-m ""` runs everything in the selected files.
+
+### Generated matrices: a pairwise slice by default, the full product on demand
+
+A test that crosses several independent dimensions (state, event order, crash point, ...) generates its cases with `itertools.product`. The full product can be tens of thousands of cases, and most of them walk the same code paths. Such a matrix keeps a **pairwise slice** in the default run: a deterministic greedy subset in which every value pair of any two dimensions occurs at least once. Every other case carries the `exhaustive` marker. The slice keeps the harness and the common interactions covered on every run. The full product proves that no combination of three or more dimensions breaks an invariant.
+
+When you add a matrix that grows beyond a few hundred cases, build it the same way: generate the combinations, take the pairwise slice for the default run, and mark the rest `exhaustive`.
+
+### The fill-evidence hold matrix
+
+`__test_the_fill_evidence_hold_matrix__` in `tests/t00_pynecore/core/test_027_cancel_tentative_state.py` crosses every state of the broker engine's fill-evidence hold (`_FillEvidenceHold` in `core/broker/sync_engine.py`) with the next arrival, the strategy's next action, the partial-bracket mode, the timing, a crash and the venue's truth. The default run takes 178 cases out of 34452. The full product takes a few minutes with `-n 8` (about three and a half on an 8-core machine).
+
+Run the full matrix when a change touches any of these:
+
+- the hold, its settlement, its expiry quarantine or the execution awaiting booking (`_defer_entry_terminal_without_fill_evidence`, `_settle_fill_evidence`, `_await_reported_execution`, `_expire_fill_evidence_holds`, `_hold_entry_awaiting_fill_evidence` and the helpers they call in `sync_engine.py`);
+- the stored hold and arrival rows (`ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND`, `ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND` in `core/broker/storage.py`) or their restore on restart (`_restore_fill_evidence_holds`);
+- how the engine routes an order event that reports an execution without its fill (terminal events, cumulative quantities, cancel-tentative entries);
+- the software partial-bracket engine's handling of a held entry's pending legs.
+
+Also run it before a PyneCore release that changes `core/broker/`, and when a default-slice case of the matrix fails: the failing pair usually has neighbours in the full product that show the shape of the bug.
+
+```bash
+cd pynecore && source ../venv/bin/activate && \
+  pytest -n 8 -m exhaustive tests/t00_pynecore/core/test_027_cancel_tentative_state.py
+```
 
 ## Key Testing Components
 

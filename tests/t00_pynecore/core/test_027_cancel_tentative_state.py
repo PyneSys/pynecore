@@ -15,6 +15,7 @@ deterministically.
 """
 import contextlib
 import dataclasses
+import heapq
 import itertools
 import sqlite3
 import time
@@ -3243,8 +3244,9 @@ def _matrix_truths(state: str, arrival: str) -> tuple[float, ...]:
     return (0.0, _MATRIX_EXECUTED)
 
 
-def _matrix_cases() -> list:
-    cases = []
+def _matrix_combinations() -> list[tuple]:
+    """Every consistent ``(state, arrival, action, mode, timing, crash, truth)`` case."""
+    combinations = []
     for state, arrival, action, mode, timing, crash in itertools.product(
             _MATRIX_STATES, _MATRIX_ARRIVALS, _MATRIX_ACTIONS, _MATRIX_MODES,
             _MATRIX_TIMINGS, _MATRIX_CRASHES):
@@ -3252,9 +3254,56 @@ def _matrix_cases() -> list:
             # Only a SOFTWARE entry's cancel becomes a cancel-tentative probe.
             continue
         for truth in _matrix_truths(state, arrival):
-            cases.append(pytest.param(
-                state, arrival, action, mode, timing, crash, truth,
-                id=f"{state}-{arrival}-{action}-{mode}-{timing}-{crash}-x{truth}"))
+            combinations.append((state, arrival, action, mode, timing, crash, truth))
+    return combinations
+
+
+def _matrix_pairwise_slice(combinations: list[tuple]) -> set[tuple]:
+    """A deterministic subset in which every value pair of any two dimensions occurs.
+
+    Greedy set cover: the next case taken is the one covering the most value
+    pairs no case taken before covers, ties broken by generation order. The
+    gains only shrink, so a heap of stale gains re-scores just the popped
+    case (lazy greedy). The slice exercises every state against every
+    arrival, action, mode, timing, crash and truth at a small fraction of
+    the full product.
+    """
+    case_pairs = [frozenset((i, case[i], j, case[j])
+                            for i, j in itertools.combinations(range(len(case)), 2))
+                  for case in combinations]
+    uncovered = set().union(*case_pairs)
+    heap = [(-len(pairs), index) for index, pairs in enumerate(case_pairs)]
+    heapq.heapify(heap)
+    taken: set[tuple] = set()
+    while uncovered:
+        _, index = heapq.heappop(heap)
+        gain = len(case_pairs[index] & uncovered)
+        if gain == 0:
+            continue
+        if heap and (-gain, index) > heap[0]:
+            heapq.heappush(heap, (-gain, index))
+            continue
+        uncovered -= case_pairs[index]
+        taken.add(combinations[index])
+    return taken
+
+
+def _matrix_cases() -> list:
+    """The matrix cases; all but the pairwise slice carry the ``exhaustive`` marker.
+
+    The default run (``-m "not live and not exhaustive"``) takes the slice
+    only. ``-m exhaustive`` runs the rest; see "Exhaustive tests" in
+    ``docs/development/testing-system.md`` for when the full product is due.
+    """
+    combinations = _matrix_combinations()
+    default_slice = _matrix_pairwise_slice(combinations)
+    cases = []
+    for case in combinations:
+        state, arrival, action, mode, timing, crash, truth = case
+        cases.append(pytest.param(
+            *case,
+            id=f"{state}-{arrival}-{action}-{mode}-{timing}-{crash}-x{truth}",
+            marks=() if case in default_slice else pytest.mark.exhaustive))
     return cases
 
 
