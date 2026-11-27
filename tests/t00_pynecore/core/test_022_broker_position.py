@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from pynecore import lib
-from pynecore.core.broker.position import BrokerPosition
+from pynecore.core.broker.position import RECOVERED_EXECUTION_KEEP_S, BrokerPosition
 from pynecore.core.broker.models import (
     ExchangeOrder,
     OrderEvent,
@@ -930,3 +930,61 @@ def __test_the_fill_cursor_counts_the_journal_quantity_of_each_fill__():
     p.record_fill(dataclasses.replace(event, journal_fill_qty=None))
     assert p.size == pytest.approx(1.998)
     assert p.fill_cursor(["e1"]) == 1.0
+
+
+def __test_a_close_excess_survives_the_stored_book_and_closes_the_late_fill_once__():
+    """The part of a venue close the book could not take in is part of the stored book.
+
+    It reads back with the book, a late fill of its order takes it once (the
+    rest stays for a later slice), and a fill of another order takes nothing.
+    """
+    p = BrokerPosition()
+    p.note_close_excess(['held-1'], 0.4, 105.0, 0.02, 7.0)
+    snapshot = BrokerPosition.parse_entry_book_snapshot(
+        {**p.entry_book_snapshot(), 'written_ms': 0})
+    assert snapshot is not None
+    restored = BrokerPosition()
+    restored.restore_entry_book(snapshot)
+    assert restored.close_excess_qty(['held-1']) == pytest.approx(0.4)
+
+    assert restored.take_close_excess(['other'], 0.4) == []
+    (part,) = restored.take_close_excess([None, 'held-1'], 0.3)
+    assert (part.qty, part.price, part.timestamp) == (pytest.approx(0.3), 105.0, 7.0)
+    assert part.fee == pytest.approx(0.015)
+    assert restored.close_excess_qty(['held-1']) == pytest.approx(0.1)
+    assert restored.drop_close_excess(['held-1']) == pytest.approx(0.1)
+    assert restored.take_close_excess(['held-1'], 0.1) == []
+    assert BrokerPosition.parse_entry_book_snapshot(
+        {**restored.entry_book_snapshot(), 'written_ms': 0,
+         'close_excess': [{'order_ids': [], 'qty': 0.1, 'price': 1.0, 'fee': 0.0,
+                           'timestamp': 0.0}]}) is None
+
+
+def __test_an_execution_booked_from_venue_totals_is_taken_once_across_the_stored_book__():
+    """What the venue totals booked reads back with the book; a stream fill of it takes it up.
+
+    The stream's own fills of the order take the recovered quantity once (the
+    rest of a larger fill is reported back), a fill of another order takes
+    nothing, a record older than the keep window is dropped, and a malformed
+    record makes the stored book unreadable.
+    """
+    p = BrokerPosition()
+    p.note_recovered_execution(['coid-1', 'xchg-1'], 0.4, 1000.0)
+    snapshot = BrokerPosition.parse_entry_book_snapshot(
+        {**p.entry_book_snapshot(), 'written_ms': 0})
+    assert snapshot is not None
+    restored = BrokerPosition()
+    restored.restore_entry_book(snapshot)
+
+    assert restored.absorb_recovered_execution(['other'], 0.4) == 0.0
+    assert restored.absorb_recovered_execution([None, 'xchg-1'], 0.3) == pytest.approx(0.3)
+    assert restored.absorb_recovered_execution(['coid-1'], 0.3) == pytest.approx(0.1)
+    assert restored.absorb_recovered_execution(['coid-1'], 0.1) == 0.0
+
+    restored.note_recovered_execution(['xchg-2'], 0.2, 1000.0)
+    restored.note_recovered_execution(['xchg-3'], 0.2, 1000.0 + RECOVERED_EXECUTION_KEEP_S)
+    assert restored.absorb_recovered_execution(['xchg-2'], 0.2) == 0.0
+    assert restored.absorb_recovered_execution(['xchg-3'], 0.2) == pytest.approx(0.2)
+    assert BrokerPosition.parse_entry_book_snapshot(
+        {**restored.entry_book_snapshot(), 'written_ms': 0,
+         'recovered_executions': [{'order_ids': ['x'], 'qty': 0.0, 'timestamp': 0.0}]}) is None

@@ -50,15 +50,27 @@ core bookkeeping a spot broker plugin needs:
   left the balance below the bot's own inventory — someone sold or
   withdrew what the bot holds — latches the external-intervention
   quarantine (process stays alive as an observer, no venue write), which
-  only an operator resume lifts; the explicit ``halt`` policy exits
-  instead. Its epoch is ``taken``: no restart touches the ledger while that
+  only an operator resume lifts. Its epoch is ``taken``: no restart touches the ledger while that
   quarantine holds, and the first start after the resume keeps the part of
-  the bot's inventory the account still holds. The manager's own
-  bookkeeping trouble (an inconclusive startup read, a measurement a
-  baseline is frozen on that never settles, a negative ledger, a lost
-  lease) latches the entry block instead; recovery is a restart, which
-  retires the corrupt ledger stretch and re-anchors a fresh epoch on the
-  venue's measured balance.
+  the bot's inventory the account still holds. The same verdict judges a
+  first start whose account holds less base than the ledger: the first
+  epoch is frozen with no foreign holdings and the shortfall is left to the
+  runtime reconcile. The manager's own bookkeeping trouble (a failed or
+  inconclusive measurement, a negative ledger, a fill id another run
+  booked, the asset lease another run holds) latches the entry block under
+  the cause ``spot_inventory:<product id>`` instead, and the manager gets
+  out of it by itself: every reconcile while it holds measures the venue
+  again (paced from 5 s up to 5 min), and the first measurement that
+  settles re-activates the epoch, books what the history returned, hands
+  those fills to the plugin for delivery and releases the cause
+  (:meth:`SpotInventoryManager._recover_in_process`). A negative ledger
+  that a complete history does not repair is consolidated into one row
+  holding its net inventory. A lease a replacement instance took over is
+  the one block that never ends in-process: this process is the zombie, the
+  replacement runs the bot, so the block is latched under
+  ``fence:spot_inventory:<product id>`` and forbids every venue write of
+  this process, exits and closes included (in memory only, so the
+  replacement is never caught by it).
 
 The manager takes explicit ``now_ms`` timestamps so reconciliation
 timing is fully deterministic under test, mirroring
@@ -71,7 +83,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol
 
 from pynecore.core.broker.exceptions import SpotInventoryConflictError
-from pynecore.core.broker.models import ExchangePosition, QuarantineKind
+from pynecore.core.broker.models import FENCE_CAUSE_PREFIX, ExchangePosition, QuarantineKind
 from pynecore.core.plugin import is_retryable_provider_error
 
 if TYPE_CHECKING:
@@ -84,6 +96,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     'INVENTORY_CONFLICT_POLICIES',
+    'SPOT_INVENTORY_CAUSE_PREFIX',
     'SpotExecution',
     'SpotExecutionBatch',
     'SpotInventoryPort',
@@ -99,8 +112,9 @@ logger = logging.getLogger(__name__)
 #: Valid ``on_inventory_conflict`` policies. Deliberately narrower than
 #: the ``on_unexpected_cancel`` set: ``re_place`` would buy back an
 #: operator's withdrawal and ``ignore`` would trade on corrupt books, so
-#: neither is applicable to an attribution conflict.
-INVENTORY_CONFLICT_POLICIES: Final = ('quarantine', 'halt')
+#: neither is applicable to an attribution conflict. No policy ends the
+#: process: the bot runs unattended and stays alive in every outcome.
+INVENTORY_CONFLICT_POLICIES: Final = ('quarantine',)
 
 #: Valid cursor scopes a port may declare for its execution-history API.
 CURSOR_SCOPES: Final = ('account', 'product', 'time')
@@ -121,6 +135,14 @@ _MAX_SETTLE_BALANCE_READS: Final = 3
 #: (:meth:`SpotInventoryManager._in_flight_orders_explaining`) and how long the
 #: span a re-anchor held is read again (:meth:`SpotInventoryManager._reread_held_span`).
 _HISTORY_LAG_CEILING_S: Final = 300.0
+
+#: Pacing of :meth:`SpotInventoryManager._recover_in_process` after a failed
+#: attempt (ms): the delay doubles from the first value up to the cap.
+_RECOVERY_FIRST_DELAY_MS: Final = 5_000
+_RECOVERY_MAX_DELAY_MS: Final = 300_000
+
+#: Prefix of the entry-block cause the manager latches its own trouble under.
+SPOT_INVENTORY_CAUSE_PREFIX: Final = 'spot_inventory:'
 
 
 class _MeasureReasons(NamedTuple):
@@ -526,10 +548,12 @@ class SpotInventoryManager:
 
     Quarantine delivery mirrors the disappearance tracker: the
     ``request_quarantine`` hook latches the engine (process stays alive,
-    ingestion keeps running); the ``halt`` policy — or a missing /
-    raising hook — arms :attr:`pending_halt`, which the plugin's event
-    stream raises so the run exits via the graceful
-    manual-intervention path. Never fail-open.
+    ingestion keeps running); a missing or raising hook arms
+    :attr:`pending_halt` once, which the plugin's event stream raises so
+    the engine latches the quarantine the conflict decided, and a raising
+    hook is tried again on every reconcile while the conflict holds. Never
+    fail-open, and never a process exit. An entry block ends by itself
+    (:meth:`_recover_in_process`).
     """
 
     def __init__(
@@ -540,6 +564,7 @@ class SpotInventoryManager:
             account_id: str,
             symbol: str,
             request_quarantine: 'Callable[..., bool | None] | None' = None,
+            release_quarantine: 'Callable[[str, str], bool] | None' = None,
             on_inventory_conflict: str = 'quarantine',
     ) -> None:
         """
@@ -553,11 +578,18 @@ class SpotInventoryManager:
         :param request_quarantine: The engine quarantine latch, normally
             the plugin's
             :attr:`~BrokerPlugin.quarantine_sink`:
-            called as ``(reason, context)``, plus
-            ``kind=QuarantineKind.EXTERNAL_INTERVENTION`` when the bot's own
+            called as ``(reason, context, cause=...)`` for the manager's own
+            trouble (an entry block under the cause
+            ``spot_inventory:<product id>``), and as ``(reason, context,
+            kind=QuarantineKind.EXTERNAL_INTERVENTION)`` when the bot's own
             inventory was taken.
-        :param on_inventory_conflict: ``'quarantine'`` (default) or
-            ``'halt'``.
+        :param release_quarantine: The release of the entry-block cause,
+            normally the plugin's
+            :attr:`~BrokerPlugin.quarantine_release_sink`: called as
+            ``(cause, resolution)`` once the manager got out of its trouble.
+            Without it the engine's entry block holds until a restart, though
+            the manager itself resumes its checks.
+        :param on_inventory_conflict: ``'quarantine'``, the only policy.
         """
         if on_inventory_conflict not in INVENTORY_CONFLICT_POLICIES:
             raise ValueError(
@@ -602,12 +634,30 @@ class SpotInventoryManager:
         self._account_id = account_id
         self._symbol = symbol
         self._request_quarantine = request_quarantine
-        self._policy = on_inventory_conflict
+        self._release_quarantine = release_quarantine
         self._epoch: 'SpotEpochRow | None' = None
         self._fold = InventoryFold()
         self._quarantined = False
         self._quarantine_reason: str | None = None
+        self._quarantine_kind: QuarantineKind | None = None
+        self._quarantine_message = ''
+        self._quarantine_context: dict[str, Any] = {}
+        # Whether the hook took the held latch (else the signal carried it).
+        self._hook_latched = False
         self._pending_halt: SpotInventoryConflictError | None = None
+        self._cause = f"{SPOT_INVENTORY_CAUSE_PREFIX}{port.product_id}"
+        # The startup returned: the engine has adopted the fold it left.
+        self._startup_done = False
+        # The engine adopted a flat position, not the ledger: the startup
+        # stopped at the asset lease, before reading the ledger.
+        self._ledger_unadopted = False
+        # A replacement instance took the asset lease over: this process is
+        # the zombie and never recovers in-process.
+        self._fenced = False
+        # In-process recovery pacing: the next attempt's time and the
+        # attempts made under the held latch.
+        self._recovery_due_ms: int | None = None
+        self._recovery_attempts = 0
         self._started = False
         self._conflict_hold_coids: frozenset[str] = frozenset()
         # The drift of the pending conflict as this process last measured it,
@@ -632,18 +682,26 @@ class SpotInventoryManager:
         return self._quarantine_reason
 
     @property
+    def quarantine_cause(self) -> str:
+        """The entry-block cause the manager latches its own trouble under."""
+        return self._cause
+
+    @property
     def pending_halt(self) -> SpotInventoryConflictError | None:
-        """Armed process-exit signal (``halt`` policy or hook fallback).
+        """Armed fallback signal of a conflict whose quarantine hook failed.
 
         The plugin's event stream checks this each pass and raises the
-        taken error so the engine's
-        :class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError`
-        handling performs the graceful stop.
+        taken error, and the engine latches the quarantine it carries
+        (:attr:`~SpotInventoryConflictError.kind`)
+        on it; the process stays alive, and nothing halts. An entry block
+        the signal latched is the plugin's report to the engine, which ends
+        it by itself once a reconcile passes without another report and the
+        venue holds what the book holds.
         """
         return self._pending_halt
 
     def consume_pending_halt(self) -> SpotInventoryConflictError | None:
-        """Take (and clear) the armed halt — consume-once."""
+        """Take (and clear) the armed signal — consume-once."""
         halt = self._pending_halt
         self._pending_halt = None
         return halt
@@ -670,7 +728,9 @@ class SpotInventoryManager:
            fresh epoch on that balance. Only a failed measurement keeps
            the quarantine. While the store holds an external-intervention
            quarantine no operator resumed, nothing is recovered: the
-           ledger stays as it is and the manager stays quarantined.
+           ledger stays as it is and the manager stays quarantined. An epoch
+           whose cursor scope no longer matches the port (a plugin upgrade)
+           is recovered the same way right here (:meth:`_rescope_epoch`).
         3. **Execution catch-up** from the epoch's durable cursor (the
            crash window between a venue fill and its local persist is
            closed here). Paged; each page commits its fills and the
@@ -685,14 +745,20 @@ class SpotInventoryManager:
            startup the baseline is frozen as
            ``current_total − reconstructed bot inventory`` (NOT the raw
            total: a crash after fills but before the first epoch write
-           must not launder those fills into the baseline).
+           must not launder those fills into the baseline), never below
+           zero (:meth:`_freeze_first_epoch`). A negative ledger the complete
+           history did not repair is consolidated
+           (:meth:`_consolidate_ledger`).
         5. **Balance invariant** — a drift is not judged here
            (:meth:`_defer_startup_drift`): the execution cursor stays where
            the catch-up began, and the runtime reconcile decides it after
            the settlement grace like any drift.
         6. **Adoption watermark** — every ledger row is folded into the
            position the engine adopts, so all rows flip ``delivered``;
-           none may later re-enter as a live event.
+           none may later re-enter as a live event. A startup that latched
+           the entry block on the way sets the same watermark on the fold it
+           leaves (:meth:`_enter_quarantine`), and the manager recovers from
+           there in-process (:meth:`_recover_in_process`).
         """
         if self._started:
             raise RuntimeError("SpotInventoryManager.startup() already ran")
@@ -706,6 +772,9 @@ class SpotInventoryManager:
         if not self._store.claim_spot_asset(
                 self._account_id, port.base_asset, port.quote_asset,
         ):
+            # The fold stays empty: the engine adopts a flat position, and the
+            # recovery once the lease is free re-anchors on that.
+            self._ledger_unadopted = True
             self._enter_quarantine(
                 'spot_lease_conflict',
                 {
@@ -735,17 +804,11 @@ class SpotInventoryManager:
             self._epoch = epoch
         if epoch is not None and epoch.cursor_scope != port.cursor_scope:
             # A plugin upgrade changed what the persisted cursor means —
-            # trusting it could silently skip history. Fail closed.
-            self._refresh_fold()
-            self._enter_quarantine(
-                'spot_cursor_scope_changed',
-                {
-                    'product_id': port.product_id,
-                    'stored_scope': epoch.cursor_scope,
-                    'port_scope': port.cursor_scope,
-                },
-            )
-            return self._startup_result()
+            # trusting it could silently skip history.
+            epoch = await self._rescope_epoch(epoch)
+            if epoch is None:
+                return self._startup_result()
+            self._epoch = epoch
 
         # (3) Execution catch-up from the durable cursor, settled against
         # the balance read it is compared with. Only the first epoch's
@@ -763,7 +826,10 @@ class SpotInventoryManager:
             epoch = self._store.get_latest_spot_epoch(port.product_id)
             assert epoch is not None
             self._epoch = epoch
-        cursor_before = epoch.exec_cursor if epoch is not None else None
+        cursor_before = (
+            epoch.exec_cursor
+            if epoch is not None and epoch.cursor_scope == port.cursor_scope else None
+        )
         try:
             measured = await self._measure_settled(
                 epoch.exec_cursor if epoch is not None else None,
@@ -784,55 +850,15 @@ class SpotInventoryManager:
         recovered = measured.recovered
         final_cursor = measured.cursor
 
-        # (4) Fold + first-epoch baseline freeze.
+        # (4) Fold + first-epoch baseline freeze. A negative ledger the
+        # complete history just read did not repair is consolidated into its
+        # net inventory.
         self._refresh_fold()
         if self._fold.violation is not None:
-            self._enter_quarantine(
-                'spot_ledger_negative_inventory',
-                {'product_id': port.product_id,
-                 'violation': self._fold.violation},
-            )
-            return self._startup_result()
-
+            epoch = self._consolidate_ledger(epoch, balance, final_cursor)
+            self._epoch = epoch
         if epoch is None:
-            baseline = balance - self._fold.net_base
-            if baseline < -port.base_tolerance:
-                # The account owns less base than the ledger says the bot
-                # holds — a foreign withdrawal or external sale in the
-                # crash window before the first epoch write. Freezing a
-                # negative foreign baseline would make the invariant hold
-                # by construction and synthesize inventory the account
-                # cannot sell. Fail closed instead.
-                self._enter_quarantine(
-                    'spot_baseline_below_inventory',
-                    {
-                        'product_id': port.product_id,
-                        'current_total': canonical_decimal(balance),
-                        'bot_inventory': canonical_decimal(self._fold.net_base),
-                        'implied_baseline': canonical_decimal(baseline),
-                    },
-                )
-                return self._startup_result()
-            with self._store.transaction():
-                epoch = self._store.insert_spot_epoch(
-                    account_id=self._account_id,
-                    base_asset=port.base_asset,
-                    product_id=port.product_id,
-                    foreign_baseline=canonical_decimal(baseline),
-                    cursor_scope=port.cursor_scope,
-                    exec_cursor=final_cursor,
-                    state='active',
-                )
-                self._store.log_event(
-                    'spot_epoch_created',
-                    payload={
-                        'product_id': port.product_id,
-                        'epoch_seq': epoch.epoch_seq,
-                        'foreign_baseline': epoch.foreign_baseline,
-                        'bot_inventory': canonical_decimal(self._fold.net_base),
-                        'current_total': canonical_decimal(balance),
-                    },
-                )
+            epoch = self._freeze_first_epoch(balance, final_cursor)
             self._epoch = epoch
 
         # (5) Balance invariant: a drift is left to the runtime verdict.
@@ -875,6 +901,7 @@ class SpotInventoryManager:
     def _startup_result(
             self, *, recovered: int = 0, adopted: int = 0,
     ) -> SpotStartupResult:
+        self._startup_done = True
         return SpotStartupResult(
             quarantined=self._quarantined,
             reason=self._quarantine_reason,
@@ -886,8 +913,9 @@ class SpotInventoryManager:
 
     def _defer_startup_drift(
             self, balance: Decimal, drift: Decimal, cursor_before: str | None,
+            *, when: str = 'startup',
     ) -> None:
-        """Leave a drift found at startup to the runtime reconcile's verdict.
+        """Leave a drift found at startup (or at an in-process recovery) to the runtime verdict.
 
         A drift after a conclusive catch-up has the same causes at startup as
         at runtime: someone else's activity on the account, judged against the
@@ -904,9 +932,11 @@ class SpotInventoryManager:
         the balance still holds the bot's inventory, the external-intervention
         quarantine when a complete history proves it taken.
 
-        :param balance: The settled startup balance.
+        :param balance: The settled balance.
         :param drift: Its distance from the expected total.
-        :param cursor_before: The epoch's execution cursor before the startup catch-up.
+        :param cursor_before: The epoch's execution cursor before the catch-up.
+        :param when: ``'startup'`` or ``'recovery'``: names the audit event
+            (``spot_<when>_drift_pending``) and the log line.
         """
         port = self._port
         epoch = self._epoch
@@ -915,12 +945,12 @@ class SpotInventoryManager:
             self._store.set_spot_epoch_cursor(port.product_id, epoch.epoch_seq, cursor_before)
             self._epoch = self._store.get_latest_spot_epoch(port.product_id)
         context = self._conflict_context(balance, drift)
-        self._store.log_event('spot_startup_drift_pending', payload=context)
+        self._store.log_event(f'spot_{when}_drift_pending', payload=context)
         logger.warning(
-            "spot inventory: at startup the %s balance of %r is %s, the bot's own inventory %s, "
-            "the expected total off by %s — not judged at startup: the runtime reconcile "
+            "spot inventory: at the %s the %s balance of %r is %s, the bot's own inventory %s, "
+            "the expected total off by %s — not judged now: the runtime reconcile "
             "decides it after the settlement grace (%.1fs), trading continues meanwhile",
-            port.base_asset, port.product_id, context['current_total'],
+            when, port.base_asset, port.product_id, context['current_total'],
             context['bot_inventory'], context['drift'], port.settlement_grace_s,
         )
 
@@ -1114,13 +1144,26 @@ class SpotInventoryManager:
     def _quarantine_foreign_row(
             self, foreign: _ForeignLedgerRow,
     ) -> SpotInventoryConflictError:
-        """Quarantine on a foreign-owned ledger row; build the halt error."""
+        """Quarantine on a foreign-owned ledger row; build the error the caller raises.
+
+        Two runs book the same venue fill: a configuration conflict (two runs
+        trading the same account and base asset from one broker store, which
+        the asset lease should have kept apart). The audit and the log say so
+        in plain words, with both run ids, so it can be diagnosed.
+        """
         self._enter_quarantine(
             'spot_foreign_ledger_row',
             {
                 'product_id': self._port.product_id,
                 'fill_id': foreign.fill_id,
                 'owner_run_id': foreign.owner_run_id,
+                'run_id': self._store.run_id,
+                'diagnosis': (
+                    f"two runs book the same fill {foreign.fill_id!r}: this run "
+                    f"{self._store.run_id!r} and {foreign.owner_run_id!r} — a "
+                    f"configuration conflict, two runs trade account "
+                    f"{self._account_id!r} and {self._port.base_asset} at once"
+                ),
             },
         )
         return SpotInventoryConflictError(
@@ -1196,11 +1239,18 @@ class SpotInventoryManager:
 
         The lease heartbeat is fenced by the physical instance: if a
         replacement instance took the lease over while this (now zombie)
-        process was silent, the heartbeat reports the loss and this run
-        quarantines instead of trading on a lease it no longer holds.
+        process was silent, the heartbeat reports the loss and this process
+        is fenced off every venue write, exits and closes included, under a
+        :data:`~pynecore.core.broker.models.FENCE_CAUSE_PREFIX` cause: the
+        replacement owns the position, and two writers must never act on one.
+        The fence lives in this process only (the replacement is not caught by
+        it) and never ends in-process.
 
-        :return: The ledger rows recovered by a runtime catch-up this
-            cycle, freshly flipped to ``delivered``. The caller (plugin)
+        While the manager holds an entry block of its own trouble, the pass
+        is a recovery attempt instead (:meth:`_recover_in_process`).
+
+        :return: The ledger rows recovered by a runtime catch-up (or by the
+            recovery) this cycle, freshly flipped to ``delivered``. The caller (plugin)
             MUST emit the corresponding
             :class:`~pynecore.core.broker.models.OrderEvent` for each so
             the sync engine's position tracks the recovered fills — the
@@ -1215,7 +1265,12 @@ class SpotInventoryManager:
         lease_held = self._store.heartbeat_spot_asset(
             self._account_id, self._port.base_asset,
         )
-        if not self._quarantined and self._epoch is not None and not lease_held:
+        if (self._epoch is not None and not lease_held and not self._fenced
+                and self._quarantine_kind is not QuarantineKind.EXTERNAL_INTERVENTION):
+            # A replacement instance owns the account now: fence this process
+            # off every venue write, over an entry block it may already hold.
+            self._fenced = True
+            self._quarantined = False
             self._enter_quarantine(
                 'spot_lease_lost',
                 {
@@ -1224,7 +1279,9 @@ class SpotInventoryManager:
                 },
             )
             return []
-        if self._quarantined or self._epoch is None:
+        if self._quarantined:
+            return await self._recover_in_process(now_ms)
+        if self._epoch is None:
             return []
         port = self._port
         rows_before_balance = self._rows_booked
@@ -1885,6 +1942,7 @@ class SpotInventoryManager:
         self._refresh_fold()
         self._quarantined = True
         self._quarantine_reason = 'spot_external_quarantine_held'
+        self._quarantine_kind = QuarantineKind.EXTERNAL_INTERVENTION
         logger.warning(
             "spot inventory: %s epoch %d for %r is kept as it is (bot inventory %s) "
             "while the external-intervention quarantine holds; it is recovered at "
@@ -1956,10 +2014,35 @@ class SpotInventoryManager:
             return self._recover_taken_epoch(
                 epoch, balance, final_cursor=final_cursor, recovered=recovered,
             )
+        return self._retire_onto_fresh_epoch(
+            epoch, balance, final_cursor=final_cursor, recovered=recovered,
+        )
+
+    def _retire_onto_fresh_epoch(
+            self, epoch: 'SpotEpochRow | None', balance: Decimal, *,
+            final_cursor: str | None, recovered: int,
+    ) -> 'SpotEpochRow':
+        """Retire every live ledger row and anchor a fresh epoch on the whole balance.
+
+        The bot owns nothing afterwards, the account owns everything. Sound
+        only where the engine holds nothing of the retired ledger: a startup
+        (the engine adopts the fold after it), or an in-process recovery
+        whose engine adopted a flat position
+        (:attr:`~SpotInventoryManager._ledger_unadopted`).
+
+        :param epoch: The epoch to close, or ``None`` when none was written.
+        :param balance: The settled venue balance.
+        :param final_cursor: The execution cursor the catch-up reached.
+        :param recovered: Fills the catch-up booked, for the audit.
+        :return: The fresh active epoch.
+        """
+        port = self._port
+        retired_fold = self._fold
         with self._store.transaction():
-            self._store.set_spot_epoch_state(
-                port.product_id, epoch.epoch_seq, 'closed',
-            )
+            if epoch is not None:
+                self._store.set_spot_epoch_state(
+                    port.product_id, epoch.epoch_seq, 'closed',
+                )
             retired = self._store.retire_spot_executions(
                 self._account_id, port.product_id,
             )
@@ -1976,8 +2059,9 @@ class SpotInventoryManager:
                 'spot_epoch_recovered',
                 payload={
                     'product_id': port.product_id,
-                    'old_epoch_seq': epoch.epoch_seq,
-                    'old_pending_conflict': epoch.pending_conflict,
+                    'old_epoch_seq': epoch.epoch_seq if epoch is not None else None,
+                    'old_pending_conflict': (
+                        epoch.pending_conflict if epoch is not None else None),
                     'epoch_seq': fresh.epoch_seq,
                     'foreign_baseline': fresh.foreign_baseline,
                     'retired_fills': retired,
@@ -1988,12 +2072,177 @@ class SpotInventoryManager:
                 },
             )
         logger.warning(
-            "spot inventory: quarantined epoch %d for %r recovered at "
-            "startup — %d ledger row(s) retired (net %s, violation: %s), "
-            "fresh baseline anchored on the venue balance %s",
-            epoch.epoch_seq, port.product_id, retired,
+            "spot inventory: quarantined epoch %s for %r recovered — %d ledger "
+            "row(s) retired (net %s, violation: %s), fresh baseline anchored on "
+            "the venue balance %s",
+            epoch.epoch_seq if epoch is not None else '-', port.product_id, retired,
             canonical_decimal(retired_fold.net_base),
             retired_fold.violation, canonical_decimal(balance),
+        )
+        self._refresh_fold()
+        return fresh
+
+    async def _rescope_epoch(self, epoch: 'SpotEpochRow') -> 'SpotEpochRow | None':
+        """Recover an epoch whose cursor scope changed, as a restart recovers a quarantined one.
+
+        The persisted cursor means something else under the port's scope (a
+        plugin upgrade), and a read from no cursor starts at the venue's
+        current watermark: the fills between the old cursor and now cannot be
+        read, so the ledger cannot be carried over. The startup recovers right
+        here what it latched the entry block on and left to the next restart:
+        the ledger retires onto a fresh epoch anchored on the measured balance
+        (:meth:`_recover_quarantined_epoch`). The engine adopts after it.
+
+        :param epoch: The epoch with the stale scope.
+        :return: The fresh active epoch, or ``None`` when the measurement
+            failed: the entry block latched with the engine adopting a flat
+            position, and the in-process recovery retries
+            (:meth:`_recover_in_process`).
+        """
+        port = self._port
+        self._store.log_event(
+            'spot_cursor_scope_changed',
+            payload={
+                'product_id': port.product_id,
+                'epoch_seq': epoch.epoch_seq,
+                'stored_scope': epoch.cursor_scope,
+                'port_scope': port.cursor_scope,
+            },
+        )
+        logger.warning(
+            "spot inventory: the execution cursor of %r was kept under scope %r, the port "
+            "now reads %r; the ledger is re-anchored on the measured balance",
+            port.product_id, epoch.cursor_scope, port.cursor_scope,
+        )
+        self._ledger_unadopted = True
+        fresh = await self._recover_quarantined_epoch(epoch)
+        if fresh is not None:
+            self._ledger_unadopted = False
+        return fresh
+
+    def _freeze_first_epoch(
+            self, balance: Decimal, final_cursor: str | None,
+    ) -> 'SpotEpochRow':
+        """Write the first epoch: the foreign baseline is the balance less the bot's ledger.
+
+        An account holding less base than the ledger (someone else sold or
+        withdrew base in the crash window before the first epoch write, or a
+        sell of the bot's own the venue has not indexed yet) has no foreign
+        holdings: the baseline is frozen at zero, never negative (that would
+        make the invariant hold by construction and synthesize inventory the
+        account cannot sell), and the shortfall is a drift the runtime
+        reconcile judges like any other.
+
+        :param balance: The settled venue balance.
+        :param final_cursor: The execution cursor the catch-up reached.
+        :return: The fresh active epoch.
+        """
+        port = self._port
+        net = self._fold.net_base
+        baseline = balance - net
+        if baseline < -port.base_tolerance:
+            logger.warning(
+                "spot inventory: the %s balance of %r is %s, below the bot's own ledger "
+                "inventory %s: no foreign holdings are frozen into the first epoch, the "
+                "runtime reconcile judges the shortfall",
+                port.base_asset, port.product_id, canonical_decimal(balance),
+                canonical_decimal(net),
+            )
+            baseline = Decimal(0)
+        with self._store.transaction():
+            epoch = self._store.insert_spot_epoch(
+                account_id=self._account_id,
+                base_asset=port.base_asset,
+                product_id=port.product_id,
+                foreign_baseline=canonical_decimal(baseline),
+                cursor_scope=port.cursor_scope,
+                exec_cursor=final_cursor,
+                state='active',
+            )
+            self._store.log_event(
+                'spot_epoch_created',
+                payload={
+                    'product_id': port.product_id,
+                    'epoch_seq': epoch.epoch_seq,
+                    'foreign_baseline': epoch.foreign_baseline,
+                    'bot_inventory': canonical_decimal(net),
+                    'current_total': canonical_decimal(balance),
+                },
+            )
+        return epoch
+
+    def _consolidate_ledger(
+            self, epoch: 'SpotEpochRow | None', balance: Decimal,
+            final_cursor: str | None,
+    ) -> 'SpotEpochRow':
+        """Fold a negative ledger a complete history did not repair into its net inventory.
+
+        A sell exceeding the running inventory means a buy is missing from
+        the ledger, or a sell was booked that was not the bot's; the history
+        just read in full returned nothing that repairs it. The position the
+        engine tracks is the fold's net inventory, so that is what the bot
+        keeps: in ONE transaction every live row retires (audit kept), one
+        ``consolidated`` buy row books the net inventory at the fold's cost
+        basis (nothing when the net is not positive), and a fresh epoch
+        freezes the rest of the balance as the foreign baseline, never below
+        zero. A balance below the kept inventory is a drift the runtime
+        reconcile judges like any other.
+
+        :param epoch: The epoch to close, or ``None`` when none was written.
+        :param balance: The settled venue balance.
+        :param final_cursor: The execution cursor the catch-up reached.
+        :return: The fresh active epoch.
+        """
+        port = self._port
+        fold = self._fold
+        kept = max(Decimal(0), fold.net_base)
+        rows = self._store.iter_spot_executions(self._account_id, port.product_id)
+        with self._store.transaction():
+            if epoch is not None:
+                self._store.set_spot_epoch_state(port.product_id, epoch.epoch_seq, 'closed')
+            retired = self._store.retire_spot_executions(self._account_id, port.product_id)
+            fresh = self._store.insert_spot_epoch(
+                account_id=self._account_id,
+                base_asset=port.base_asset,
+                product_id=port.product_id,
+                foreign_baseline=canonical_decimal(max(Decimal(0), balance - kept)),
+                cursor_scope=port.cursor_scope,
+                exec_cursor=final_cursor,
+                state='active',
+            )
+            if kept > 0:
+                cost = fold.cost_quote if fold.cost_quote > 0 else Decimal(0)
+                self._store.record_spot_execution(
+                    self._account_id, port.product_id,
+                    fill_id=f"consolidated:{self._store.run_id}:{fresh.epoch_seq}",
+                    side='buy',
+                    base_delta=canonical_decimal(kept),
+                    quote_delta=canonical_decimal(-cost),
+                    price=canonical_decimal(cost / kept),
+                    fee_amount='0',
+                    fee_currency=port.quote_asset,
+                    ts_ms=rows[-1].ts_ms + 1 if rows else 1,
+                    delivered=True,
+                )
+            self._store.log_event(
+                'spot_ledger_consolidated',
+                payload={
+                    'product_id': port.product_id,
+                    'old_epoch_seq': epoch.epoch_seq if epoch is not None else None,
+                    'epoch_seq': fresh.epoch_seq,
+                    'violation': fold.violation,
+                    'retired_fills': retired,
+                    'kept': canonical_decimal(kept),
+                    'current_total': canonical_decimal(balance),
+                    'foreign_baseline': fresh.foreign_baseline,
+                },
+            )
+        logger.error(
+            "spot inventory: the ledger of %r stays negative after a complete history read "
+            "(%s): %d row(s) consolidated into the net inventory %s, the foreign baseline "
+            "is %s",
+            port.product_id, fold.violation, retired, canonical_decimal(kept),
+            fresh.foreign_baseline,
         )
         self._refresh_fold()
         return fresh
@@ -2157,23 +2406,43 @@ class SpotInventoryManager:
 
         Persists the epoch's ``quarantined`` state (``taken`` for an
         external intervention; when an epoch exists, and never over a
-        ``taken`` one), then delivers per policy: the ``request_quarantine``
-        hook latches the engine and the process stays alive; ``halt`` —
-        or a missing / raising hook — arms :attr:`pending_halt`. Never
-        fail-open.
+        ``taken`` one), then delivers it (:meth:`_deliver_latch`): the
+        ``request_quarantine`` hook latches the engine and the process stays
+        alive; a missing or raising hook arms :attr:`pending_halt`, which
+        carries ``kind``. Never fail-open.
+
+        A latch during the startup leaves the fold the engine adopts: the
+        fold is read and every row flips ``delivered`` with it (the adoption
+        watermark), so the in-process recovery delivers exactly the rows it
+        books itself. A startup stopped at the asset lease, or at the
+        recovery of an epoch whose cursor scope changed, leaves no ledger: the
+        engine adopts a flat position
+        (:attr:`~SpotInventoryManager._ledger_unadopted`).
 
         :param kind: The quarantine the hook latches. ``ENTRY_BLOCK`` is the
-            manager's own bookkeeping trouble; ``EXTERNAL_INTERVENTION``
-            (someone took the bot's inventory) freezes every venue write
-            until the operator resumes the run.
+            manager's own bookkeeping trouble, under :attr:`quarantine_cause`;
+            ``EXTERNAL_INTERVENTION`` (someone took the bot's inventory)
+            freezes every venue write until the operator resumes the run.
         """
         if self._quarantined:
             return
         self._quarantined = True
         self._quarantine_reason = reason
+        self._quarantine_kind = kind
+        self._recovery_due_ms = None
+        self._recovery_attempts = 0
+        adopt = not self._startup_done and not self._ledger_unadopted
+        if adopt:
+            self._refresh_fold()
+        elif not self._startup_done:
+            self._fold = InventoryFold()
         epoch = self._epoch
         state = 'taken' if kind is QuarantineKind.EXTERNAL_INTERVENTION else 'quarantined'
         with self._store.transaction():
+            if adopt:
+                self._store.mark_spot_executions_delivered(
+                    self._account_id, self._port.product_id,
+                )
             # A ``taken`` epoch stays taken until its recovery: a measurement
             # failing on the way (a later ``quarantined`` latch) must not make
             # the next start retire the inventory the account still holds.
@@ -2202,32 +2471,237 @@ class SpotInventoryManager:
                 f"base than the bot's own inventory; every venue write stops "
                 f"until the operator resumes the run"
             )
-        else:
+        elif self._fenced:
             message = (
-                f"spot inventory conflict ({reason}): trading stops; "
-                f"restart the run to recover on a fresh venue-balance baseline"
+                f"spot inventory lease lost ({reason}): a replacement instance of the "
+                f"run owns the {self._port.base_asset} lease now; this process writes "
+                f"nothing to the venue any more (no order, amend, cancel or close) and "
+                f"never resumes, the replacement runs the bot"
             )
-        quarantined = False
-        if self._policy == 'quarantine' and self._request_quarantine is not None:
-            # noinspection PyBroadException
-            try:
-                if kind is QuarantineKind.ENTRY_BLOCK:
-                    self._request_quarantine(message, dict(context))
-                else:
-                    self._request_quarantine(message, dict(context), kind=kind)
-            except Exception:
-                logger.exception(
-                    "request_quarantine hook failed for %r; falling back "
-                    "to the process-exiting halt", reason,
-                )
-            else:
-                quarantined = True
-        if not quarantined:
-            # 'halt' policy, or a quarantining policy whose hook is
-            # missing / raised: arm the process-exiting signal.
-            self._pending_halt = SpotInventoryConflictError(
-                message, context=dict(context),
+        else:
+            diagnosis = context.get('diagnosis')
+            message = (
+                f"spot inventory conflict ({reason})"
+                f"{f': {diagnosis}' if diagnosis else ''}: new entries stop; the bot "
+                f"measures the venue balance and its execution history again and "
+                f"resumes by itself once they settle"
             )
+        self._quarantine_message = message
+        self._quarantine_context = dict(context)
+        self._hook_latched = False
+        self._deliver_latch(signal=True)
         logger.error(
             "spot inventory QUARANTINE (%s): %s", reason, context,
         )
+
+    def _deliver_latch(self, *, signal: bool) -> None:
+        """Hand the held latch to the engine: the hook, else the signal.
+
+        :param signal: Arm :attr:`pending_halt` when the hook is missing or
+            raises. Only the first delivery arms it: the signal is one report
+            the plugin's event stream raises, and a repeat would tear the
+            stream down on every pass. A raising hook is tried again on every
+            reconcile while the latch holds (:meth:`_recover_in_process`).
+        """
+        kind = self._quarantine_kind
+        assert kind is not None
+        if self._request_quarantine is not None:
+            # noinspection PyBroadException
+            try:
+                if kind is QuarantineKind.ENTRY_BLOCK:
+                    self._request_quarantine(
+                        self._quarantine_message, dict(self._quarantine_context),
+                        cause=self._latch_cause(),
+                    )
+                else:
+                    self._request_quarantine(
+                        self._quarantine_message, dict(self._quarantine_context), kind=kind,
+                    )
+            except Exception:
+                logger.exception(
+                    "request_quarantine hook failed for %r; falling back "
+                    "to the SpotInventoryConflictError signal", self._quarantine_reason,
+                )
+            else:
+                self._hook_latched = True
+                self._pending_halt = None
+                return
+        if signal:
+            # The hook is missing or raised: arm the signal the engine latches
+            # the same quarantine on.
+            self._pending_halt = SpotInventoryConflictError(
+                self._quarantine_message, context=dict(self._quarantine_context), kind=kind,
+            )
+
+    def _latch_cause(self) -> str:
+        """The cause the held entry block is latched under.
+
+        :attr:`quarantine_cause`, or for a fenced zombie
+        (:attr:`~SpotInventoryManager._fenced`) the same behind
+        :data:`~pynecore.core.broker.models.FENCE_CAUSE_PREFIX`: the engine then
+        refuses every venue write of this process, exits and closes included,
+        since the replacement instance owns the position.
+        """
+        return f"{FENCE_CAUSE_PREFIX}{self._cause}" if self._fenced else self._cause
+
+    async def _recover_in_process(self, now_ms: int) -> 'list[SpotExecutionRow]':
+        """Get out of the manager's own entry block by measuring the venue again.
+
+        Runs on every reconcile while the manager holds an entry block of its
+        own trouble (an external intervention waits for the operator, and a
+        fenced zombie, :attr:`~SpotInventoryManager._fenced`, never resumes).
+        The first attempt runs on the first pass; a failed one is paced from
+        :data:`_RECOVERY_FIRST_DELAY_MS`, doubling up to
+        :data:`_RECOVERY_MAX_DELAY_MS`, with no deadline. An attempt:
+
+        1. claims the asset lease (another live run holding it fails the
+           attempt);
+        2. catches the ledger up from the epoch's cursor and reads the balance
+           it is compared with (:meth:`_measure_settled`); a failed or
+           inconclusive read, or a fill id another run booked, fails the
+           attempt;
+        3. settles the books against what the engine holds. An engine that
+           adopted a flat position
+           (:attr:`~SpotInventoryManager._ledger_unadopted`) gets a fresh
+           epoch anchored on the whole balance, with the ledger retired
+           (:meth:`_retire_onto_fresh_epoch`). Otherwise every row the
+           attempt booked is handed back for delivery, a ledger still
+           negative is consolidated (:meth:`_consolidate_ledger`), a start
+           that wrote no epoch writes the first one
+           (:meth:`_freeze_first_epoch`), and a ``quarantined`` epoch is
+           active again;
+        4. leaves a drift to the runtime verdict
+           (:meth:`_defer_startup_drift`), lifts the manager's latch and
+           releases :attr:`quarantine_cause` through ``release_quarantine``.
+           An entry block the signal latched is the engine's to end: no
+           report of it comes any more.
+
+        :param now_ms: This pass's timestamp.
+        :return: The ledger rows the attempt booked, flipped to
+            ``delivered``, for the plugin to emit; empty while the latch holds.
+        """
+        if self._quarantine_kind is not QuarantineKind.ENTRY_BLOCK:
+            return []
+        if not self._hook_latched and self._request_quarantine is not None:
+            self._deliver_latch(signal=False)
+        if self._fenced:
+            return []
+        if self._recovery_due_ms is not None and now_ms < self._recovery_due_ms:
+            return []
+        self._recovery_attempts += 1
+        delay_ms = min(
+            _RECOVERY_MAX_DELAY_MS,
+            _RECOVERY_FIRST_DELAY_MS * 2 ** min(self._recovery_attempts - 1, 16),
+        )
+        self._recovery_due_ms = now_ms + delay_ms
+        port = self._port
+        reason = self._quarantine_reason
+        if not self._store.claim_spot_asset(
+                self._account_id, port.base_asset, port.quote_asset,
+        ):
+            logger.warning(
+                "spot inventory: %s still holds for %r: another live run holds the %s "
+                "lease; next attempt in %.0fs", reason, port.product_id, port.base_asset,
+                delay_ms / 1000.0,
+            )
+            return []
+        epoch = self._store.get_latest_spot_epoch(port.product_id)
+        if epoch is not None and epoch.state == 'taken':
+            return []
+        self._epoch = epoch
+        cursor_before = (
+            epoch.exec_cursor
+            if epoch is not None and epoch.cursor_scope == port.cursor_scope else None
+        )
+        try:
+            measured = await self._measure_settled(
+                cursor_before, _RECOVERY_MEASURE_REASONS,
+                {'product_id': port.product_id,
+                 'epoch_seq': epoch.epoch_seq if epoch is not None else None},
+                must_settle=epoch is None or self._ledger_unadopted,
+            )
+        except SpotInventoryConflictError:
+            measured = None
+        if measured is None:
+            logger.warning(
+                "spot inventory: %s still holds for %r: the venue could not be measured; "
+                "next attempt in %.0fs", reason, port.product_id, delay_ms / 1000.0,
+            )
+            return []
+        balance = measured.balance
+        epoch = self._store.get_latest_spot_epoch(port.product_id)
+        self._epoch = epoch
+        self._refresh_fold()
+        delivered: list['SpotExecutionRow'] = []
+        if self._ledger_unadopted:
+            epoch = self._retire_onto_fresh_epoch(
+                epoch, balance, final_cursor=measured.cursor, recovered=measured.recovered,
+            )
+            cursor_before = None
+        else:
+            delivered = self._deliver_recovered()
+            if self._fold.violation is not None:
+                epoch = self._consolidate_ledger(epoch, balance, measured.cursor)
+            elif epoch is None:
+                epoch = self._freeze_first_epoch(balance, measured.cursor)
+            elif epoch.state != 'active':
+                self._store.set_spot_epoch_state(port.product_id, epoch.epoch_seq, 'active')
+                epoch = self._store.get_latest_spot_epoch(port.product_id)
+        self._epoch = epoch
+        drift = self._invariant_drift(balance)
+        if abs(drift) > port.base_tolerance:
+            self._defer_startup_drift(balance, drift, cursor_before, when='recovery')
+        else:
+            self._hold_reread_cursor()
+        self._quarantined = False
+        self._quarantine_reason = None
+        self._quarantine_kind = None
+        self._ledger_unadopted = False
+        self._recovery_due_ms = None
+        attempts = self._recovery_attempts
+        self._recovery_attempts = 0
+        self._store.log_event(
+            'spot_inventory_quarantine_recovered',
+            payload={
+                'product_id': port.product_id,
+                'reason': reason,
+                'attempts': attempts,
+                'recovered_fills': len(delivered),
+                'bot_inventory': canonical_decimal(self._fold.net_base),
+                'current_total': canonical_decimal(balance),
+            },
+        )
+        logger.warning(
+            "spot inventory: %s for %r resolved by the bot after %d attempt(s): the venue "
+            "balance %s and the bot's inventory %s were measured again (%d fill(s) booked)",
+            reason, port.product_id, attempts, canonical_decimal(balance),
+            canonical_decimal(self._fold.net_base), len(delivered),
+        )
+        self._release_latch(
+            f"the spot inventory of {port.product_id} was measured again ({reason})")
+        return delivered
+
+    def _release_latch(self, resolution: str) -> None:
+        """Release :attr:`quarantine_cause` once the manager got out of its trouble.
+
+        :param resolution: What resolved it, for the engine's log line.
+        """
+        hook_latched = self._hook_latched
+        self._hook_latched = False
+        self._pending_halt = None
+        if not hook_latched:
+            return
+        if self._release_quarantine is None:
+            logger.warning(
+                "spot inventory: the plugin wired no release_quarantine, so the engine's "
+                "entry block (cause %r) holds until a restart", self._cause,
+            )
+            return
+        # noinspection PyBroadException
+        try:
+            self._release_quarantine(self._cause, resolution)
+        except Exception:
+            logger.exception(
+                "release_quarantine hook failed for %r; the engine's entry block holds "
+                "until a restart", self._cause,
+            )

@@ -3,7 +3,9 @@ The quarantine records a supervisor parses from the bot's log.
 
 A supervisor (the live lab, an operator's alerting) reads the bot's stdout
 line by line and must find, on one physical line each: the latch token with
-the kind value and the quarantine id, and the exact resume command. The log
+the kind value and the quarantine id, and what ends the latch: the exact
+resume command of an external intervention, or the open causes of an entry
+block, which the bot ends by itself (no command is printed for it). The log
 sink renders through :class:`~pynecore.lib.log.PineRichHandler` at the durable
 width, which folds every long record onto continuation lines; the quarantine
 records must survive that.
@@ -20,7 +22,11 @@ import pytest
 
 from pynecore import lib
 from pynecore.core.broker.disappearance import resolve_unexpected_cancel_policy
-from pynecore.core.broker.models import ExchangeCapabilities, QuarantineKind
+from pynecore.core.broker.models import (
+    FENCE_CAUSE_PREFIX,
+    ExchangeCapabilities,
+    QuarantineKind,
+)
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore, RunContext
@@ -43,6 +49,10 @@ _LATCH = re.compile(
 _COMMAND = re.compile(
     r"sync engine quarantine (?P<qid>[0-9a-f]+) resume command: "
     r"(?P<command>pyne broker resume '(?P<run_id>[^']+)' (?P=qid))$"
+)
+_SELF_ENDING = re.compile(
+    r"sync engine quarantine (?P<qid>[0-9a-f]+) ends by itself: open causes: "
+    r"(?P<causes>\S+(?:, \S+)*) — "
 )
 
 
@@ -121,6 +131,10 @@ def _commands(buffer: io.StringIO) -> list[re.Match]:
     return [m for line in _lines(buffer) if (m := _COMMAND.search(line))]
 
 
+def _self_ending(buffer: io.StringIO) -> list[re.Match]:
+    return [m for line in _lines(buffer) if (m := _SELF_ENDING.search(line))]
+
+
 def __test_a_latch_logs_its_kind_id_and_command_on_one_line_each__(
         tmp_path: Path, durable_sink: io.StringIO,
 ) -> None:
@@ -184,7 +198,7 @@ def __test_an_escalation_logs_the_same_stable_record__(
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_ctx(store)
         engine = _engine(ctx)
-        engine.record_quarantine("protective_exit_rejected")
+        engine.record_quarantine("protective_exit_rejected", cause="protective_exit_rejected:L")
         engine.record_quarantine("operator moved the stop",
                                  kind=QuarantineKind.EXTERNAL_INTERVENTION)
 
@@ -192,7 +206,46 @@ def __test_an_escalation_logs_the_same_stable_record__(
         assert [m['kind'] for m in latches] == ['entry_block', 'external_intervention']
         assert latches[1]['status'] == 'escalated from entry_block'
         assert latches[0]['qid'] == latches[1]['qid'] == engine.quarantine_id
-        assert [m['qid'] for m in _commands(durable_sink)] == [engine.quarantine_id] * 2
+        assert [m['qid'] for m in _commands(durable_sink)] == [engine.quarantine_id]
+        assert [m['causes'] for m in _self_ending(durable_sink)] == [
+            'protective_exit_rejected:L']
+        ctx.close()
+
+
+def __test_an_entry_block_names_its_causes_and_no_resume_command__(
+        tmp_path: Path, durable_sink: io.StringIO,
+) -> None:
+    """The bot's own trouble asks nobody to act: its record names what the bot ends by itself."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine = _engine(ctx)
+        engine.record_quarantine("protective_exit_rejected", cause="protective_exit_rejected:L")
+        engine.record_quarantine("close_rejected_repeatedly", cause="close_rejected:S")
+        engine._quarantine_reminded_at = 0.0  # noqa: SLF001
+        engine._log_quarantine_record(" (reminder, entered x)", "still held",  # noqa: SLF001
+                                      error=False)
+
+        assert [m['kind'] for m in _latches(durable_sink)] == ['entry_block', 'entry_block']
+        assert [m['causes'] for m in _self_ending(durable_sink)] == [
+            'protective_exit_rejected:L', 'close_rejected:S, protective_exit_rejected:L']
+        assert _commands(durable_sink) == []
+        assert not any("pyne broker resume" in line for line in _lines(durable_sink))
+        ctx.close()
+
+
+def __test_a_fenced_process_is_named_as_fenced__(
+        tmp_path: Path, durable_sink: io.StringIO,
+) -> None:
+    """A fence never ends in its process: the record says so instead of a self-ending block."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        ctx = _open_ctx(store)
+        engine = _engine(ctx)
+        engine.record_quarantine("spot_lease_lost", cause=f"{FENCE_CAUSE_PREFIX}spot:BTC")
+
+        fenced = [line for line in _lines(durable_sink)
+                  if f"quarantine {engine.quarantine_id} fenced: fence:spot:BTC — " in line]
+        assert len(fenced) == 1
+        assert _self_ending(durable_sink) == [] and _commands(durable_sink) == []
         ctx.close()
 
 

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from pynecore.core.broker.exceptions import BracketAttachAfterFillRejectedError
 
 __all__ = [
+    'FENCE_CAUSE_PREFIX',
     'OrderStatus',
     'OrderType',
     'LegType',
@@ -40,6 +41,7 @@ __all__ = [
     'CANCEL_REASON_VENUE_REJECTED',
     'VENUE_DRIVEN_CANCEL_REASONS',
     'ExchangePosition',
+    'OrderExecution',
     'PositionLeg',
     'Quote',
     'ExchangeCapabilities',
@@ -58,9 +60,9 @@ __all__ = [
     'LegPartialRepairedEvent',
     'LegRepairFailedEvent',
     'BracketReconstructedEvent',
-    'ManualInterventionRequiredEvent',
     'QuarantineEnteredEvent',
     'QuarantineResumedEvent',
+    'QuarantineEndedEvent',
     'ProtectionDegradedEvent',
     'ProtectionRearmedUnverifiedEvent',
     'UnattributedPositionChangeEvent',
@@ -133,7 +135,9 @@ class QuarantineKind(StrEnum):
     ``ENTRY_BLOCK``: the bot's own venue-side trouble (a protective exit or
     a close the venue keeps refusing, a spot inventory conflict). Nobody
     touched the account, so protection keeps working: exits, closes and
-    cancels flow, only new exposure is blocked.
+    cancels flow, only new exposure is blocked. Every request names its
+    cause, and the bot ends the latch by itself once each cause's condition
+    is gone; no operator action is needed.
 
     ``EXTERNAL_INTERVENTION``: someone else (the operator or another bot)
     changed a bot-owned order or position. The operator knows something the
@@ -144,6 +148,14 @@ class QuarantineKind(StrEnum):
     """
     ENTRY_BLOCK = "entry_block"
     EXTERNAL_INTERVENTION = "external_intervention"
+
+
+#: Prefix of an ``ENTRY_BLOCK`` cause that also forbids every venue write of
+#: the process while it is held: the cause of a process that must not write at
+#: all, such as a fenced zombie whose replacement instance owns the account.
+#: In memory only, like every ``ENTRY_BLOCK`` latch: it never reaches another
+#: process or a restart.
+FENCE_CAUSE_PREFIX = 'fence:'
 
 
 class LegType(StrEnum):
@@ -502,6 +514,37 @@ class ExchangePosition:
 
 
 @dataclass(frozen=True)
+class OrderExecution:
+    """What the venue holds of one order's execution, read again on demand.
+
+    Returned by
+    :meth:`~pynecore.core.plugin.broker.BrokerPlugin.fetch_order_execution`
+    when the engine recovers an execution the plugin's stream never delivered
+    (an entry whose terminal event did not carry the executed quantity, or a
+    close whose outcome no record shows).
+
+    :ivar order: The venue's record of the order: its status,
+        ``filled_qty`` (journal unit, cumulative) with ``filled_qty_known``,
+        ``average_fill_price``, ``fee`` (cumulative) and ``fee_currency``.
+        ``None`` when the venue proves it holds no order under the ids asked
+        for (it never reached the venue, so nothing of it executed); a venue
+        that cannot prove that answers ``None`` for the whole read instead.
+    :ivar fills: Every execution of the order as the fill events the plugin's
+        stream reports (``event_type`` ``'partial'`` / ``'filled'``, the
+        stream's ``fill_id``, ``fill_qty``, ``journal_fill_qty``,
+        ``fill_price``, ``fee``), oldest first; ``None`` when the venue keeps
+        only the order's totals. The engine books the fills it has not taken
+        yet: the same ``fill_id`` a later stream delivery carries is taken once.
+    :ivar fee_reported: Whether the venue reports the order's commission.
+        ``False``: ``order.fee`` (and the fills' ``fee``) mean nothing, and the
+        engine books the execution with the fee marked unreported.
+    """
+    order: 'ExchangeOrder | None'
+    fills: 'tuple[OrderEvent, ...] | None' = None
+    fee_reported: bool = True
+
+
+@dataclass(frozen=True)
 class Quote:
     """A venue's current top of book for one symbol.
 
@@ -795,6 +838,14 @@ class EntryIntent:
     # route selector, and letting it flip the diff would re-dispatch an entry the
     # broker already holds.
     skip_flip: bool = field(default=False, compare=False)
+    # The part of ``qty`` that closes the opposite position (a price-based
+    # stop-and-reverse: ``strategy.entry`` adds the position it reads at
+    # creation, ``Order.flip_extra``). The rest of ``qty`` opens the entry's
+    # side. A dispatch the engine held back until the book was true sizes this
+    # part from the position at dispatch instead
+    # (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._resize_waited_dispatch`).
+    # ``compare=False``: ``qty`` already carries it.
+    flip_qty: float = field(default=0.0, compare=False)
 
     @property
     def intent_key(self) -> str:
@@ -959,11 +1010,32 @@ class CloseIntent:
             return
         if self.synthetic_kind not in {
             'partial_trigger', 'marketable_exit', 'defensive_close',
-            'reversal_close', 'leg_guard',
+            'reversal_close', 'leg_guard', 'held_execution_close',
         }:
             raise ValueError(
                 f"CloseIntent.synthetic_kind is invalid: {self.synthetic_kind!r}"
             )
+        if self.synthetic_kind == 'held_execution_close':
+            # The close the engine sends when an entry's execution evidence
+            # never arrived and the strategy asked to close or reverse the
+            # exposure it covers. ``qty`` is the venue position the engine
+            # read right before, which includes an execution the book does
+            # not hold, so the close is sized against the VENUE, not the
+            # journal: a plugin reduces the symbol's venue position by
+            # ``qty`` in a form that cannot open opposite exposure (a native
+            # reduce-only order, a close of the venue position by its own
+            # quantity), even where no journal row owns that execution.
+            # Symbol-wide, no targets. A netting plugin opts in with
+            # ``BrokerPlugin.supports_held_execution_close``; on a hedging
+            # account the core's one-way emulator closes the venue legs.
+            if (self.target_entry_id is not None
+                    or self.target_position_coid is not None
+                    or self.target_exchange_id is not None
+                    or self.target_leg_id is not None):
+                raise ValueError(
+                    "CloseIntent held_execution_close is symbol-wide and takes no targets."
+                )
+            return
         if self.synthetic_kind == 'reversal_close':
             # The close leg of a MARKET stop-and-reverse consumes the WHOLE
             # symbol position (every Pine entry id, pyramids included), so
@@ -1954,32 +2026,15 @@ class UnattributedPositionChangeEvent(BrokerEvent):
 
 
 @dataclass
-class ManualInterventionRequiredEvent(BrokerEvent):
-    """Emitted when the sync engine halts because the plugin raised
-    :class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError`.
-
-    Surfaces the operator-actionable details (reason, optional intent key,
-    plugin-supplied diagnostic context) so the observability bus, on-call
-    alerting, and the user-facing event stream can page without the runner
-    needing to reach into plugin internals. After this event fires the
-    engine is halted — all subsequent
-    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.sync` calls return early
-    until the strategy is restarted.
-    """
-    reason: str
-    intent_key: str | None = None
-    context: dict | None = None
-
-
-@dataclass
 class QuarantineEnteredEvent(BrokerEvent):
     """Emitted when the sync engine latches (or escalates) its quarantine.
 
     Quarantine stops trading without stopping the bot: the process stays a
     live observer of its open exposure. What it still does on the venue
-    depends on ``kind`` (see :class:`QuarantineKind`). The engine never
-    leaves quarantine on its own; the operator resumes it with
-    ``pyne broker resume <run_id> <quarantine_id>``.
+    depends on ``kind`` (see :class:`QuarantineKind`). An
+    ``ENTRY_BLOCK`` latch ends by itself once every cause it holds for is gone
+    (:class:`QuarantineEndedEvent`); an ``EXTERNAL_INTERVENTION`` latch only by
+    the operator's ``pyne broker resume <run_id> <quarantine_id>``.
     """
     reason: str
     intent_key: str | None = None
@@ -1993,6 +2048,19 @@ class QuarantineResumedEvent(BrokerEvent):
     """Emitted when an operator resume request cleared the quarantine latch."""
     quarantine_id: str
     kind: QuarantineKind
+
+
+@dataclass
+class QuarantineEndedEvent(BrokerEvent):
+    """Emitted when the bot ended an ``ENTRY_BLOCK`` quarantine by itself.
+
+    Every cause the latch held for was resolved by the bot
+    (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.end_quarantine_cause`);
+    the process keeps running and dispatches entries again.
+    """
+    quarantine_id: str
+    kind: QuarantineKind
+    resolution: str
 
 
 @dataclass
@@ -2171,9 +2239,10 @@ class PartialBracketCancelTentativeDegradedEvent(BrokerEvent):
     """The stale-grace deadline (default 10s) for a ``cancel_tentative``
     intent expired without resolution.
 
-    The parent dispatch is promoted to ``DEGRADED_HALT``; the script's
-    further entries on the symbol are blocked until manual intervention
-    via :class:`ManualInterventionRequiredEvent`.
+    The parent dispatch is degraded: new entries are blocked by an
+    ``entry_block`` quarantine while the engine keeps probing the venue with
+    backoff, and the quarantine cause ends by itself once the disposition
+    resolves.
     """
     intent_key: str
     symbol: str
@@ -2189,8 +2258,7 @@ class EntryDeferredCancelDispositionPendingEvent(BrokerEvent):
     The new intent is NOT dispatched and NOT adopted — the prior
     dispatch's disposition is still unresolved, and an in-flight broker
     state would create a double-life. The script's signal will retry on
-    the next ``sync()`` once the cancel disposition is resolved or
-    promoted to ``DEGRADED_HALT``.
+    the next ``sync()`` once the cancel disposition is resolved.
     """
     intent_key: str
     pine_id: str

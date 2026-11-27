@@ -188,14 +188,16 @@ When you add a matrix that grows beyond a few hundred cases, build it the same w
 
 ### The fill-evidence hold matrix
 
-`__test_the_fill_evidence_hold_matrix__` in `tests/t00_pynecore/core/test_027_cancel_tentative_state.py` crosses every state of the broker engine's fill-evidence hold (`_FillEvidenceHold` in `core/broker/sync_engine.py`) with the next arrival, the strategy's next action, the partial-bracket mode, the timing, a crash and the venue's truth. The default run takes 178 cases out of 34452. The full product takes a few minutes with `-n 8` (about three and a half on an 8-core machine).
+`__test_the_fill_evidence_hold_matrix__` in `tests/t00_pynecore/core/test_027_cancel_tentative_state.py` crosses every state of the broker engine's fill-evidence hold (`_FillEvidenceHold` in `core/broker/sync_engine.py`) with the next arrival, the strategy's next action (a market reversal under another id and a `strategy.close_all` included, which act on a simulated venue), the partial-bracket mode, the timing, a crash and the venue's truth; a hold that ends in its expiry quarantine is then recovered by the bot itself from the venue's order record (the execution booked exactly once, the hold's quarantine cause ended exactly when the venue holds what the book holds). The harness's reconcile runs the engine's own recovery steps (`_expire_fill_evidence_holds`, `_recover_held_executions`, `_resolve_entry_block_causes`), and its resume only stamps the request: no operator statement settles a hold. The default run takes 181 cases out of 42108. The full product takes a few minutes with `-n 8` (about three and a half on an 8-core machine).
 
 Run the full matrix when a change touches any of these:
 
 - the hold, its settlement, its expiry quarantine or the execution awaiting booking (`_defer_entry_terminal_without_fill_evidence`, `_settle_fill_evidence`, `_await_reported_execution`, `_expire_fill_evidence_holds`, `_hold_entry_awaiting_fill_evidence` and the helpers they call in `sync_engine.py`);
 - the stored hold and arrival rows (`ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND`, `ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND` in `core/broker/storage.py`) or their restore on restart (`_restore_fill_evidence_holds`);
 - how the engine routes an order event that reports an execution without its fill (terminal events, cumulative quantities, cancel-tentative entries);
-- the software partial-bracket engine's handling of a held entry's pending legs.
+- the software partial-bracket engine's handling of a held entry's pending legs;
+- the dispatches that wait for a held entry's evidence or close the venue position over an expired hold (`_wait_for_unresolved_execution`, `_close_of_expired_hold`, `_close_held_exposure_from_venue`, `_split_held_execution_close_fill`), and the stored close (`HELD_EXECUTION_CLOSE_EVENT_KIND`);
+- the bot's own recovery of an expired hold and the end of its quarantine cause (`_recover_held_executions`, `_fetch_order_execution` and its contract check `_order_execution_violation`, `_apply_recovered_execution`, `_absorb_repeated_venue_total`, `_resolve_entry_block_causes`, `end_quarantine_cause`), and the resize of a held-back dispatch (`_resize_waited_dispatch`).
 
 Also run it before a PyneCore release that changes `core/broker/`, and when a default-slice case of the matrix fails: the failing pair usually has neighbours in the full product that show the shape of the bug.
 

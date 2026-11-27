@@ -45,23 +45,25 @@ that core:
 - **Dual signal.** A confirmed unexpected cancel is booked as a terminal
   close AND yielded as a synthesised ``cancelled`` :class:`OrderEvent`
   (the engine's router cleans its tracking — essential under the
-  non-halting policies), while the configured ``on_unexpected_cancel``
+  ``re_place`` and ``ignore`` policies), while the configured ``on_unexpected_cancel``
   policy separately decides the operational reaction. ``stop``
   QUARANTINES through the ``request_quarantine`` hook as an external
   intervention: the engine stops writing to the venue altogether, but the
   process — and this tracker's ingestion loop — stays alive;
   raising here instead would tear down the very event stream the
-  quarantine invariant requires to keep running. Only the explicit
-  ``halt`` policy (or a quarantining policy with no hook wired — the
-  fail-safe fallback) arms the process-exiting halt. ``stop`` latches
+  quarantine invariant requires to keep running. Only a ``stop`` whose
+  hook is missing or raised arms the fail-safe fallback, an
+  :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` the
+  consumer raises to the engine, which latches the same quarantine on it
+  (no policy ends the process). ``stop`` latches
   before the row is retired, and a row whose latch is not stored yet stays
   live (stamped) until it is: a closed row must never outlive, across a
   restart, the latch that blocks the venue writes. Persistence and
   policy application run BEFORE the event is yielded, so neither depends
   on the consumer pulling another element from the generator; a pending
-  halt survives an abandoned generator and re-raises on the next
-  :meth:`DisappearanceTracker.observe` call. The halt is delivered
-  exactly once — each raise site consumes it.
+  fallback signal survives an abandoned generator and re-raises on the next
+  :meth:`DisappearanceTracker.observe` call. It is delivered exactly once —
+  each raise site consumes it.
 - **Cancels before an operator resume are accepted.** A disappearance under
   investigation when the operator resumed the run, or a row's first absence
   after the resume (:func:`accept_missing_before_resume`), retires its row on
@@ -175,7 +177,7 @@ RESUME_FIRST_ABSENCE_WINDOW_S = 300.0
 
 #: Valid ``on_unexpected_cancel`` policies (see ``BrokerDefaults``).
 UNEXPECTED_CANCEL_POLICIES = (
-    'stop', 're_place', 'ignore', 'halt',
+    'stop', 're_place', 'ignore',
 )
 
 #: Float comparison slack for fill quantities, matching the reconcile
@@ -364,24 +366,27 @@ def resolve_unexpected_cancel_policy(
     (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._apply_unexpected_cancel_policy`).
 
     Applies the ``ignore`` / ``re_place`` audit-only logging and the
-    ``stop`` quarantine latch, and RETURNS the halt the caller must arm its
-    own way (the tracker parks it on :attr:`~DisappearanceTracker.pending_halt`; the engine
-    records + raises it) — or ``None`` when the outcome needed no halt
-    (ignored, re-placed, or quarantined). An unexpected cancel is someone
+    ``stop`` quarantine latch, and RETURNS the fallback signal the caller
+    must deliver its own way when the latch could not be requested (the
+    tracker parks it on :attr:`~DisappearanceTracker.pending_halt`; the
+    engine latches the quarantine on it) — or ``None`` when the outcome
+    needed nothing more (ignored, re-placed, or quarantined). An unexpected cancel is someone
     else acting on a bot-owned order, so ``stop`` latches an
     :attr:`~QuarantineKind.EXTERNAL_INTERVENTION`
     quarantine: the bot leaves the venue exactly as the operator left it.
     The fail-closed rule lives here: a ``stop`` whose ``request_quarantine``
-    sink is missing or raises falls back to the halt, never to continued
-    trading.
+    sink is missing or raises falls back to the
+    :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` signal,
+    never to continued trading; the engine latches the external-intervention
+    quarantine when it receives it.
 
     :param policy: The configured ``on_unexpected_cancel`` policy name
         (one of :data:`UNEXPECTED_CANCEL_POLICIES`).
     :param reason: Human-readable description of the confirmed cancel,
-        carried into the halt / quarantine request.
+        carried into the quarantine request.
     :param context: Structured payload passed to the quarantine sink.
     :param request_quarantine: Quarantine latch sink; ``None`` (an unwired
-        sink under a quarantining policy) triggers the fail-closed halt. A sink
+        sink under a quarantining policy) returns the fail-closed signal. A sink
         that returns ``False`` already recorded this intervention under its
         held latch (a re-report after a restart): no audit event is written.
     :param log_event: Audit sink (``RunContext.log_event``); ``None`` skips
@@ -418,15 +423,15 @@ def resolve_unexpected_cancel_policy(
         except Exception:
             logger.exception(
                 "request_quarantine hook failed for %r; falling back "
-                "to the process-exiting halt", client_order_id,
+                "to the UnexpectedCancelError signal", client_order_id,
             )
         else:
             quarantined = True
             if noted is not False:
                 _log(f'{audit_prefix}_quarantine')
     if not quarantined:
-        # 'halt', or a quarantining policy whose hook is missing / raised:
-        # arm the process-exiting manual-intervention signal.
+        # A quarantining policy whose hook is missing / raised: hand the
+        # engine the signal it latches the quarantine on.
         return UnexpectedCancelError(reason, context=context)
     return None
 
@@ -566,8 +571,10 @@ class DisappearanceTracker:
         answers ``True``; until then the row keeps its stamp and is confirmed
         again on the next pass. A sink must therefore store the latch in
         ``store_ctx`` (the engine's sink does). When it is missing (or
-        raises), the policy falls back to arming the process-exiting halt —
-        fail-safe, never fail-open into continued trading.
+        raises), the policy falls back to arming the
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` signal
+        the engine latches the quarantine on — fail-safe, never fail-open into
+        continued trading.
     :param sibling_coids: Maps a :data:`MissingResolution.CLOSED` row to
         the client-order-ids of live sibling rows sharing its position
         (a netting account merges pyramid entries onto one position id);
@@ -642,8 +649,8 @@ class DisappearanceTracker:
         self._cancelled_event_factory = cancelled_event_factory
         self._fill_event_factory = fill_event_factory
         self._retire_cancelled_row = retire_cancelled_row
-        #: Halt decided by a halting policy but not yet delivered to the
-        #: consumer. Survives an abandoned generator: re-raised at the top
+        #: Fallback signal of a ``stop`` whose hook failed, not yet delivered
+        #: to the consumer. Survives an abandoned generator: re-raised at the top
         #: of the next :meth:`observe` call. Consumed (cleared) by whichever
         #: raise site delivers it, so it fires exactly once.
         self._pending_halt: UnexpectedCancelError | None = None
@@ -655,17 +662,17 @@ class DisappearanceTracker:
 
     @property
     def pending_halt(self) -> UnexpectedCancelError | None:
-        """The undelivered halt decided by a halting policy, if any.
+        """The undelivered fallback signal of a ``stop`` whose hook failed, if any.
 
         Observational only — delivery happens by the :class:`UnexpectedCancelError`
         raised from :meth:`observe`, which consumes it. A plugin that both
         consumes the generator and reads this property must not act on the
-        property independently, or it would double-handle the same halt.
+        property independently, or it would double-handle the same signal.
         """
         return self._pending_halt
 
     def _take_pending_halt(self) -> UnexpectedCancelError | None:
-        """Consume the pending halt so it is delivered exactly once."""
+        """Consume the pending signal so it is delivered exactly once."""
         halt = self._pending_halt
         self._pending_halt = None
         return halt
@@ -688,8 +695,9 @@ class DisappearanceTracker:
         :param now_ts: The observation timestamp (unix seconds); also
             the value stamped into ``missing_pending_since``.
         :raises UnexpectedCancelError: After the ``cancelled`` event of a
-            row whose policy is halting — or immediately, when a halt
-            decided on an earlier (abandoned) pass is still undelivered.
+            row whose ``stop`` latch could not be requested — or immediately,
+            when such a signal of an earlier (abandoned) pass is still
+            undelivered.
         """
         halt = self._take_pending_halt()
         if halt is not None:
@@ -731,7 +739,7 @@ class DisappearanceTracker:
                     self._register_executions(hook_row, register_ids)
                 except Exception:
                     # A committed terminal row must never be stranded
-                    # without its event / halt by a dedup-seeding failure.
+                    # without its event / signal by a dedup-seeding failure.
                     logger.exception(
                         "register_executions hook failed for %r",
                         row.client_order_id,
@@ -1299,15 +1307,15 @@ class DisappearanceTracker:
     def _apply_policy(self, row: 'OrderRow') -> None:
         """Apply the ``on_unexpected_cancel`` policy for a confirmed cancel.
 
-        Runs BEFORE the cancelled event is yielded: the quarantine / halt
-        decision must not depend on the consumer pulling further elements.
-        ``stop`` latches the engine's external-intervention quarantine
-        through the ``request_quarantine`` hook — the process (and this
-        observation loop) keeps running; a missing or raising hook falls
-        back to arming the halt, never to continued trading. ``halt``
-        always arms :attr:`pending_halt`; it is raised after the row's
-        events were yielded (or at the top of the next pass, when the
-        generator was abandoned).
+        Runs BEFORE the cancelled event is yielded: the quarantine decision
+        must not depend on the consumer pulling further elements. ``stop``
+        latches the engine's external-intervention quarantine through the
+        ``request_quarantine`` hook — the process (and this observation loop)
+        keeps running; a missing or raising hook falls back to arming
+        :attr:`pending_halt`, never to continued trading. That signal is
+        raised after the row's events were yielded (or at the top of the next
+        pass, when the generator was abandoned), and the engine latches the
+        quarantine on it.
         """
         reason = (
             f"Bot-owned order disappeared unexpectedly: "

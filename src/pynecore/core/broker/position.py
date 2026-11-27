@@ -32,7 +32,8 @@ if TYPE_CHECKING:
     from pynecore.types.strategy import QtyType
     from pynecore.core.broker.models import OrderEvent
 
-__all__ = ['BrokerPosition', 'EntryBookSnapshot', 'ProvisionalClose']
+__all__ = ['BrokerPosition', 'CloseExcess', 'EntryBookSnapshot', 'ProvisionalClose',
+           'RecoveredExecution']
 
 #: How many fills the position remembers the trades of, for a fee reported
 #: after them (:meth:`BrokerPosition.book_fill_fee`). A fee arrives close
@@ -65,6 +66,11 @@ class EntryBookSnapshot:
         binding a further slice of that order grows.
     :ivar fill_cursors: Client / venue order id -> the most the book had
         taken in of that order (:meth:`BrokerPosition.fill_cursor`).
+    :ivar close_excess: The parts of venue closes the book could not take in
+        yet (:meth:`BrokerPosition.note_close_excess`).
+    :ivar recovered_executions: The executions booked from the venue's order
+        totals whose own fills the stream may still deliver
+        (:meth:`BrokerPosition.note_recovered_execution`).
     """
     size: float
     entry_seq: int
@@ -73,6 +79,60 @@ class EntryBookSnapshot:
     bindings: tuple[_EntryBinding, ...]
     order_bindings: dict[str, int]
     fill_cursors: dict[str, float]
+    close_excess: tuple[CloseExcess, ...]
+    recovered_executions: tuple['RecoveredExecution', ...]
+
+
+@dataclass(slots=True)
+class RecoveredExecution:
+    """An execution the book took from the venue's order totals, not from its own fills.
+
+    The sync engine read an entry's order from the venue after its stream
+    never delivered the execution, and booked the order's executed quantity
+    as one fill at the venue's average price. The stream may still deliver the
+    order's own fills, under other fill ids: each takes up this quantity
+    instead of being booked again (:meth:`BrokerPosition.absorb_recovered_execution`).
+
+    :ivar order_ids: The order's client and venue order ids.
+    :ivar qty: The quantity (journal unit) a later fill of the order still
+        takes up, positive.
+    :ivar timestamp: When the totals were booked, epoch seconds; a record
+        older than :data:`RECOVERED_EXECUTION_KEEP_S` is dropped.
+    """
+    order_ids: tuple[str, ...]
+    qty: float
+    timestamp: float
+
+
+#: How long the book keeps a :class:`RecoveredExecution` for a late stream
+#: fill of its order: a week, far beyond any delivery lag.
+RECOVERED_EXECUTION_KEEP_S = 7 * 24 * 3600.0
+
+
+@dataclass(slots=True)
+class CloseExcess:
+    """The part of a venue close that closed more than the book held.
+
+    An entry's order ended at the venue without the venue's executed quantity,
+    so the book does not hold all of what it executed, and the venue close the
+    sync engine sent over it closed that execution too. The book books the
+    close only up to what it holds; the rest waits here and closes the entry's
+    own late fill when it arrives (:meth:`BrokerPosition.take_close_excess`),
+    at the venue close's price, so the round trip is booked with both real
+    prices and the book never goes past flat.
+
+    :ivar order_ids: The venue order ids of the entries whose execution the
+        close took; a fill of any of them takes from this excess.
+    :ivar qty: The quantity still to close, positive.
+    :ivar price: The venue close's fill price.
+    :ivar fee: The part of the venue close's fee that belongs to :attr:`qty`.
+    :ivar timestamp: The venue close's fill time, epoch seconds.
+    """
+    order_ids: tuple[str, ...]
+    qty: float
+    price: float
+    fee: float
+    timestamp: float
 
 
 @dataclass(slots=True)
@@ -158,6 +218,11 @@ class BrokerPosition(PositionBase):
         # The binding book (see :class:`~pynecore.lib.strategy._EntryBinding`):
         '_entry_book', '_entry_seq', '_order_bindings', 'last_spent_entry_ids',
         'book_faithful', '_fill_cursors', '_fill_places', '_fill_place_seq', 'book_moves',
+        # Venue-close parts waiting for the late fill they close (see
+        # :meth:`note_close_excess`):
+        '_close_excess',
+        # Executions booked from venue totals (see :meth:`note_recovered_execution`):
+        '_recovered_executions',
         # Fill id -> the trades its fee went to (see :meth:`book_fill_fee`):
         '_fee_targets',
         # Per-evaluation set of close keys already seen this script run, so a
@@ -244,6 +309,12 @@ class BrokerPosition(PositionBase):
         # across processes of a run: the engine seeds it from the store.
         self._fill_places: dict[str, int] = {}
         self._fill_place_seq: int = 0
+        # The parts of venue closes that closed an execution the book did not
+        # hold yet, oldest first (see :meth:`note_close_excess`).
+        self._close_excess: list[CloseExcess] = []
+        # Executions booked from the venue's order totals whose own fills the
+        # stream may still deliver (see :meth:`note_recovered_execution`).
+        self._recovered_executions: list[RecoveredExecution] = []
         # How many times a booked fill or an unbooked reduction moved the
         # book in this process: a reading of the venue taken at one count is
         # comparable with the book only while the count stays the same.
@@ -1205,6 +1276,26 @@ class BrokerPosition(PositionBase):
         """
         return self._pyramid_count()
 
+    def bound_qty_of_orders(self, order_ids: Iterable[str]) -> float:
+        """The open bound quantity of the bindings the venue orders ``order_ids`` opened.
+
+        Each open binding counts once, however many of the ids it was opened
+        or grown under; a binding a close already spent counts what is left
+        of it.
+
+        :param order_ids: Venue order ids of entry fills.
+        :return: The summed bound quantity, unsigned.
+        """
+        seen: set[int] = set()
+        qty = 0.0
+        for order_id in order_ids:
+            binding = self._order_bindings.get(order_id)
+            if binding is None or binding.seq in seen or binding not in self._entry_book:
+                continue
+            seen.add(binding.seq)
+            qty += binding.bound
+        return round(qty, 12)
+
     def _keep_book_in_step(self) -> None:
         """Rebuild the binding book from the trade rows when it no longer adds up.
 
@@ -1456,9 +1547,140 @@ class BrokerPosition(PositionBase):
             if qty > self._fill_cursors.get(key, 0.0):
                 self._fill_cursors[key] = qty
 
-    def forget_fill_cursors(self) -> None:
-        """Drop the fill cursors: a flat book owes no fill of any order."""
-        self._fill_cursors.clear()
+    def forget_fill_cursors(self, keep: Iterable[str] = ()) -> None:
+        """Drop the fill cursors: a flat book owes no fill of any order but ``keep``.
+
+        :param keep: Order ids whose fills the book still owes (an entry held
+            for its execution evidence, :meth:`note_close_excess`): their
+            cursors stay, so a late fill of them is judged against what the
+            book already took in.
+        """
+        kept = {key: self._fill_cursors[key] for key in keep if key in self._fill_cursors}
+        self._fill_cursors = kept
+
+    def note_close_excess(self, order_ids: Iterable[str], qty: float, price: float,
+                          fee: float, timestamp: float) -> None:
+        """Keep the part of a venue close the book could not book against its position.
+
+        The caller booked the close up to what the book held. ``qty`` more was
+        closed at the venue: the execution of the held entries ``order_ids``
+        that the book has not taken in. Their late fill opens a binding as
+        usual and is closed at once by this excess (:meth:`take_close_excess`),
+        so the book holds the round trip with the entry's real fill price and
+        the close's real price. Part of the book and its snapshot
+        (:meth:`entry_book_snapshot`).
+
+        :param order_ids: The held entries' venue order ids.
+        :param qty: The excess, positive.
+        :param price: The venue close's fill price.
+        :param fee: The venue close's fee share of the excess.
+        :param timestamp: The venue close's fill time, epoch seconds.
+        """
+        if qty <= 0.0:
+            return
+        self.book_moves += 1
+        self._close_excess.append(CloseExcess(tuple(order_ids), qty, price, fee, timestamp))
+
+    def take_close_excess(self, order_ids: Sequence[str | None],
+                          qty: float) -> list[CloseExcess]:
+        """Take up to ``qty`` of the excesses waiting for a fill of ``order_ids``.
+
+        :param order_ids: The booked entry fill's client and venue order ids.
+        :param qty: The entry fill's quantity.
+        :return: The taken parts, oldest first, each with its own price and its
+            fee share; empty when no excess waits for the order.
+        """
+        keys = {key for key in order_ids if key}
+        taken: list[CloseExcess] = []
+        remaining = qty
+        for excess in list(self._close_excess):
+            if remaining <= 1e-12:
+                break
+            if not keys.intersection(excess.order_ids):
+                continue
+            part = min(excess.qty, remaining)
+            share = part / excess.qty
+            taken.append(CloseExcess(excess.order_ids, part, excess.price,
+                                     excess.fee * share, excess.timestamp))
+            remaining -= part
+            excess.qty -= part
+            excess.fee -= excess.fee * share
+            if excess.qty <= 1e-12:
+                self._close_excess.remove(excess)
+        if taken:
+            self.book_moves += 1
+        return taken
+
+    def drop_close_excess(self, order_ids: Iterable[str]) -> float:
+        """Drop the excesses waiting for a fill of ``order_ids``; nothing is booked.
+
+        For a hold that ended without that fill (the operator's statement that
+        the entry did not execute, or a fill that booked less): the venue
+        position is closed and the book is flat, so nothing is left to close.
+
+        :param order_ids: The held entries' venue order ids.
+        :return: The quantity dropped.
+        """
+        keys = set(order_ids)
+        dropped = [excess for excess in self._close_excess
+                   if keys.intersection(excess.order_ids)]
+        for excess in dropped:
+            self._close_excess.remove(excess)
+        if dropped:
+            self.book_moves += 1
+        return sum(excess.qty for excess in dropped)
+
+    def close_excess_qty(self, order_ids: Iterable[str]) -> float:
+        """The excess quantity still waiting for a fill of ``order_ids``."""
+        keys = set(order_ids)
+        return sum(excess.qty for excess in self._close_excess
+                   if keys.intersection(excess.order_ids))
+
+    def note_recovered_execution(self, order_ids: Iterable[str], qty: float,
+                                 timestamp: float) -> None:
+        """Keep an execution just booked from the venue's order totals.
+
+        Part of the book and its snapshot (:meth:`entry_book_snapshot`), so it
+        is written with the booking itself. Records older than
+        :data:`RECOVERED_EXECUTION_KEEP_S` are dropped here.
+
+        :param order_ids: The order's client and venue order ids.
+        :param qty: The booked quantity (journal unit).
+        :param timestamp: The booking time, epoch seconds.
+        """
+        self._recovered_executions = [
+            record for record in self._recovered_executions
+            if timestamp - record.timestamp < RECOVERED_EXECUTION_KEEP_S]
+        ids = tuple(order_id for order_id in order_ids if order_id)
+        if qty <= 0.0 or not ids:
+            return
+        self.book_moves += 1
+        self._recovered_executions.append(RecoveredExecution(ids, qty, timestamp))
+
+    def absorb_recovered_execution(self, order_ids: Sequence[str | None], qty: float) -> float:
+        """Take up to ``qty`` of the venue-totals execution of an order a stream fill repeats.
+
+        :param order_ids: The fill's client and venue order ids.
+        :param qty: The fill's quantity (journal unit).
+        :return: The quantity taken up; ``0.0`` when nothing of the order was
+            booked from its totals.
+        """
+        keys = {key for key in order_ids if key}
+        remaining = qty
+        for record in list(self._recovered_executions):
+            if remaining <= 1e-12:
+                break
+            if not keys.intersection(record.order_ids):
+                continue
+            part = min(record.qty, remaining)
+            record.qty -= part
+            remaining -= part
+            if record.qty <= 1e-12:
+                self._recovered_executions.remove(record)
+        taken = qty - remaining
+        if taken > 0.0:
+            self.book_moves += 1
+        return taken
 
     def fill_cursor_keys(self) -> frozenset[str]:
         """The order ids (client and venue) the book keeps a fill cursor for."""
@@ -1518,9 +1740,13 @@ class BrokerPosition(PositionBase):
         (:meth:`fill_cursor`).
 
         :return: ``{'size', 'entry_seq', 'faithful', 'bindings',
-            'fill_cursors'}``; each binding is ``{'seq', 'entry_id',
-            'init_size', 'bound', 'sign', 'entry_price', 'order_ids'}``,
-            oldest first.
+            'fill_cursors', 'close_excess', 'recovered_executions'}``; each
+            binding is ``{'seq', 'entry_id', 'init_size', 'bound', 'sign',
+            'entry_price', 'order_ids'}``, oldest first, each close excess
+            (:meth:`note_close_excess`) ``{'order_ids', 'qty', 'price', 'fee',
+            'timestamp'}``, and each recovered execution
+            (:meth:`note_recovered_execution`) ``{'order_ids', 'qty',
+            'timestamp'}``.
         """
         order_ids: dict[int, list[str]] = {}
         for order_id, binding in self._order_bindings.items():
@@ -1537,6 +1763,16 @@ class BrokerPosition(PositionBase):
                 for binding in self._entry_book
             ],
             'fill_cursors': dict(self._fill_cursors),
+            'close_excess': [
+                {'order_ids': list(excess.order_ids), 'qty': excess.qty,
+                 'price': excess.price, 'fee': excess.fee, 'timestamp': excess.timestamp}
+                for excess in self._close_excess
+            ],
+            'recovered_executions': [
+                {'order_ids': list(record.order_ids), 'qty': record.qty,
+                 'timestamp': record.timestamp}
+                for record in self._recovered_executions
+            ],
         }
 
     @staticmethod
@@ -1569,10 +1805,42 @@ class BrokerPosition(PositionBase):
         faithful = payload.get('faithful')
         rows = payload.get('bindings')
         raw_cursors = payload.get('fill_cursors')
+        raw_excess = payload.get('close_excess')
+        raw_recovered = payload.get('recovered_executions')
         if (size is None or entry_seq is None or written_ms is None
                 or not isinstance(faithful, bool) or not isinstance(rows, list)
-                or not isinstance(raw_cursors, dict)):
+                or not isinstance(raw_cursors, dict) or not isinstance(raw_excess, list)
+                or not isinstance(raw_recovered, list)):
             return None
+        recovered: list[RecoveredExecution] = []
+        for raw in raw_recovered:
+            if not isinstance(raw, dict):
+                return None
+            record_ids = raw.get('order_ids')
+            record_qty = number(raw.get('qty'))
+            record_ts = number(raw.get('timestamp'))
+            if (not isinstance(record_ids, list) or not record_ids
+                    or not all(isinstance(order_id, str) for order_id in record_ids)
+                    or record_qty is None or record_qty <= 0.0 or record_ts is None):
+                return None
+            recovered.append(RecoveredExecution(tuple(record_ids), record_qty, record_ts))
+        close_excess: list[CloseExcess] = []
+        for raw in raw_excess:
+            if not isinstance(raw, dict):
+                return None
+            excess_ids = raw.get('order_ids')
+            excess_qty = number(raw.get('qty'))
+            excess_price = number(raw.get('price'))
+            excess_fee = number(raw.get('fee'))
+            excess_ts = number(raw.get('timestamp'))
+            if (not isinstance(excess_ids, list) or not excess_ids
+                    or not all(isinstance(order_id, str) for order_id in excess_ids)
+                    or excess_qty is None or excess_qty <= 0.0
+                    or excess_price is None or excess_price <= 0.0
+                    or excess_fee is None or excess_ts is None):
+                return None
+            close_excess.append(CloseExcess(tuple(excess_ids), excess_qty, excess_price,
+                                            excess_fee, excess_ts))
         fill_cursors: dict[str, float] = {}
         for key, raw in raw_cursors.items():
             qty = number(raw)
@@ -1611,14 +1879,17 @@ class BrokerPosition(PositionBase):
         return EntryBookSnapshot(
             size=size, entry_seq=entry_seq, faithful=faithful, written_ms=written_ms,
             bindings=tuple(bindings), order_bindings=order_bindings,
-            fill_cursors=fill_cursors,
+            fill_cursors=fill_cursors, close_excess=tuple(close_excess),
+            recovered_executions=tuple(recovered),
         )
 
     def restore_entry_book(self, snapshot: EntryBookSnapshot) -> None:
         """Replace the binding book with a stored one, verbatim.
 
         The bindings, the venue order ids whose further slices grow them, the
-        sequence counter, the fill cursors and
+        sequence counter, the fill cursors, the close excesses
+        (:meth:`note_close_excess`), the recovered executions
+        (:meth:`note_recovered_execution`) and
         :attr:`~BrokerPosition.book_faithful` come back as they were written;
         the trade rows and the size are left alone. Whether the stored book
         fits the position is the caller's to judge.
@@ -1633,6 +1904,9 @@ class BrokerPosition(PositionBase):
         self._entry_seq = max(
             [snapshot.entry_seq, *(binding.seq for binding in snapshot.bindings)])
         self._fill_cursors = dict(snapshot.fill_cursors)
+        self._close_excess = [copy.copy(excess) for excess in snapshot.close_excess]
+        self._recovered_executions = [copy.copy(record)
+                                      for record in snapshot.recovered_executions]
         self.book_faithful = snapshot.faithful
 
     def record_provisional_close(self, event: 'OrderEvent') -> ProvisionalClose:

@@ -15,7 +15,10 @@ module owns the rule, and a plugin supplies the lookup:
 
 * the venue still has the order working or has executed some of it
   (:attr:`ParkedOutcome.LANDED`): nothing to release, the engine verification
-  or the fill path unparks it;
+  or the fill path unparks it. An order the venue no longer lists, whose
+  execution the plugin's stream can therefore never deliver, the plugin hands
+  over with :meth:`~pynecore.core.plugin.broker.BrokerPlugin.request_execution_hold`:
+  the engine confirms the row on it and books its execution from the venue;
 * the venue has the order and refused it without a fill
   (:attr:`ParkedOutcome.REFUSED`): rejected at once;
 * the venue conclusively has no such order (:attr:`ParkedOutcome.ABSENT`):
@@ -72,7 +75,6 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_WORKING,
     EXTRAS_KEY_REJECTED_ON_ABSENCE,
     PENDING_DISPATCH_STATES,
-    STATE_DISPOSITION_UNKNOWN,
     find_pending_dispatch,
 )
 
@@ -123,14 +125,13 @@ def awaits_venue_answer(store_ctx: 'RunContext', row: 'OrderRow') -> bool:
     in any pending state. A ``submitted`` row of this process does not: it is
     mid-flight, or the engine retries it itself.
 
+    The rule is :meth:`~pynecore.core.broker.storage.RunContext.awaits_venue_answer`.
+
     :param store_ctx: The run's store.
     :param row: A live row without a venue order id.
     :return: Whether the row is the resolver's to look up.
     """
-    if row.state == STATE_DISPOSITION_UNKNOWN:
-        return True
-    return (row.state in PENDING_DISPATCH_STATES
-            and store_ctx.is_inherited_dispatch(row.client_order_id))
+    return store_ctx.awaits_venue_answer(row)
 
 
 def park_inherited_dispatches(store_ctx: 'RunContext') -> list[str]:

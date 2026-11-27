@@ -144,6 +144,7 @@ def build_entry_intent(order: Order, symbol: str) -> EntryIntent:
         alert_message=_na_to_none(order.alert_message),
         is_strategy_order=(order.order_type == _order_type_normal),
         skip_flip=order.skip_flip,
+        flip_qty=abs(order.flip_extra),
     )
 
 

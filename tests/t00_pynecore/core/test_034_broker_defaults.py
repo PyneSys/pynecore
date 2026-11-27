@@ -65,13 +65,13 @@ def __test_invalid_policy_raises_value_error__(tmp_path: Path) -> None:
 
 
 def __test_valid_policy_set_contents__() -> None:
-    """``VALID_UNEXPECTED_CANCEL_POLICIES`` holds exactly the four expected policies.
+    """``VALID_UNEXPECTED_CANCEL_POLICIES`` holds exactly the three expected policies.
 
     Guard against accidental drift between the validator's allow-set
     and the policy branches implemented in
     :meth:`DisappearanceTracker._apply_policy`."""
     assert VALID_UNEXPECTED_CANCEL_POLICIES == frozenset({
-        'stop', 're_place', 'ignore', 'halt',
+        'stop', 're_place', 'ignore',
     })
 
 
@@ -81,16 +81,25 @@ def __test_inventory_conflict_policy_loaded_and_validated__(tmp_path: Path) -> N
     The set is deliberately narrower than ``on_unexpected_cancel`` —
     an attribution conflict has no safe ``re_place``/``ignore`` analogue,
     so those values must be rejected here even though the other knob
-    accepts similar spellings."""
+    accepts similar spellings. No policy ends the process, so ``halt`` is
+    rejected too."""
     assert VALID_INVENTORY_CONFLICT_POLICIES == frozenset({
-        'quarantine', 'halt',
+        'quarantine',
     })
+    (tmp_path / 'brokers.toml').write_text(
+        'on_inventory_conflict = "quarantine"\n',
+        encoding='utf-8',
+    )
+    defaults = load_broker_defaults(tmp_path)
+    assert defaults.on_inventory_conflict == 'quarantine'
+
+    _ensured.clear()
     (tmp_path / 'brokers.toml').write_text(
         'on_inventory_conflict = "halt"\n',
         encoding='utf-8',
     )
-    defaults = load_broker_defaults(tmp_path)
-    assert defaults.on_inventory_conflict == 'halt'
+    with pytest.raises(ValueError):
+        load_broker_defaults(tmp_path)
 
     _ensured.clear()
     (tmp_path / 'brokers.toml').write_text(

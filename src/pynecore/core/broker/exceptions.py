@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from pynecore.core.broker.models import QuarantineKind
+
 if TYPE_CHECKING:
     from pynecore.core.broker.models import ExchangeOrder
 
@@ -360,19 +362,23 @@ class OrderSyncError(BrokerError):
 
 
 class BrokerManualInterventionError(BrokerError):
-    """Automated execution cannot safely continue — a human must resolve
-    broker-side ambiguity before the strategy runs again.
+    """The plugin cannot safely go on with what the engine asked of it.
 
     Raised by a BrokerPlugin when reconcile or recovery logic encounters a
     state that cannot be resolved without risking an incorrect trade — e.g.
     a partial-close race whose reverse leg cannot be confidently identified,
     or a crash-recovery heuristic that finds multiple candidate deals for a
-    single submitted intent. Semantics are **terminal**: the sync engine
-    halts all further dispatches and the runner performs a graceful stop.
+    single submitted intent. The sync engine never stops the run on it: it
+    latches a quarantine (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.record_quarantine`)
+    and keeps the process alive. An :class:`UnexpectedCancelError` (someone
+    else acted on the account) latches the ``external_intervention``
+    quarantine; any other report latches an ``entry_block`` that ends by
+    itself once a reconcile passes without a new report and the venue holds
+    what the book holds. A write the error interrupted is treated as one of
+    unknown outcome, never sent again blindly.
     Distinct from :class:`ExchangeOrderRejectedError` (the order is known
     not to exist) and :class:`OrderDispositionUnknownError` (the plugin
-    parks and retries on next sync) — manual intervention signals that
-    *automated* recovery cannot proceed safely.
+    parks and retries on next sync).
 
     :ivar reason: Human-readable description of the ambiguity.
     :ivar intent_key: The intent's diff key, if the ambiguity relates to a
@@ -399,27 +405,37 @@ class SpotInventoryConflictError(BrokerManualInterventionError):
     could not be established.
 
     Raised by the :class:`~pynecore.core.broker.spot_inventory.SpotInventoryManager`
-    when the ``halt`` inventory-conflict policy is active (or as the
-    fail-safe fallback when the quarantine hook is missing / raising):
+    as the fail-safe fallback when its quarantine hook is missing or raised:
     an unexplainable base-balance drift in either direction, a corrupt
     or foreign ledger row, an inconclusive execution catch-up, or a
-    lost asset-ownership lease. External intervention in the bot's
-    inventory is not supported — there is no adoption path, so the safe
-    terminal signal is manual intervention followed by a restart, whose
-    startup recovery re-anchors on the venue's measured balance.
+    lost asset-ownership lease. The engine latches the quarantine the
+    manager decided (:attr:`kind`) when the error reaches it.
+
+    :ivar kind: The quarantine kind the conflict calls for: ``entry_block``
+        for the bot's own inventory trouble, ``external_intervention`` when
+        the bot's inventory was taken.
     """
+
+    def __init__(
+            self,
+            reason: str,
+            *,
+            intent_key: str | None = None,
+            context: dict | None = None,
+            kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK,
+    ) -> None:
+        super().__init__(reason, intent_key=intent_key, context=context)
+        self.kind = kind
 
 
 class UnexpectedCancelError(BrokerManualInterventionError):
     """A bot-owned order disappeared without the bot having cancelled it.
 
     Indicates external interference (manual user action, exchange-side
-    maintenance, margin-induced cancel, etc.). Modelled as a manual-
-    intervention error because automated recovery cannot reason about why
-    the order vanished — the safe default is to halt and let a human
-    inspect. The sync engine's
-    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.run_event_stream` and
-    dispatch paths catch :class:`BrokerManualInterventionError` uniformly, so the same
-    graceful-stop pipeline applies whether the trigger came from a polling snapshot or
-    from an in-flight dispatch.
+    maintenance, margin-induced cancel, etc.): someone else acted on the
+    account. The sync engine latches the ``external_intervention``
+    quarantine on it wherever it arrives (the event stream, a dispatch, a
+    reconcile read): the process stays alive and the bot leaves the venue as
+    it is until the operator resumes it. Raised only where the quarantine
+    hook a policy needs is missing or failed.
     """

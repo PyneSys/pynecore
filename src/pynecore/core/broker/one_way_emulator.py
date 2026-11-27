@@ -4270,6 +4270,22 @@ class OneWayEmulator:
         await self._replay_residual_opens(port)
         return await self._replay_bracket_ownership(port)
 
+    async def settle_pending_close_legs(self, port: 'PositionPort') -> bool:
+        """Settle every pending close-leg row now, in the running process.
+
+        The first pass of :meth:`restart_replay` on its own: what each pending
+        row's send executed is established from the live legs and the venue's
+        answer, and only what is provably still open is re-sent
+        (:meth:`_replay_close_legs`). The sync engine runs it for a held
+        partial-bracket close whose leg send's answer was lost, so the bot
+        settles it without a restart.
+
+        :return: ``True`` when every pending row was settled.
+        """
+        if self._store_ctx is None:
+            return True
+        return await self._replay_close_legs(port)
+
     async def _replay_close_legs(self, port: 'PositionPort') -> bool:
         """Reconcile + re-dispatch any pending close-leg rows (first replay pass).
 

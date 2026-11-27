@@ -1315,7 +1315,7 @@ class SoftwarePartialBracketEngine:
         ``reconcile()`` cancel-retry-loop resolves the disposition (→
         :meth:`confirm_cancel_tentative` or
         :meth:`restore_legs_from_cancel_tentative`) or the stale-grace
-        deadline expires (→ ``DEGRADED_HALT`` by the caller).
+        deadline expires (→ degraded by the caller, which keeps probing).
 
         Already ``armed`` legs are NOT affected: per the dossier's leg-
         trio atomicity invariant (:meth:`on_parent_entry_filled` flips

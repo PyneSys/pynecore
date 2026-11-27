@@ -295,7 +295,7 @@ def __test_a_trigger_under_quarantine_opens_nothing__():
     eng, pos = _engine(broker)
     _place(pos)
     eng.sync(BAR, last_price=1.17)
-    eng.record_quarantine("external cancel detected")
+    eng.record_quarantine("external cancel detected", cause="test")
     eng._drive_stop_limit_watches(last_price=1.19)
     assert broker.entries == []
     assert eng._stop_limit_engine.get_watch("Long") is None

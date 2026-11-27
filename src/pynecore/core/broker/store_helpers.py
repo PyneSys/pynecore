@@ -416,8 +416,8 @@ LEG_STATE_CASCADED_CANCEL_BY_NATIVE_SL = 'cascaded_cancel_by_native_sl'
 # the outcome flips the leg to ``aborted_parent_never_arrived`` (on
 # ``CANCEL_CONFIRMED``), to ``aborted_parent_gone`` (on
 # ``FILLED_AND_CLOSED``) or back to ``pending_entry`` / ``armed`` (on
-# ``ALREADY_FILLED``). Stale-grace expiry promotes the parent to
-# ``DEGRADED_HALT``. See the cancel-tentative state design dossier.
+# ``ALREADY_FILLED``). Stale-grace expiry degrades the parent (entries
+# blocked, the probe goes on). See the cancel-tentative state design dossier.
 LEG_STATE_CANCEL_TENTATIVE = 'cancel_tentative'
 
 # Terminal states — the row is closed (``closed_ts_ms`` is set) and
@@ -532,17 +532,14 @@ STOP_LIMIT_STATE_ABORTED = 'aborted'
 # States of a watch row written by a version that modelled a both-set entry as
 # two OCO legs (a native LIMIT resting from the start plus a software STOP
 # that fired a MARKET). Such a row is never driven: the restart retires it
-# (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._retire_legacy_oco_watch`).
+# (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._retire_legacy_oco_watches`).
 LEGACY_OCO_STATE_CANCEL_PENDING = 'cancel_pending'
 LEGACY_OCO_STATE_MARKET_PENDING = 'stop_market_pending'
 
-# Terminal states — the row is closed and the engine no longer owns it. The
-# legacy OCO terminals count too, so a closed legacy row is never replayed.
+# Terminal states — the row is closed and the engine no longer owns it.
 STOP_LIMIT_STATE_TERMINAL: frozenset[str] = frozenset({
     STOP_LIMIT_STATE_FILLED,
     STOP_LIMIT_STATE_ABORTED,
-    'limit_won',
-    'stop_won',
 })
 
 # Live states — the row is alive and the engine drives its next transition.

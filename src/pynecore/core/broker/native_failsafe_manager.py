@@ -74,6 +74,13 @@ PUT_MAX_ATTEMPTS_DEFAULT: int = 3
 """§2.6.7 immediate retry budget before the state transitions to
 ``degrading``. Each ``record_put_failure`` call counts as one attempt."""
 
+HEAL_FIRST_DELAY_MS: float = 5_000.0
+"""First delay before the bot re-arms a ``degraded`` fail-safe it still owns
+(:meth:`NativeFailsafeManager.heal_degraded`); it doubles with every re-arm."""
+
+HEAL_MAX_DELAY_MS: float = 300_000.0
+"""Cap of the self-heal delay: the bot keeps re-arming at this pace, with no end."""
+
 STALE_WINDOW_MS_DEFAULT: float = 30_000.0
 """§2.6.7 stale window. ``degrading`` states that do not confirm
 ``actual_level == desired_level`` within this window flip to ``degraded``.
@@ -277,8 +284,8 @@ class NativeStopState:
     # in :meth:`_clear_outstanding`.
     batch_put_acked: bool = False
     # Reason tag for a ``degraded`` state, used to scope automatic recovery. A
-    # PUT-failure ``degraded`` (``None``) requires an explicit user reset
-    # (§2.6.7). A confirmation-timeout ``degraded`` may instead recover to
+    # PUT-failure ``degraded`` (``None``) is re-armed by the bot itself
+    # (:meth:`NativeFailsafeManager.heal_degraded`). A confirmation-timeout ``degraded`` may instead recover to
     # ``healthy`` on its own when a later reconcile snapshot finally confirms the
     # latest desired triple — the broker protection is verified present again.
     degraded_reason: str | None = None
@@ -353,6 +360,10 @@ class NativeFailsafeManager:
         # this on every sync tick and forwards to the plugin. Entries
         # disappear on :meth:`record_put_success` / :meth:`record_put_failure`.
         self._pending: dict[str, NativeBracketSnapshot] = {}
+        # Self-healing of an own ``DEGRADED`` state (:meth:`heal_degraded`):
+        # per parent, how many re-arms ran and when the next one is due
+        # (epoch ms). In memory only: a restart heals afresh.
+        self._heal_backoff: dict[str, tuple[int, float]] = {}
 
     # --- Lifecycle ------------------------------------------------------
 
@@ -526,8 +537,9 @@ class NativeFailsafeManager:
             return None
         if state.health is FailsafeHealth.DEGRADED:
             # §2.6.7: once the stale window has expired and the state is
-            # ``DEGRADED``, the engine must not write the broker-native stop
-            # again until the user calls ``set_risk`` / ``reset_to_engine``.
+            # ``DEGRADED``, the engine writes the broker-native stop again only
+            # through its own re-arm (:meth:`heal_degraded`) or a
+            # ``set_risk`` / ``reset_to_engine``.
             # A leg cancellation or trailing-level move arriving in this
             # window would otherwise re-queue a ``NativeBracketSnapshot`` and
             # overwrite the stop the operator may already have edited
@@ -623,8 +635,8 @@ class NativeFailsafeManager:
             if state.owner is not FailsafeOwner.ENGINE_FAILSAFE:
                 continue
             if state.health is FailsafeHealth.DEGRADED:
-                # §2.6.7: DEGRADED requires user reset before the engine
-                # writes the broker-native stop again. Mirror the guard in
+                # §2.6.7: DEGRADED writes the broker-native stop again only
+                # through :meth:`heal_degraded` or a reset. Mirror the guard in
                 # :meth:`recompute_worst_sl` so a coalesced trail flush
                 # cannot bypass it.
                 continue
@@ -818,7 +830,8 @@ class NativeFailsafeManager:
             # remaining can still flip when a fresh ``recompute_worst_sl``
             # restocked ``immediate_attempts_remaining`` mid-window).
             # Once DEGRADED, §2.6.7 forbids further engine-driven PUTs
-            # until ``set_risk`` / ``reset_to_engine``; re-queueing would
+            # until the bot's own re-arm (:meth:`heal_degraded`) or a reset;
+            # re-queueing would
             # have ``drive_native_failsafe`` dispatch another snapshot on
             # the next tick and potentially overwrite a manual broker-side
             # edit. Mirror the post-exhaustion DEGRADED guard below.
@@ -842,8 +855,8 @@ class NativeFailsafeManager:
             # A retry PUT that was already in flight when
             # :meth:`tick_stale_window` promoted the state to DEGRADED
             # can land here with the current generation. Once DEGRADED,
-            # §2.6.7 forbids further engine-driven PUTs until the user
-            # explicitly calls ``set_risk`` / ``reset_to_engine``;
+            # §2.6.7 forbids further engine-driven PUTs until the bot's own
+            # re-arm (:meth:`heal_degraded`) or a reset;
             # re-queueing a snapshot now would have ``drive_native_failsafe``
             # dispatch it on the next tick and potentially overwrite any
             # manual broker-side edit the operator made after the
@@ -959,8 +972,8 @@ class NativeFailsafeManager:
                 # A confirmation-timeout DEGRADED auto-recovers once the broker
                 # finally confirms the latest desired triple: the protection is
                 # verified present again, so no manual reset is required. A
-                # PUT-failure DEGRADED (``degraded_reason is None``) does NOT
-                # auto-recover — §2.6.7 keeps requiring an explicit user reset.
+                # PUT-failure DEGRADED (``degraded_reason is None``) recovers
+                # through the bot's own re-arm (:meth:`heal_degraded`).
                 #
                 # The ownership guard is load-bearing: a confirmation-timeout
                 # DEGRADED whose broker stop was then manually edited takes the
@@ -1174,6 +1187,59 @@ class NativeFailsafeManager:
         if state.health is not FailsafeHealth.HEALTHY:
             self._transition(state, FailsafeHealth.HEALTHY, 'user reset')
 
+    def heal_degraded(self, *, now_ms: float) -> list[str]:
+        """Re-arm every ``DEGRADED`` fail-safe the engine still owns, with a backoff.
+
+        A ``DEGRADED`` state the engine owns is the bot's own trouble: its
+        PUTs failed past the stale window, or the venue never confirmed an
+        acknowledged one. Nobody edited the stop (an observed edit flips the
+        owner to ``UNKNOWN``, an external intervention only the operator
+        lifts). The bot gets out by itself: it re-queues the desired
+        full-replacement snapshot, the way :meth:`reset_to_engine` does, and
+        the state goes to ``DEGRADING``, so new entries and partial brackets
+        stay blocked until a snapshot of the venue confirms the stop
+        (:meth:`on_native_bracket_observed`); a re-arm that fails again
+        degrades again after the stale window. The first re-arm comes
+        :data:`HEAL_FIRST_DELAY_MS` after the state was first seen degraded
+        (a late confirmation still recovers it without a write), and the
+        delay doubles with every re-arm up to :data:`HEAL_MAX_DELAY_MS`,
+        with no end.
+
+        :param now_ms: The engine's bar-clock time, epoch ms.
+        :return: The parents re-armed by this call.
+        """
+        healed: list[str] = []
+        for ref in [ref for ref in self._heal_backoff if ref not in self._states]:
+            del self._heal_backoff[ref]
+        for state in list(self._states.values()):
+            ref = state.parent_entry_dispatch_ref
+            if (state.health is not FailsafeHealth.DEGRADED
+                    or state.owner is not FailsafeOwner.ENGINE_FAILSAFE):
+                if state.health is FailsafeHealth.HEALTHY:
+                    self._heal_backoff.pop(ref, None)
+                continue
+            if ref not in self._heal_backoff:
+                # A confirmation may still land: the first re-arm waits.
+                self._heal_backoff[ref] = (0, now_ms + HEAL_FIRST_DELAY_MS)
+                continue
+            attempts, due_ms = self._heal_backoff[ref]
+            if now_ms < due_ms:
+                continue
+            delay = min(HEAL_MAX_DELAY_MS, HEAL_FIRST_DELAY_MS * 2.0 ** min(attempts + 1, 16))
+            self._heal_backoff[ref] = (attempts + 1, now_ms + delay)
+            state.immediate_attempts_remaining = self._put_max_attempts
+            state.pending_retry = False
+            self._clear_outstanding(state)
+            state.degraded_reason = None
+            state.generation += 1
+            state.last_desired_change_ts_ms = now_ms
+            state.degrading_since_ts_ms = now_ms
+            self._pending[ref] = self._build_snapshot(state)
+            self._note_batch_start(state, sl=state.desired_level, now_ms=now_ms)
+            self._transition(state, FailsafeHealth.DEGRADING, 'self-heal re-arm')
+            healed.append(ref)
+        return healed
+
     # --- Gates ---------------------------------------------------------
 
     def is_new_partial_bracket_blocked(
@@ -1220,7 +1286,8 @@ class NativeFailsafeManager:
           ``healthy``, but :meth:`recompute_worst_sl` is a no-op for
           non-``ENGINE_FAILSAFE`` ownership, so a freshly armed leg would
           add exposure without driving an updated worst-SL to the broker.
-          Recovery requires :meth:`reset_to_engine` (user reset).
+          An ``UNKNOWN`` owner means someone else edited the stop: only
+          :meth:`reset_to_engine` (the operator) recovers it.
         """
         state = self._states.get(parent_entry_dispatch_ref)
         if state is None:
@@ -1421,9 +1488,9 @@ class NativeFailsafeManager:
         if (now_ms - anchor) < window:
             return
         self._transition(state, FailsafeHealth.DEGRADED, 'stale-window expired')
-        # Once the stale window has expired, manual ``set_risk`` /
-        # ``reset_to_engine`` is required before the engine writes the
-        # broker-native stop again (§2.6.7). Leaving ``pending_retry`` and the
+        # Once the stale window has expired, the engine writes the
+        # broker-native stop again only through its own re-arm after a delay
+        # (:meth:`heal_degraded`) or a reset (§2.6.7). Leaving ``pending_retry`` and the
         # queued snapshot intact would let the very next ``drive_native_failsafe``
         # tick re-dispatch the same failed PUT — ``pending_dispatch()`` runs
         # immediately after ``tick_stale_window`` — and ``record_put_failure``
@@ -1470,8 +1537,8 @@ class NativeFailsafeManager:
         # DO NOT re-dispatch (a broken / again-lagging feed proves nothing, and a
         # blind re-PUT could clobber a manual edit). A later confirming snapshot
         # auto-recovers this state in :meth:`on_native_bracket_observed`; the
-        # ``degraded_reason`` tag scopes that recovery so a PUT-failure DEGRADED
-        # still requires an explicit user reset.
+        # ``degraded_reason`` tag scopes that recovery; the bot's own re-arm
+        # (:meth:`heal_degraded`) covers both.
         state.degraded_reason = 'confirmation-timeout'
         self._transition(state, FailsafeHealth.DEGRADED, 'confirmation-timeout')
         # Defensively drop any queued snapshot so ``pending_dispatch()`` (which

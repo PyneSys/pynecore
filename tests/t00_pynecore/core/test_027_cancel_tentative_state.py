@@ -20,6 +20,7 @@ import itertools
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 
@@ -38,14 +39,19 @@ from pynecore.core.broker.models import (
     EntryDeferredCancelDispositionPendingEvent,
     EntryIntent,
     ExchangeCapabilities,
+    ExchangeOrder,
     ExchangePosition,
     ExitIntent,
-    ManualInterventionRequiredEvent,
+    LegType,
+    OrderExecution,
     OrderStatus,
     OrderType,
     PartialBracketCancelTentativeDegradedEvent,
     PartialBracketCancelTentativeResolvedEvent,
     PartialBracketCancelTentativeStartedEvent,
+    QuarantineEndedEvent,
+    QuarantineEnteredEvent,
+    QuarantineKind,
 )
 from pynecore.core.broker.intent_builder import build_intents
 from pynecore.core.broker.native_failsafe_manager import FailsafeHealth
@@ -83,7 +89,12 @@ from pynecore.core.broker.store_helpers import (
     LEG_STATE_PENDING_ENTRY,
     STATE_PARTIAL_BRACKET_LEG,
 )
-from pynecore.core.broker.sync_engine import OrderSyncEngine, _CancelTentativeMeta
+from pynecore.core.broker.sync_engine import (
+    _VENUE_RECOVERY_CAP_S,
+    _VENUE_RECOVERY_FIRST_S,
+    OrderSyncEngine,
+    _CancelTentativeMeta,
+)
 from pynecore.lib.strategy import Trade
 from types import SimpleNamespace
 
@@ -491,13 +502,24 @@ def __test_reconcile_cancel_confirmed_resolves_and_clears__():
     assert resolved[0].via == 'reconcile_retry'
 
 
-def __test_reconcile_stale_grace_promotes_to_degraded_halt__():
-    """Stale-grace expiry after an in-session retry ⇒ halt latched.
+def _degraded(engine: OrderSyncEngine, key: str) -> bool:
+    """The parent is degraded: an entry block holds under its cause, and the
+    entry stays tentative so the probe goes on."""
+    return (engine.quarantined
+            and engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+            and engine._entry_block_causes.get(f"cancel_disposition:{key}")
+            == 'partial_bracket_cancel_disposition_unresolved'
+            and key in engine._cancel_disposition_pending)
+
+
+def __test_reconcile_stale_grace_promotes_to_a_degraded_entry_block__():
+    """Stale-grace expiry after an in-session retry ⇒ degraded: new entries
+    are blocked, the process stays alive and the entry stays tentative.
 
     ``retry_count=1`` records that one ``execute_cancel_with_outcome``
-    attempt already ran in this session — the precondition the halt
-    promotion requires (a zero-retry expired entry gets probed first,
-    see ``__test_stale_anchor_restart_probes_before_halt__``).
+    attempt already ran in this session — the precondition the
+    degradation requires (a zero-retry expired entry gets probed first,
+    see ``__test_stale_anchor_restart_probes_before_degrading__``).
     """
     events: list[BrokerEvent] = []
     broker = _MockBroker()
@@ -510,19 +532,55 @@ def __test_reconcile_stale_grace_promotes_to_degraded_halt__():
         since_ts_ms=BAR_TS - 5_000, reason='broker_timeout', retry_count=1,
     )
     engine._drive_cancel_tentative(now_ms=BAR_TS)
-    # Halt latched.
-    assert engine.halted is True
-    assert engine._halted_reason == 'partial_bracket_cancel_disposition_unresolved'
+    # Degraded: entry block latched under its own cause.
+    assert _degraded(engine, intent.intent_key)
     # Degraded-event emitted.
     degraded = [e for e in events
                 if isinstance(e, PartialBracketCancelTentativeDegradedEvent)]
     assert len(degraded) == 1
     assert degraded[0].intent_key == intent.intent_key
-    # ManualInterventionRequiredEvent emitted.
-    mire = [e for e in events
-            if isinstance(e, ManualInterventionRequiredEvent)]
-    assert len(mire) == 1
-    assert mire[0].reason == 'partial_bracket_cancel_disposition_unresolved'
+    # The quarantine is entered once, with the stable reason.
+    entered = [e for e in events if isinstance(e, QuarantineEnteredEvent)]
+    assert len(entered) == 1
+    assert entered[0].reason == 'partial_bracket_cancel_disposition_unresolved'
+    assert entered[0].kind is QuarantineKind.ENTRY_BLOCK
+
+
+def __test_degraded_cancel_disposition_keeps_probing_and_ends_its_entry_block__():
+    """A degraded parent is probed on with the venue re-read backoff, never
+    abandoned: the venue's definite answer resolves it, and the next
+    reconcile ends the entry block by itself."""
+    events: list[BrokerEvent] = []
+    broker = _MockBroker(cancel_outcomes=[
+        CancelDispositionOutcome.UNKNOWN, CancelDispositionOutcome.CANCEL_CONFIRMED,
+    ])
+    engine = _mk_engine(broker, events=events, cancel_tentative_stale_grace_s=1.0)
+    intent = _seed_parent_intent_and_leg(engine)
+    engine._cancel_disposition_pending[intent.intent_key] = _CancelTentativeMeta(
+        since_ts_ms=BAR_TS - 5_000, reason='broker_timeout', retry_count=1,
+    )
+    engine._mark_reads_confirmed()
+    engine._drive_cancel_tentative(now_ms=BAR_TS)
+    assert _degraded(engine, intent.intent_key)
+    assert broker.cancel_with_outcome_calls == []
+    # Within the first backoff delay nothing is asked.
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 1_000)
+    assert broker.cancel_with_outcome_calls == []
+    # Past it the venue is asked again; an UNKNOWN keeps the entry degraded.
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 6_000)
+    assert len(broker.cancel_with_outcome_calls) == 1
+    assert _degraded(engine, intent.intent_key)
+    # The delay doubled: the next probe waits 10 s, then the venue answers.
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 12_000)
+    assert len(broker.cancel_with_outcome_calls) == 1
+    engine._drive_cancel_tentative(now_ms=BAR_TS + 17_000)
+    assert len(broker.cancel_with_outcome_calls) == 2
+    assert intent.intent_key not in engine._cancel_disposition_pending
+    assert len([e for e in events
+                if isinstance(e, PartialBracketCancelTentativeDegradedEvent)]) == 1
+    engine._resolve_entry_block_causes(now_ms=BAR_TS + 18_000)
+    assert not engine.quarantined
+    assert not engine._stale_cancel_dispositions
 
 
 def __test_stale_grace_waits_while_broker_reads_unconfirmed__():
@@ -545,7 +603,7 @@ def __test_stale_grace_waits_while_broker_reads_unconfirmed__():
     engine._drive_cancel_tentative(now_ms=BAR_TS)
     engine._drive_cancel_tentative(now_ms=BAR_TS + 1_000)
     # Grace expired with an in-session retry, yet no halt: the venue is down.
-    assert engine.halted is False
+    assert engine.quarantined is False
     assert len(broker.cancel_with_outcome_calls) == 2
     meta = engine._cancel_disposition_pending[intent.intent_key]
     assert meta.retry_count == 0
@@ -555,12 +613,11 @@ def __test_stale_grace_waits_while_broker_reads_unconfirmed__():
     # second pass halts on the persistent UNKNOWN.
     engine._mark_reads_confirmed()
     engine._drive_cancel_tentative(now_ms=BAR_TS + 2_000)
-    assert engine.halted is False
+    assert engine.quarantined is False
     assert len(broker.cancel_with_outcome_calls) == 3
     assert meta.retry_count == 1
     engine._drive_cancel_tentative(now_ms=BAR_TS + 3_000)
-    assert engine.halted is True
-    assert engine._halted_reason == 'partial_bracket_cancel_disposition_unresolved'
+    assert _degraded(engine, intent.intent_key)
     assert len(broker.cancel_with_outcome_calls) == 3
 
 
@@ -590,7 +647,7 @@ def __test_transport_failure_on_cancel_probe_is_not_venue_evidence__():
     for step in range(1, 4):
         engine._drive_cancel_tentative(now_ms=BAR_TS + step * 1_000)
     meta = engine._cancel_disposition_pending[intent.intent_key]
-    assert engine.halted is False
+    assert engine.quarantined is False
     assert len(broker.cancel_with_outcome_calls) == 3
     assert meta.retry_count == 0
     assert meta.last_retry_outcome is CancelDispositionOutcome.UNKNOWN
@@ -599,12 +656,11 @@ def __test_transport_failure_on_cancel_probe_is_not_venue_evidence__():
     # The venue answers UNKNOWN once the link is back: that probe is the
     # first real evidence, and the next pass halts on it.
     engine._drive_cancel_tentative(now_ms=BAR_TS + 4_000)
-    assert engine.halted is False
+    assert engine.quarantined is False
     assert len(broker.cancel_with_outcome_calls) == 4
     assert meta.retry_count == 1
     engine._drive_cancel_tentative(now_ms=BAR_TS + 5_000)
-    assert engine.halted is True
-    assert engine._halted_reason == 'partial_bracket_cancel_disposition_unresolved'
+    assert _degraded(engine, intent.intent_key)
     assert len(broker.cancel_with_outcome_calls) == 4
 
 
@@ -975,7 +1031,7 @@ def __test_cancel_tentative_legless_survives_restart_from_journal__(tmp_path):
         # teardown purges the journal row (record_complete by key).
         engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_000)
         assert engine2._cancel_disposition_pending == {}
-        assert engine2.halted is False
+        assert engine2.quarantined is False
         assert len(broker2.cancel_with_outcome_calls) == 1
         _, pending2 = ctx2.replay()
         assert pending2 == {}
@@ -1144,7 +1200,7 @@ def __test_filled_and_closed_resolves_without_restore_booking_or_halt__():
     engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 5_000)
     engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 6_000)
 
-    assert engine.halted is False
+    assert engine.quarantined is False
     assert len(broker.cancel_with_outcome_calls) == 1
     assert engine._cancel_disposition_pending == {}
     assert [leg.leg_state for leg in legs] == [LEG_STATE_ABORTED_PARENT_GONE]
@@ -1254,7 +1310,7 @@ def __test_filled_and_closed_after_a_restart_is_not_re_armed__(tmp_path):
         assert intent.intent_key in engine2._cancel_disposition_pending
         engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_200_000)
         engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_201_000)
-        assert engine2.halted is False
+        assert engine2.quarantined is False
         assert engine2._cancel_disposition_pending == {}
         assert intent.intent_key not in engine2._order_mapping
         assert intent.intent_key not in engine2._envelopes
@@ -1273,18 +1329,18 @@ def __test_filled_and_closed_after_a_restart_is_not_re_armed__(tmp_path):
         assert intent.intent_key not in engine3._order_mapping
         engine3._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_300_000)
         assert broker3.cancel_with_outcome_calls == []
-        assert engine3.halted is False
+        assert engine3.quarantined is False
 
 
-def __test_cancel_tentative_stale_grace_rehalts_after_restart__(tmp_path):
-    """Stale-grace expiry keeps the journal row: a restart probes, then re-halts.
+def __test_cancel_tentative_stale_grace_degrades_again_after_restart__(tmp_path):
+    """Stale-grace expiry keeps the journal row: a restart probes, then degrades again.
 
-    Expiry latches the manual-intervention halt and deliberately KEEPS
+    Expiry degrades the entry (new entries blocked) and deliberately KEEPS
     the ``cancel_tentative`` row. A restart re-arms the entry with the
     original (already expired) anchor; the retry loop must then probe
-    the venue at least once IN THE NEW SESSION before it may re-halt —
+    the venue at least once IN THE NEW SESSION before it may degrade again —
     a definite outcome resolves the entry, only a persistent ``UNKNOWN``
-    re-latches the halt. Deleting the row would let a leg-less parent's
+    degrades it again. Deleting the row would let a leg-less parent's
     unresolved disposition silently vanish across the restart instead.
     """
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
@@ -1302,13 +1358,13 @@ def __test_cancel_tentative_stale_grace_rehalts_after_restart__(tmp_path):
         intent = _seed_parent_intent_and_leg(engine, with_leg=False)
         engine._dispatch_cancel(intent)
         meta = engine._cancel_disposition_pending[intent.intent_key]
-        # First drive past the grace: probes once (UNKNOWN), no halt yet.
+        # First drive past the grace: probes once (UNKNOWN), not degraded yet.
         engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 5_000)
-        assert engine.halted is False
+        assert engine.quarantined is False
         assert len(broker.cancel_with_outcome_calls) == 1
-        # Second drive: retry already ran, grace still expired — halt.
+        # Second drive: retry already ran, grace still expired — degraded.
         engine._drive_cancel_tentative(now_ms=meta.since_ts_ms + 6_000)
-        assert engine.halted is True
+        assert _degraded(engine, intent.intent_key)
         # The obligation must not vanish across a restart: row kept.
         _, pending = ctx.replay()
         kinds = [r.dispatch_kind for r in pending.values()]
@@ -1323,25 +1379,23 @@ def __test_cancel_tentative_stale_grace_rehalts_after_restart__(tmp_path):
             broker2, store_ctx=ctx2, cancel_tentative_stale_grace_s=1.0,
         )
         assert intent.intent_key in engine2._cancel_disposition_pending
-        # Fresh session: the expired anchor alone must NOT halt — the
+        # Fresh session: the expired anchor alone must NOT degrade — the
         # venue is probed once first (persistent UNKNOWN here).
         engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 10_000)
-        assert engine2.halted is False
+        assert engine2.quarantined is False
         assert len(broker2.cancel_with_outcome_calls) == 1
         engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 11_000)
-        assert engine2.halted is True
-        assert (engine2._halted_reason
-                == 'partial_bracket_cancel_disposition_unresolved')
+        assert _degraded(engine2, intent.intent_key)
 
 
-def __test_stale_anchor_restart_probes_before_halt__(tmp_path):
-    """Restart with a long-expired anchor resolves via the venue, no halt.
+def __test_stale_anchor_restart_probes_before_degrading__(tmp_path):
+    """Restart with a long-expired anchor resolves via the venue, no entry block.
 
     Regression for the bybit-spot cycle 18-66 restart churn (measured
     2026-08-22): a rotation shutdown stranded a cancel-tentative parent,
     and every restarted run re-armed the entry with the original anchor,
     saw the 10s grace long expired with ``retry_count == 0`` and promoted
-    straight to ``DEGRADED_HALT`` — no venue probe ever ran, so the loop
+    straight to the degraded state — no venue probe ever ran, so the loop
     could never terminate even though ``execute_cancel_with_outcome``
     resolves the disposition authoritatively on the first attempt.
     """
@@ -1370,7 +1424,7 @@ def __test_stale_anchor_restart_probes_before_halt__(tmp_path):
         engine2 = _mk_engine(broker2, store_ctx=ctx2)
         assert intent.intent_key in engine2._cancel_disposition_pending
         engine2._drive_cancel_tentative(now_ms=meta.since_ts_ms + 1_200_000)
-        assert engine2.halted is False
+        assert engine2.quarantined is False
         assert engine2._cancel_disposition_pending == {}
         assert len(broker2.cancel_with_outcome_calls) == 1
         # The resolved obligation purged its journal row.
@@ -1459,7 +1513,7 @@ def __test_cancel_probe_crash_window_rehydrates_via_outcome_not_bool_retry__(
         assert len(broker2.cancel_with_outcome_calls) == 1
         assert broker2.cancel_calls == []  # never took the bool-only retry
         assert engine2._cancel_disposition_pending == {}
-        assert engine2.halted is False
+        assert engine2.quarantined is False
         # Row purged by the ALREADY_FILLED targeted record_unpark.
         _, pending2 = ctx2.replay()
         assert pending2 == {}
@@ -1538,7 +1592,7 @@ def __test_dispatch_cancel_false_on_software_parent_enters_cancel_tentative__():
 
     assert len(broker.cancel_with_outcome_calls) == 1  # outcome-driven, not bool
     assert intent.intent_key not in engine._cancel_disposition_pending
-    assert engine.halted is False
+    assert engine.quarantined is False
     legs = list(engine._partial_bracket_engine.iter_legs())
     assert len(legs) == 1
     # Preserved, NOT ``aborted_parent_never_arrived`` — the protection survives.
@@ -1605,7 +1659,7 @@ def __test_a_cancelled_partly_executed_tentative_parent_keeps_its_legs__(order):
     assert engine._partial_bracket_engine.get_leg(leg.key) is leg
     assert intent.intent_key not in engine._order_mapping
     assert intent.intent_key in engine._envelopes
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 def __test_a_retried_partly_executed_cancel_resolution_drops_the_dead_mapping__():
@@ -1654,7 +1708,7 @@ def __test_a_retried_partly_executed_cancel_resolution_drops_the_dead_mapping__(
     engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.4, fill_id='x-1'))
     assert engine._position.size == pytest.approx(0.4)
     assert leg.leg_state == LEG_STATE_ARMED
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 def __test_a_retried_partial_fill_resolution_still_cancels_the_remainder__():
@@ -1741,7 +1795,7 @@ def __test_a_tentative_cancel_without_execution_evidence_stays_tentative__():
     assert engine._cancel_disposition_pending == {}
     assert engine._position.size == pytest.approx(0.4)
     assert leg.leg_state == LEG_STATE_ARMED
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 @pytest.mark.parametrize('terminal', ['cancelled', 'venue_cancelled', 'rejected'])
@@ -1771,7 +1825,7 @@ def __test_an_entry_terminal_without_execution_evidence_keeps_the_entry__(termin
     assert engine._order_mapping.get(intent.intent_key) == ['xchg-parent']
     assert engine._active_intents.get(intent.intent_key) is not None
     assert intent.intent_key in engine._envelopes
-    assert engine.halted is False and not engine.quarantined
+    assert engine.quarantined is False and not engine.quarantined
 
     engine._route_event(event)
 
@@ -1835,7 +1889,6 @@ def __test_a_strategy_diff_keeps_an_entry_awaiting_execution_evidence__(diff, ev
         assert leg.leg_state == LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED
         assert intent.intent_key not in engine._order_mapping
     assert engine._entries_awaiting_fill_evidence == {}
-    assert engine.halted is False
 
 
 @pytest.mark.parametrize('evidence', ['fill', 'zero'])
@@ -1882,7 +1935,6 @@ def __test_an_oca_cascade_keeps_an_entry_awaiting_execution_evidence__(evidence)
         assert leg.leg_state == LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED
         assert intent.intent_key not in engine._order_mapping
     assert engine._entries_awaiting_fill_evidence == {}
-    assert engine.halted is False
 
 
 def __test_a_cancel_of_an_entry_awaiting_execution_evidence_does_not_land__():
@@ -1932,7 +1984,7 @@ def __test_a_residual_cancel_that_did_not_land_keeps_the_remainder_mapped__():
     assert engine._order_mapping.get(intent.intent_key) == ['xchg-parent']
     assert engine._position.size == pytest.approx(0.4)
     assert leg.leg_state == LEG_STATE_ARMED
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 def __test_an_unexecuted_tentative_parent_cancel_still_aborts_its_legs__():
@@ -2076,20 +2128,20 @@ def __test_an_entry_held_for_its_evidence_stays_held_across_a_restart__(tmp_path
         assert engine2._position.size == pytest.approx(0.4)
         assert engine2._entries_awaiting_fill_evidence == {}
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
-        assert engine2.halted is False and not engine2.quarantined
+        assert engine2.quarantined is False and not engine2.quarantined
 
 
-def __test_a_hold_without_evidence_quarantines_once_and_only_a_not_executed_resume_releases_it__(
+def __test_a_hold_without_evidence_quarantines_once_and_the_venue_releases_it__(
         tmp_path):
-    """A hold the venue never resolves ends in one quarantine, which the operator lifts.
+    """A hold the stream never resolves ends in one quarantine, which the bot lifts itself.
 
     Past the fill-report grace without evidence the bot enters an
     ``ENTRY_BLOCK`` quarantine, once; the hold stays, so evidence arriving
     later still applies. A restart re-arms the expired hold and quarantines
-    again. A plain resume of that quarantine keeps the hold: the venue may
-    show what the order executed while the journal owns none of it. The
-    resume that states the entry did not execute releases it, and the restart
-    after it neither holds the entry nor maps its order.
+    again. A resume of that quarantine keeps the hold: the venue may show
+    what the order executed while the journal owns none of it. The venue's
+    order history showing nothing executed releases it, the quarantine ends,
+    and the restart after it neither holds the entry nor maps its order.
     """
     from pynecore.core.broker.models import QuarantineKind
     from pynecore.core.broker.storage import ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND
@@ -2132,25 +2184,26 @@ def __test_a_hold_without_evidence_quarantines_once_and_only_a_not_executed_resu
 
         # A plain resume keeps the hold: the restart quarantines again.
         ctx3 = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
-        engine3 = _mk_engine(_MockBroker(), store_ctx=ctx3)
+        broker3 = _HeldCloseBroker()
+        broker3.executions = [OrderExecution(order=_venue_parent(OrderStatus.CANCELLED, 0.0))]
+        engine3 = _mk_engine(broker3, store_ctx=ctx3)
         assert intent.intent_key in engine3._entries_awaiting_fill_evidence
         assert engine3._order_mapping.get(intent.intent_key) == ['xchg-parent']
         engine3._expire_fill_evidence_holds(now_ms=int(time.time() * 1000))
         assert engine3.quarantined
-        assert store.held_fill_evidence_entries(ctx3.run_id) == {intent.intent_key}
-        stated_id = engine3.quarantine_id
-        assert stated_id is not None
-        store.request_quarantine_resume(ctx3.run_id, stated_id, None, [intent.intent_key])
+        engine3._recover_held_executions(now_ms=int(time.time() * 1000))
+        engine3._drain_events()
+        assert engine3._entries_awaiting_fill_evidence == {}
+        assert intent.intent_key not in engine3._order_mapping
+        engine3._resolve_entry_block_causes(now_ms=int(time.time() * 1000))
+        assert not engine3.quarantined
+        engine3._flush_owed_store_writes()
         ctx3.close()
 
-        # The restart after the resume stating the entry did not execute releases it.
         ctx4 = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
-        engine4 = _mk_engine(_MockBroker(), store_ctx=ctx4)
-        # The statement is applied as the venue's proven zero, on the first drain.
-        engine4._drain_events()
-        assert engine4._entries_awaiting_fill_evidence == {}
-        assert intent.intent_key not in engine4._order_mapping
+        engine4 = _mk_engine(_HeldCloseBroker(), store_ctx=ctx4)
         assert ctx4.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
+        assert intent.intent_key not in engine4._order_mapping
         engine4._expire_fill_evidence_holds(now_ms=int(time.time() * 1000))
         assert not engine4.quarantined
 
@@ -2262,7 +2315,7 @@ def __test_evidence_received_before_a_restart_settles_the_hold_after_it__(tmp_pa
         engine2._drain_events()
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
         assert intent.intent_key not in engine2._order_mapping
-        assert engine2.halted is False and not engine2.quarantined
+        assert engine2.quarantined is False and not engine2.quarantined
 
 
 class _ProcessDeath(BaseException):
@@ -2312,7 +2365,7 @@ def __test_a_process_death_after_the_settling_evidence_replays_it_at_the_restart
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
         assert ctx2.fill_evidence_holds() == {}
-        assert engine2.halted is False and not engine2.quarantined
+        assert engine2.quarantined is False and not engine2.quarantined
 
 
 def __test_a_plugin_resend_next_to_the_replayed_evidence_is_harmless__(tmp_path):
@@ -2348,7 +2401,7 @@ def __test_a_plugin_resend_next_to_the_replayed_evidence_is_harmless__(tmp_path)
         assert intent.intent_key not in engine2._envelopes
         assert ctx2.fill_evidence_holds() == {}
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
-        assert engine2.halted is False and not engine2.quarantined
+        assert engine2.quarantined is False and not engine2.quarantined
 
 
 def __test_positive_evidence_for_a_restart_held_entry_waits_for_its_intent__():
@@ -2385,14 +2438,14 @@ def __test_positive_evidence_for_a_restart_held_entry_waits_for_its_intent__():
     consumed = engine._active_intents[intent.intent_key]
     assert isinstance(consumed, EntryIntent)
     assert consumed.qty == pytest.approx(0.4)
-    assert engine.halted is False and not engine.quarantined
+    assert engine.quarantined is False and not engine.quarantined
 
 
-def __test_an_operator_not_executed_release_retires_the_pending_protection__(tmp_path):
-    """The operator's ``--entry-not-executed`` tears the entry down like a proven zero.
+def __test_a_venue_proven_unexecuted_entry_retires_its_pending_protection__(tmp_path):
+    """The venue's record of nothing executed tears the entry down like a proven zero.
 
-    The resume stating the held entry did not execute is applied on the
-    restarted engine's first drain: its pending partial-bracket leg is aborted
+    The restarted bot reads the held order from the venue, which shows it
+    unexecuted: on the next drain its pending partial-bracket leg is aborted
     (``parent_never_arrived``), so a later order under the same Pine id
     cannot arm it, and the mapping, the envelope and the stored hold are gone.
     """
@@ -2405,9 +2458,7 @@ def __test_an_operator_not_executed_release_retires_the_pending_protection__(tmp
         hold = engine._entries_awaiting_fill_evidence[intent.intent_key]
         engine._expire_fill_evidence_holds(
             now_ms=hold.since_ms + int(engine._fill_report_grace_s() * 1000))
-        quarantine_id = engine.quarantine_id
-        assert quarantine_id is not None
-        store.request_quarantine_resume(ctx.run_id, quarantine_id, None, [intent.intent_key])
+        assert engine.quarantine_id is not None
         # The entry's pending partial-bracket leg, as the journal persisted it.
         ctx.upsert_order(
             'leg-1', symbol=SYMBOL, side='sell', qty=1.0, filled_qty=0.0,
@@ -2425,19 +2476,24 @@ def __test_an_operator_not_executed_release_retires_the_pending_protection__(tmp
         ctx.close()
 
         ctx2 = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
-        engine2 = _mk_engine(_MockBroker(), store_ctx=ctx2)
+        broker2 = _HeldCloseBroker()
+        broker2.executions = [OrderExecution(order=_venue_parent(OrderStatus.CANCELLED, 0.0))]
+        engine2 = _mk_engine(broker2, store_ctx=ctx2)
         engine2._current_bar_ts_ms = BAR_TS
         (leg,) = list(engine2._partial_bracket_engine.iter_legs())
         assert leg.leg_state == LEG_STATE_PENDING_ENTRY
         assert engine2._order_mapping.get(intent.intent_key) == ['xchg-parent']
 
+        engine2._expire_fill_evidence_holds(now_ms=int(time.time() * 1000))
+        engine2._recover_held_executions(now_ms=int(time.time() * 1000))
         engine2._drain_events()
+        engine2._flush_owed_store_writes()
 
         assert leg.leg_state == LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED
         assert intent.intent_key not in engine2._order_mapping
         assert engine2._entries_awaiting_fill_evidence == {}
         assert ctx2.fill_evidence_holds() == {}
-        engine2._expire_fill_evidence_holds(now_ms=int(time.time() * 1000))
+        engine2._resolve_entry_block_causes(now_ms=int(time.time() * 1000))
         assert not engine2.quarantined
 
 
@@ -2514,7 +2570,7 @@ def __test_a_landed_cancel_with_a_queued_fill_keeps_the_filled_part_protected__(
     engine._drain_events()
     assert engine._position.size == pytest.approx(0.4)
     assert leg.leg_state == LEG_STATE_ARMED
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 def __test_a_landed_cancel_with_a_queued_partly_executed_terminal_keeps_the_legs__():
@@ -2534,7 +2590,7 @@ def __test_a_landed_cancel_with_a_queued_partly_executed_terminal_keeps_the_legs
     engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.4, fill_id='x-1'))
     assert engine._position.size == pytest.approx(0.4)
     assert leg.leg_state == LEG_STATE_ARMED
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 def __test_a_landed_cancel_with_nothing_queued_still_tears_the_entry_down__():
@@ -2575,7 +2631,7 @@ def __test_a_landed_non_software_cancel_with_a_queued_fill_waits_for_the_fill__(
     assert engine._forced_cancel_pending == {}
     assert intent.intent_key not in engine._order_mapping
     assert len(broker.cancel_calls) == 2
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 def __test_a_confirmed_tentative_cancel_with_a_queued_fill_resolves_as_filled__():
@@ -2634,7 +2690,7 @@ def __test_a_landed_residual_cancel_with_a_queued_fill_routes_that_fill__():
     assert len(broker.cancel_calls) == 1
     assert engine._position.size == pytest.approx(0.6)
     assert intent.intent_key not in engine._order_mapping
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 def __test_a_storage_failure_while_evidence_settles_a_hold_retries_it_in_process__(tmp_path):
@@ -2677,7 +2733,7 @@ def __test_a_storage_failure_while_evidence_settles_a_hold_retries_it_in_process
         engine._flush_owed_store_writes()
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
 
 
 def __test_a_second_restart_before_the_execution_is_booked_keeps_the_hold__(tmp_path):
@@ -2738,7 +2794,7 @@ def __test_a_second_restart_before_the_execution_is_booked_keeps_the_hold__(tmp_
         assert ctx3.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx3.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
         assert engine3._fill_evidence_awaiting_execution == {}
-        assert engine3.halted is False and not engine3.quarantined
+        assert engine3.quarantined is False and not engine3.quarantined
 
 
 def _hold_fsm_evidence(evidence: str) -> list:
@@ -2860,7 +2916,7 @@ def __test_the_fill_evidence_hold_reaches_its_outcome_from_every_state_and_crash
             assert size == 0.0
         elif crash != 'death_before_release':
             assert size == pytest.approx(0.4)
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
 
         for event in events:
             engine.on_order_event(event)
@@ -2874,7 +2930,7 @@ def __test_the_fill_evidence_hold_reaches_its_outcome_from_every_state_and_crash
             # A restarted engine owns a pre-restart fill through the startup
             # adoption, which this test does not run.
             assert engine._position.size == pytest.approx(size)
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
 
 
 def _hold_positive_terminal(event_type: str = 'cancelled'):
@@ -2992,7 +3048,7 @@ def __test_a_restart_between_slices_keeps_the_hold_until_the_reported_execution_
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
         assert engine2._entries_awaiting_fill_evidence == {}
         assert engine2._fill_evidence_awaiting_execution == {}
-        assert engine2.halted is False and not engine2.quarantined
+        assert engine2.quarantined is False and not engine2.quarantined
 
 
 def __test_a_landed_cancel_with_a_queued_unknown_execution_terminal_keeps_the_legs__():
@@ -3018,7 +3074,7 @@ def __test_a_landed_cancel_with_a_queued_unknown_execution_terminal_keeps_the_le
     engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.4, fill_id='x-1'))
     assert engine._position.size == pytest.approx(0.4)
     assert leg.leg_state == LEG_STATE_ARMED
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 @pytest.mark.parametrize('terminal', ['cancelled', 'rejected'])
@@ -3048,7 +3104,7 @@ def __test_a_reported_execution_not_yet_booked_blocks_a_new_cycle_of_the_entry__
 
     assert engine._position.size == pytest.approx(0.4)
     assert not engine._entry_execution_awaiting_booking(intent.intent_key)
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 def __test_a_fill_queued_ahead_of_the_reported_execution_keeps_the_restart_barrier__(tmp_path):
@@ -3097,7 +3153,7 @@ def __test_a_fill_queued_ahead_of_the_reported_execution_keeps_the_restart_barri
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
         assert engine2._fill_evidence_awaiting_execution == {}
-        assert engine2.halted is False and not engine2.quarantined
+        assert engine2.quarantined is False and not engine2.quarantined
 
 
 @pytest.mark.parametrize('evidence', ['zero', 'fill'])
@@ -3122,7 +3178,7 @@ def __test_a_native_strategy_cancel_with_a_queued_unknown_execution_holds_the_en
 
     assert intent.intent_key in engine._entries_awaiting_fill_evidence
     assert engine._order_mapping.get(intent.intent_key) == ['xchg-parent']
-    assert not engine.quarantined and engine.halted is False
+    assert not engine.quarantined and engine.quarantined is False
 
     if evidence == 'zero':
         engine.on_order_event(_ct_order_event('cancelled', filled_qty=0.0, fill_qty=None))
@@ -3135,7 +3191,7 @@ def __test_a_native_strategy_cancel_with_a_queued_unknown_execution_holds_the_en
     assert engine._forced_cancel_pending == {}
     assert intent.intent_key not in engine._order_mapping
     assert engine._position.size == pytest.approx(0.0 if evidence == 'zero' else 0.4)
-    assert not engine.quarantined and engine.halted is False
+    assert not engine.quarantined and engine.quarantined is False
 
 
 @pytest.mark.parametrize('diff', ['changed', 'removed_then_readded'])
@@ -3181,7 +3237,7 @@ def __test_an_entry_awaiting_its_reported_execution_sends_nothing_on_its_key__(d
     engine._diff_and_dispatch([changed])
 
     assert sent and sent[0][0] == 'new'
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 # === The fill-evidence hold matrix =====================================
@@ -3218,8 +3274,16 @@ _MATRIX_ARRIVALS = ('slice', 'cum_slice', 'cum_rise', 'terminal_rise', 'queued_r
 #: A restart of the bot inside an arrival's sequence, before what was received
 #: is drained.
 _MATRIX_RESTART = 'restart'
+#: ``reverse``: a market stop-and-reverse under another id (a 1.0 sell) next to
+#: the kept entry; ``close_all``: a ``strategy.close_all`` sized from the book.
+#: Both act on the venue (:class:`_MatrixVenueBroker`).
 _MATRIX_ACTIONS = ('keep', 'remove', 'qty', 'price', 'readd', 'close', 'oca_cancel',
-                   'oca_reduce', 'close_sweep')
+                   'oca_reduce', 'close_sweep', 'reverse', 'close_all')
+#: The actions that write to the matrix venue, and what each sibling state's
+#: sibling order executed there (the fills its arrivals deliver).
+_MATRIX_VENUE_ACTIONS = ('reverse', 'close_all')
+_MATRIX_SIBLING_VENUE = {'reported_sibling': _MATRIX_SIBLING_REPORTED,
+                         'rising_sibling': _MATRIX_SIBLING_RISEN}
 _MATRIX_MODES = ('software', 'native')
 _MATRIX_TIMINGS = ('drained', 'queued')
 #: ``torn``: the process dies right after the first store write of the
@@ -3307,6 +3371,72 @@ def _matrix_cases() -> list:
     return cases
 
 
+@dataclass
+class _MatrixVenueBroker(_MockBroker):
+    """The matrix venue of the ``reverse`` and ``close_all`` actions.
+
+    It holds the position the venue executed (:attr:`_MatrixRun.venue`, which
+    survives the bot's restarts), closes reduce-only, never past flat, and
+    reports each close and entry it executes as a fill on the engine's event
+    queue. It closes a ``held_execution_close`` by its venue quantity.
+    """
+    run: '_MatrixRun | None' = None
+    supports_held_execution_close: bool = True
+
+    def _write(self, kind: str, envelope: DispatchEnvelope, executed: float):
+        from pynecore.core.broker.models import ExchangeOrder, LegType, OrderEvent
+        run = self.run
+        assert run is not None and run.engine is not None
+        intent = envelope.intent
+        run.venue_writes += 1
+        order_id = f"xchg-v{run.venue_writes}"
+        order = ExchangeOrder(
+            id=order_id, symbol=SYMBOL, side=intent.side, order_type=OrderType.MARKET,
+            qty=intent.qty, filled_qty=0.0, remaining_qty=intent.qty, price=None,
+            stop_price=None, average_fill_price=None, status=OrderStatus.OPEN,
+            timestamp=BAR_TS / 1000.0, fee=0.0, fee_currency='USDT')
+        if executed > 0.0:
+            filled = dataclasses.replace(
+                order, filled_qty=executed, remaining_qty=0.0, average_fill_price=100.0,
+                status=OrderStatus.FILLED)
+            run.engine.on_order_event(OrderEvent(
+                order=filled, event_type='filled', fill_price=100.0, fill_qty=executed,
+                timestamp=BAR_TS / 1000.0, pine_id=intent.pine_id,
+                from_entry=intent.pine_id if kind == 'close' else None,
+                leg_type=LegType.CLOSE if kind == 'close' else LegType.ENTRY,
+                fill_id=f"v-{run.venue_writes}", journal_fill_qty=executed))
+        return order
+
+    async def get_position(self, symbol: str) -> ExchangePosition | None:
+        run = self.run
+        assert run is not None
+        if abs(run.venue) <= 1e-12:
+            return None
+        return ExchangePosition(
+            symbol=SYMBOL, side='long' if run.venue > 0.0 else 'short', size=abs(run.venue),
+            entry_price=100.0, unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+            margin_mode='cross')
+
+    async def execute_entry(self, envelope: DispatchEnvelope):
+        run = self.run
+        assert run is not None
+        run.on_venue_write('entry', envelope.intent)
+        intent = envelope.intent
+        run.venue = round(run.venue + (intent.qty if intent.side == 'buy' else -intent.qty), 12)
+        return [self._write('entry', envelope, intent.qty)]
+
+    async def execute_close(self, envelope: DispatchEnvelope):
+        run = self.run
+        assert run is not None
+        run.on_venue_write('close', envelope.intent)
+        intent = envelope.intent
+        closes_long = intent.side == 'sell'
+        held = run.venue if closes_long else -run.venue
+        executed = round(min(intent.qty, max(held, 0.0)), 12)
+        run.venue = round(run.venue - executed if closes_long else run.venue + executed, 12)
+        return self._write('close', envelope, executed)
+
+
 class _MatrixRun:
     """One generated case: the engines it runs and what they did on the entry's key."""
 
@@ -3340,15 +3470,42 @@ class _MatrixRun:
         #: Whether the sibling's first slice shows more executed than its
         #: terminal event reported (:data:`_MATRIX_SIBLING_RISEN`).
         self.sibling_rises = False
+        #: The venue position of the venue actions (:class:`_MatrixVenueBroker`),
+        #: and how many writes it took.
+        self.venue = 0.0
+        self.venue_writes = 0
+        #: Whether a venue action went out while the book held less of the held
+        #: order than it executed with no hold standing: a slice the venue had
+        #: not announced (the evidence settles the hold on what it shows).
+        self.sized_short = False
 
     # --- engines
 
     def _broker(self) -> _MockBroker:
-        broker = _MockBroker()
+        broker = (_MatrixVenueBroker(run=self) if self.action in _MATRIX_VENUE_ACTIONS
+                  else _MockBroker())
         broker.capabilities = ExchangeCapabilities(
             partial_qty_bracket_exit=(CapabilityLevel.SOFTWARE if self.mode == 'software'
-                                      else CapabilityLevel.NATIVE))
+                                      else CapabilityLevel.NATIVE),
+            short_selling=CapabilityLevel.NATIVE)
         return broker
+
+    def on_venue_write(self, kind: str, intent) -> None:
+        """Judge a write of a venue action against the hold, when it reaches the venue."""
+        engine = self.engine
+        assert engine is not None
+        holds = engine._unresolved_execution_holds()
+        expired = any(hold.expired for hold in holds.values())
+        held_close = getattr(intent, 'synthetic_kind', None) == 'held_execution_close'
+        if kind == 'entry' and intent.pine_id == 'short' and engine.quarantined:
+            self.violations.append(f"the reversal's new side opened under the quarantine: {intent}")
+        if not holds and engine._position.fill_cursor(['xchg-parent']) < self.truth - 1e-9:
+            self.sized_short = True
+        if held_close and not expired:
+            self.violations.append(f"a venue close over a hold that did not expire: {intent}")
+        elif holds and not held_close and not expired:
+            self.violations.append(
+                f"{kind} sized from the book while the execution is unresolved: {intent}")
 
     def start(self) -> None:
         self.ctx = self.store.open_run(_run_identity(), script_source="src", script_path="t027.py")
@@ -3437,27 +3594,16 @@ class _MatrixRun:
     def resume(self) -> None:
         """The hold expires, the operator resumes the quarantine, the bot restarts.
 
-        The operator states the entry did not execute when that is true, and
-        also when the store already holds the venue's report of an execution
-        (the statement raced the evidence, or the operator misread the venue):
-        the engine must not apply that statement over the stored evidence.
-        Otherwise the resume is a plain one.
+        A resume states nothing about the entry: the restarted bot keeps the
+        hold and recovers the execution from the venue itself.
         """
         engine, ctx = self.engine, self.ctx
         assert engine is not None and ctx is not None
         engine._expire_fill_evidence_holds(now_ms=int(time.time() * 1000) + 10 ** 9)
         engine._flush_owed_store_writes()
         quarantine_id = engine.quarantine_id
-        if quarantine_id is not None and 'parent' in self.store.held_fill_evidence_entries(
-                ctx.run_id):
-            hold_row = ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND)['parent']
-            stored = hold_row.get('awaiting_execution')
-            arrival = ctx.keyed_events_for_run_id(
-                ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND).get('xchg-parent')
-            reported = ((isinstance(stored, list) and stored[1] > 0.0)
-                        or (arrival is not None and arrival['order']['filled_qty'] > 0.0))
-            stated = ['parent'] if self.truth == 0.0 or reported else []
-            self.store.request_quarantine_resume(ctx.run_id, quarantine_id, None, stated)
+        if quarantine_id is not None:
+            self.store.request_quarantine_resume(ctx.run_id, quarantine_id)
         self.restart()
 
     def arm_death(self) -> None:
@@ -3524,14 +3670,28 @@ class _MatrixRun:
                     and intent == self.intent and self.action == 'keep'):
                 self.violations.append(f"resend of the executed entry: {intent}")
 
-        def dispatch_new(intent) -> None:
+        real_new = engine._dispatch_new
+        real_modify = engine._dispatch_modify
+
+        def reaches_venue(intent) -> bool:
+            # The venue actions' own intents and the closes the engine makes
+            # for them; the entry and its bracket stay recorded only.
+            return self.action in _MATRIX_VENUE_ACTIONS and (
+                intent.intent_key in ('short', '')
+                or getattr(intent, 'synthetic_kind', None) is not None)
+
+        def venue_new(intent, **kwargs) -> None:
             write('new', intent)
+            if reaches_venue(intent):
+                real_new(intent, **kwargs)
 
-        def dispatch_modify(_old, new) -> None:
+        def venue_modify(old, new) -> None:
             write('modify', new)
+            if reaches_venue(new):
+                real_modify(old, new)
 
-        engine._dispatch_new = dispatch_new  # type: ignore[method-assign]
-        engine._dispatch_modify = dispatch_modify  # type: ignore[method-assign]
+        engine._dispatch_new = venue_new  # type: ignore[method-assign]
+        engine._dispatch_modify = venue_modify  # type: ignore[method-assign]
         real_cancel = broker.execute_cancel
         real_cancel_outcome = broker.execute_cancel_with_outcome
 
@@ -3612,6 +3772,16 @@ class _MatrixRun:
             return [dataclasses.replace(intent, order_type=OrderType.LIMIT, limit=99.0)]
         if action == 'readd':
             return [] if step == 0 else [intent]
+        if action == 'reverse':
+            return [intent, EntryIntent(pine_id='short', symbol=SYMBOL, side='sell', qty=1.0,
+                                        order_type=OrderType.MARKET)]
+        if action == 'close_all':
+            assert self.engine is not None
+            booked = self.engine._position.size
+            if booked <= 0.0:
+                # Pine closes nothing of a flat book.
+                return [intent]
+            return [intent, CloseIntent(pine_id='', symbol=SYMBOL, side='sell', qty=booked)]
         assert action == 'close'
         return [CloseIntent(pine_id='parent', symbol=SYMBOL, side='sell', qty=1.0)]
 
@@ -3653,7 +3823,12 @@ class _MatrixRun:
                     self.strategy_side_effect()
                     side_effect = False
                 engine._drain_events()
-                engine._expire_fill_evidence_holds(now_ms=int(time.time() * 1000))
+                # The engine's reconcile: the expiry, the bot's own recovery
+                # and the end of the causes resolved.
+                now_ms = int(time.time() * 1000)
+                engine._expire_fill_evidence_holds(now_ms=now_ms)
+                engine._recover_held_executions(now_ms=now_ms)
+                engine._resolve_entry_block_causes(now_ms=now_ms)
                 engine._flush_owed_store_writes()
                 break
             except sqlite3.Error:
@@ -3862,6 +4037,40 @@ def _matrix_enter_state(run: _MatrixRun, state: str, crash: str) -> None:
         run.consumed_here = True
 
 
+def _matrix_self_recovery(run: '_MatrixRun', truth: float) -> None:
+    """The bot gets out of an expired hold by itself: it reads the held order from the venue.
+
+    The venue's order history shows what the order executed (``truth``). The
+    hold ends with no human: the execution is booked exactly once (or the
+    entry is released as unexecuted), the book never goes short, and the
+    hold's quarantine cause ends exactly when the venue holds what the book
+    holds.
+    """
+    engine = run.engine
+    assert engine is not None
+    order = ExchangeOrder(
+        id='xchg-parent', symbol=SYMBOL, side='buy', order_type=OrderType.MARKET, qty=1.0,
+        filled_qty=truth, remaining_qty=round(1.0 - truth, 12), price=None, stop_price=None,
+        average_fill_price=100.0 if truth > 0.0 else None, status=OrderStatus.CANCELLED,
+        timestamp=BAR_TS / 1000.0, fee=0.0, fee_currency='USDT')
+
+    async def fetch_order_execution(order_id, client_order_id):
+        return OrderExecution(order=order)
+
+    run.broker.fetch_order_execution = fetch_order_execution  # type: ignore[attr-defined]
+    now = int(time.time() * 1000)
+    for step in range(3):
+        _recover(engine, now + step * int(_VENUE_RECOVERY_CAP_S * 1000))
+    assert not engine._entry_execution_unresolved('parent'), "the bot did not end its own hold"
+    assert engine._position.fill_cursor(['xchg-parent']) == pytest.approx(truth)
+    assert engine._position.size >= -1e-9
+    venue = run.venue if isinstance(run.broker, _MatrixVenueBroker) else 0.0
+    matches = abs(venue - engine._position.size) <= 1e-9
+    if engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK or not engine.quarantined:
+        assert ('fill_evidence:parent' in engine._entry_block_causes) is not matches, (
+            f"venue {venue}, book {engine._position.size}")
+
+
 @pytest.mark.parametrize('state,arrival,action,mode,timing,crash,truth', _matrix_cases())
 def __test_the_fill_evidence_hold_matrix__(
         tmp_path, state, arrival, action, mode, timing, crash, truth):
@@ -3876,10 +4085,21 @@ def __test_the_fill_evidence_hold_matrix__(
     applied (no hold, settlement, parked event or awaited execution in
     memory, no hold or arrival row in the store) or in the expiry
     quarantine, never in a halt.
+
+    The venue actions (a market reversal under another id, a close_all)
+    reach the venue only against the true book: nothing is closed or opened
+    while the execution is unresolved and the hold stands; once the evidence
+    settles the reversal ends 1.0 short (TradingView) and the close_all flat.
+    Over an expired hold a close the strategy requested is never left open by
+    the quarantine (the venue is flat after the next sync), the reversal's
+    new side never opens under it, and the book never goes short. The bot
+    then gets out of the expired hold by itself (:func:`_matrix_self_recovery`).
     """
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         run = _MatrixRun(store, mode, action)
         run.truth = truth
+        # What the venue executed: the held order's truth and the sibling's fills.
+        run.venue = round(truth + _MATRIX_SIBLING_VENUE.get(state, 0.0), 12)
         run.start()
         _matrix_enter_state(run, state, crash)
         engine = run.engine
@@ -3926,7 +4146,6 @@ def __test_the_fill_evidence_hold_matrix__(
         assert engine is not None
         ctx = run.ctx
         assert not run.violations, run.violations
-        assert engine.halted is False
         booked = engine._position.fill_cursor(['xchg-parent'])
         assert booked == pytest.approx(truth), f"booked {booked} of {truth}"
         clean = (engine._entries_awaiting_fill_evidence == {}
@@ -3944,20 +4163,50 @@ def __test_the_fill_evidence_hold_matrix__(
                 list(ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND)))
             engine._expire_fill_evidence_holds(now_ms=int(time.time() * 1000) + 10 ** 9)
             assert engine.quarantined, "a standing hold did not quarantine at its expiry"
+            if action in _MATRIX_VENUE_ACTIONS:
+                # The strategy keeps asking to close or reverse over the expired
+                # hold: the quarantine must not leave that position open.
+                asked = action == 'reverse' or engine._position.size > 0.0
+                run.sync(5)
+                assert not run.violations, run.violations
+                if asked and not engine.venue_writes_blocked:
+                    assert abs(run.venue) <= 1e-9, (
+                        f"a close the strategy requested is left open by the quarantine: "
+                        f"the venue holds {run.venue}")
+                assert engine._position.size >= -1e-9, "the book went short over the hold"
+            _matrix_self_recovery(run, truth)
         elif crash != 'resume' or truth == 0.0:
-            # An executed entry's expired hold re-quarantines after the resume;
-            # only the operator lifts that latch, after its fill is booked.
+            # An executed entry's expired hold re-quarantines after the resume
+            # and its cause ends once the venue matches the book (the matrix
+            # venue of the non-venue actions holds nothing).
             assert not engine.quarantined
         # A new cycle of the entry the strategy changed after the evidence was
         # applied re-binds the bracket to it.
         new_cycle = (any(kind == 'new' for kind, _intent in run.writes)
-                     or run.swept_resolved)
+                     or run.swept_resolved
+                     # A venue action that closed the position retires its protection.
+                     or (action in _MATRIX_VENUE_ACTIONS and engine._position.size <= 1e-9))
         if (run.leg is not None and truth > 0.0 and booked > run.seeded + 1e-9
                 and not new_cycle):
             # The engine that routed the execution armed its protection.
             assert run.leg.leg_state == LEG_STATE_ARMED
         if run.leg is not None and truth > 0.0 and not new_cycle:
             assert run.leg.leg_state in (LEG_STATE_ARMED, LEG_STATE_PENDING_ENTRY)
+        if (clean and action in _MATRIX_VENUE_ACTIONS and state not in _MATRIX_SIBLING_VENUE
+                and crash in ('none', 'storage_error')):
+            # (The harness's restart rebuilds no book from the venue, so the
+            # venue is compared only within one process.) The book tracks the
+            # venue; once the evidence settled, the request went out against
+            # the true book: a reversal ends 1.0 short (TradingView), only
+            # closed under a quarantine that blocks its new side; a close_all
+            # ends flat. A slice the venue never announced can only be booked
+            # when it arrives, after the request went out.
+            assert engine._position.size == pytest.approx(run.venue), (
+                f"book {engine._position.size}, venue {run.venue}")
+            if not run.sized_short:
+                expected = -1.0 if action == 'reverse' and not engine.quarantined else 0.0
+                assert engine._position.size == pytest.approx(expected), (
+                    f"book {engine._position.size}, venue {run.venue}")
 
 
 def __test_a_held_tentative_entry_waits_for_its_hold_expiry_instead_of_halting__():
@@ -3981,10 +4230,10 @@ def __test_a_held_tentative_entry_waits_for_its_hold_expiry_instead_of_halting__
     for step in range(3):
         engine._drive_cancel_tentative(now_ms=int(time.time() * 1000) + 120_000 + step)
 
-    assert engine.halted is False
+    assert engine.quarantined is False
     assert 'parent' in engine._entries_awaiting_fill_evidence
     engine._expire_fill_evidence_holds(now_ms=int(time.time() * 1000) + 10 ** 9)
-    assert engine.quarantined and engine.halted is False
+    assert engine.quarantined
 
 
 def __test_a_fill_slice_showing_more_executed_keeps_the_dispatch_barrier__():
@@ -4038,7 +4287,7 @@ def __test_an_awaited_execution_that_never_arrives_expires_into_the_quarantine__
 
     engine._expire_fill_evidence_holds(now_ms=int(time.time() * 1000) + 10 ** 9)
 
-    assert engine.quarantined and engine.halted is False
+    assert engine.quarantined
     assert engine._entry_execution_awaiting_booking(intent.intent_key)
     engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.4, fill_id='x-1'))
     assert not engine._entry_execution_unresolved(intent.intent_key)
@@ -4078,7 +4327,7 @@ def __test_booked_parked_evidence_releases_the_hold_without_a_reissue__(tmp_path
         assert intent.intent_key not in engine2._order_mapping
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx2.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
-        assert not engine2.quarantined and engine2.halted is False
+        assert not engine2.quarantined and engine2.quarantined is False
 
 
 def __test_a_later_fill_showing_more_executed_raises_the_awaited_execution__(tmp_path):
@@ -4126,15 +4375,14 @@ def __test_a_later_fill_showing_more_executed_raises_the_awaited_execution__(tmp
         assert sent and sent[0] == changed
 
 
-def __test_a_not_executed_resume_over_a_reported_execution_is_refused__(tmp_path):
-    """The operator cannot state an entry unexecuted once the venue reported its execution.
+def __test_a_venue_record_contradicting_a_reported_execution_releases_nothing__(tmp_path):
+    """A record of no such order cannot undo an execution the venue already reported.
 
     A 0.2 slice of the held entry shows 0.4 executed and the rest never
-    arrives: the hold expires into the quarantine. The store names the entry
-    as reported executed (what the CLI refuses ``--entry-not-executed`` on),
-    and a statement recorded anyway is not applied by the restart: no
-    synthetic zero is queued, the mapping stays, the hold re-quarantines and
-    ends once the missing 0.2 is booked.
+    arrives: the hold expires into the quarantine. After a resume and a
+    restart the venue answers that it holds no such order: nothing is
+    released (no synthetic zero is queued, the mapping stays), the hold
+    re-quarantines and ends once the missing 0.2 is booked.
     """
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
         ctx = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
@@ -4150,20 +4398,24 @@ def __test_a_not_executed_resume_over_a_reported_execution_is_refused__(tmp_path
         engine._flush_owed_store_writes()
         quarantine_id = engine.quarantine_id
         assert quarantine_id is not None
-        assert store.fill_evidence_entries_reported_executed(ctx.run_id) == {key: 0.4}
-        store.request_quarantine_resume(ctx.run_id, quarantine_id, None, [key])
+        store.request_quarantine_resume(ctx.run_id, quarantine_id)
         ctx.close()
 
         ctx2 = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
-        engine2 = _mk_engine(_MockBroker(), store_ctx=ctx2)
+        broker2 = _HeldCloseBroker()
+        broker2.executions = [OrderExecution(order=None)]
+        engine2 = _mk_engine(broker2, store_ctx=ctx2)
         engine2._current_bar_ts_ms = BAR_TS
         engine2._position.seed_fill_cursors({'xchg-parent': 0.2})
+        engine2._expire_fill_evidence_holds(now_ms=int(time.time() * 1000))
+        engine2._recover_held_executions(now_ms=int(time.time() * 1000))
+        assert broker2.execution_reads == [('xchg-parent', None)]
         assert engine2._event_queue.empty()
         engine2._drain_events()
         assert engine2._order_mapping.get(key) == ['xchg-parent']
         assert engine2._entry_execution_unresolved(key)
         engine2._expire_fill_evidence_holds(now_ms=int(time.time() * 1000))
-        assert engine2.quarantined and engine2.halted is False
+        assert engine2.quarantined
 
         engine2.on_order_event(
             _ct_order_event('partial', filled_qty=0.4, fill_qty=0.2, fill_id='x-2'))
@@ -4183,7 +4435,7 @@ def __test_a_rejected_terminal_resolves_a_cancel_tentative_parent__(executed):
     (nothing, or 0.4): the tentative cancel is resolved (confirmed, or as
     filled with the legs kept for the execution), so the cancel-retry probe
     past the stale grace no longer halts the bot over an order that ended.
-    This is the terminal an operator's ``--entry-not-executed`` stands for.
+    It is the terminal the venue's own record of a held order proves.
     """
     engine = _mk_engine(_MockBroker())
     intent = _seed_parent_intent_and_leg(engine)
@@ -4202,7 +4454,7 @@ def __test_a_rejected_terminal_resolves_a_cancel_tentative_parent__(executed):
     engine._drive_cancel_tentative(now_ms=int(time.time() * 1000) + 120_000)
 
     assert intent.intent_key not in engine._cancel_disposition_pending
-    assert engine.halted is False
+    assert engine.quarantined is False
     if executed > 0.0:
         assert leg.leg_state == LEG_STATE_PENDING_ENTRY
     else:
@@ -4216,7 +4468,7 @@ class _ReversalBroker(_MockBroker):
         super().__init__(capabilities=ExchangeCapabilities(
             partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
             short_selling=CapabilityLevel.NATIVE))
-        self.placed: list[tuple[str, object]] = []
+        self.placed: list[tuple[str, Any]] = []
 
     @staticmethod
     def _order(order_id: str, intent) -> object:
@@ -4257,11 +4509,10 @@ def __test_a_reversal_over_an_entry_awaiting_its_execution__(reverse_id):
     The held entry's 0.2 slice shows 0.4 executed (``AWAITING_EXECUTION``,
     the book long 0.2). The strategy reverses with a MARKET sell entry: under
     the same id it is a change of the held key and nothing is sent on that
-    key; under another id the reversal goes ahead (its close leg for the
-    booked 0.2, then the parked open once the book is flat), and nothing is
-    sent, amended or cancelled on the held key. Once the missing 0.2 is
-    booked the order's 0.4 is booked exactly once and the book matches the
-    venue.
+    key; under another id the reversal waits (nothing is closed, cancelled or
+    sent while the book holds only part of the execution). Once the missing
+    0.2 is booked the order's 0.4 is booked exactly once, the reversal closes
+    the whole 0.4 and opens the 1.0 short: the TradingView result.
     """
     from pynecore.core.broker.models import LegType
     broker = _ReversalBroker()
@@ -4286,6 +4537,15 @@ def __test_a_reversal_over_an_entry_awaiting_its_execution__(reverse_id):
                           order_type=OrderType.MARKET)
     intents = [reverse] if reverse_id == key else [intent, reverse]
     engine._diff_and_dispatch(intents)
+    engine._diff_and_dispatch(intents)
+    assert broker.placed == []
+    assert cancels == []
+
+    engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.2, fill_id='x-2'))
+    engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.2, fill_id='x-2'))
+    assert not engine._entry_execution_unresolved(key)
+    assert engine._position.fill_cursor(['xchg-parent']) == pytest.approx(0.4)
+    assert engine._position.size == pytest.approx(0.4)
 
     def on_held_key(placed) -> bool:
         return getattr(placed, 'intent_key', None) == key
@@ -4293,27 +4553,639 @@ def __test_a_reversal_over_an_entry_awaiting_its_execution__(reverse_id):
     if reverse_id == key:
         assert broker.placed == []
     else:
+        engine._diff_and_dispatch(intents)
         (kind, close), = broker.placed
         assert kind == 'close' and close.synthetic_kind == 'reversal_close'
-        assert close.qty == pytest.approx(0.2)
-        engine._route_event(_reversal_fill('xchg-close', close.pine_id, 'sell', 0.2, 'c-1',
+        assert close.qty == pytest.approx(0.4)
+        engine._route_event(_reversal_fill('xchg-close', close.pine_id, 'sell', 0.4, 'c-1',
                                            leg_type=LegType.CLOSE))
         assert engine._position.size == pytest.approx(0.0)
         engine._diff_and_dispatch(intents)
         assert [kind for kind, _placed in broker.placed] == ['close', 'entry']
         assert broker.placed[1][1].pine_id == reverse_id
+        assert broker.placed[1][1].qty == pytest.approx(1.0)
         engine._route_event(_reversal_fill('xchg-short', reverse_id, 'sell', 1.0, 's-1'))
     assert not any(on_held_key(placed) for _kind, placed in broker.placed)
     assert not any(on_held_key(cancelled) for cancelled in cancels)
-
-    engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.2, fill_id='x-2'))
-    engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.2, fill_id='x-2'))
-    assert not engine._entry_execution_unresolved(key)
-    assert engine._position.fill_cursor(['xchg-parent']) == pytest.approx(0.4)
-    # The venue: 0.4 long, the reduce-only close of 0.2, the 1.0 short.
-    expected = 0.4 if reverse_id == key else -0.8
+    # The venue: 0.4 long, the reduce-only close of 0.4, the 1.0 short.
+    expected = 0.4 if reverse_id == key else -1.0
     assert engine._position.size == pytest.approx(expected)
-    assert engine.halted is False
+    assert engine.quarantined is False
+
+
+class _HeldCloseBroker(_ReversalBroker):
+    """A venue that keeps its own position: 0.4 long of the held order, closes reduce-only.
+
+    Netting by default (``get_position``, ``execute_close`` reduces the venue
+    position by the close's quantity, never past flat); ``hedging`` exposes
+    the venue as one leg per opened order through a position port instead.
+    """
+
+    def __init__(self, *, hedging: bool = False, supports: bool = True) -> None:
+        super().__init__()
+        self.supports_held_execution_close = supports
+        self.position_port = self if hedging else None
+        self.read_error: Exception | None = None
+        self.close_error: Exception | None = None
+        #: The venue's legs: leg id -> (side, qty, entry id).
+        self.legs: dict[str, tuple[str, float, str | None]] = {}
+        self.closed_legs: list[tuple[str, float]] = []
+        self.placed_legs: list[float] = []
+        self.position_reads = 0
+        #: The venue's answers to ``fetch_order_execution``, in order (the last
+        #: one repeats); empty: the plugin cannot read an order's execution.
+        self.executions: list[Any] = []
+        self.execution_reads: list[tuple[str | None, str | None]] = []
+
+    async def fetch_order_execution(self, order_id, client_order_id):
+        self.execution_reads.append((order_id, client_order_id))
+        if not self.executions:
+            raise NotImplementedError
+        answer = self.executions[0] if len(self.executions) == 1 else self.executions.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    @property
+    def venue(self) -> float:
+        return round(sum(qty if side == 'buy' else -qty
+                         for side, qty, _entry in self.legs.values()), 12)
+
+    def hold(self, qty: float) -> None:
+        """The venue holds ``qty`` long of the held order."""
+        self.legs = {'L1': ('buy', qty, 'parent')}
+
+    def _reduce(self, side: str, qty: float) -> float:
+        """Reduce the venue position by ``qty`` closing ``side``; what executed."""
+        remaining = qty
+        for leg_id, (leg_side, leg_qty, entry) in list(self.legs.items()):
+            if leg_side == side or remaining <= 1e-12:
+                continue
+            part = min(leg_qty, remaining)
+            remaining = round(remaining - part, 12)
+            if leg_qty - part <= 1e-12:
+                del self.legs[leg_id]
+            else:
+                self.legs[leg_id] = (leg_side, round(leg_qty - part, 12), entry)
+        return round(qty - remaining, 12)
+
+    async def get_position(self, symbol: str) -> ExchangePosition | None:
+        self.position_reads += 1
+        if self.read_error is not None:
+            raise self.read_error
+        venue = self.venue
+        if abs(venue) <= 1e-12:
+            return None
+        return ExchangePosition(
+            symbol=SYMBOL, side='long' if venue > 0.0 else 'short', size=abs(venue),
+            entry_price=100.0, unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+            margin_mode='cross')
+
+    async def execute_entry(self, envelope: DispatchEnvelope):
+        intent = envelope.intent
+        self.legs[f"E{len(self.legs) + 1}"] = (intent.side, intent.qty, intent.pine_id)
+        return await super().execute_entry(envelope)
+
+    async def execute_close(self, envelope: DispatchEnvelope):
+        self.placed.append(('close', envelope.intent))
+        if self.close_error is not None:
+            raise self.close_error
+        self._reduce(envelope.intent.side, envelope.intent.qty)
+        return self._order('xchg-close', envelope.intent)
+
+    # --- PositionPort surface (active with ``hedging=True``)
+
+    async def fetch_raw_positions(self, symbol: str):
+        from pynecore.core.broker.models import PositionLeg
+        self.position_reads += 1
+        if self.read_error is not None:
+            raise self.read_error
+        return [PositionLeg(leg_id=leg_id, symbol=SYMBOL, side=side, qty=qty,
+                            entry_price=100.0, open_time=float(index), unrealized_pnl=0.0,
+                            entry_id=entry)
+                for index, (leg_id, (side, qty, entry)) in enumerate(self.legs.items())]
+
+    async def get_volume_quantizer(self, symbol: str):
+        return lambda units: int(round(units * 100))
+
+    async def close_leg(self, symbol: str, leg_id: str, volume: int, coid: str) -> None:
+        qty = volume / 100
+        self.closed_legs.append((leg_id, qty))
+        side, leg_qty, entry = self.legs[leg_id]
+        if leg_qty - qty <= 1e-12:
+            del self.legs[leg_id]
+        else:
+            self.legs[leg_id] = (side, round(leg_qty - qty, 12), entry)
+
+    async def close_leg_executed(self, symbol, leg_id, coids, since_ms):
+        return 0
+
+    async def reject_out_of_range(self, envelope, qty):
+        return None
+
+    async def place_leg(self, envelope, qty):
+        self.placed_legs.append(qty)
+        intent = envelope.intent
+        self.legs[f"P{len(self.placed_legs)}"] = (intent.side, qty, intent.pine_id)
+        return [self._order(f"xchg-{intent.pine_id}", intent)]
+
+
+def _held_close_setup(state: str = 'awaiting', **broker_kw):
+    """A held long entry whose order executed 0.4 at the venue.
+
+    ``awaiting``: the venue's 0.2 slice showed 0.4 executed, the book holds 0.2
+    (``AWAITING_EXECUTION``). ``held``: the order ended without the venue's
+    executed quantity and no fill reached the book (``HELD``).
+    """
+    broker = _HeldCloseBroker(**broker_kw)
+    broker.hold(0.4)
+    engine = _mk_engine(broker)
+    intent = _seed_parent_intent_and_leg(engine, with_leg=False)
+    engine._route_event(_ct_unknown_execution(
+        _ct_order_event('cancelled', filled_qty=0.0, fill_qty=None)))
+    if state == 'awaiting':
+        engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.2,
+                                            fill_id='x-1'))
+        assert engine._entry_execution_awaiting_booking('parent')
+    else:
+        assert 'parent' in engine._entries_awaiting_fill_evidence
+    return broker, engine, intent
+
+
+def _expire(engine: OrderSyncEngine) -> None:
+    engine._expire_fill_evidence_holds(now_ms=int(time.time() * 1000) + 10 ** 9)
+    assert engine.quarantined
+
+
+def _late_fill(qty: float, fill_id: str = 'x-2'):
+    """The held order's missing fill: the order shows 0.4 executed."""
+    return _ct_order_event('partial', filled_qty=0.4, fill_qty=qty, fill_id=fill_id)
+
+
+def _held_close_requests(request: str, intent: EntryIntent, booked: float) -> list:
+    """The strategy's intents for ``request`` over the held long entry.
+
+    A close is emitted while the book holds a position, as Pine sizes it.
+    """
+    if request == 'reverse':
+        return [intent, EntryIntent(pine_id='short', symbol=SYMBOL, side='sell', qty=1.0,
+                                    order_type=OrderType.MARKET)]
+    if request == 'limit_reverse':
+        return [intent, EntryIntent(pine_id='short', symbol=SYMBOL, side='sell',
+                                    qty=round(1.0 + booked, 12), order_type=OrderType.LIMIT,
+                                    limit=101.0, flip_qty=booked)]
+    if request == 'close_all':
+        if booked <= 0.0:
+            return [intent]
+        return [intent, CloseIntent(pine_id='', symbol=SYMBOL, side='sell', qty=booked)]
+    assert request == 'close_held'
+    if booked <= 0.0:
+        return []
+    return [CloseIntent(pine_id='parent', symbol=SYMBOL, side='sell', qty=booked)]
+
+
+def __test_a_waiting_reversal_never_tears_down_the_held_entrys_protection__():
+    """The reversal waits before its pre-clear sweep: the held entry keeps its exit.
+
+    The sweep of a stop-and-reverse cancels the closing legs of every
+    consumed entry. While the held entry's execution is not all booked, the
+    reversal does not start, so the exit that protects the executed entry is
+    neither cancelled nor retired.
+    """
+    broker, engine, intent = _held_close_setup()
+    cancels: list = []
+    real_cancel = broker.execute_cancel
+
+    async def execute_cancel(envelope):
+        cancels.append(envelope.intent)
+        return await real_cancel(envelope)
+
+    broker.execute_cancel = execute_cancel  # type: ignore[method-assign]
+    exit_intent = ExitIntent(pine_id='tp', from_entry='parent', symbol=SYMBOL, side='sell',
+                             qty=1.0, tp_price=120.0)
+    engine._active_intents[exit_intent.intent_key] = exit_intent
+    engine._order_mapping[exit_intent.intent_key] = ['xchg-tp']
+
+    engine._diff_and_dispatch([*_held_close_requests('reverse', intent, 0.2), exit_intent])
+
+    assert broker.placed == []
+    assert cancels == []
+    assert engine._active_intents[exit_intent.intent_key] == exit_intent
+    assert engine._order_mapping[exit_intent.intent_key] == ['xchg-tp']
+    assert engine._pending_reversal_opens == {}
+
+
+@pytest.mark.parametrize('request_kind', ['reverse', 'limit_reverse', 'close_all'])
+def __test_a_position_sized_dispatch_waits_for_the_held_execution__(request_kind):
+    """A reversal or close_all over a held entry waits, then goes out against the true book.
+
+    Nothing is sent while the book holds 0.2 of the 0.4 the order executed.
+    The sync that books the missing 0.2 sends it sized from the whole 0.4: the
+    market reversal's close takes 0.4, a close_all goes out on the same bar
+    (no decline gate delays it), a price-based reversal is placed as the
+    strategy sized it then.
+    """
+    from pynecore.core.broker.models import LegType
+    broker, engine, intent = _held_close_setup()
+    for _sync in range(2):
+        engine._diff_and_dispatch(_held_close_requests(request_kind, intent, 0.2))
+    assert broker.placed == []
+    assert not engine.quarantined
+
+    engine._route_event(_late_fill(0.2))
+    assert not engine._entry_execution_unresolved('parent')
+    assert engine._position.size == pytest.approx(0.4)
+
+    engine._diff_and_dispatch(_held_close_requests(request_kind, intent, 0.4))
+    (kind, placed), = broker.placed
+    if request_kind == 'reverse':
+        assert kind == 'close' and placed.synthetic_kind == 'reversal_close'
+        assert placed.qty == pytest.approx(0.4)
+        engine._route_event(_reversal_fill('xchg-close', placed.pine_id, 'sell', 0.4, 'c-1',
+                                           leg_type=LegType.CLOSE))
+        engine._diff_and_dispatch(_held_close_requests(request_kind, intent, 0.0))
+        assert [kind for kind, _placed in broker.placed] == ['close', 'entry']
+        engine._route_event(_reversal_fill('xchg-short', 'short', 'sell', 1.0, 's-1'))
+        assert engine._position.size == pytest.approx(-1.0)
+    elif request_kind == 'close_all':
+        assert kind == 'close' and placed.synthetic_kind is None and placed.pine_id == ''
+        assert placed.qty == pytest.approx(0.4)
+    else:
+        assert kind == 'entry' and placed.pine_id == 'short'
+        assert placed.qty == pytest.approx(1.4)
+    assert engine.quarantined is False
+
+
+@pytest.mark.parametrize('fill_order', ['close_first', 'late_fill_first', 'never'])
+@pytest.mark.parametrize('request_kind,state', [
+    ('reverse', 'awaiting'), ('reverse', 'held'), ('close_all', 'awaiting'),
+    ('close_held', 'awaiting'),
+])
+def __test_an_expired_hold_closes_the_venue_position_then_stays_quarantined__(
+        request_kind, state, fill_order):
+    """Over an expired hold the strategy's close or reversal closes the venue position.
+
+    The evidence never came within the grace: the bot is quarantined. The
+    strategy asks to close (or reverse) the long, so the engine reads the
+    venue (0.4 long, the book holds 0.2 or nothing) and closes all of it
+    with one ``held_execution_close``; the reversal's new side never opens.
+    The close's fill is booked up to the book and its excess waits for the
+    held order's late fill, which it closes: the book never goes short, the
+    late fill is booked exactly once, and the book ends flat with the venue.
+    Without the late fill the book stays flat and the excess waits. The
+    quarantine stands throughout.
+    """
+    from pynecore.core.broker.models import LegType
+    broker, engine, intent = _held_close_setup(state)
+    booked = engine._position.size
+    _expire(engine)
+    requests = _held_close_requests(request_kind, intent, booked)
+
+    engine._diff_and_dispatch(requests)
+    (kind, close), = broker.placed
+    assert kind == 'close' and close.synthetic_kind == 'held_execution_close'
+    assert close.side == 'sell' and close.qty == pytest.approx(0.4)
+    assert broker.venue == pytest.approx(0.0)
+    # Settling: no venue read, no second close.
+    reads = broker.position_reads
+    engine._diff_and_dispatch(requests)
+    assert len(broker.placed) == 1 and broker.position_reads == reads
+
+    close_fill = _reversal_fill('xchg-close', close.pine_id, 'sell', 0.4, 'c-1',
+                                leg_type=LegType.CLOSE)
+    sizes: list[float] = []
+    if fill_order == 'late_fill_first':
+        engine._route_event(_late_fill(0.4 - booked))
+        sizes.append(engine._position.size)
+        engine._route_event(close_fill)
+    else:
+        engine._route_event(close_fill)
+        sizes.append(engine._position.size)
+        if fill_order == 'close_first':
+            engine._route_event(_late_fill(0.4 - booked))
+            engine._route_event(_late_fill(0.4 - booked))
+    sizes.append(engine._position.size)
+    assert all(size >= -1e-12 for size in sizes)
+    assert engine._position.size == pytest.approx(0.0)
+    engine._diff_and_dispatch(_held_close_requests(request_kind, intent, 0.0))
+    assert [kind for kind, _placed in broker.placed] == ['close']
+    assert engine.quarantined
+    if fill_order == 'never':
+        assert engine._entry_execution_unresolved('parent')
+        assert engine._position.close_excess_qty(['xchg-parent']) == pytest.approx(0.4 - booked)
+        assert engine._held_execution_close is not None
+    else:
+        assert not engine._entry_execution_unresolved('parent')
+        assert engine._position.fill_cursor(['xchg-parent']) == pytest.approx(0.4)
+        assert engine._position.close_excess_qty(['xchg-parent']) == 0.0
+        assert engine._held_execution_close is None
+        # The round trip of the execution is booked with both real prices.
+        assert sum(abs(trade.size) for trade in engine._position.closed_trades) == (
+            pytest.approx(0.4))
+
+
+def __test_an_expired_hold_with_an_unreadable_venue_position_closes_nothing__():
+    """A venue position the engine cannot read is never closed blindly.
+
+    The strategy asks to reverse over the expired hold, but ``get_position``
+    fails: nothing is sent, the bot stays quarantined, and the close goes out
+    once the venue can be read again.
+    """
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+    broker, engine, intent = _held_close_setup()
+    _expire(engine)
+    broker.read_error = ExchangeConnectionError("positions endpoint down")
+    engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.2))
+    assert broker.placed == []
+    assert engine.quarantined
+
+    broker.read_error = None
+    engine._held_close_read_ms = 0
+    engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.2))
+    (kind, close), = broker.placed
+    assert close.synthetic_kind == 'held_execution_close' and close.qty == pytest.approx(0.4)
+
+
+def __test_an_expired_hold_under_an_external_intervention_writes_nothing__():
+    """An external-intervention latch forbids the held-execution close too.
+
+    Someone else touched the account: the bot writes nothing to the venue,
+    whatever the strategy asks.
+    """
+    from pynecore.core.broker.models import QuarantineKind
+    broker, engine, intent = _held_close_setup()
+    _expire(engine)
+    engine.record_quarantine('order_moved', {'client_order_id': 'x'},
+                             kind=QuarantineKind.EXTERNAL_INTERVENTION)
+    for request_kind in ('reverse', 'close_all', 'close_held'):
+        engine._diff_and_dispatch(_held_close_requests(request_kind, intent, 0.2))
+    assert broker.placed == []
+    assert broker.position_reads == 0
+    assert broker.venue == pytest.approx(0.4)
+
+
+def __test_an_expired_hold_on_a_plugin_without_venue_close_closes_the_booked_part__():
+    """A netting plugin that cannot close by venue quantity closes what the book holds.
+
+    Without :attr:`BrokerPlugin.supports_held_execution_close` the engine
+    sends the book's own symbol-wide close for the booked 0.2 and leaves the
+    rest to the operator; once the book is flat it sends nothing for the
+    unbooked part the plugin cannot reach.
+    """
+    from pynecore.core.broker.models import LegType
+    broker, engine, intent = _held_close_setup(supports=False)
+    _expire(engine)
+    engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.2))
+    (kind, close), = broker.placed
+    assert close.synthetic_kind == 'reversal_close' and close.qty == pytest.approx(0.2)
+    assert broker.venue == pytest.approx(0.2)
+    engine._route_event(_reversal_fill('xchg-close', close.pine_id, 'sell', 0.2, 'c-1',
+                                       leg_type=LegType.CLOSE))
+    assert engine._position.size == pytest.approx(0.0)
+    marker = engine._held_execution_close
+    assert marker is not None
+    marker.sent_ms -= 10 ** 6
+    engine._held_close_read_ms = 0
+    engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.2))
+    assert len(broker.placed) == 1
+    assert broker.position_reads == 2
+    assert engine.quarantined
+
+
+@pytest.mark.parametrize('outcome', ['landed', 'lost'])
+def __test_an_unknown_outcome_held_close_is_never_sent_again_blindly__(outcome):
+    """A held-execution close of unknown outcome waits, then the venue decides.
+
+    The close's dispatch timed out. Inside the settle window nothing is read
+    or sent. Past it the venue is read: a close that landed left the venue
+    flat and nothing more goes out; one that never landed is sent again
+    under a fresh id, sized from the fresh read.
+    """
+    broker, engine, intent = _held_close_setup()
+    _expire(engine)
+    broker.close_error = OrderDispositionUnknownError("close timed out",
+                                                      client_order_id='held-close')
+    if outcome == 'landed':
+        real_close = broker.execute_close
+
+        async def landing_close(envelope):
+            broker._reduce(envelope.intent.side, envelope.intent.qty)
+            return await real_close(envelope)
+
+        broker.execute_close = landing_close  # type: ignore[method-assign]
+    engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.2))
+    assert len(broker.placed) == 1
+    first = broker.placed[0][1]
+    broker.close_error = None
+    engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.2))
+    assert len(broker.placed) == 1
+
+    marker = engine._held_execution_close
+    assert marker is not None
+    marker.sent_ms -= 10 ** 6
+    engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.2))
+    if outcome == 'landed':
+        assert len(broker.placed) == 1
+    else:
+        (_kind, _first), (_kind2, second) = broker.placed
+        assert second.pine_id != first.pine_id
+        assert second.synthetic_kind == 'held_execution_close'
+        assert second.qty == pytest.approx(0.4)
+
+
+def __test_a_failed_held_close_write_sends_nothing_and_the_next_sync_sends_it__(tmp_path):
+    """The held-execution close is stored before it is sent (persist-first).
+
+    A storage error on that write ends the sync with nothing sent; the next
+    sync sends the close. The stored record is what a restart re-arms.
+    """
+    from pynecore.core.broker.storage import HELD_EXECUTION_CLOSE_EVENT_KIND
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
+        broker = _HeldCloseBroker()
+        broker.hold(0.4)
+        engine = _mk_engine(broker, store_ctx=ctx)
+        intent = _seed_parent_intent_and_leg(engine, with_leg=False)
+        engine._route_event(_ct_unknown_execution(
+            _ct_order_event('cancelled', filled_qty=0.0, fill_qty=None)))
+        engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.2,
+                                            fill_id='x-1'))
+        engine._flush_owed_store_writes()
+        _expire(engine)
+        real_replace = ctx.replace_keyed_events
+        failed: list[bool] = []
+
+        def replace_keyed_events(event_kind, *args, **kwargs):
+            if event_kind == HELD_EXECUTION_CLOSE_EVENT_KIND and not failed:
+                failed.append(True)
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_replace(event_kind, *args, **kwargs)
+
+        ctx.replace_keyed_events = replace_keyed_events  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.OperationalError):
+            engine._diff_and_dispatch(_held_close_requests('close_all', intent, 0.2))
+        assert broker.placed == []
+        assert engine._held_execution_close is None
+
+        engine._diff_and_dispatch(_held_close_requests('close_all', intent, 0.2))
+        (kind, close), = broker.placed
+        assert close.synthetic_kind == 'held_execution_close'
+        stored = ctx.keyed_events_for_run_id(HELD_EXECUTION_CLOSE_EVENT_KIND)['close']
+        assert stored['pine_ids'] == [close.pine_id]
+        assert stored['order_ids'] == ['xchg-parent']
+
+
+def __test_a_restart_after_the_held_close_was_sent_reads_the_venue_before_another__(tmp_path):
+    """A restart re-arms the sent held-execution close from the store.
+
+    The restarted bot does not send another close while the first one
+    settles, caps the first close's late fill at the book (the excess waits
+    for the held order's fill), and once the venue shows the position closed
+    sends nothing more. The held order's fill then closes against the excess
+    and the record is retired.
+    """
+    from pynecore.core.broker.models import LegType
+    from pynecore.core.broker.storage import HELD_EXECUTION_CLOSE_EVENT_KIND
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
+        broker = _HeldCloseBroker()
+        broker.hold(0.4)
+        engine = _mk_engine(broker, store_ctx=ctx)
+        intent = _seed_parent_intent_and_leg(engine, with_leg=False)
+        engine._route_event(_ct_unknown_execution(
+            _ct_order_event('cancelled', filled_qty=0.0, fill_qty=None)))
+        _expire(engine)
+        engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.0))
+        (_kind, close), = broker.placed
+        engine._flush_owed_store_writes()
+        ctx.close()
+
+        ctx2 = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
+        broker2 = _HeldCloseBroker()
+        engine2 = _mk_engine(broker2, store_ctx=ctx2)
+        engine2._current_bar_ts_ms = BAR_TS
+        marker = engine2._held_execution_close
+        assert marker is not None and marker.pine_ids == [close.pine_id]
+        _expire(engine2)
+        engine2._diff_and_dispatch(_held_close_requests('reverse', intent, 0.0))
+        assert broker2.placed == [] and broker2.position_reads == 0
+
+        engine2._route_event(_reversal_fill('xchg-close', close.pine_id, 'sell', 0.4, 'c-1',
+                                            leg_type=LegType.CLOSE))
+        assert engine2._position.size == pytest.approx(0.0)
+        assert engine2._position.close_excess_qty(['xchg-parent']) == pytest.approx(0.4)
+
+        marker.sent_ms -= 10 ** 6
+        engine2._diff_and_dispatch(_held_close_requests('reverse', intent, 0.0))
+        assert broker2.placed == [] and broker2.position_reads == 1
+
+        engine2._route_event(_late_fill(0.4))
+        assert engine2._position.size == pytest.approx(0.0)
+        assert not engine2._entry_execution_unresolved('parent')
+        assert engine2._held_execution_close is None
+        engine2._flush_owed_store_writes()
+        assert ctx2.keyed_events_for_run_id(HELD_EXECUTION_CLOSE_EVENT_KIND) == {}
+
+
+def __test_a_close_of_a_held_entry_parked_for_its_cancel_closes_from_the_venue__():
+    """A close of an expired held entry is not refused for good by its parked cancel.
+
+    The strategy dropped the entry and its cancel is parked for retry, which
+    the hold keeps from landing; the strategy then closes the entry. Over the
+    expired hold the close goes out as the venue close, not deferred behind
+    the cancel that never retries.
+    """
+    broker, engine, intent = _held_close_setup()
+    engine._forced_cancel_pending['parent'] = intent
+    _expire(engine)
+    engine._diff_and_dispatch(_held_close_requests('close_held', intent, 0.2))
+    (kind, close), = broker.placed
+    assert close.synthetic_kind == 'held_execution_close' and close.qty == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize('latch', ['storage_failure', 'close_rejected', 'plugin_cause'])
+def __test_a_market_reversal_under_a_quarantine_closes_the_position_only__(latch):
+    """An ENTRY_BLOCK quarantine runs a reversal's close leg and blocks its new side.
+
+    No entry is held: the book is the venue's. The quarantine (any cause, the
+    engine's own or a plugin's) blocks new exposure, but
+    the strategy asked to close the long: the close leg goes out, and once
+    the book is flat the short is not opened.
+    """
+    from pynecore.core.broker.models import LegType
+    broker = _HeldCloseBroker()
+    broker.hold(0.5)
+    engine = _mk_engine(broker)
+    intent = _seed_parent_intent_and_leg(engine, with_leg=False)
+    engine._route_event(_ct_order_event('partial', filled_qty=0.5, fill_qty=0.5,
+                                        fill_id='x-1'))
+    assert engine._position.size == pytest.approx(0.5)
+    engine.record_quarantine(latch, cause={'storage_failure': 'storage_failure',
+                                           'close_rejected': 'close_rejected:x',
+                                           'plugin_cause': 'vanished_order:7'}[latch])
+    requests = _held_close_requests('reverse', intent, 0.5)
+
+    engine._diff_and_dispatch(requests)
+    (kind, close), = broker.placed
+    assert close.synthetic_kind == 'reversal_close' and close.qty == pytest.approx(0.5)
+    engine._route_event(_reversal_fill('xchg-close', close.pine_id, 'sell', 0.5, 'c-1',
+                                       leg_type=LegType.CLOSE))
+    assert engine._position.size == pytest.approx(0.0)
+    for _sync in range(2):
+        engine._diff_and_dispatch(requests)
+    assert [kind for kind, _placed in broker.placed] == ['close']
+    assert engine._position.size == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize('evidence', ['settled', 'expired'])
+def __test_a_hedging_reversal_over_a_held_entry_closes_the_whole_venue_leg__(evidence):
+    """On a hedging account the reversal's per-leg close takes the held execution too.
+
+    The held order's leg holds 0.4 at the venue, the book 0.2. A per-leg
+    close of the booked 0.2 would leave 0.2 of that leg as a separate venue
+    long next to the new short. The reversal waits instead; once the evidence
+    settles, its close takes the whole 0.4 leg and the short opens (-1.0).
+    Over an expired hold the engine closes the venue legs it reads (the whole
+    0.4) and the short never opens.
+    """
+    from pynecore.core.broker.models import LegType
+    broker, engine, intent = _held_close_setup(hedging=True)
+    requests = _held_close_requests('reverse', intent, 0.2)
+    engine._diff_and_dispatch(requests)
+    assert broker.closed_legs == [] and broker.placed_legs == []
+
+    if evidence == 'settled':
+        engine._route_event(_late_fill(0.2))
+        engine._diff_and_dispatch(requests)
+        assert broker.closed_legs == [('L1', pytest.approx(0.4))]
+        close_key = next(key for key in engine._envelopes
+                         if key.startswith('__pyne_reversal_close__'))
+        engine._route_event(dataclasses.replace(
+            _reversal_fill('xchg-close-L1', close_key, 'sell', 0.4, 'c-1',
+                           leg_type=LegType.CLOSE), from_entry=close_key))
+        assert engine._position.size == pytest.approx(0.0)
+        engine._diff_and_dispatch(requests)
+        assert broker.placed_legs == [pytest.approx(1.0)]
+        engine._route_event(_reversal_fill('xchg-short', 'short', 'sell', 1.0, 's-1'))
+        assert engine._position.size == pytest.approx(-1.0)
+        assert broker.venue == pytest.approx(-1.0)
+        return
+
+    _expire(engine)
+    engine._diff_and_dispatch(requests)
+    assert broker.closed_legs == [('L1', pytest.approx(0.4))]
+    assert broker.venue == pytest.approx(0.0)
+    marker = engine._held_execution_close
+    assert marker is not None
+    engine._route_event(dataclasses.replace(
+        _reversal_fill('xchg-close-L1', marker.pine_ids[0], 'sell', 0.4, 'c-1',
+                       leg_type=LegType.CLOSE), from_entry=marker.pine_ids[0]))
+    engine._route_event(_late_fill(0.2))
+    assert engine._position.size == pytest.approx(0.0)
+    assert not engine._entry_execution_unresolved('parent')
+    engine._diff_and_dispatch(requests)
+    assert broker.placed_legs == []
+    assert engine.quarantined
 
 
 @pytest.mark.parametrize('terminal', ['cancelled', 'rejected'])
@@ -4360,7 +5232,7 @@ def __test_a_tentative_parent_terminal_ahead_of_its_fill_keeps_the_dispatch_barr
         assert engine._position.size == pytest.approx(0.4)
         assert not engine._entry_execution_unresolved(intent.intent_key)
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
         ctx.close()
 
 
@@ -4453,7 +5325,7 @@ def __test_a_later_terminal_report_raises_the_awaited_execution_after_unmapping_
         assert not engine._entry_execution_unresolved(key)
         assert engine._position.size == pytest.approx(0.6)
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
         ctx.close()
 
 
@@ -4502,7 +5374,7 @@ def __test_a_higher_terminal_report_queued_behind_a_fill_keeps_the_awaited_execu
         assert engine._position.size == pytest.approx(0.6)
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
         ctx.close()
 
 
@@ -4559,7 +5431,7 @@ def __test_a_stale_lower_terminal_repeat_keeps_the_stored_execution_across_a_res
         assert not engine._entry_execution_unresolved(key)
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
         ctx.close()
 
 
@@ -4618,7 +5490,7 @@ def __test_a_hold_awaits_every_reporting_order_and_settles_on_the_last_fill__(tm
         assert engine._fill_evidence_awaiting_execution == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
         ctx.close()
 
 
@@ -4681,7 +5553,7 @@ def __test_a_sibling_slice_showing_more_executed_raises_its_booking_target__(tmp
         assert engine._fill_evidence_floors == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
         ctx.close()
 
 
@@ -4746,7 +5618,7 @@ def __test_a_queued_fill_showing_more_executed_keeps_the_hold_after_an_earlier_f
         assert engine._fill_evidence_queued == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND) == {}
         assert ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND) == {}
-        assert engine.halted is False and not engine.quarantined
+        assert engine.quarantined is False and not engine.quarantined
         ctx.close()
 
 
@@ -4830,7 +5702,7 @@ def __test_a_sibling_orders_booked_fills_do_not_release_the_awaited_execution__(
 
     engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.2, fill_id='x-2'))
     assert not engine._entry_execution_unresolved(key)
-    assert engine.halted is False
+    assert engine.quarantined is False
 
 
 @pytest.mark.parametrize('terminal', ['cancelled', 'rejected'])
@@ -4871,3 +5743,494 @@ def __test_a_tentative_parent_proven_unexecuted_retires_its_native_failsafe__(te
     assert leg.leg_state == LEG_STATE_ABORTED_PARENT_NEVER_ARRIVED
     assert manager.get_state(ref).health is FailsafeHealth.RETIRED
     assert not manager.block_new_entry(symbol=SYMBOL, pine_id='other', bar_ts_ms=BAR_TS)
+
+
+# === The bot's own recovery of a held entry's execution =======================
+
+
+def _venue_parent(status: OrderStatus, filled: float, *, avg: float | None = 100.5,
+                  fee: float = 0.04):
+    """The venue's record of the held order ``xchg-parent`` (a 1-unit buy), read again."""
+    return ExchangeOrder(
+        id='xchg-parent', symbol=SYMBOL, side='buy', order_type=OrderType.MARKET,
+        qty=1.0, filled_qty=filled, remaining_qty=round(1.0 - filled, 12), price=None,
+        stop_price=None, average_fill_price=avg if filled > 0.0 else None, status=status,
+        timestamp=BAR_TS / 1000.0, fee=fee, fee_currency='USDT')
+
+
+def _recover(engine: OrderSyncEngine, now_ms: int) -> None:
+    """One reconcile pass of the recovery: read, drain what it queued, resolve the causes."""
+    engine._recover_held_executions(now_ms=now_ms)
+    engine.apply_async_events()
+    engine._resolve_entry_block_causes(now_ms=now_ms)
+
+
+def __test_an_expired_awaiting_hold_is_booked_from_the_venues_executions__():
+    """The fill never came: the bot reads the order's executions and books the missing one.
+
+    The book holds 0.2 of the 0.4 the venue reported. The venue's executions
+    are the stream's own fills: the booked one is taken once, the missing
+    one is booked at its own price, the hold ends, and the quarantine ends by
+    itself once the venue holds what the book holds. Nothing waits for a human.
+    """
+    broker, engine, _intent = _held_close_setup()
+    _expire(engine)
+    now = int(time.time() * 1000)
+    fills = (_ct_order_event('partial', filled_qty=0.2, fill_qty=0.2, fill_id='x-1'),
+             dataclasses.replace(_late_fill(0.2), fill_price=100.9))
+    broker.executions = [OrderExecution(order=_venue_parent(OrderStatus.CANCELLED, 0.4),
+                                        fills=fills)]
+
+    _recover(engine, now)
+
+    assert broker.execution_reads == [('xchg-parent', None)]
+    assert engine._position.size == pytest.approx(0.4)
+    assert sorted(t.entry_price for t in engine._position.open_trades) == [100.0, 100.9]
+    assert not engine._entry_execution_unresolved('parent')
+    assert not engine.quarantined
+    assert engine.quarantine_kind is None
+
+
+@pytest.mark.parametrize('fee_reported', [True, False])
+def __test_an_expired_unknown_hold_is_booked_from_the_venues_totals__(fee_reported, caplog):
+    """The venue never said what the order executed: its totals are booked, exactly once.
+
+    Nothing of the order is booked, so the venue's average is the price of
+    the whole execution and its cumulative fee its commission; a fee the
+    venue does not report is booked as none and said so. A later stream fill
+    of the same execution, under its own fill id, is taken without booking
+    it again.
+    """
+    broker, engine, _intent = _held_close_setup('held')
+    _expire(engine)
+    broker.executions = [OrderExecution(order=_venue_parent(OrderStatus.CANCELLED, 0.4),
+                                        fee_reported=fee_reported)]
+
+    _recover(engine, int(time.time() * 1000))
+
+    assert engine._position.size == pytest.approx(0.4)
+    (trade,) = engine._position.open_trades
+    assert trade.entry_price == pytest.approx(100.5)
+    assert trade.commission == pytest.approx(0.04 if fee_reported else 0.0)
+    assert ('unreported' in caplog.text) is (not fee_reported)
+    assert not engine._entry_execution_unresolved('parent')
+    assert not engine.quarantined
+
+    engine._route_event(_ct_order_event('partial', filled_qty=0.4, fill_qty=0.4,
+                                        fill_id='stream-1'))
+    assert engine._position.size == pytest.approx(0.4)
+
+
+def __test_a_partly_booked_order_is_never_booked_from_its_totals__():
+    """The average alone does not give the price of the unbooked rest: nothing is invented.
+
+    The book holds 0.2 of the order, the venue keeps only its totals. Nothing
+    is booked, the quarantine stands and the bot asks again after its backoff
+    (the plugin owes the executions); once the venue returns them the gap is
+    booked and the quarantine ends.
+    """
+    broker, engine, _intent = _held_close_setup()
+    _expire(engine)
+    now = int(time.time() * 1000)
+    broker.executions = [OrderExecution(order=_venue_parent(OrderStatus.CANCELLED, 0.4))]
+
+    _recover(engine, now)
+    assert engine._position.size == pytest.approx(0.2)
+    assert engine.quarantined
+
+    _recover(engine, now + 1000)
+    assert len(broker.execution_reads) == 1, "the backoff holds the next read"
+
+    broker.executions = [OrderExecution(
+        order=_venue_parent(OrderStatus.CANCELLED, 0.4),
+        fills=(_ct_order_event('partial', filled_qty=0.2, fill_qty=0.2, fill_id='x-1'),
+               _late_fill(0.2)))]
+    _recover(engine, now + 6000)
+    assert len(broker.execution_reads) == 2
+    assert engine._position.size == pytest.approx(0.4)
+    assert not engine.quarantined
+
+
+@pytest.mark.parametrize('answer', ['zero_executed', 'no_such_order'])
+def __test_an_order_the_venue_shows_unexecuted_releases_the_held_entry__(answer):
+    """The venue proves nothing executed: the entry is released by the bot itself.
+
+    The venue's order history shows zero executed (or no such order at
+    all), so the hold ends as unexecuted, and with the venue flat the
+    quarantine ends.
+    """
+    broker, engine, _intent = _held_close_setup('held')
+    broker.legs = {}
+    _expire(engine)
+    order = _venue_parent(OrderStatus.CANCELLED, 0.0) if answer == 'zero_executed' else None
+    broker.executions = [OrderExecution(order=order)]
+
+    _recover(engine, int(time.time() * 1000))
+
+    assert engine._position.size == pytest.approx(0.0)
+    assert not engine._entry_execution_unresolved('parent')
+    assert not engine.quarantined
+
+
+def __test_the_recovery_reads_the_venue_with_a_capped_backoff_and_no_deadline__(caplog):
+    """A venue that cannot answer is asked again, never in a tight loop and never given up.
+
+    A failing read is logged once per situation; a failing read and a
+    ``None`` answer are asked again after a doubling delay capped at a few
+    minutes, also hours later.
+    """
+    broker, engine, _intent = _held_close_setup('held')
+    _expire(engine)
+    now = int(time.time() * 1000)
+    broker.executions = [ConnectionError('venue down'), None, ConnectionError('venue down')]
+    for step in range(3):
+        engine._recover_held_executions(now_ms=now + step)
+    assert len(broker.execution_reads) == 1
+    assert caplog.text.count("reading its execution from the venue failed") == 1
+
+    delays = []
+    at = now
+    for _read in range(12):
+        state = engine._venue_recoveries['order:xchg-parent']
+        delays.append((state.next_ms - at) / 1000.0)
+        at = state.next_ms
+        engine._recover_held_executions(now_ms=at)
+    assert delays[0] == pytest.approx(_VENUE_RECOVERY_FIRST_S)
+    assert all(later >= earlier for earlier, later in zip(delays, delays[1:]))
+    assert max(delays) == pytest.approx(_VENUE_RECOVERY_CAP_S)
+    assert len(broker.execution_reads) == 13
+    assert engine.quarantined and engine._entry_execution_unresolved('parent')
+
+
+def __test_a_restart_during_the_recovery_reads_the_venue_again_and_books_once__(tmp_path):
+    """The process stops while the venue cannot answer; the next one recovers by itself.
+
+    The expired hold survives the restart, the restarted bot reads the
+    venue at once, books the totals and ends its quarantine. A stream fill
+    of the same execution delivered after a second restart is taken once:
+    what the totals booked is kept with the book.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
+        broker = _HeldCloseBroker()
+        broker.hold(0.4)
+        broker.executions = [ConnectionError('venue down')]
+        engine = _mk_engine(broker, store_ctx=ctx)
+        _seed_parent_intent_and_leg(engine, with_leg=False)
+        engine._route_event(_ct_unknown_execution(
+            _ct_order_event('cancelled', filled_qty=0.0, fill_qty=None)))
+        _expire(engine)
+        _recover(engine, int(time.time() * 1000))
+        assert engine._position.size == pytest.approx(0.0) and engine.quarantined
+        engine._flush_owed_store_writes()
+        ctx.close()
+
+        ctx2 = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
+        broker2 = _HeldCloseBroker()
+        broker2.hold(0.4)
+        broker2.executions = [OrderExecution(order=_venue_parent(OrderStatus.CANCELLED, 0.4))]
+        engine2 = _mk_engine(broker2, store_ctx=ctx2)
+        engine2._current_bar_ts_ms = BAR_TS
+        assert engine2._entry_execution_unresolved('parent')
+        _expire(engine2)
+        _recover(engine2, int(time.time() * 1000))
+        assert broker2.execution_reads == [('xchg-parent', None)]
+        assert engine2._position.size == pytest.approx(0.4)
+        assert not engine2._entry_execution_unresolved('parent')
+        assert not engine2.quarantined
+        engine2._persist_entry_book()
+        engine2._flush_owed_store_writes()
+        snapshot = engine2._position.entry_book_snapshot()
+        assert [record['qty'] for record in snapshot['recovered_executions']] == [0.4]
+        ctx2.close()
+
+
+def __test_a_failed_audit_write_never_stops_the_recovery__(tmp_path):
+    """The recovery's audit row is not part of the booking: a store that refuses it is logged."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(_run_identity(), script_source="src", script_path="t027.py")
+        broker = _HeldCloseBroker()
+        broker.hold(0.4)
+        broker.executions = [OrderExecution(order=_venue_parent(OrderStatus.CANCELLED, 0.4))]
+        engine = _mk_engine(broker, store_ctx=ctx)
+        _seed_parent_intent_and_leg(engine, with_leg=False)
+        engine._route_event(_ct_unknown_execution(
+            _ct_order_event('cancelled', filled_qty=0.0, fill_qty=None)))
+        _expire(engine)
+
+        def refuse(*_args, **_kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        ctx.log_event = refuse  # type: ignore[method-assign]
+        _recover(engine, int(time.time() * 1000))
+        assert engine._position.size == pytest.approx(0.4)
+        assert not engine._entry_execution_unresolved('parent')
+        ctx.close()
+
+
+def __test_a_venue_close_over_an_expired_hold_then_the_recovery_ends_the_quarantine__():
+    """The strategy reversed over the expired hold: the venue close, then the bot's own recovery.
+
+    The venue close flattened the venue and its excess waits for the held
+    order's execution; the recovery books that execution, which the excess
+    closes at the venue close's price. The book never went short, the
+    reversal's new side did not open while the cause stood, and the
+    quarantine ends by itself with the book and the venue flat.
+    """
+    broker, engine, intent = _held_close_setup('held')
+    _expire(engine)
+    engine._diff_and_dispatch(_held_close_requests('reverse', intent, 0.0))
+    (_kind, close), = broker.placed
+    engine._route_event(_reversal_fill('xchg-close', close.pine_id, 'sell', 0.4, 'c-1',
+                                       leg_type=LegType.CLOSE))
+    assert engine._position.size == pytest.approx(0.0)
+    broker.executions = [OrderExecution(order=_venue_parent(OrderStatus.CANCELLED, 0.4))]
+
+    _recover(engine, int(time.time() * 1000))
+
+    assert engine._position.size == pytest.approx(0.0)
+    assert not engine._entry_execution_unresolved('parent')
+    assert engine._held_execution_close is None
+    assert not engine.quarantined
+    assert [kind for kind, _placed in broker.placed] == ['close']
+
+
+def __test_a_waited_price_reversal_is_sized_from_the_true_book_without_a_reissue__():
+    """A limit reversal created over the booked 0.2 goes out closing the whole 0.4.
+
+    The strategy sized it 1.2 (flip 0.2) and does not issue it again. Once
+    the held execution is booked, the order goes out as 1.4 (flip 0.4), and an
+    amend of its level keeps that flip.
+    """
+    broker, engine, intent = _held_close_setup()
+    stale = _held_close_requests('limit_reverse', intent, 0.2)
+    engine._diff_and_dispatch(stale)
+    assert broker.placed == []
+    engine._route_event(_late_fill(0.2))
+    assert engine._position.size == pytest.approx(0.4)
+
+    engine._diff_and_dispatch(stale)
+    (kind, placed), = broker.placed
+    assert kind == 'entry' and placed.qty == pytest.approx(1.4)
+    assert engine._active_intents['short'].qty == pytest.approx(1.2)
+
+    moved = [stale[0], dataclasses.replace(stale[1], limit=102.0)]
+    resized = engine._resize_waited_dispatch(moved[1])
+    assert resized.qty == pytest.approx(1.4) and resized.flip_qty == pytest.approx(0.4)
+
+
+def __test_a_waited_close_all_closes_the_true_position__():
+    """A close_all the strategy sized from the booked 0.2 closes the whole 0.4 once it goes out."""
+    broker, engine, intent = _held_close_setup()
+    stale = _held_close_requests('close_all', intent, 0.2)
+    engine._diff_and_dispatch(stale)
+    assert broker.placed == []
+    engine._route_event(_late_fill(0.2))
+
+    engine._diff_and_dispatch(stale)
+    (kind, placed), = broker.placed
+    assert kind == 'close' and placed.pine_id == '' and placed.qty == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize('held_side', ['buy', 'sell'])
+def __test_an_unbooked_held_execution_never_masks_an_external_reduction__(held_side):
+    """The venue holds the reported unbooked execution too: a real shrink is still seen.
+
+    The book holds 0.2 of a long entry the venue reported 0.4 executed of. A
+    venue of 0.3 is an external reduction of 0.1, not "more than the book".
+    A held entry on the other side could explain a lower venue by itself:
+    nothing is judged while it stands.
+    """
+    broker, engine, _intent = _held_close_setup()
+    (_key, hold), = engine._fill_evidence_awaiting_execution.values()
+    hold.side = held_side
+    venue = ExchangePosition(symbol=SYMBOL, side='long', size=0.3, entry_price=100.0,
+                             unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+                             margin_mode='cross')
+    expected = 0.1 if held_side == 'buy' else 0.0
+    assert engine._external_shrink_delta(venue) == pytest.approx(expected)
+
+
+# === ENTRY_BLOCK causes end by themselves ========================================
+
+
+def __test_an_entry_block_ends_with_its_last_cause_and_never_on_its_own_otherwise__():
+    """Each cause ends by its producer; the latch ends with the last one, in this process.
+
+    A cause-less request is refused and latches nothing (nothing could ever
+    end it), and an external-intervention latch never ends by the bot,
+    whatever its entry-block causes do.
+    """
+    events: list[BrokerEvent] = []
+    engine = _mk_engine(_MockBroker(), events)
+    engine.record_quarantine('first', cause='a')
+    engine.record_quarantine('second', cause='b')
+    assert engine.end_quarantine_cause('a', 'gone') is False
+    assert engine.quarantined
+    assert engine.end_quarantine_cause('missing', 'gone') is False
+    assert engine.end_quarantine_cause('b', 'gone') is True
+    assert not engine.quarantined and engine.quarantine_id is None
+    assert [type(event) for event in events if isinstance(event, QuarantineEndedEvent)] == [
+        QuarantineEndedEvent]
+
+    with pytest.raises(ValueError, match='needs a cause'):
+        engine.record_quarantine('plugin latch without a cause')
+    assert not engine.quarantined and engine._entry_block_causes == {}
+    engine.record_quarantine('third', cause='c')
+    assert engine.end_quarantine_cause('c', 'gone') is True
+    assert not engine.quarantined
+
+    engine2 = _mk_engine(_MockBroker())
+    engine2.record_quarantine('own trouble', cause='d')
+    engine2.record_quarantine('someone moved the stop', kind=QuarantineKind.EXTERNAL_INTERVENTION)
+    assert engine2.end_quarantine_cause('d', 'gone') is False
+    assert engine2.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+
+
+def __test_an_ended_entry_block_lets_the_next_entry_out__():
+    """Once the bot ended its quarantine the strategy's next entry is dispatched."""
+    broker = _HeldCloseBroker()
+    engine = _mk_engine(broker)
+    engine.record_quarantine('close_rejected_repeatedly', cause='close_rejected:x')
+    entry = EntryIntent(pine_id='long', symbol=SYMBOL, side='buy', qty=1.0,
+                        order_type=OrderType.MARKET)
+    engine._diff_and_dispatch([entry])
+    assert broker.placed == []
+    engine._resolve_entry_block_causes(now_ms=int(time.time() * 1000))
+    assert not engine.quarantined
+    engine._diff_and_dispatch([dataclasses.replace(entry, pine_id='long2')])
+    assert [kind for kind, _placed in broker.placed] == ['entry']
+
+
+def __test_a_protective_exit_cause_ends_once_the_unprotected_position_is_closed__():
+    """The venue refused to protect entry L; the cause ends once nothing of L is open."""
+    broker = _HeldCloseBroker()
+    engine = _mk_engine(broker)
+    _seed_parent_intent_and_leg(engine, with_leg=False)
+    engine._route_event(_ct_order_event('partial', filled_qty=0.5, fill_qty=0.5,
+                                        fill_id='x-1'))
+    engine.record_quarantine('protective_exit_rejected', cause='protective_exit_rejected:parent')
+    engine._resolve_entry_block_causes(now_ms=int(time.time() * 1000))
+    assert engine.quarantined
+    engine._position.record_fill(_reversal_fill('xchg-c', 'c', 'sell', 0.5, 'c-1',
+                                                leg_type=LegType.CLOSE))
+    assert not any(b.entry_id == 'parent' for b in engine._position.bindings)
+    engine._resolve_entry_block_causes(now_ms=int(time.time() * 1000))
+    assert not engine.quarantined
+
+
+@pytest.mark.parametrize(('answer', 'expected', 'fraction'), [
+    ('no_such_order', 'refused', 0.0),
+    ('zero', 'refused', 0.0),
+    ('full', 'sent', 0.0),
+    ('part', 'partial', 0.25),
+    ('working', 'working', 0.0),
+    ('cannot_tell', None, 0.0),
+])
+def __test_a_close_no_record_settles_is_settled_from_the_venues_order_history__(
+        answer, expected, fraction):
+    """The bot reads a held partial-bracket close by its client order id instead of asking a human."""
+    broker = _HeldCloseBroker()
+    engine = _mk_engine(broker)
+
+    def order(status, filled):
+        return ExchangeOrder(
+            id='xchg-c', symbol=SYMBOL, side='sell', order_type=OrderType.MARKET, qty=0.4,
+            filled_qty=filled, remaining_qty=round(0.4 - filled, 12), price=None,
+            stop_price=None, average_fill_price=100.0 if filled else None, status=status,
+            timestamp=BAR_TS / 1000.0, fee=0.0, fee_currency='USDT')
+
+    broker.executions = [{
+        'no_such_order': OrderExecution(order=None),
+        'zero': OrderExecution(order=order(OrderStatus.CANCELLED, 0.0)),
+        'full': OrderExecution(order=order(OrderStatus.FILLED, 0.4)),
+        'part': OrderExecution(order=order(OrderStatus.CANCELLED, 0.1)),
+        'working': OrderExecution(order=order(OrderStatus.OPEN, 0.0)),
+        'cannot_tell': None,
+    }[answer]]
+    evidence = engine._venue_close_outcome('close-coid')
+    assert broker.execution_reads == [(None, 'close-coid')]
+    if expected is None:
+        assert evidence is None
+        return
+    assert evidence is not None and evidence.outcome == expected
+    assert evidence.executed_fraction == pytest.approx(fraction)
+    assert engine._venue_close_outcome('close-coid') is None, "the backoff holds the next read"
+
+
+# === The fan's unsettled leg send, settled in this process ======================
+
+
+def __test_a_held_fan_close_runs_the_leg_settlement_in_process_after_its_window__():
+    """No restart and no operator: the bot settles the fan's unsettled leg send itself.
+
+    The emulator's leg settlement runs first after the settle window (a send
+    still in flight lands first), then with the backoff; a settlement that
+    could not complete is tried again; nothing runs while the venue writes are
+    blocked.
+    """
+    broker = _HeldCloseBroker(hedging=True)
+    engine = _mk_engine(broker)
+    calls: list[int] = []
+    answers = [False, True]
+
+    async def settle(port):
+        calls.append(1)
+        return answers.pop(0)
+
+    engine._one_way_emulator.settle_pending_close_legs = settle  # type: ignore[method-assign]
+    now = int(time.time() * 1000)
+    engine._replay_held_fan_close('close-1', broker)
+    assert calls == []
+    state = engine._venue_recoveries['fanreplay:close-1']
+    assert state.next_ms >= now + 60_000
+
+    state.next_ms = 0
+    engine._replay_held_fan_close('close-1', broker)
+    assert calls == [1]
+    engine._replay_held_fan_close('close-1', broker)
+    assert calls == [1], "the backoff holds the next settlement"
+
+    engine.record_quarantine('someone moved the stop', kind=QuarantineKind.EXTERNAL_INTERVENTION)
+    state.next_ms = 0
+    engine._replay_held_fan_close('close-1', broker)
+    assert calls == [1], "no settlement sends while the venue writes are blocked"
+
+
+@pytest.mark.parametrize('answer', [
+    'fills_above_filled', 'fills_below_filled', 'other_order', 'filled_above_qty',
+    'fill_without_id', 'executions_of_no_order',
+])
+def __test_an_execution_record_that_breaks_the_contract_books_nothing__(answer, caplog):
+    """A record whose figures do not add up is refused: nothing booked, the quarantine stands.
+
+    Every figure is in the journal unit. The bot asks again after its
+    backoff; once the plugin answers consistently the gap is booked.
+    """
+    broker, engine, _intent = _held_close_setup()
+    _expire(engine)
+    stream_fill = _ct_order_event('partial', filled_qty=0.2, fill_qty=0.2, fill_id='x-1')
+    late = _late_fill(0.2)
+    order = _venue_parent(OrderStatus.CANCELLED, 0.4)
+    bad = {
+        'fills_above_filled': OrderExecution(order=order, fills=(stream_fill, late, _late_fill(
+            0.2, fill_id='x-3'))),
+        'fills_below_filled': OrderExecution(order=order, fills=(late,)),
+        'other_order': OrderExecution(order=dataclasses.replace(order, id='xchg-other'),
+                                      fills=(stream_fill, late)),
+        'filled_above_qty': OrderExecution(order=dataclasses.replace(order, filled_qty=1.5)),
+        'fill_without_id': OrderExecution(order=order, fills=(
+            stream_fill, dataclasses.replace(late, fill_id=None))),
+        'executions_of_no_order': OrderExecution(order=None, fills=(late,)),
+    }[answer]
+    broker.executions = [bad, OrderExecution(order=order, fills=(stream_fill, late))]
+    now = int(time.time() * 1000)
+
+    _recover(engine, now)
+    assert engine._position.size == pytest.approx(0.2)
+    assert engine.quarantined
+    assert 'breaks the BrokerPlugin.fetch_order_execution contract' in caplog.text
+
+    _recover(engine, now + int(_VENUE_RECOVERY_FIRST_S * 1000))
+    assert engine._position.size == pytest.approx(0.4)
+    assert not engine.quarantined

@@ -314,7 +314,8 @@ def __test_confirm_inconclusive_keeps_stamp_and_warns_once__(tmp_path: Path) -> 
 
 
 def __test_confirm_cancelled_dual_signal_stop_policy__(tmp_path: Path) -> None:
-    """CANCELLED: persist first, yield the cancelled event, then halt."""
+    """CANCELLED: persist first, yield the cancelled event, then raise the
+    fallback signal (no quarantine hook is wired)."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
@@ -340,10 +341,10 @@ def __test_confirm_cancelled_dual_signal_stop_policy__(tmp_path: Path) -> None:
         assert cancels == [("c1", {'missing_since': T0, 'grace': GRACE})]
 
 
-def __test_abandoned_generator_still_halts_next_pass__(tmp_path: Path) -> None:
+def __test_abandoned_generator_still_signals_next_pass__(tmp_path: Path) -> None:
     """Persist + policy never depend on the consumer pulling the next
-    element: a halt decided under an abandoned generator re-raises on
-    the next observe call."""
+    element: a fallback signal decided under an abandoned generator
+    re-raises on the next observe call."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
@@ -396,7 +397,7 @@ def __test_policy_stop_with_quarantine_hook_does_not_halt__(
         tmp_path: Path,
 ) -> None:
     """With the quarantine hook wired, ``stop`` latches an external-intervention
-    quarantine and the observation loop survives — the process-exiting halt is
+    quarantine and the observation loop survives — the fallback signal is
     never armed."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
@@ -473,10 +474,10 @@ def __test_venue_driven_cancel_retires_with_reason_and_no_policy__(
     The push of a venue-driven cancel (reduce-only squeeze, OCA trigger) can
     be lost like any other; the grace-expiry verdict then names the cause.
     The row retires, the cancelled event carries the reason so the engine
-    trims the leg, and neither the quarantine nor the halt fires — even
-    under the halting policies.
+    trims the leg, and neither the quarantine nor its fallback signal fires,
+    under the quarantining policy too.
     """
-    for policy in ('stop', 'halt'):
+    for policy in ('stop', 'ignore'):
         path = tmp_path / f"{policy}.sqlite"
         with BrokerStore(path, plugin_name=PLUGIN) as store:
             ctx = _open_run(store)
@@ -542,37 +543,20 @@ def __test_retire_hook_keeps_a_partially_filled_row_live__(tmp_path: Path) -> No
         assert latched == [QuarantineKind.EXTERNAL_INTERVENTION]
 
 
-def __test_policy_halt_raises_process_exit_signal__(tmp_path: Path) -> None:
-    """The explicit ``halt`` policy keeps the process-exiting behavior:
-    dual signal first, then the raise."""
+def __test_policy_halt_is_not_a_policy__(tmp_path: Path) -> None:
+    """No policy ends the process: ``halt`` is refused at construction."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
-        _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
-        latched: list[tuple[str, dict]] = []
-        tracker = _make_tracker(
-            ctx, policy='halt',
-            request_quarantine=lambda reason, context: latched.append(
-                (reason, context)),
-        )
-
-        async def scenario() -> None:
-            gen = tracker.observe({'working': set()}, T_EXPIRED)
-            event = await anext(gen)
-            assert event.event_type == 'cancelled'
-            with pytest.raises(UnexpectedCancelError):
-                await anext(gen)
-
-        _run(scenario())
-        # ``halt`` never touches the quarantine hook, even when wired.
-        assert latched == []
-        assert len(_read_events(ctx, 'unexpected_cancel_quarantine')) == 0
+        with pytest.raises(ValueError):
+            _make_tracker(ctx, policy='halt')
 
 
-def __test_quarantine_hook_failure_falls_back_to_halt__(
+def __test_quarantine_hook_failure_falls_back_to_the_signal__(
         tmp_path: Path,
 ) -> None:
-    """A raising quarantine hook must fail-safe into the halt, never
-    fail-open into continued trading."""
+    """A raising quarantine hook must fail-safe into the
+    :class:`UnexpectedCancelError` signal the engine latches the quarantine
+    on, never fail-open into continued trading."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
@@ -1118,9 +1102,9 @@ def __test_concurrent_breadcrumb_preserved_on_clear__(tmp_path: Path) -> None:
         assert MISSING_PENDING_EXTRA not in row.extras
 
 
-def __test_halt_delivered_exactly_once__(tmp_path: Path) -> None:
-    """The pending halt is consumed by the raise: a later pass with no new
-    disappearance does not re-raise the same halt."""
+def __test_fallback_signal_delivered_exactly_once__(tmp_path: Path) -> None:
+    """The pending signal is consumed by the raise: a later pass with no new
+    disappearance does not re-raise the same signal."""
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_run(store)
         _seed_row(ctx, "c1", extras={MISSING_PENDING_EXTRA: T0})
@@ -1130,7 +1114,7 @@ def __test_halt_delivered_exactly_once__(tmp_path: Path) -> None:
             _run(_drain(tracker, {'working': set()}, T_EXPIRED))
         assert tracker.pending_halt is None
 
-        # Second pass: the row is retired, no new halt, no re-raise.
+        # Second pass: the row is retired, no new signal, no re-raise.
         events = _run(_drain(tracker, {'working': set()}, T_EXPIRED + 1.0))
         assert events == []
         assert tracker.pending_halt is None

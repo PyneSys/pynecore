@@ -25,7 +25,7 @@ from typing import Any, Coroutine
 import pytest
 
 from pynecore.core.broker.exceptions import SpotInventoryConflictError
-from pynecore.core.broker.models import QuarantineKind
+from pynecore.core.broker.models import FENCE_CAUSE_PREFIX, QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.spot_inventory import (
     _HISTORY_LAG_CEILING_S,
@@ -136,6 +136,7 @@ def _manager(
         port: FakeSpotPort,
         *,
         hook: Any = None,
+        release: Any = None,
         policy: str = 'quarantine',
 ) -> SpotInventoryManager:
     return SpotInventoryManager(
@@ -143,8 +144,25 @@ def _manager(
         account_id=ACCOUNT,
         symbol="BTCUSD",
         request_quarantine=hook,
+        release_quarantine=release,
         on_inventory_conflict=policy,
     )
+
+
+class _Latch:
+    """The engine's quarantine sinks, recording what the manager requested and released."""
+
+    def __init__(self) -> None:
+        self.requested: list[tuple[str, Any, Any]] = []
+        self.released: list[tuple[str, str]] = []
+
+    def request(self, reason: str, _context: dict, **kw: Any) -> bool:
+        self.requested.append((reason, kw.get('kind'), kw.get('cause')))
+        return True
+
+    def release(self, cause: str, resolution: str) -> bool:
+        self.released.append((cause, resolution))
+        return True
 
 
 def _read_events(ctx: RunContext, kind: str) -> list[dict]:
@@ -318,7 +336,7 @@ def __test_startup_first_epoch_freezes_baseline_not_raw_total__(tmp_path: Path):
         fee_amount='0', fee_currency='USD', ts_ms=T0_MS,
     )
     calls: list = []
-    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)))
+    mgr = _manager(ctx, port, hook=lambda r, c, **kw: calls.append((r, c)))
     result = _run(mgr.startup())
     assert not result.quarantined
     assert result.epoch is not None
@@ -452,7 +470,7 @@ def __test_startup_inconclusive_catchup_fails_closed__(tmp_path: Path):
     port = FakeSpotPort(balance=Decimal('0'))
     port.batches[None] = SpotExecutionBatch(conclusive=False)
     calls: list = []
-    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)))
+    mgr = _manager(ctx, port, hook=lambda r, c, **kw: calls.append((r, c)))
     result = _run(mgr.startup())
     assert result.quarantined
     assert result.reason == 'spot_catchup_inconclusive'
@@ -467,7 +485,7 @@ def __test_startup_balance_failure_fails_closed__(tmp_path: Path):
     port = FakeSpotPort()
     port.balance_error = ConnectionError("balance endpoint down")
     calls: list = []
-    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)))
+    mgr = _manager(ctx, port, hook=lambda r, c, **kw: calls.append((r, c)))
     result = _run(mgr.startup())
     assert result.quarantined
     assert result.reason == 'spot_startup_balance_unavailable'
@@ -635,7 +653,7 @@ def __test_startup_recovers_a_quarantined_epoch_on_the_venue_balance__(tmp_path:
     ctx3 = _open_run(store)
     port3 = FakeSpotPort(balance=Decimal('12'))
     calls: list = []
-    mgr3 = _manager(ctx3, port3, hook=lambda r, c: calls.append((r, c)))
+    mgr3 = _manager(ctx3, port3, hook=lambda r, c, **kw: calls.append((r, c)))
     result = _run(mgr3.startup())
     assert not result.quarantined
     assert calls == []
@@ -742,21 +760,61 @@ def __test_startup_recovery_stays_quarantined_when_measurement_fails__(tmp_path:
     store.close()
 
 
-def __test_startup_cursor_scope_change_fails_closed__(tmp_path: Path):
+def __test_startup_cursor_scope_change_recovers_on_the_balance_at_once__(tmp_path: Path):
+    """A plugin upgrade changed what the stored cursor means: the start recovers right away.
+
+    The stale cursor is never trusted, and a read from no cursor starts at
+    the venue's watermark, so the ledger cannot be carried over: the start
+    re-anchors a fresh epoch on the measured balance, as the restart after
+    the quarantine did, before the engine adopts. The start latched the entry
+    block here and waited for that restart.
+    """
     store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
-    ctx = _open_run(store)
-    port = FakeSpotPort(balance=Decimal('0'))
-    mgr = _manager(ctx, port)
-    assert not _run(mgr.startup()).quarantined
-    ctx.close()
+    _bot_holding_one(store, foreign='3')
 
     ctx2 = _open_run(store)
-    port2 = FakeSpotPort(balance=Decimal('0'))
+    port2 = FakeSpotPort(balance=Decimal('4'))
     port2.cursor_scope = "time"  # plugin upgrade changed cursor meaning
-    mgr2 = _manager(ctx2, port2)
+    calls: list = []
+    mgr2 = _manager(ctx2, port2, hook=lambda r, c, **kw: calls.append(r))
     result = _run(mgr2.startup())
-    assert result.quarantined
-    assert result.reason == 'spot_cursor_scope_changed'
+    assert not result.quarantined and calls == []
+    assert port2.fetch_calls[0] is None, "the stale cursor is never read"
+    assert result.fold.net_base == Decimal(0)
+    assert result.epoch is not None
+    assert result.epoch.epoch_seq == 2 and result.epoch.cursor_scope == "time"
+    assert Decimal(result.epoch.foreign_baseline) == Decimal('4')
+    events = _read_events(ctx2, 'spot_cursor_scope_changed')
+    assert len(events) == 1 and events[0]['stored_scope'] == "product"
+    assert len(_read_events(ctx2, 'spot_epoch_recovered')) == 1
+    store.close()
+
+
+def __test_a_scope_change_whose_measurement_fails_recovers_in_process__(tmp_path: Path):
+    """The re-anchor at the scope change cannot measure: the engine adopts flat, the bot retries."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    _bot_holding_one(store, foreign='3')
+
+    ctx2 = _open_run(store)
+    port2 = FakeSpotPort(balance=Decimal('4'))
+    port2.cursor_scope = "time"
+    port2.balance_error = ConnectionError("balance endpoint down")
+    latch = _Latch()
+    mgr2 = _manager(ctx2, port2, hook=latch.request, release=latch.release)
+    result = _run(mgr2.startup())
+    assert result.quarantined and result.reason == 'spot_recovery_balance_unavailable'
+    assert mgr2.synthesize_position(100.0) is None, "the engine adopts a flat position"
+
+    port2.balance_error = None
+    _run(mgr2.reconcile(T0_MS))
+    assert not mgr2.quarantined
+    assert mgr2.fold.net_base == Decimal(0)
+    epoch = ctx2.get_latest_spot_epoch(port2.product_id)
+    assert epoch is not None and epoch.cursor_scope == "time"
+    assert Decimal(epoch.foreign_baseline) == Decimal('4')
+    assert port2.fetch_calls and all(cursor is None or cursor == "anchor-0"
+                                     for cursor in port2.fetch_calls)
+    assert [cause for cause, _ in latch.released] == [mgr2.quarantine_cause]
     store.close()
 
 
@@ -770,7 +828,7 @@ def __test_reconcile_fill_first_race_resolves_via_catchup__(tmp_path: Path):
     ctx = _open_run(store)
     port = FakeSpotPort(balance=Decimal('5'))
     calls: list = []
-    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)))
+    mgr = _manager(ctx, port, hook=lambda r, c, **kw: calls.append((r, c)))
     assert not _run(mgr.startup()).quarantined
 
     # A fill landed at the venue (balance 6) but the stream lagged.
@@ -880,7 +938,7 @@ def __test_reconcile_unexplained_drift_holds_the_cursor__(tmp_path: Path):
     store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
     ctx = _open_run(store)
     port = FakeSpotPort(balance=Decimal('5'))
-    mgr = _manager(ctx, port, hook=lambda r, c: None)
+    mgr = _manager(ctx, port, hook=lambda r, c, **kw: None)
     assert not _run(mgr.startup()).quarantined
 
     # The balance moved, the history lags: the read drains nothing and
@@ -1980,29 +2038,16 @@ def __test_reconcile_locked_base_needs_total_ownership_read__(tmp_path: Path):
 # === Quarantine delivery: policies, hook fallback, halt ====================
 
 
-def __test_policy_halt_arms_pending_halt_not_hook__(tmp_path: Path):
+def __test_policy_halt_is_refused__(tmp_path: Path):
+    """No policy ends the process: ``halt`` is refused at construction."""
     store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
     ctx = _open_run(store)
-    port = FakeSpotPort(balance=Decimal('5'))
-    calls: list = []
-    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)),
-                   policy='halt')
-    result = _run(mgr.startup())  # baseline 5
-    assert not result.quarantined
-    ctx.close()
-
-    ctx2, mgr2, result = _inconclusive_restart(
-        store, FakeSpotPort(balance=Decimal('7')),
-        hook=lambda r, c: calls.append((r, c)), policy='halt')
-    assert result.quarantined
-    assert not calls  # hook not consulted under halt
-    halt = mgr2.consume_pending_halt()
-    assert isinstance(halt, SpotInventoryConflictError)
-    assert mgr2.consume_pending_halt() is None  # consume-once
+    with pytest.raises(ValueError):
+        _manager(ctx, FakeSpotPort(balance=Decimal('5')), policy='halt')
     store.close()
 
 
-def __test_quarantine_hook_failure_falls_back_to_halt__(tmp_path: Path):
+def __test_quarantine_hook_failure_falls_back_to_the_signal__(tmp_path: Path):
     store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
     ctx = _open_run(store)
     port = FakeSpotPort(balance=Decimal('5'))
@@ -2016,11 +2061,15 @@ def __test_quarantine_hook_failure_falls_back_to_halt__(tmp_path: Path):
     ctx2, mgr2, result = _inconclusive_restart(
         store, FakeSpotPort(balance=Decimal('9')), hook=raising_hook)
     assert result.quarantined
-    assert isinstance(mgr2.pending_halt, SpotInventoryConflictError)
+    signal = mgr2.consume_pending_halt()
+    assert isinstance(signal, SpotInventoryConflictError)
+    # The signal carries the quarantine the conflict decided, for the engine.
+    assert signal.kind is QuarantineKind.ENTRY_BLOCK
+    assert mgr2.consume_pending_halt() is None  # consume-once
     store.close()
 
 
-def __test_missing_hook_falls_back_to_halt__(tmp_path: Path):
+def __test_missing_hook_falls_back_to_the_signal__(tmp_path: Path):
     store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
     ctx = _open_run(store)
     port = FakeSpotPort(balance=Decimal('5'))
@@ -2041,7 +2090,7 @@ def __test_negative_inventory_live_fill_quarantines__(tmp_path: Path):
     ctx = _open_run(store)
     port = FakeSpotPort(balance=Decimal('0'))
     calls: list = []
-    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)))
+    mgr = _manager(ctx, port, hook=lambda r, c, **kw: calls.append((r, c)))
     assert not _run(mgr.startup()).quarantined
     mgr.record_live_fill(_fill("b1", base='1', price='100'))
     mgr.record_live_fill(
@@ -2051,6 +2100,230 @@ def __test_negative_inventory_live_fill_quarantines__(tmp_path: Path):
     assert mgr.quarantined
     assert mgr.quarantine_reason == 'spot_ledger_negative_inventory'
     assert len(calls) == 1
+    store.close()
+
+
+# === In-process recovery of the manager's own trouble ========================
+
+
+def __test_a_startup_measurement_failure_recovers_in_process__(tmp_path: Path):
+    """The balance read fails at the start: the bot measures again by itself and resumes.
+
+    The entry block carries the manager's cause; every reconcile while it
+    holds is a recovery attempt, paced after a failed one, and the first
+    settled measurement writes the epoch and releases the cause. The block
+    held until a restart before.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('7'))
+    port.balance_error = ConnectionError("balance endpoint down")
+    latch = _Latch()
+    mgr = _manager(ctx, port, hook=latch.request, release=latch.release)
+    result = _run(mgr.startup())
+    assert result.quarantined and result.reason == 'spot_startup_balance_unavailable'
+    assert latch.requested == [(latch.requested[0][0], None, mgr.quarantine_cause)]
+    assert mgr.quarantine_cause == "spot_inventory:BTC-USD"
+
+    assert _run(mgr.reconcile(T0_MS)) == []
+    assert mgr.quarantined, "the venue is still down"
+    calls = port.balance_calls
+    _run(mgr.reconcile(T0_MS + 1_000))
+    assert port.balance_calls == calls, "a failed attempt paces the next one"
+    assert latch.released == []
+
+    port.balance_error = None
+    assert _run(mgr.reconcile(T0_MS + 5_000)) == []
+    assert not mgr.quarantined and mgr.quarantine_reason is None
+    assert [cause for cause, _ in latch.released] == [mgr.quarantine_cause]
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None and epoch.state == 'active'
+    assert Decimal(epoch.foreign_baseline) == Decimal('7')
+    recovered = _read_events(ctx, 'spot_inventory_quarantine_recovered')
+    assert len(recovered) == 1 and recovered[0]['attempts'] == 2
+    store.close()
+
+
+def __test_a_negative_ledger_the_history_repairs_recovers_with_its_fill__(tmp_path: Path):
+    """A stream gap lost the bot's buy before its sell: the history returns it.
+
+    The recovery books the missing buy, hands it to the plugin for delivery
+    and resumes on the same epoch.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('0'))
+    latch = _Latch()
+    mgr = _manager(ctx, port, hook=latch.request, release=latch.release)
+    assert not _run(mgr.startup()).quarantined
+    mgr.record_live_fill(_fill("b1", base='1', price='100'))
+    mgr.record_live_fill(_fill("s1", side='sell', base='-2', quote='200', price='100',
+                               ts_ms=T0_MS + 1))
+    assert mgr.quarantine_reason == 'spot_ledger_negative_inventory'
+
+    port.batches["anchor-0"] = SpotExecutionBatch(
+        executions=(_fill("b0", base='1', price='100', ts_ms=T0_MS - 1),),
+        next_cursor="anchor-1",
+    )
+    delivered = _run(mgr.reconcile(T0_MS + 10_000))
+    assert [row.fill_id for row in delivered] == ["b0"]
+    assert not mgr.quarantined
+    assert mgr.fold.net_base == Decimal(0) and mgr.fold.violation is None
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None and epoch.epoch_seq == 1 and epoch.state == 'active'
+    assert [cause for cause, _ in latch.released] == [mgr.quarantine_cause]
+    assert _read_events(ctx, 'spot_ledger_consolidated') == []
+    store.close()
+
+
+def __test_a_negative_ledger_no_history_repairs_is_consolidated__(tmp_path: Path):
+    """No fill in a complete history repairs the ledger: its net inventory is kept.
+
+    The engine tracks the fold's net inventory, so the recovery keeps exactly
+    that: the rows retire into one consolidated row at the fold's cost basis
+    and the rest of the balance becomes the foreign baseline.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    port = FakeSpotPort(balance=Decimal('0'))
+    latch = _Latch()
+    mgr = _manager(ctx, port, hook=latch.request, release=latch.release)
+    assert not _run(mgr.startup()).quarantined
+    mgr.record_live_fill(_fill("s1", side='sell', base='-1', quote='100', price='100'))
+    assert mgr.quarantine_reason == 'spot_ledger_negative_inventory'
+    mgr.record_live_fill(_fill("b1", base='3', price='100', ts_ms=T0_MS + 1))
+    position = mgr.synthesize_position(100.0)
+    assert position is not None and position.size == 2.0
+    port.balance = Decimal('2.5')
+
+    assert _run(mgr.reconcile(T0_MS + 10_000)) == []
+    assert not mgr.quarantined
+    assert mgr.fold.net_base == Decimal('2') and mgr.fold.violation is None
+    after = mgr.synthesize_position(100.0)
+    assert after is not None and after.size == 2.0, "the engine's position is unchanged"
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None and epoch.epoch_seq == 2
+    assert Decimal(epoch.foreign_baseline) == Decimal('0.5')
+    events = _read_events(ctx, 'spot_ledger_consolidated')
+    assert len(events) == 1 and events[0]['retired_fills'] == 2 and events[0]['kept'] == '2'
+    assert [cause for cause, _ in latch.released] == [mgr.quarantine_cause]
+    assert _run(mgr.reconcile(T0_MS + 20_000)) == [] and not mgr.quarantined
+    store.close()
+
+
+def __test_a_start_another_run_blocked_resumes_flat_once_the_lease_is_free__(tmp_path: Path):
+    """Another live run held the base asset at the start; the bot resumes once it is gone.
+
+    The engine adopted a flat position (the start read no ledger), so the
+    recovery anchors a fresh epoch on the whole balance and retires the
+    ledger rather than show the engine inventory it never adopted.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx_a = _open_run(store)
+    assert ctx_a.claim_spot_asset(ACCOUNT, "BTC", "USD")
+    ctx_b = _open_run(store, label="second")
+    ctx_b.record_spot_execution(
+        ACCOUNT, "BTC-USD", fill_id="b-old", side='buy',
+        base_delta='1', quote_delta='-100', price='100',
+        fee_amount='0', fee_currency='USD', ts_ms=T0_MS, client_order_id="c-b-old",
+    )
+    port = FakeSpotPort(balance=Decimal('4'))
+    latch = _Latch()
+    mgr = _manager(ctx_b, port, hook=latch.request, release=latch.release)
+    result = _run(mgr.startup())
+    assert result.quarantined and result.reason == 'spot_lease_conflict'
+    assert mgr.synthesize_position(100.0) is None, "the engine adopts a flat position"
+
+    _run(mgr.reconcile(T0_MS))
+    assert mgr.quarantined and port.balance_calls == 0, "the other run still holds it"
+    ctx_a.release_spot_asset(ACCOUNT, "BTC")
+    assert _run(mgr.reconcile(T0_MS + 5_000)) == []
+    assert not mgr.quarantined
+    assert mgr.synthesize_position(100.0) is None
+    epoch = ctx_b.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None and Decimal(epoch.foreign_baseline) == Decimal('4')
+    assert [cause for cause, _ in latch.released] == [mgr.quarantine_cause]
+    store.close()
+
+
+def __test_a_hook_that_raised_is_tried_again_and_its_cause_released__(tmp_path: Path):
+    """The engine's sink failed once: the signal reports it, the sink is tried again."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    assert not _run(_manager(ctx, FakeSpotPort(balance=Decimal('5'))).startup()).quarantined
+    ctx.close()
+
+    latch = _Latch()
+    failures = [RuntimeError("sink broken")]
+
+    def flaky(reason: str, context: dict, **kw: Any) -> bool:
+        if failures:
+            raise failures.pop()
+        return latch.request(reason, context, **kw)
+
+    port = FakeSpotPort(balance=Decimal('5'))
+    ctx2, mgr, result = _inconclusive_restart(store, port, hook=flaky)
+    mgr._release_quarantine = latch.release  # noqa: SLF001 — the runner's wiring
+    assert result.quarantined
+    assert isinstance(mgr.consume_pending_halt(), SpotInventoryConflictError)
+
+    _run(mgr.reconcile(T0_MS))
+    assert mgr.quarantined
+    assert latch.requested == [(latch.requested[0][0], None, mgr.quarantine_cause)]
+    assert mgr.pending_halt is None, "the signal is delivered once"
+
+    port.batches["anchor-0"] = SpotExecutionBatch(next_cursor="anchor-0")
+    _run(mgr.reconcile(T0_MS + 5_000))
+    assert not mgr.quarantined
+    assert [cause for cause, _ in latch.released] == [mgr.quarantine_cause]
+    store.close()
+
+
+def __test_a_signal_latched_block_is_not_reported_again_once_recovered__(tmp_path: Path):
+    """Without a hook the engine ends the signal's block itself: no report comes any more."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    assert not _run(_manager(ctx, FakeSpotPort(balance=Decimal('5'))).startup()).quarantined
+    ctx.close()
+
+    port = FakeSpotPort(balance=Decimal('5'))
+    ctx2, mgr, result = _inconclusive_restart(store, port, hook=None)
+    assert result.quarantined
+    assert isinstance(mgr.consume_pending_halt(), SpotInventoryConflictError)
+    _run(mgr.reconcile(T0_MS))
+    assert mgr.quarantined and mgr.pending_halt is None
+    port.batches["anchor-0"] = SpotExecutionBatch(next_cursor="anchor-0")
+    _run(mgr.reconcile(T0_MS + 5_000))
+    assert not mgr.quarantined and mgr.pending_halt is None
+    store.close()
+
+
+def __test_a_fill_id_another_run_booked_keeps_the_block_while_it_stands__(tmp_path: Path):
+    """Two runs claim one fill: every attempt finds the conflict again, nothing resumes."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx_a = _open_run(store)
+    ctx_a.record_spot_execution(
+        ACCOUNT, "BTC-USD", fill_id="shared-1", side='buy',
+        base_delta='1', quote_delta='-100', price='100',
+        fee_amount='0', fee_currency='USD', ts_ms=T0_MS,
+    )
+    ctx_a.close()
+    ctx_a.release_spot_asset(ACCOUNT, "BTC")
+
+    ctx_b = _open_run(store, label="second")
+    port = FakeSpotPort(balance=Decimal('1'))
+    port.batches[None] = SpotExecutionBatch(
+        executions=(_fill("shared-1", base='1', price='100'),), next_cursor="anchor-1")
+    latch = _Latch()
+    mgr = _manager(ctx_b, port, hook=latch.request, release=latch.release)
+    assert _run(mgr.startup()).reason == 'spot_foreign_ledger_row'
+    assert "two runs book the same fill 'shared-1'" in latch.requested[0][0]
+    (audit,) = _read_events(ctx_b, 'spot_inventory_quarantine')
+    assert "configuration conflict" in audit['diagnosis']
+    for offset_ms in (0, 5_000, 20_000):
+        assert _run(mgr.reconcile(T0_MS + offset_ms)) == []
+    assert mgr.quarantined and latch.released == []
+    assert len(latch.requested) == 1
     store.close()
 
 
@@ -2069,7 +2342,7 @@ def __test_lease_second_run_starts_quarantined__(tmp_path: Path):
     ctx_b = _open_run(store, label="second")
     port_b = FakeSpotPort(balance=Decimal('0'))
     calls: list = []
-    mgr_b = _manager(ctx_b, port_b, hook=lambda r, c: calls.append((r, c)))
+    mgr_b = _manager(ctx_b, port_b, hook=lambda r, c, **kw: calls.append((r, c)))
     result = _run(mgr_b.startup())
     assert result.quarantined
     assert result.reason == 'spot_lease_conflict'
@@ -2150,7 +2423,7 @@ def __test_foreign_ledger_row_quarantines_both_paths__(tmp_path: Path):
         next_cursor="anchor-1",
     )
     calls: list = []
-    mgr = _manager(ctx_b, port, hook=lambda r, c: calls.append((r, c)))
+    mgr = _manager(ctx_b, port, hook=lambda r, c, **kw: calls.append((r, c)))
     result = _run(mgr.startup())
     assert result.quarantined
     assert result.reason == 'spot_foreign_ledger_row'
@@ -2395,9 +2668,15 @@ def __test_inconclusive_page_does_not_advance_cursor__(tmp_path: Path):
     store.close()
 
 
-def __test_startup_negative_baseline_quarantines__(tmp_path: Path):
-    """F3: a first-epoch freeze must refuse a negative foreign baseline
-    (account owns less base than the ledger's bot inventory)."""
+def __test_startup_below_the_ledger_freezes_no_foreign_holdings__(tmp_path: Path):
+    """F3: a first start whose account holds less base than the ledger's inventory.
+
+    No negative foreign baseline is ever frozen: the first epoch holds no
+    foreign base, and the shortfall gets the runtime verdict. A complete
+    history that never explains it is someone taking the bot's base, the
+    external intervention. The start latched an entry block here that no
+    restart could ever lift (every first start found the same shortfall).
+    """
     store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
     ctx = _open_run(store)
     # Crash window: ledger already holds a 2 BTC bot buy, but the account
@@ -2409,14 +2688,49 @@ def __test_startup_negative_baseline_quarantines__(tmp_path: Path):
         client_order_id="c-pre1",
     )
     port = FakeSpotPort(balance=Decimal('0.5'))
-    calls: list = []
-    mgr = _manager(ctx, port, hook=lambda r, c: calls.append((r, c)))
+    latch = _Latch()
+    mgr = _manager(ctx, port, hook=latch.request, release=latch.release)
     result = _run(mgr.startup())
-    assert result.quarantined
-    assert result.reason == 'spot_baseline_below_inventory'
-    assert len(calls) == 1
-    # No epoch was frozen with an impossible negative baseline.
-    assert ctx.get_latest_spot_epoch(port.product_id) is None
+    assert not result.quarantined and latch.requested == []
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None and Decimal(epoch.foreign_baseline) == Decimal(0)
+    pending = _read_events(ctx, 'spot_startup_drift_pending')
+    assert len(pending) == 1 and pending[0]['drift'] == '-1.5'
+
+    _run(mgr.reconcile(T0_MS + 60_000))
+    _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
+    assert latch.requested == [
+        (latch.requested[0][0], QuarantineKind.EXTERNAL_INTERVENTION, None)]
+    assert mgr.quarantine_reason == 'spot_inventory_taken'
+    epoch = ctx.get_latest_spot_epoch(port.product_id)
+    assert epoch is not None and epoch.state == 'taken'
+    store.close()
+
+
+def __test_startup_below_the_ledger_resolves_when_the_own_sell_is_indexed__(tmp_path: Path):
+    """The shortfall at the first start is the bot's own sell the history returns late."""
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx = _open_run(store)
+    ctx.record_spot_execution(
+        ACCOUNT, "BTC-USD", fill_id="pre1", side='buy',
+        base_delta='2', quote_delta='-200', price='100',
+        fee_amount='0', fee_currency='USD', ts_ms=T0_MS,
+        client_order_id="c-pre1",
+    )
+    port = FakeSpotPort(balance=Decimal('0.5'))
+    latch = _Latch()
+    mgr = _manager(ctx, port, hook=latch.request, release=latch.release)
+    assert not _run(mgr.startup()).quarantined
+    port.batches["anchor-0"] = SpotExecutionBatch(
+        executions=(_fill("own-sell", side='sell', base='-1.5', quote='150', price='100',
+                          ts_ms=T0_MS + 1),),
+        next_cursor="anchor-1",
+    )
+    delivered = _run(mgr.reconcile(T0_MS + 60_000))
+    assert [row.fill_id for row in delivered] == ["own-sell"]
+    _run(mgr.reconcile(T0_MS + 60_000 + 31_000))
+    assert not mgr.quarantined and latch.requested == []
+    assert mgr.fold.net_base == Decimal('0.5')
     store.close()
 
 
@@ -2575,7 +2889,7 @@ def __test_reconcile_quarantines_on_lease_loss__(tmp_path: Path):
     ctx_a = _open_run(store)
     port_a = FakeSpotPort(balance=Decimal('10'))
     calls: list = []
-    mgr_a = _manager(ctx_a, port_a, hook=lambda r, c: calls.append((r, c)))
+    mgr_a = _manager(ctx_a, port_a, hook=lambda r, c, **kw: calls.append((r, c)))
     assert not _run(mgr_a.startup()).quarantined
 
     # A replacement run takes the (now stale) lease over.
@@ -2591,6 +2905,53 @@ def __test_reconcile_quarantines_on_lease_loss__(tmp_path: Path):
     assert mgr_a.quarantined
     assert mgr_a.quarantine_reason == 'spot_lease_lost'
     assert len(calls) == 1
+    assert "writes nothing to the venue" in calls[0][0]
+    # The fenced zombie never resumes in-process, even once the lease is free.
+    ctx_b.release_spot_asset(ACCOUNT, "BTC")
+    calls_before = port_a.balance_calls
+    for offset_ms in (5_000, 60_000, 600_000):
+        _run(mgr_a.reconcile(T0_MS + offset_ms))
+    assert mgr_a.quarantined and port_a.balance_calls == calls_before
+    store.close()
+
+
+def _take_lease_over(store: BrokerStore) -> RunContext:
+    """A replacement run takes the (aged) lease of the running one over."""
+    ctx_b = _open_run(store, label="second")
+    # noinspection SqlResolve,SqlWithoutWhere
+    ctx_b._store._conn.execute(  # type: ignore[attr-defined]
+        "UPDATE spot_asset_owner SET heartbeat_ts_ms = heartbeat_ts_ms - ?",
+        (10 * 60 * 1000,),
+    )
+    assert ctx_b.claim_spot_asset(ACCOUNT, "BTC", "USD")
+    return ctx_b
+
+
+@pytest.mark.parametrize('blocked_before', [False, True])
+def __test_a_fenced_zombie_latches_the_write_fence__(tmp_path: Path, blocked_before):
+    """The zombie's block forbids every venue write of its process, exits included.
+
+    The cause carries :data:`FENCE_CAUSE_PREFIX`, which the engine turns into
+    a write block in this process only; an entry block the manager already
+    held does not keep it from fencing.
+    """
+    store = BrokerStore(tmp_path / "b.sqlite", plugin_name=PLUGIN)
+    ctx_a = _open_run(store)
+    port_a = FakeSpotPort(balance=Decimal('10'))
+    latch = _Latch()
+    mgr_a = _manager(ctx_a, port_a, hook=latch.request, release=latch.release)
+    assert not _run(mgr_a.startup()).quarantined
+    if blocked_before:
+        port_a.balance_error = ConnectionError("down")
+        mgr_a.record_live_fill(_fill("s1", side='sell', base='-1', quote='100', price='100'))
+        assert mgr_a.quarantine_reason == 'spot_ledger_negative_inventory'
+    _take_lease_over(store)
+
+    _run(mgr_a.reconcile(T0_MS))
+    assert mgr_a.quarantine_reason == 'spot_lease_lost'
+    fence = f"{FENCE_CAUSE_PREFIX}{mgr_a.quarantine_cause}"
+    assert latch.requested[-1] == (latch.requested[-1][0], None, fence)
+    assert latch.released == []
     store.close()
 
 

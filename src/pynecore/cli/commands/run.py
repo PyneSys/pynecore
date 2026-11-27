@@ -1755,18 +1755,16 @@ def run(
                                 "waiting for its fill; the next run reconciles "
                                 "it from the venue",
                             )
-                    except BrokerManualInterventionError:
-                        # The ``[BROKER] ERROR sync engine halted by …`` line
-                        # logged from ``OrderSyncEngine._record_halt`` already
-                        # carries the reason + context. Just append a single
-                        # follow-up hint in the same Pine log format so the
-                        # operator knows the strategy is no longer running.
+                    except BrokerManualInterventionError as exc:
+                        # Only a report the plugin raises outside the sync
+                        # engine (while it connects or starts up) reaches
+                        # here: the engine answers every report it receives
+                        # with a quarantine and the run goes on.
                         progress.stop()
-                        stop_reason = "manual intervention required"
+                        stop_reason = "plugin refused to start"
                         broker_warning(
-                            "live streaming stopped — manual intervention "
-                            "required, resolve the broker-side state and "
-                            "restart"
+                            "live streaming stopped — the broker plugin could not "
+                            "start safely: %s", exc.reason,
                         )
                     finally:
                         if heartbeat is not None:

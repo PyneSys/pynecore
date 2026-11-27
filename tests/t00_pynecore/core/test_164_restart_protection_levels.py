@@ -1276,7 +1276,6 @@ def __test_a_re_assert_the_venue_refuses_twice_closes_the_parent_defensively__(
             'defensive_close']
         assert not [r for r in caplog.records if "re-asserted after" in r.getMessage()]
         assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
-        assert not engine.halted
         ctx.close()
 
 
@@ -1567,7 +1566,7 @@ def __test_a_resumed_entry_block_is_a_plain_restart__(tmp_path: Path) -> None:
         guard.expect("p1", _BOT_LEVELS, row_coid="leg-1")
         guard.settle("p1", _BOT_LEVELS)
         engine = _engine(ctx)
-        engine.record_quarantine("protective_exit_rejected")
+        engine.record_quarantine("protective_exit_rejected", cause="protective_exit_rejected:L")
         assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
         quarantine_id = engine.quarantine_id
         assert quarantine_id is not None

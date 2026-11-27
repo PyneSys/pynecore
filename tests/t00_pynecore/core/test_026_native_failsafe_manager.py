@@ -21,6 +21,7 @@ from pynecore.core.broker.models import (
     PartialBracketBlockedDegradedFailsafeEvent,
 )
 from pynecore.core.broker.native_failsafe_manager import (
+    HEAL_FIRST_DELAY_MS,
     FailsafeHealth,
     FailsafeObservation,
     FailsafeOwner,
@@ -1446,3 +1447,67 @@ def __test_an_accepted_first_observation_becomes_the_baseline__():
     assert not any(isinstance(e, BrokerNativeFailsafeExternalEditEvent) for e in events)
     # Once the bot's level is confirmed, a further foreign level is an edit again.
     assert _observe(manager, 90.0) is FailsafeObservation.EXTERNAL_EDIT
+
+
+# ---------------------------------------------------------------------
+# Self-healing of an own DEGRADED state
+# ---------------------------------------------------------------------
+
+
+def _degrade_by_put_failure(manager: NativeFailsafeManager) -> None:
+    snap = manager.recompute_worst_sl(
+        parent_entry_dispatch_ref=PARENT_REF, active_sl_levels=[90.0], now_ms=1000.0)
+    manager.record_put_failure(
+        PARENT_REF, generation=snap.generation, reason='rate-limit', now_ms=1010.0)
+    manager.tick_stale_window(now_ms=10_000.0)
+    assert manager.get_state(PARENT_REF).health is FailsafeHealth.DEGRADED
+
+
+def __test_an_own_degraded_failsafe_re_arms_itself_and_heals_on_confirmation__():
+    """No manual reset: the bot re-arms its own stop and the venue's confirmation heals it.
+
+    The first re-arm waits HEAL_FIRST_DELAY_MS (a late confirmation still
+    lands without a write); it re-queues the desired stop and moves the state
+    to DEGRADING, so new entries stay blocked until a snapshot confirms the
+    stop. A re-arm that fails again degrades again; the next re-arm waits
+    twice as long after the previous one.
+    """
+    manager, _events = _make_manager(put_max_attempts=1, stale_window_ms=5_000.0)
+    _register_long(manager)
+    _degrade_by_put_failure(manager)
+
+    assert manager.heal_degraded(now_ms=10_000.0) == []
+    assert manager.pending_dispatch() == []
+    assert manager.heal_degraded(now_ms=10_000.0 + HEAL_FIRST_DELAY_MS) == [PARENT_REF]
+    state = manager.get_state(PARENT_REF)
+    assert state.health is FailsafeHealth.DEGRADING
+    (snap,) = manager.pending_dispatch()
+    assert snap.stop_level == 90.0
+    assert manager.block_new_entry(symbol=SYMBOL, pine_id='L', bar_ts_ms=0)
+
+    manager.record_put_failure(
+        PARENT_REF, generation=snap.generation, reason='rate-limit', now_ms=16_000.0)
+    manager.tick_stale_window(now_ms=21_000.0)
+    assert state.health is FailsafeHealth.DEGRADED
+    rearmed_at = 10_000.0 + HEAL_FIRST_DELAY_MS
+    assert manager.heal_degraded(now_ms=rearmed_at + 2 * HEAL_FIRST_DELAY_MS - 1) == []
+    assert manager.heal_degraded(now_ms=rearmed_at + 2 * HEAL_FIRST_DELAY_MS) == [PARENT_REF]
+    (snap,) = manager.pending_dispatch()
+    manager.mark_dispatch_in_flight(PARENT_REF, now_ms=40_500.0)
+    manager.record_put_success(PARENT_REF, generation=snap.generation, now_ms=41_000.0)
+    manager.on_native_bracket_observed(
+        PARENT_REF, stop_level=90.0, profit_level=None, trailing_stop=None, now_ms=42_000.0)
+    assert state.health is FailsafeHealth.HEALTHY
+    assert not manager.block_new_entry(symbol=SYMBOL, pine_id='L', bar_ts_ms=0)
+
+
+def __test_a_failsafe_someone_else_edited_is_never_re_armed_by_the_bot__():
+    """An UNKNOWN owner is an external edit: only the operator's reset recovers it."""
+    manager, _events = _make_manager(put_max_attempts=1, stale_window_ms=5_000.0)
+    _register_long(manager)
+    _degrade_by_put_failure(manager)
+    manager.get_state(PARENT_REF).owner = FailsafeOwner.UNKNOWN
+    for now_ms in (10_000.0, 10_000.0 + 10 ** 7):
+        assert manager.heal_degraded(now_ms=now_ms) == []
+    assert manager.get_state(PARENT_REF).health is FailsafeHealth.DEGRADED
+    assert manager.pending_dispatch() == []

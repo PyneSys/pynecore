@@ -54,11 +54,10 @@ from pynecore.core._file_io import ProcessLifetimeLock
 from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.store_helpers import (
-    EXTRAS_KEY_LEG_STATE,
-    EXTRAS_KEY_TRIGGER_CLOSE_COID,
-    LEG_STATE_TRIGGERING,
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
     PENDING_DISPATCH_STATES,
-    STATE_PARTIAL_BRACKET_LEG,
+    STATE_DISPOSITION_UNKNOWN,
     STATE_REJECTED,
 )
 
@@ -83,7 +82,8 @@ __all__ = [
     'ENTRY_FILL_ORDER_EVENT_KIND',
     'ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND',
     'ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND',
-    'FILL_EVIDENCE_OPERATOR_RELEASE_FIELD',
+    'HELD_EXECUTION_CLOSE_EVENT_KIND',
+    'EXECUTION_HOLD_REQUEST_EVENT_KIND',
 ]
 
 _log = logging.getLogger(__name__)
@@ -134,11 +134,6 @@ ENTRY_FILL_ORDER_EVENT_KIND: Final[str] = 'entry_fill_order'
 # restart re-arms the hold (and the order mapping the evidence routes through)
 # instead of dispatching the entry afresh. Kept however old it is.
 ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND: Final[str] = 'entry_fill_evidence_hold'
-# Payload field of an :data:`ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND` event the
-# operator's ``pyne broker resume --entry-not-executed ENTRY_ID`` sets (to the
-# resumed quarantine id) in the transaction of the resume request: the
-# restarted bot releases that hold as an entry that did not execute.
-FILL_EVIDENCE_OPERATOR_RELEASE_FIELD: Final[str] = 'operator_not_executed'
 # Event kind of the execution evidence of a held entry the sync engine received
 # but may not have applied yet, one event per venue order id (the
 # ``client_order_id`` column holds the order id; payload: the terminal event,
@@ -147,6 +142,24 @@ FILL_EVIDENCE_OPERATOR_RELEASE_FIELD: Final[str] = 'operator_not_executed'
 # stops before applying it settles the hold at its restart. Kept however old
 # it is.
 ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND: Final[str] = 'entry_fill_evidence_arrival'
+# Event kind of the venue close the sync engine sends when an entry's execution
+# evidence never arrived and the strategy asked to close or reverse the
+# exposure it covers (``OrderSyncEngine._close_held_exposure_from_venue``), one
+# event under the fixed key ``'close'`` (payload: the close attempts' pine ids,
+# the held orders, the venue position read before the send, the request). Written
+# before the close is sent and deleted once the venue shows the position closed
+# or no hold is left, so a restart neither forgets that a close went out nor
+# sends another one before reading the venue again. Kept however old it is.
+HELD_EXECUTION_CLOSE_EVENT_KIND: Final[str] = 'held_execution_close'
+# Event kind of a plugin's request that the sync engine hold an entry for its
+# execution read from the venue (:meth:`RunContext.request_execution_hold`),
+# one event per client order id (payload ``{'order_id': ..., 'intent_key':
+# ..., 'requested_ts_ms': n}``): the dispatch provably landed on a venue order
+# whose execution the stream will never report. The engine consumes it at its
+# next sync and deletes it in the transaction that stores the hold
+# (``OrderSyncEngine._consume_execution_hold_requests``), so a restart in
+# between consumes it then. Kept however old it is.
+EXECUTION_HOLD_REQUEST_EVENT_KIND: Final[str] = 'execution_hold_request'
 # Keys per statement of :meth:`RunContext.replace_keyed_events`'s delete, under
 # SQLite's bound-parameter limit.
 _KEYED_EVENT_BATCH: Final[int] = 500
@@ -738,6 +751,11 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ADD COLUMN entry_id TEXT;
         ALTER TABLE fill_receipts
             ADD COLUMN qty REAL NOT NULL DEFAULT 0;
+    """),
+    (13, "drop operator_close_decisions", """
+        -- A held partial-bracket close is settled from the venue's order
+        -- history (``BrokerPlugin.fetch_order_execution``).
+        DROP TABLE operator_close_decisions;
     """),
 ]
 
@@ -1612,7 +1630,11 @@ class BrokerStore:
            :data:`ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND` event (an entry still
            waiting for its execution evidence, deleted once it arrived) and
            every :data:`ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND` event (that
-           evidence, received but maybe not applied, deleted with its hold).
+           evidence, received but maybe not applied, deleted with its hold),
+           and every :data:`HELD_EXECUTION_CLOSE_EVENT_KIND` event (a venue
+           close sent over such an entry, deleted once it settled), and every
+           :data:`EXECUTION_HOLD_REQUEST_EVENT_KIND` event (a plugin's request
+           to hold a landed entry, deleted once the engine took it).
         2. ``orders`` closed before the cutoff. Live rows are never
            touched.
         3. Orphan ``order_refs`` — rows whose order no longer exists.
@@ -1660,10 +1682,11 @@ class BrokerStore:
                 "      JOIN runs r ON r.run_instance_id = e.run_instance_id "
                 "      JOIN runs own ON own.run_instance_id = events.run_instance_id "
                 "      WHERE r.run_id = own.run_id AND e.kind = events.kind)) "
-                "  AND events.kind NOT IN (?, ?, ?, ?)",
+                "  AND events.kind NOT IN (?, ?, ?, ?, ?, ?)",
                 (cutoff, ENTRY_BOOK_EVENT_KIND, ENTRY_BOOK_CURSOR_EVENT_KIND,
                  ENTRY_FILL_ORDER_EVENT_KIND, ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND,
-                 ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND),
+                 ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND, HELD_EXECUTION_CLOSE_EVENT_KIND,
+                 EXECUTION_HOLD_REQUEST_EVENT_KIND),
             ).rowcount
             deleted_orders = self._conn.execute(
                 "DELETE FROM orders "
@@ -1746,11 +1769,7 @@ class BrokerStore:
         return [_row_to_quarantine(row) for row in rows]
 
     # noinspection SqlResolve
-    def request_quarantine_resume(
-            self, run_id: str, quarantine_id: str,
-            close_decisions: Mapping[str, bool] | None = None,
-            entries_not_executed: Iterable[str] = (),
-    ) -> QuarantineRow | None:
+    def request_quarantine_resume(self, run_id: str, quarantine_id: str) -> QuarantineRow | None:
         """Stamp an operator resume request on an open quarantine latch.
 
         Called from another process (``pyne broker resume``) while the bot
@@ -1759,27 +1778,9 @@ class BrokerStore:
         only records the request. Idempotent: a second request keeps the
         first stamp.
 
-        ``close_decisions`` records, in the same transaction, the operator's
-        decision on held partial-bracket closes no venue record settles
-        (:meth:`held_trigger_close_coids`): the bot restarted by the resume
-        settles each such close with it (:meth:`RunContext.operator_close_decision`).
-        A decision names one close of the run; a later decision on the same
-        close replaces an earlier one no bot applied yet.
-
-        ``entries_not_executed`` records, in the same transaction, the
-        operator's statement that the order of an entry held for its
-        execution evidence (:meth:`held_fill_evidence_entries`) did not
-        execute: the hold's event is marked
-        (:data:`FILL_EVIDENCE_OPERATOR_RELEASE_FIELD`) and the bot restarted
-        by the resume releases it.
-
         :param run_id: The logical run the latch belongs to.
         :param quarantine_id: The latch to resume; a request naming another
             or an already ended latch matches nothing.
-        :param close_decisions: ``{close client order id: executed}``; the
-            caller validated every id against :meth:`held_trigger_close_coids`.
-        :param entries_not_executed: Held entries' intent keys; the caller
-            validated every key against :meth:`held_fill_evidence_entries`.
         :return: The latch row after the stamp, or ``None`` when no open
             latch matches both ``run_id`` and ``quarantine_id`` (nothing is
             recorded then).
@@ -1793,34 +1794,6 @@ class BrokerStore:
             ).fetchone()
             if row is None:
                 return None
-            for close_coid, executed in (close_decisions or {}).items():
-                conn.execute(
-                    "INSERT INTO operator_close_decisions (run_id, close_coid, executed, "
-                    "  quarantine_id, recorded_ts_ms) VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT (run_id, close_coid) DO UPDATE SET "
-                    "  executed = excluded.executed, quarantine_id = excluded.quarantine_id, "
-                    "  recorded_ts_ms = excluded.recorded_ts_ms "
-                    "WHERE operator_close_decisions.applied_ts_ms IS NULL",
-                    (run_id, close_coid, 1 if executed else 0, quarantine_id, now),
-                )
-            for key in entries_not_executed:
-                for event in conn.execute(
-                        "SELECT e.id, e.payload FROM events AS e "
-                        "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
-                        "WHERE r.run_id = ? AND e.kind = ? AND e.client_order_id = ?",
-                        (run_id, ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, key),
-                ).fetchall():
-                    try:
-                        payload = json.loads(event['payload'] or '{}')
-                    except ValueError:
-                        payload = {}
-                    if not isinstance(payload, dict):
-                        payload = {}
-                    payload[FILL_EVIDENCE_OPERATOR_RELEASE_FIELD] = quarantine_id
-                    conn.execute(
-                        "UPDATE events SET payload = ? WHERE id = ?",
-                        (json.dumps(payload), event['id']),
-                    )
             conn.execute(
                 "UPDATE quarantines SET resume_requested_ts_ms = ? "
                 "WHERE run_id = ? AND quarantine_id = ? "
@@ -1833,107 +1806,6 @@ class BrokerStore:
                 (run_id, quarantine_id),
             ).fetchone()
         return None if row is None else _row_to_quarantine(row)
-
-    # noinspection SqlResolve
-    def held_trigger_close_coids(self, run_id: str) -> set[str]:
-        """The client order ids of the partial-bracket closes the run holds.
-
-        A held close is the recorded close of a live engine-trigger leg row
-        still ``triggering`` (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_TRIGGER_CLOSE_COID`):
-        the sync engine settles it from the venue's evidence, or, when no
-        record can, from the operator's decision.
-
-        :param run_id: The logical run.
-        :return: The held closes' client order ids.
-        """
-        with self.read_lock() as conn:
-            rows = conn.execute(
-                "SELECT o.* FROM orders AS o "
-                "JOIN runs AS r ON o.run_instance_id = r.run_instance_id "
-                "WHERE r.run_id = ? AND o.state = ? AND o.closed_ts_ms IS NULL",
-                (run_id, STATE_PARTIAL_BRACKET_LEG),
-            ).fetchall()
-        held: set[str] = set()
-        for row in rows:
-            extras = _row_to_order(row).extras or {}
-            close_coid = extras.get(EXTRAS_KEY_TRIGGER_CLOSE_COID)
-            if extras.get(EXTRAS_KEY_LEG_STATE) == LEG_STATE_TRIGGERING and close_coid:
-                held.add(str(close_coid))
-        return held
-
-    # noinspection SqlResolve
-    def held_fill_evidence_entries(self, run_id: str) -> set[str]:
-        """The intent keys of the entries the run holds for their execution evidence.
-
-        One :data:`ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND` event per held entry,
-        written by the sync engine while the entry's order is terminal at the
-        venue without a reported executed quantity.
-
-        :param run_id: The logical run.
-        :return: The held entries' intent keys (the Pine entry ids).
-        """
-        with self.read_lock() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT e.client_order_id FROM events AS e "
-                "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
-                "WHERE r.run_id = ? AND e.kind = ? AND e.client_order_id IS NOT NULL",
-                (run_id, ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND),
-            ).fetchall()
-        return {str(row['client_order_id']) for row in rows}
-
-    # noinspection SqlResolve
-    def fill_evidence_entries_reported_executed(self, run_id: str) -> dict[str, float]:
-        """The held entries whose execution the venue reported, with the reported quantity.
-
-        A held entry (:meth:`held_fill_evidence_entries`) whose hold event
-        names a positive ``awaiting_execution`` (the terminal event reporting
-        it was applied, its fill not booked yet), or one of whose orders has a
-        stored :data:`ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND` event reporting
-        a positive executed quantity. Such an entry did execute: the operator
-        cannot state otherwise (``pyne broker resume --entry-not-executed``),
-        and the sync engine does not apply such a statement at its restart.
-
-        :param run_id: The logical run.
-        :return: Intent key -> the largest executed quantity reported.
-        """
-        with self.read_lock() as conn:
-            rows = conn.execute(
-                "SELECT e.kind, e.client_order_id, e.payload FROM events AS e "
-                "JOIN runs AS r ON e.run_instance_id = r.run_instance_id "
-                "WHERE r.run_id = ? AND e.kind IN (?, ?) AND e.client_order_id IS NOT NULL",
-                (run_id, ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND,
-                 ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND),
-            ).fetchall()
-        holds: dict[str, dict] = {}
-        arrived: dict[str, float] = {}
-        for row in rows:
-            try:
-                payload = json.loads(row['payload'] or '{}')
-            except ValueError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            key = str(row['client_order_id'])
-            if row['kind'] == ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND:
-                holds[key] = payload
-                continue
-            order = payload.get('order')
-            filled = order.get('filled_qty') if isinstance(order, dict) else None
-            if isinstance(filled, (int, float)) and filled > 0.0:
-                arrived[key] = max(arrived.get(key, 0.0), float(filled))
-        reported: dict[str, float] = {}
-        for key, payload in holds.items():
-            best = 0.0
-            stored = payload.get('awaiting_execution')
-            if (isinstance(stored, list) and len(stored) == 2
-                    and isinstance(stored[1], (int, float))):
-                best = float(stored[1])
-            order_ids = payload.get('order_ids')
-            for order_id in order_ids if isinstance(order_ids, list) else ():
-                best = max(best, arrived.get(str(order_id), 0.0))
-            if best > 0.0:
-                reported[key] = best
-        return reported
 
 
 # === RunContext ============================================================
@@ -2041,6 +1913,98 @@ class RunContext:
         :return: The ids; empty when the run inherited no pending dispatch.
         """
         return frozenset(self._inherited_dispatches)
+
+    def awaits_venue_answer(self, row: 'OrderRow') -> bool:
+        """Whether a live row's dispatch waits for the venue's answer about it.
+
+        A :data:`~pynecore.core.broker.store_helpers.STATE_DISPOSITION_UNKNOWN`
+        row does, and so does an inherited dispatch (:meth:`is_inherited_dispatch`)
+        in any pending state. A ``submitted`` row of this process does not: it
+        is mid-flight, or the engine retries it itself. A row that has its
+        venue order id is answered already.
+
+        :param row: A row of this run.
+        :return: Whether the row's outcome is still the venue's to tell.
+        """
+        if row.closed_ts_ms is not None or row.exchange_order_id:
+            return False
+        if row.state == STATE_DISPOSITION_UNKNOWN:
+            return True
+        return (row.state in PENDING_DISPATCH_STATES
+                and row.client_order_id in self._inherited_dispatches)
+
+    def execution_hold_applies(self, row: 'OrderRow') -> bool:
+        """Whether :meth:`request_execution_hold` may hand ``row``'s order to the engine.
+
+        The row is a live entry row (``extras['kind']`` a position or a working
+        order, with an intent key) whose order is not settled in the store:
+        either its dispatch still waits for the venue's answer
+        (:meth:`awaits_venue_answer`), or it is taken over, with its venue order
+        id, and still live.
+
+        :param row: A row of this run.
+        """
+        if (row.closed_ts_ms is not None or not row.intent_key
+                or (row.extras or {}).get('kind') not in (ENTRY_KIND_POSITION,
+                                                          ENTRY_KIND_WORKING)):
+            return False
+        return self.awaits_venue_answer(row) or bool(row.exchange_order_id)
+
+    def request_execution_hold(self, client_order_id: str, order_id: str) -> None:
+        """Ask the sync engine to hold an entry for its execution, read from the venue.
+
+        For a live entry row (:meth:`execution_hold_applies`) whose order the
+        plugin proved reached the venue as ``order_id`` and ended there, while
+        the stream will never report what it executed: the order, or the
+        position it opened, is closed since, and the venue does not list it any
+        more. Two rows get here:
+
+        - a dispatch whose outcome waits for the venue's answer (parked with an
+          unknown disposition, or left pending by an earlier process): the
+          engine's verification only promotes an order the venue still lists
+          open, so without this the dispatch stays pending, and the intent's
+          entry held, for the rest of the run;
+        - a taken-over working order (its row has its venue order id) that
+          executed while no process of the run was watching, so no fill of it
+          reaches the engine.
+
+        The request is stored as one keyed event
+        (:data:`EXECUTION_HOLD_REQUEST_EVENT_KIND`); a second request for the
+        same row replaces it. The sync engine takes it at its next sync, in one
+        transaction: a pending row gets ``order_id`` and the
+        :data:`~pynecore.core.broker.store_helpers.STATE_CONFIRMED` state (the
+        dispatch landed, it is not sent again), a park of the row is retired,
+        and the entry gets an expired fill-evidence hold over ``order_id``,
+        whether or not its Pine intent is active. From then on the
+        held-execution recovery owns it: the engine reads the order's execution
+        from the venue (:meth:`BrokerPlugin.fetch_order_execution`) and books
+        it, with new entries blocked until the book holds what the order
+        executed and the venue holds what the book holds.
+
+        :param client_order_id: The entry row's client order id.
+        :param order_id: The venue order id the execution is read under.
+        :raises ValueError: When ``order_id`` is empty, or the row is no live
+            entry row :meth:`execution_hold_applies` to.
+        :raises sqlite3.Error: When the request could not be stored.
+        """
+        if not order_id:
+            raise ValueError(f"request_execution_hold({client_order_id!r}): no venue order id")
+        with self._store.transaction():
+            row = self.get_order(client_order_id)
+            if row is None or not self.execution_hold_applies(row):
+                raise ValueError(
+                    f"request_execution_hold({client_order_id!r}): not a live entry row "
+                    f"whose order is unsettled")
+            self.replace_keyed_events(EXECUTION_HOLD_REQUEST_EVENT_KIND, {
+                client_order_id: {'order_id': order_id, 'intent_key': row.intent_key,
+                                  'requested_ts_ms': _now_ms()}})
+
+    def execution_hold_requests(self) -> dict[str, dict]:
+        """The stored :meth:`request_execution_hold` requests, by client order id.
+
+        :return: Client order id -> ``{'order_id', 'intent_key', 'requested_ts_ms'}``.
+        """
+        return self.keyed_events_for_run_id(EXECUTION_HOLD_REQUEST_EVENT_KIND)
 
     def release_inherited_dispatch(self, client_order_id: str) -> None:
         """Hand an inherited dispatch row over to this process.
@@ -3838,52 +3802,27 @@ class RunContext:
                           if isinstance(raw_ids, list) else ())
         return holds
 
-    # noinspection SqlResolve
-    def operator_close_decision(self, close_coid: str) -> bool | None:
-        """The operator's decision on a held partial-bracket close of this logical run.
+    def held_execution_order_ids(self) -> frozenset[str]:
+        """The venue order ids whose execution the sync engine still owes to its book.
 
-        Recorded by ``pyne broker resume --close-executed`` /
-        ``--close-not-executed`` (:meth:`BrokerStore.request_quarantine_resume`).
+        The one documented read for a plugin that must count such an order's
+        execution as the run's own (in its venue position read, its owned
+        legs, its startup adoption), though no journal row of the plugin
+        shows it: the orders of every entry held for its execution evidence
+        (:meth:`fill_evidence_holds`), and the orders a venue close the engine
+        sent over an expired hold took the execution of
+        (:data:`HELD_EXECUTION_CLOSE_EVENT_KIND`), until that close is
+        retired. Scoped to the logical run; read it fresh on every pass, never
+        cache it across passes.
 
-        :param close_coid: The held close's client order id.
-        :return: ``True`` when the operator stated the close executed,
-            ``False`` when it did not, ``None`` without a decision.
+        :return: The venue order ids.
         """
-        with self._store.read_lock() as conn:
-            row = conn.execute(
-                "SELECT executed FROM operator_close_decisions "
-                "WHERE run_id = ? AND close_coid = ?",
-                (self.run_id, close_coid),
-            ).fetchone()
-        return None if row is None else bool(row['executed'])
-
-    # noinspection SqlResolve
-    def mark_operator_close_decision_applied(self, close_coid: str) -> None:
-        """Stamp the operator's decision on ``close_coid`` applied, with its audit event.
-
-        One transaction: the stamp and an ``operator_close_decision_applied``
-        event under the close's client order id.
-
-        :param close_coid: The settled close's client order id.
-        """
-        with self._store.transaction() as conn:
-            row = conn.execute(
-                "SELECT executed, quarantine_id FROM operator_close_decisions "
-                "WHERE run_id = ? AND close_coid = ?",
-                (self.run_id, close_coid),
-            ).fetchone()
-            if row is None:
-                return
-            conn.execute(
-                "UPDATE operator_close_decisions SET applied_ts_ms = ? "
-                "WHERE run_id = ? AND close_coid = ? AND applied_ts_ms IS NULL",
-                (_now_ms(), self.run_id, close_coid),
-            )
-            self.log_event(
-                'operator_close_decision_applied', client_order_id=close_coid,
-                payload={'executed': bool(row['executed']),
-                         'quarantine_id': row['quarantine_id']},
-            )
+        order_ids = {order_id for ids in self.fill_evidence_holds().values() for order_id in ids}
+        for payload in self.keyed_events_for_run_id(HELD_EXECUTION_CLOSE_EVENT_KIND).values():
+            raw_ids = payload.get('order_ids')
+            if isinstance(raw_ids, list):
+                order_ids.update(str(order_id) for order_id in raw_ids if order_id)
+        return frozenset(order_ids)
 
     # noinspection SqlResolve
     def end_quarantine(self, quarantine_id: str, end_reason: str) -> None:

@@ -30,7 +30,7 @@ from pynecore.core import script as script_mod
 from pynecore.lib import timeframe as timeframe_lib
 from pynecore.lib.log import (broker_debug, broker_info, broker_warning, ohlcv_info, sim_info,
                               logger)
-from pynecore.core.broker.exceptions import BrokerManualInterventionError, ExchangeConnectionError
+from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.types.ohlcv import OHLCV
 from pynecore.types.na import na_float, set_bool_na
 from pynecore.core.syminfo import SymInfo, mintick_decimals
@@ -1670,9 +1670,11 @@ class ScriptRunner:
             # sink above — the engine latch is idempotent and thread-safe from
             # the broker event-loop thread; plugins without disappearance
             # tracking simply never call it. Without this wiring the tracker
-            # falls back to the process-exiting halt.
+            # falls back to raising the UnexpectedCancelError signal, which the
+            # engine answers with the same quarantine.
             engine = cast('OrderSyncEngine', self._order_sync_engine)
             broker_plugin.quarantine_sink = engine.record_quarantine
+            broker_plugin.quarantine_release_sink = engine.end_quarantine_cause
             # The read side of the same latch: every plugin checks it at its
             # transport chokepoint, so an external-intervention quarantine also
             # stops the plugin's own background writes.
@@ -1866,13 +1868,6 @@ class ScriptRunner:
         # the next bar against a position the previous instance was
         # already closing defensively.
         engine._replay_pending_defensive_closes()
-        # Same replay contract for the stop-and-reverse fold's surplus
-        # corrections: their must-settle markers are re-armed from the
-        # durable ``flip_surplus_close_armed`` audit events so a parked
-        # correction's post-restart ``rejected`` resolution still
-        # escalates and the stale-grace reconcile keeps demanding proof
-        # of settlement.
-        engine._replay_pending_flip_surplus_closes()
         self._startup_reconcile(engine)
 
     @staticmethod
@@ -1890,7 +1885,8 @@ class ScriptRunner:
         operator interrupts. The reconcile is re-entrant on that fault — the
         periodic reconcile already parks it and retries — and every plugin
         commits nothing from a failed adoption read. Anything else (a
-        permanent misconfiguration, a deliberate halt) still propagates.
+        permanent misconfiguration) still propagates; a manual-intervention
+        report of the plugin is answered by the engine with a quarantine.
 
         :param engine: The run's sync engine.
         """
@@ -1975,17 +1971,13 @@ class ScriptRunner:
         loss in-band; only a fully failed recovery surfaces
         :class:`ExchangeConnectionError` from dispatch. Park the cycle and retry
         on the next bar — the COID-idempotent diff re-dispatches safely — rather
-        than crashing the live run. A deliberate halt
-        (:class:`BrokerManualInterventionError`) is NOT caught here and still
-        stops the bot. A dispatch-bridge ``TimeoutError`` (a broker call wedged
-        past ``execute_timeout``) is deliberately NOT parked: the engine's
-        ``run_coroutine_threadsafe(...).result(timeout)`` does not cancel the
-        still-running coroutine, so the in-flight order may yet land — silently
-        re-dispatching it next bar could double-fill a close/amend (which carry
-        no ``client_order_id`` and so are not exchange-deduped). It stays fatal
-        (the pre-existing behaviour), which is the safe choice for a wedged
-        broker. A slow but recoverable re-auth instead surfaces as the
-        ``ExchangeConnectionError`` above, bounded by ``_REAUTH_TIMEOUT``.
+        than crashing the live run. A manual-intervention report of the
+        plugin never reaches this point: the engine latches its quarantine and
+        the run goes on (:meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.sync`),
+        and an order write that outran the dispatch bridge is parked by the
+        engine as one of unknown outcome. A slow but recoverable re-auth
+        surfaces as the ``ExchangeConnectionError`` above, bounded by
+        ``_REAUTH_TIMEOUT``.
         """
         try:
             cast('OrderSyncEngine', self._order_sync_engine).sync(
@@ -2142,24 +2134,6 @@ class ScriptRunner:
     def drawings() -> dict:
         """Full snapshot of the live drawing objects (lines/labels/boxes/...)."""
         return viz.drawings_snapshot()
-
-    def _finalize_broker_halt(self) -> None:
-        """Book the broker events queued before a halt, before the teardown.
-
-        Runs while the run is unwinding from the halt, while the position, the
-        journal and the trade output are still open; the halt itself still
-        propagates. A failure here is logged, never raised over the halt: the
-        next run reconciles whatever stayed unbooked from the venue.
-        """
-        if self._order_sync_engine is None:
-            return
-        try:
-            cast('OrderSyncEngine', self._order_sync_engine).finalize_halt()
-        except Exception as exc:  # noqa: BLE001 - the halt must propagate unmasked
-            broker_warning(
-                "could not book every broker event queued before the halt (%s); "
-                "the next run reconciles them from the venue", exc,
-            )
 
     def settle_broker_stop(self) -> None:
         """Ingest the fills of already-dispatched market orders at a stop.
@@ -4133,16 +4107,6 @@ class ScriptRunner:
 
                 live_stream = itertools.chain([first_live_update], ohlcv_iterator)
                 for bar_update in live_stream:
-                    # An async halt latched on the broker event-loop thread
-                    # (e.g. ``UnexpectedCancelError`` from a polling plugin)
-                    # must surface NOW — before ``[OHLCV]`` is logged or any
-                    # state advances. Without this, a halt set mid-bar would
-                    # only fire at the next bar close (via
-                    # ``apply_async_events``), spilling a bogus OHLCV log line
-                    # for a bar the bot is no longer trading.
-                    if self._order_sync_engine is not None:
-                        cast('OrderSyncEngine', self._order_sync_engine).raise_if_halted()
-
                     candle = bar_update
                     is_new_bar = (candle.timestamp != last_bar_timestamp)
 
@@ -4420,8 +4384,7 @@ class ScriptRunner:
                                     # A recoverable broker loss surfaced while
                                     # draining async fills (e.g. a deferred entry
                                     # re-dispatch after a failed re-auth). Skip the
-                                    # drain this bar; the next bar retries. A halt
-                                    # is not caught here and still stops the bot.
+                                    # drain this bar; the next bar retries.
                                     broker_warning(
                                         "async event apply skipped after "
                                         "connection error: %s — retrying next bar",
@@ -4572,10 +4535,6 @@ class ScriptRunner:
 
         except KeyboardInterrupt:
             self.settle_broker_stop()
-            raise
-
-        except BrokerManualInterventionError:
-            self._finalize_broker_halt()
             raise
 
         finally:  # Python reference counter will close this even if the iterator is not exhausted

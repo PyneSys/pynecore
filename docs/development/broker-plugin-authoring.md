@@ -5,7 +5,7 @@ title: "Broker Plugin Authoring Guide"
 description: "Implement a PyneCore BrokerPlugin using the documented contract for live order handling. Review persistence requirements and the behavior broker authors must test."
 icon: "account_balance"
 date: "2026-07-12"
-lastmod: "2026-11-17"
+lastmod: "2026-11-26"
 draft: false
 toc: true
 categories: ["Development"]
@@ -149,7 +149,7 @@ trading depends on `update_symbol_info()` upholding these invariants:
   `retryable` from an error code. Long-running `--broker` / `--live` runs
   wait out retryable faults; a misclassified permanent fault (bad
   credentials marked retryable) loops forever, and a misclassified
-  transient one halts a healthy bot.
+  transient one stops a healthy bot from starting.
 
 ## Broker layer — the hidden contract
 
@@ -197,8 +197,10 @@ venue respectively):
    tracking) plus the configured `on_unexpected_cancel` policy — the
    default `stop` latches the engine's **external-intervention
    quarantine** (wire the runner-injected `quarantine_sink` into the
-   tracker's `request_quarantine`), while `halt` raises
-   `UnexpectedCancelError` for a process exit. The sink returns `False`
+   tracker's `request_quarantine`); no policy ends the process. A tracker
+   whose sink is missing or raised raises `UnexpectedCancelError` from
+   `observe()` instead, and the engine latches the same quarantine when it
+   reaches it. The sink returns `False`
    when the held latch already noted the same intervention (the same
    order, protection key or reason); the tracker then skips its audit
    event, and a plugin that calls the sink itself can do the same.
@@ -297,7 +299,7 @@ new exposure is blocked, protection keeps working.
 Only the plugin can see who changed a bot-owned order or position, so it
 must report it: call `self.report_external_intervention(reason, context)`.
 It applies the `on_unexpected_cancel` policy exactly like an unexpected
-cancel (`stop` latches the external-intervention quarantine, `halt` raises).
+cancel (`stop` latches the external-intervention quarantine).
 
 **Moved or removed SL/TP.** Use a
 `pynecore.core.broker.protection_guard.ProtectionLevelGuard` with
@@ -427,7 +429,7 @@ you have seen executed, usually `0.0`).
 |------------------------------------------------------|---------------------------------------------------------------------------------------------------|
 | `filled_qty > 0` (known or not)                      | execution proven: legs stay for the filled part, a tentative parent resolves as filled            |
 | `filled_qty == 0`, `filled_qty_known=True` (default) | proven unfilled: legs aborted, mapping and intent retired, tentative cancel confirmed             |
-| `filled_qty == 0`, `filled_qty_known=False`          | nothing applied: order stays mapped, legs pending, tentative parent tentative, no policy, no halt |
+| `filled_qty == 0`, `filled_qty_known=False`          | nothing applied: order stays mapped, legs pending, tentative parent tentative, no policy           |
 
 In the last case you owe the core the evidence: deliver the same terminal
 event again with the venue's quantity once you know it (an order-history
@@ -446,18 +448,43 @@ persisted, so a restart re-arms it together with the order mapping your
 later events route through. Deliver the evidence within your
 `fill_report_grace_s`: a hold older than that puts the bot into an
 `ENTRY_BLOCK` quarantine with one warning naming the entry and its orders.
-The operator checks the order on the venue, closes there anything it
-executed (the journal owns none of it, so the restart would not adopt it),
-and resumes with `pyne broker resume RUN_ID QUARANTINE_ID
---entry-not-executed ENTRY_ID`; the restart after that resume applies the
-statement like the venue's proven zero (pending legs aborted, mapping and
-envelope retired), then releases the hold, and the script may send the
-entry again. A plain resume keeps the hold, and the restart quarantines
-again. Once the venue reported an executed quantity for the entry (a
-terminal event of yours with a positive `filled_qty`), the entry did
-execute: the command refuses `--entry-not-executed` for it, the restart
-does not apply such a statement recorded earlier, and the hold ends only
-when you deliver the missing fill.
+While the hold stands, a reversal of the other side or a `strategy.close_all`
+over the entry waits: sized from the book, it would close only the booked part
+(see 2b for what happens once the hold expired). Once the wait ends, the
+dispatch is sized from the true book: a price-based reversal's flip and a
+`strategy.close_all` close the position the book holds at dispatch.
+
+Once the hold expired the bot recovers the execution itself; nobody is
+expected to look. It calls `fetch_order_execution(order_id, None)` for every
+order of the hold, with a backoff that doubles up to five minutes and no
+deadline (see 2c), and feeds the answer through the same event path as your
+stream:
+
+| Your answer                                                    | What the core does                                                                 |
+|----------------------------------------------------------------|------------------------------------------------------------------------------------|
+| the order's executions (`fills`)                               | books the fills it has not taken (by `fill_id`), which settles the hold            |
+| totals only, nothing of the order booked                       | books one fill at `average_fill_price` with the order's `fee`                      |
+| totals only, part of the order booked                          | nothing: the rest's price is not exact; asks again (return the executions)         |
+| `filled_qty == 0` (known), or `order=None` (no such order)     | releases the entry as unexecuted                                                   |
+| order not terminal, quantity unknown, `None`, or a raise       | asks again later                                                                   |
+
+A fill booked from your totals (`fill_id` `<order id>:venue-total`) is kept
+with the book: a later stream fill of the same order is taken up by it
+instead of being booked twice. The quarantine cause of the hold ends by
+itself once the hold ended and the venue position (`get_position()`, or the
+net of `fetch_raw_positions`) equals the book. No operator statement
+releases a hold: `fetch_order_execution` is abstract, so every plugin
+answers it, and an answer that breaks its contract (see 2c) books nothing
+and is asked again.
+
+A plugin that must count the held order's execution as the run's own (in its
+`get_position()`, its owned legs, its startup adoption of unjournaled legs)
+reads the order ids from `RunContext.held_execution_order_ids()`: the orders
+of every hold and of the venue close the core sent over an expired one. Read
+it fresh on every pass; never read the hold events' payloads yourself. A leg
+or deal such an order opened is the run's own execution, never a foreign or
+an adopted one: adopt it into the book only through the hold's recovery,
+or it is booked twice.
 
 The core stores the evidence the moment it receives it: a terminal event
 with the venue's quantity for an order a hold waits on is written to the
@@ -597,6 +624,115 @@ when no live or recently closed journal row of the run shows more
 and leaves the cursor behind, so the restart adopts the position FIFO from
 the journal instead.
 
+### 2b. A close over an entry whose evidence never came: `held_execution_close`
+
+A quarantine never leaves open a position the strategy asked to close. When an
+entry's hold expired and the strategy asks to close or reverse its exposure
+(`strategy.close` of the entry, `strategy.close_all`, a market
+stop-and-reverse), the core reads the venue position and closes it, then the
+quarantine stands until the core recovered the entry's execution (above); a
+reversal's new side does not open meanwhile. An `EXTERNAL_INTERVENTION` latch still forbids every
+venue write, and a `get_position()` (or `fetch_raw_positions`) that fails sends
+nothing.
+
+The close is a `CloseIntent` with `synthetic_kind='held_execution_close'`:
+symbol-wide, no targets, `qty` the venue position the core read right before.
+It includes an execution your journal may own no row of (the entry's order
+ended without the venue's executed quantity), so it is sized against the
+venue, not the journal.
+
+- **Hedging account** (`position_port`): nothing to do. The core's one-way
+  emulator closes the venue legs (`close_leg`), the unbooked execution's leg
+  included.
+- **Netting account**: set `supports_held_execution_close = True` on the
+  plugin once `execute_close` reduces the symbol's venue position by
+  `intent.qty` in a form that cannot open or grow opposite exposure (a native
+  reduce-only market order, a close of the venue position by its own
+  quantity), whatever your journal rows hold; journal it under
+  `envelope.client_order_id(KIND_CLOSE)` like any close and report its fills
+  as `LegType.CLOSE` fills of that order, labelled with the intent's
+  `pine_id`. Without the flag (the default) the core sends the book's own
+  symbol-wide `reversal_close` for what the book holds and tells the operator
+  what is left on the venue.
+
+The core persists the close before it sends it, never sends another one
+before it read the venue again, and books its fill only up to what the book
+holds; the rest closes the entry's late fill when you deliver it (or when
+the core recovers it), so keep delivering that fill as usual.
+
+**A second close after a fresh read must never over-close.** The core waits
+at least `max(execute_timeout, 60 s)` after a close, and for as long as the
+close's dispatch row (its `intent_key`) is still open, before it reads the
+venue again; a close whose outcome is unknown is never re-sent blindly. A
+plugin that journals the close without that `intent_key`, or ends the row at
+once on an unknown outcome, leaves only the 60 s window: then a first close
+that executes after the read can meet a second one. That is safe only
+because both are bounded by the venue position at the time they execute (a
+reduce-only order, a close of a position id by at most its volume, a per-leg
+close): the contract above is what makes the re-send harmless, so never
+send this close as a plain market order.
+
+### 2c. The bot gets out of its own trouble: `fetch_order_execution`, causes
+
+The bot runs unattended. A quarantine that waits for a human is right only
+where a human acted on the account (`EXTERNAL_INTERVENTION`, section 1a). An
+`ENTRY_BLOCK` quarantine is the bot's own trouble, and the bot must end it by
+itself:
+
+- **Read the venue's order history.** `fetch_order_execution(order_id,
+  client_order_id)` is abstract: every plugin implements it (see its
+  docstring for the exact contract). Return the order's venue record
+  (`OrderExecution`) with its cumulative `filled_qty`, `average_fill_price`,
+  `fee`, and its executions as the fill events your stream would deliver,
+  with the same `fill_id`s. The core uses it for a held entry's lost
+  execution (section 2) and for a partial-bracket close no journal record
+  settles (looked up by `client_order_id` only). Set `fee_reported=False`
+  when the venue reports no commission; return `order=None` only when the
+  venue proves it has no such order. Read-only.
+- **Answer in the journal's units.** The record is compared with the book
+  and the journal, which count in the unit your journal rows use
+  (`OrderRow.qty` and `OrderRow.filled_qty`), so:
+  - `order.qty` and `order.filled_qty` are in the journal unit, as the
+    order's journal row holds them;
+  - every execution carries `journal_fill_qty` in the journal unit, and
+    `fill_qty` in the position unit, exactly as the stream's fill event of it
+    (they differ for a fee-net spot fill or a contract converted to base
+    units);
+  - `fee` is the commission as the stream's fill events carry it, in their
+    `fee_currency`: cumulative on `order`, per execution on the fills. A
+    venue that keeps only the order's totals and counts in another unit than
+    the journal returns the executions instead.
+- **A record that contradicts itself books nothing.** The core checks the
+  answer before it books anything; a violation is logged as an ERROR that
+  names the broken rule (`... breaks the BrokerPlugin.fetch_order_execution
+  contract`), and the order is read again later with the same backoff. It is
+  never a crash. The checks:
+
+  | Rule                                                                | Violation example                                          |
+  |---------------------------------------------------------------------|------------------------------------------------------------|
+  | `order=None` comes without executions                               | executions of an order the venue does not hold             |
+  | the record is of the order asked for (venue id, else client id)     | the record is of order 77, not 42                          |
+  | `filled_qty` is finite, not negative, at most a set `qty`           | executed 1.5 of an order of 1.0                            |
+  | every execution is a `partial` / `filled` event with a `fill_id`    | execution 'x' is not a priced fill with an id              |
+  | every execution has positive `journal_fill_qty`, `fill_qty`, price  | execution 'x' is not a priced fill with an id              |
+  | every execution is of the same order                                | execution 'x' is of order 77                               |
+  | with `filled_qty_known`, the `journal_fill_qty` sum is `filled_qty` | the executions add up to 0.2, the order shows 0.4 executed |
+
+- **Name the cause of every `ENTRY_BLOCK` you latch.** Pass
+  `cause='<unique key>'` to `quarantine_sink`, and call
+  `quarantine_release_sink(cause, resolution)` once the condition is gone
+  (you closed the deal you had to close, the venue's records proved the
+  outcome, the foreign deal that blocked your write is gone). The latch ends
+  with its last cause, in the running process. The cause is mandatory: a
+  request without one latches nothing and raises `ValueError`.
+- **A cause that starts with `FENCE_CAUSE_PREFIX` (`'fence:'`, from
+  `pynecore.core.broker.models`) blocks every venue write of the process**,
+  exits, cancels and closes included, not only new entries. Use it only for
+  a process that must not write at all any more because another instance
+  owns the position (the spot manager's lost asset lease). The fence lives in
+  the process memory only: it is never persisted, so the replacement
+  instance that owns the position is not caught by it.
+
 ### 3. `ExchangeOrder.client_order_id` echo is mandatory
 
 Every `ExchangeOrder` you return or embed in an event must carry the
@@ -629,7 +765,8 @@ silently breaks and the bot can double-open.
   the close of that position (booked earlier, e.g. before a restart),
   answer `FILLED_AND_CLOSED` instead: the engine resolves the cancel
   without restoring anything, booking a fill or re-arming it on restart.
-  `UNKNOWN` for that case is retried until the stale grace halts the bot.
+  `UNKNOWN` for that case is retried; past the stale grace new entries are
+  blocked and the engine keeps asking, with backoff, until you answer.
 - `execute_cancel()` may answer `True` once the venue order is gone, even
   when it executed part of its quantity first: deliver that execution's
   event (and a terminal event with the executed quantity) to the engine
@@ -840,7 +977,7 @@ checklist point 3), and (c) never reuse one id for two different broker
 entities (distinct `KIND_*` codes exist precisely so a stop-fired market
 never shares an id with the limit leg it replaces).
 
-## Transient faults: reads park, writes halt
+## Transient faults: reads park, writes park for verification
 
 Classify connectivity faults into the broker taxonomy instead of letting
 SDK exceptions escape raw:
@@ -853,13 +990,30 @@ SDK exceptions escape raw:
   fill).
 
 The engine has a safety net for escaped raw transients, and it is
-asymmetric by design: on a per-bar **read** it parks (reads are
-idempotent), on an order **write** it halts
-(`BrokerManualInterventionError`) because it cannot tell a never-sent
-request from a landed one. A plugin that classifies explicitly keeps the
-recoverable paths recovering — the net only exists to make contract
-violations safe, not to be the plan. Centralise SDK-specific
+asymmetric by design: on a per-bar **read** it parks the cycle and reads
+again (reads are idempotent); on an order **write** it cannot tell a
+never-sent request from a landed one, so it takes the write as one of
+unknown outcome — parked and verified like an `OrderDispositionUnknownError`,
+never sent again blindly — and blocks new entries (an `entry_block`
+quarantine) until a reconcile passes without another such fault and the
+venue holds what the book holds. A plugin that classifies explicitly keeps
+the recoverable paths recovering without the entry block — the net only
+exists to make contract violations safe, not to be the plan. Centralise SDK-specific
 classification in `_map_exception()`.
+
+The classified outcomes of a write are exactly these:
+`ExchangeConnectionError` and its subclasses (not sent),
+`ExchangeOrderRejectedError` and its subclasses and `OrderSkippedByPlugin`
+(refused), `OrderDispositionUnknownError` (unknown outcome),
+`BrokerManualInterventionError` (an intervention report) and a failed store
+write (`sqlite3.Error`). Every other exception escaping an entry, exit,
+close, cancel or amend — a raw SDK error, a `ProviderError`, an
+`ExchangeRateLimitError`, an `AuthenticationError`, an `OrderSyncError`, a
+bare `ValueError` — is taken as a write of unknown outcome on every dispatch
+path, including the engine's own recovery writes. It never ends the run
+loop and is never sent again blindly. A rate limit on a write is therefore
+best reported as `ExchangeConnectionError` when the venue refused the request
+before acting on it.
 
 ### A parked dispatch must be released, not only promoted
 
@@ -942,6 +1096,102 @@ not `NATIVE` must provide:
 - for `LANDED`, the same take-over your startup recovery uses, so the row
   gets its venue id and a MARKET entry's fill reaches the engine as an
   `OrderEvent` — never only a row update.
+- for `LANDED` on an order whose execution your stream can **no longer
+  deliver** (the order, or the position it opened, is closed since, and the
+  venue does not list it any more), hand the order to the engine with
+  `self.request_execution_hold(row.client_order_id, order_id)`, described
+  below. The same call hands over a taken-over working order that executed
+  while the bot was not running.
+
+#### An execution the stream cannot report: `request_execution_hold`
+
+```python
+def request_execution_hold(self, client_order_id: str, order_id: str) -> bool
+```
+
+For a live entry row (`store_ctx.execution_hold_applies(row)`) whose order you
+proved reached the venue as `order_id` and ended there, while the stream will
+never report what it executed: the order, or the position it opened, is
+closed since, and the venue does not list it any more. Two rows qualify:
+
+- a dispatch that waits for the venue's answer
+  (`store_ctx.awaits_venue_answer(row)`: parked with an unknown disposition,
+  or left pending by an earlier process). The engine's verification promotes
+  only an order the venue still lists open, and the fill path needs an event
+  you cannot produce, so without this call the row stays pending and the
+  intent's entry stays held for the rest of the run;
+- a taken-over working order (the row has its venue order id) that executed
+  while no process of the run was watching. After a restart nothing maps
+  that order to its entry, so a terminal event of it reaches no entry, and a
+  re-declared entry would go out again next to the execution. Call it from
+  your startup recovery, **before** the engine's first sync; a terminal
+  event without the executed quantity (`filled_qty_known=False`) is no
+  substitute here, because the engine holds such an event only for an order
+  it has mapped to an active entry.
+
+When your venue keeps the order's executions, deliver them as fill events as
+usual; this call is for the order whose execution you cannot deliver.
+
+The call stores the request (`RunContext.request_execution_hold`, one keyed
+event per client order id; asking again replaces it) and returns `True` once
+it is stored. It returns `False`, with a warning in the log, when the run has
+no store, when the row is no live entry dispatch waiting for the venue's
+answer (it was settled meanwhile), or when the store write failed: then
+nothing changed, and you ask again on a later pass. Call it outside every
+store transaction.
+
+The engine takes the request at its next sync, in one transaction: a pending
+row gets `order_id` and the `confirmed` state (the send is not repeated, and
+`inherited_dispatch_in_flight` no longer holds the entry), a park of the row
+is retired, and the entry gets the fill-evidence hold over `order_id`,
+already expired, with or without its Pine intent active; a re-declared entry
+adopts the held order instead of being sent afresh. A restart before or after
+that take-over holds the entry the same way. From then on the held-execution
+rules apply unchanged:
+
+- new entries are blocked under the cause `fill_evidence:<intent key>`, and
+  the engine reads the order's execution with
+  `fetch_order_execution(order_id, None)` (backoff up to 5 minutes, no
+  deadline) until it can book it; a venue that holds no such order releases
+  the entry as unexecuted;
+- the execution is booked with the venue's figures, and the block ends once
+  the book holds what the order executed and the venue holds what the book
+  holds (see below for the position that closed since);
+- while the hold stands, the strategy cannot cancel or re-send the entry,
+  and a close or reversal it asks for over it closes the venue position as
+  read from the venue, never more. An entry the strategy no longer emits is
+  booked all the same: its execution is the venue's, not the script's.
+
+`store_ctx.held_execution_order_ids()` lists `order_id` from the take-over
+until the execution is booked; your reconcile must not take the order's
+absence from the venue for an intervention while it is listed.
+
+**Your duty: deliver the close of the position that closed since.** The
+execution you hand over opened a position, and the venue holds less of it
+now (the deal was closed by a protective leg, a stop-out, or by anyone).
+Deliver that close as the stream would have: `CLOSE` fill events labelled
+with the entry (`pine_id`, or `from_entry`), with the venue's close price,
+quantity, `journal_fill_qty`, commission and its own `fill_id`. Send them
+whenever you know them: a close fill that arrives while the entry's
+execution is still being read from the venue waits in the engine and closes
+the entry once it is booked, so the order of the two does not matter. The
+round trip is then booked with both real prices.
+
+When no close fill reaches the engine, the engine still ends in a
+consistent state by itself, in the running process: once the fill-report
+grace passed with the venue steady below the book, nothing of the bot in
+flight and no fill routed, it closes the handed-over exposure the venue no
+longer holds at the entries' average price, through the same provisional
+close it books an unexplained reduction with. The trades are closed, not
+wiped; the realized P&L is the commission only and approximate; one WARNING
+is logged and the close-out is audited (`held_execution_close_adopted`),
+with no `UnattributedPositionChangeEvent` and no "no fill explains it"
+ERROR, since the reduction is the one the hand-over announced. A close fill
+you deliver later is not booked a second time: once the venue confirms it
+was that close, it re-prices the close-out at its own price and fee. A
+process that restarts before the close-out resumes the booked position from
+the journal, and its startup reconcile adopts the venue as it does for every
+resumed position.
 
 If the venue cannot prove either outcome for a row (its history no longer
 reaches back to the row's dispatch), answer `INCONCLUSIVE` and log why: the
@@ -978,10 +1228,16 @@ case: the engine then holds its "someone else changed the position"
 verdict, for a bounded time, so your own exit is not booked as an
 external close.
 
-The general operational rule: **a thrown error stops the bot and strands
-the user.** Prefer keep-running behaviours (retry, observe, degrade) on
-every recoverable path; halt only when continuing could lose money
-(ambiguous writes, failed defensive recovery).
+The general operational rule: **the bot runs unattended and never stops
+itself.** Prefer keep-running behaviours (retry, observe, degrade) on every
+recoverable path. Where continuing could lose money, raise
+`BrokerManualInterventionError` or latch an `entry_block` with a `cause`
+you end yourself: the engine never ends the process on it. It latches an
+`entry_block` that ends once a reconcile passes without another report and
+the venue holds what the book holds (an `UnexpectedCancelError` latches the
+external-intervention quarantine instead), keeps exits, closes and cancels
+running, and parks a write the report interrupted as one of unknown outcome.
+Only an external intervention waits for the operator.
 
 ## Optional hooks
 
@@ -1298,11 +1554,29 @@ implementing the `SpotInventoryPort` surface, then drives one
 `SpotInventoryManager` per run (the Bybit plugin's spot category is the
 reference wiring):
 
+- **Construction** passes both quarantine sinks:
+  `request_quarantine=self.quarantine_sink` and
+  `release_quarantine=self.quarantine_release_sink`. The manager latches its
+  own trouble (a failed or inconclusive measurement, a negative ledger, a
+  fill id another run booked, the asset lease another live run holds) as an
+  `ENTRY_BLOCK` under the cause `spot_inventory:<product id>`, measures the
+  venue again on every `reconcile` while it holds (paced from 5 s up to
+  5 min, no deadline), and releases the cause once a measurement settles.
+  Without the release sink the engine's entry block holds until a restart.
+  Someone taking the bot's own base is the `EXTERNAL_INTERVENTION` latch,
+  which only the operator resumes. A lease a replacement instance took over
+  fences the old (zombie) process under the cause
+  `fence:spot_inventory:<product id>`: it writes nothing to the venue any
+  more, no order, amend, cancel or close, and never resumes; the replacement
+  runs the bot. A fill id another run booked is a configuration conflict (two
+  runs trade the same account and base): the manager blocks new entries and
+  keeps measuring, exits and closes keep running, and the log and the audit
+  name both runs and the shared fill id.
 - **`startup()`** once after authentication, before the engine's startup
   reconcile — asset-ownership lease claim, execution catch-up from the
-  durable cursor, epoch/invariant validation, adoption watermark. Any
-  inconclusive read or unexplainable drift quarantines before a single
-  dispatch.
+  durable cursor, epoch/invariant validation, adoption watermark. A failed
+  or inconclusive read latches the entry block before a single dispatch; a
+  drift is left to the runtime verdict.
 - **`record_live_fill()`** for every fill observed on the live stream,
   BEFORE emitting the corresponding `OrderEvent` — the return value is
   the emit gate (a replayed fill id returns `False` and must not be
@@ -1316,10 +1590,15 @@ reference wiring):
   stream-gap fill), already flipped to `delivered`; emit an `OrderEvent`
   for each. The periodic engine reconcile ignores position *increases*,
   so a recovered fill left un-emitted would stay invisible to the
-  strategy until the next restart's adoption. The lease heartbeat is
+  strategy until the next restart's adoption. The rows an in-process
+  recovery books come back the same way. The lease heartbeat is
   fenced by the physical run instance: if a replacement instance took
-  the lease over while this process was silent, `reconcile` quarantines
-  instead of trading on a lease it no longer holds.
+  the lease over while this process was silent, `reconcile` latches the
+  write fence instead of trading on a lease it no longer holds.
+- **`consume_pending_halt()`** after each `reconcile`: a conflict whose
+  quarantine sink was missing or raised arms this signal once; raise it on
+  the engine's channel (the event stream) and the engine latches the
+  quarantine it carries. Nothing halts: the process stays alive.
 - **`synthesize_position(mark)`** from `get_position()`.
 
 ### The port surface
@@ -1412,8 +1691,8 @@ A drift still unexplained past the grace is judged against the bot's
   ledger untouched) and the bot keeps trading. No quarantine.
 - **The balance is below the bot's inventory and the history read was
   complete**: someone sold or withdrew what the bot holds. The manager
-  latches the `EXTERNAL_INTERVENTION` quarantine (or exits under the
-  `halt` policy); there is no adoption path. After the operator resume
+  latches the `EXTERNAL_INTERVENTION` quarantine; there is no adoption
+  path. After the operator resume
   the first start keeps the part of the bot's inventory the account still
   holds.
 - **The balance is below the bot's inventory but the history read was
@@ -1449,7 +1728,7 @@ spurious drift quarantine), and a concurrent second run on the same base
 starts quarantined. The lease is keyed on the physical run instance, so
 a resumed zombie sharing the reused `run_id` cannot steal its lease back
 from the replacement instance — its next heartbeat reports the loss and
-it quarantines. An instance on another workdir or machine is only
+the process stops writing to the venue for good. An instance on another workdir or machine is only
 *detected* by the balance invariant, not prevented — a dedicated
 (sub)account per bot per base asset remains the recommended mode. It
 makes drift conflicts rare, and every conflict that still occurs is
@@ -1472,10 +1751,10 @@ levels:
   current position minus every active sell-side entry intent's quantity,
   judged after the market stop-and-reverse fold. A `strategy.order` sell
   that only reduces an existing long flows through; a dispatch that
-  would project negative records a graceful halt
-  (`BrokerManualInterventionError`) — never a silent skip, which would
-  leave the script believing it is short. Exits and closes are
-  reduce-only by engine contract and are not gated.
+  would project negative is refused like a venue reject (nothing is sent,
+  the Pine order sees no fill, an identical re-emission is silenced after
+  a few refusals), and a stop-and-reverse still runs its close leg. Exits
+  and closes are reduce-only by engine contract and are not gated.
 
 Margin/CFD venues that hold signed positions natively declare
 `short_selling=NATIVE` (both reference plugins do), which disables both
@@ -1487,9 +1766,9 @@ gates.
   (self-healing TOML at `workdir/config/plugins/<name>.toml`).
 - **Broker-agnostic policies do not belong in plugin configs.** The
   cross-broker `workdir/config/brokers.toml` (`BrokerDefaults`) owns them;
-  today that is `on_unexpected_cancel` (`stop` / `re_place` / `ignore` /
-  `halt`) and `on_inventory_conflict`
-  (`quarantine` / `halt`, spot venues only — deliberately narrower:
+  today that is `on_unexpected_cancel` (`stop` / `re_place` / `ignore`)
+  and `on_inventory_conflict`
+  (`quarantine` only, spot venues only — deliberately narrower:
   `re_place` would buy back an operator's withdrawal and `ignore` would
   trade on corrupt books), injected onto the plugin instance by the CLI
   before the runner starts.
@@ -1547,8 +1826,10 @@ A plugin usually learns its account's mode only in `connect()` or on its
 first broker call, so it sets `position_port` / `spot_inventory_port`
 after the startup probe ran. The order sync engine therefore runs the
 port checks again (`validate_plugin_ports`) the first time it sees a
-port, and stops the bot before it drives anything through a port that
-fails them.
+port. A port that fails them cannot be driven: the bot stays alive, books
+what the venue reports and sends nothing (an `entry_block` quarantine with
+every venue write refused) until a probe passes; fix the plugin and restart
+it.
 
 A conforming plugin produces zero findings — all three reference plugins
 do, and each asserts it in its own test suite (`test_*_contract.py`).

@@ -212,12 +212,12 @@ def validate_plugin_ports(plugin: BrokerPlugin) -> list[str]:
                 f"{', '.join(missing)}. The SpotInventoryManager drives the "
                 f"venue purely through this surface — implement all of them."
             )
-        if plugin.on_inventory_conflict not in ('quarantine', 'halt'):
+        if plugin.on_inventory_conflict != 'quarantine':
             errors.append(
                 f"{name}.on_inventory_conflict is "
                 f"{plugin.on_inventory_conflict!r} — must be 'quarantine' "
-                f"or 'halt' (the inventory-conflict policy set is narrower "
-                f"than on_unexpected_cancel by design)."
+                f"(the inventory-conflict policy set is narrower than "
+                f"on_unexpected_cancel by design)."
             )
         grace = getattr(spot_port, 'settlement_grace_s', None)
         if (isinstance(grace, bool)

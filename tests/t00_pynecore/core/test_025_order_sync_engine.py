@@ -24,6 +24,7 @@ import pytest
 from pynecore import lib
 from pynecore.lib import strategy, syminfo
 from pynecore.core.broker.exceptions import (
+    AuthenticationError,
     BracketAttachAfterFillRejectedError,
     BrokerManualInterventionError,
     ClientOrderIdSpentError,
@@ -35,6 +36,7 @@ from pynecore.core.broker.exceptions import (
     MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
+    OrderSyncError,
     UnexpectedCancelError,
     VenueWritesQuarantinedError,
 )
@@ -51,11 +53,13 @@ from pynecore.core.broker.sync_engine import (
     _BoundedIdSet,
     _CancelTentativeMeta,
     _OPPOSITE_ENTRY_FILL_WAIT_S,
+    _RejectedModifyDeferred,
     _bracket_skip_reason,
 )
 from pynecore.core.broker.one_way_emulator import BracketFanResult, LegSettleResult
 from pynecore.core.plugin import ProviderError, TransientProviderError
 from pynecore.core.broker.models import (
+    FENCE_CAUSE_PREFIX,
     CANCEL_REASON_VENUE_REDUCE_ONLY,
     CANCEL_REASON_VENUE_REJECTED,
     INTENT_KEY_SEP,
@@ -77,6 +81,7 @@ from pynecore.core.broker.models import (
     OcaPartialFillPolicy,
     OcaType,
     OrderEvent,
+    OrderExecution,
     OrderStatus,
     OrderType,
     LegType,
@@ -1159,7 +1164,7 @@ def __test_a_vanished_defensive_target_settles_its_own_entry_not_the_older_leg__
     )
     engine.reconcile()
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert 'L2' not in engine._pending_defensive_close  # type: ignore[attr-defined]
     assert pos.size == 1.0
     assert [binding.entry_id for binding in pos.bindings] == ["L1"]
@@ -1176,8 +1181,9 @@ def __test_a_sibling_reduction_of_the_same_size_does_not_settle_an_open_defensiv
     the marker stays armed. By the probe, L1's leg has closed instead: the
     aggregate shrank by exactly the marker's quantity, yet the venue still
     holds L2's leg, unprotected. The probe must not take the aggregate for
-    L2's close; past the grace it halts, whether or not the plugin attributes
-    the surviving leg to its entry.
+    L2's close; past the grace it keeps the marker armed and blocks new
+    entries under the close's cause, whether or not the plugin attributes the
+    surviving leg to its entry.
     """
     from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
 
@@ -1212,9 +1218,10 @@ def __test_a_sibling_reduction_of_the_same_size_does_not_settle_an_open_defensiv
         symbol=SYMBOL, side="long", size=1.0, entry_price=50_002.0,
         unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
     )
-    with pytest.raises(BrokerManualInterventionError):
-        engine.reconcile()
+    engine.reconcile()
 
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert 'defensive_close:L2' in engine._entry_block_causes  # type: ignore[attr-defined]
     assert 'L2' in engine._pending_defensive_close  # type: ignore[attr-defined]
     assert [binding.entry_id for binding in pos.bindings] == ["L1", "L2"]
 
@@ -1226,7 +1233,7 @@ def __test_a_partial_defensive_close_settles_while_its_target_leg_keeps_the_rest
     1 unit off L2's leg. The close fill is withheld past the grace while the
     venue shows L2's leg at 1 unit and the aggregate down by 1: the leg holds
     no more than the entry's bound quantity minus the close, so the probe
-    settles the close instead of halting on the listed leg.
+    settles the close instead of blocking on the listed leg.
     """
     from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
 
@@ -1269,7 +1276,7 @@ def __test_a_partial_defensive_close_settles_while_its_target_leg_keeps_the_rest
     )
     engine.reconcile()
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert 'L2' not in engine._pending_defensive_close  # type: ignore[attr-defined]
     assert pos.size == 2.0
 
@@ -1282,7 +1289,8 @@ def __test_a_defensive_target_leg_is_judged_by_its_own_size_not_its_entrys__(tar
     defensive close targets ``leg-L2a``. By the probe the aggregate fell by
     the close's 1 unit. When L1's leg closed instead, ``leg-L2a`` still holds
     its whole unit: L2's bound quantity minus the close also equals 1, but the
-    leg itself did not shrink, so the probe halts. When ``leg-L2a`` is gone,
+    leg itself did not shrink, so the probe keeps the close pending and blocks
+    new entries. When ``leg-L2a`` is gone,
     the close landed and the probe settles it.
     """
     from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
@@ -1324,12 +1332,13 @@ def __test_a_defensive_target_leg_is_judged_by_its_own_size_not_its_entrys__(tar
     )
     if target_closed:
         engine.reconcile()
-        assert engine.halted is False
+        assert not engine.quarantined
         assert 'L2' not in engine._pending_defensive_close  # type: ignore[attr-defined]
         assert pos.size == 2.0
     else:
-        with pytest.raises(BrokerManualInterventionError):
-            engine.reconcile()
+        engine.reconcile()
+        assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+        assert 'defensive_close:L2' in engine._entry_block_causes  # type: ignore[attr-defined]
         assert 'L2' in engine._pending_defensive_close  # type: ignore[attr-defined]
         assert [binding.entry_id for binding in pos.bindings] == ["L1", "L2"]
 
@@ -1355,9 +1364,9 @@ def __test_a_shared_target_leg_shrink_waits_for_every_close_aimed_at_it__(both_l
     that leg, each read it at 3 units before dispatch, and both fills are
     withheld. When only L3's marker is past the grace and the leg is down by
     one unit, that unit may be L2's close: the probe neither settles L3 nor
-    halts, it waits. Once both markers are stale, a leg down by one unit
-    proves one close missing and the probe halts; a leg down by two settles
-    both.
+    blocks, it waits. Once both markers are stale, a leg down by one unit
+    proves one close missing and the probe blocks new entries under both
+    closes' causes; a leg down by two settles both.
     """
     from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
 
@@ -1384,7 +1393,7 @@ def __test_a_shared_target_leg_shrink_waits_for_every_close_aimed_at_it__(both_l
     )
     engine.reconcile()
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert set(markers) == {'L2', 'L3'}
     assert pos.size == 3.0
 
@@ -1393,12 +1402,14 @@ def __test_a_shared_target_leg_shrink_waits_for_every_close_aimed_at_it__(both_l
         b.raw_legs = [replace(b.raw_legs[0], qty=1.0)]
         b.position = replace(b.position, size=1.0)
         engine.reconcile()
-        assert engine.halted is False
+        assert not engine.quarantined
         assert not markers
         assert pos.size == 1.0
     else:
-        with pytest.raises(BrokerManualInterventionError):
-            engine.reconcile()
+        engine.reconcile()
+        assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+        assert {'defensive_close:L2', 'defensive_close:L3'} <= set(
+            engine._entry_block_causes)  # type: ignore[attr-defined]
         assert set(markers) == {'L2', 'L3'}
 
 
@@ -1450,7 +1461,7 @@ def __test_one_close_of_a_shared_leg_does_not_settle_the_other__():
     )
     engine.reconcile()
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert set(markers) == {'L3'}
     assert pos.size == 2.0
 
@@ -1464,7 +1475,7 @@ def __test_a_booked_reduction_voids_the_target_leg_baselines__():
     by L3's unit and ``leg-long`` is one unit below the baseline, but that
     unit was L2's: the probe must not credit it to L3. With the baseline
     voided by the booked fill, the still-listed leg proves nothing and the
-    probe halts.
+    probe keeps L3's close pending and blocks new entries.
     """
     from pynecore.core.broker.sync_engine import DEFENSIVE_CLOSE_RESOLUTION_GRACE_S
 
@@ -1490,9 +1501,10 @@ def __test_a_booked_reduction_voids_the_target_leg_baselines__():
         symbol=SYMBOL, side="long", size=1.0, entry_price=50_002.0,
         unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
     )
-    with pytest.raises(BrokerManualInterventionError):
-        engine.reconcile()
+    engine.reconcile()
 
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert 'defensive_close:L3' in engine._entry_block_causes  # type: ignore[attr-defined]
     assert set(markers) == {'L3'}
     assert markers['L3'].reject_context.position_leg_qty is None
     assert pos.size == 2.0
@@ -2269,7 +2281,6 @@ def __test_racing_protective_fill_flattens_and_opens_the_parked_entry__():
     assert len(b.entry_calls) == n_entries + 1
     assert b.entry_calls[-1].intent.qty == 1.0
     assert engine._pending_reversal_opens == {}
-    assert engine._pending_flip_surplus_closes == {}
     assert len(b.close_calls) == 1  # only the reversal close itself
 
     engine._route_event(  # type: ignore[attr-defined]
@@ -4959,12 +4970,13 @@ def __test_write_outrunning_the_bridge_waits_for_the_plugins_classification__():
         loop.close()
 
 
-def __test_write_unresolved_past_the_grace_halts_controlled__():
+def __test_write_unresolved_past_the_grace_parks_as_unknown_and_blocks_entries__():
     """
     A write still unresolved after the classification grace — a wedged loop or
-    a plugin venue call with no timeout of its own — must escalate to the
-    controlled :class:`BrokerManualInterventionError` halt, never escape as a
-    raw ``TimeoutError`` crash.
+    a plugin venue call with no timeout of its own — is a write of unknown
+    outcome: it surfaces as :class:`OrderDispositionUnknownError` for the caller
+    to park, blocks new entries under the untranslated-fault cause, and never
+    escapes as a raw ``TimeoutError`` crash.
     """
     import threading
 
@@ -4992,8 +5004,12 @@ def __test_write_unresolved_past_the_grace_halts_controlled__():
     )
 
     try:
-        with pytest.raises(BrokerManualInterventionError):
-            engine._run_async_write(_wedged_write())
+        with pytest.raises(OrderDispositionUnknownError) as excinfo:
+            engine._run_async_write(_wedged_write(), client_order_id='coid-wedged')
+        assert excinfo.value.client_order_id == 'coid-wedged'
+        assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+        assert 'untranslated_write_fault' in engine._entry_block_causes  # type: ignore[attr-defined]
+        assert not engine.venue_writes_blocked
     finally:
         # Release the wedged coroutine and let it finish BEFORE stopping the
         # loop, so teardown never destroys a still-pending task.
@@ -5061,7 +5077,7 @@ def __test_permanently_wedged_read_is_abandoned_and_the_run_keeps_going__():
         # Inside the grace: the wedge is kept (no stacking) and new exposure
         # is deferred, but the run is alive.
         engine.sync(BAR_TS)
-        assert not engine.halted
+        assert not engine.quarantined
         assert b.entry_calls == [], "entry dispatched against an unconfirmed view"
         assert engine._inflight_read is wedged, "a second read stacked inside the grace"
 
@@ -5071,7 +5087,7 @@ def __test_permanently_wedged_read_is_abandoned_and_the_run_keeps_going__():
         engine._inflight_read_since = aged
 
         engine.sync(BAR_TS + 60_000)
-        assert not engine.halted, "a read outage must never stop the run"
+        assert not engine.quarantined, "a read outage must never stop the run"
         assert b.entry_calls == [], "entry dispatched against an unconfirmed view"
         assert wedged.cancelled(), "the overdue read was not abandoned"
         fresh = engine._inflight_read
@@ -5085,7 +5101,7 @@ def __test_permanently_wedged_read_is_abandoned_and_the_run_keeps_going__():
         loop.call_soon_threadsafe(release.set)
         fresh.result(timeout=5.0)
         engine.sync(BAR_TS + 120_000)
-        assert not engine.halted
+        assert not engine.quarantined
         assert engine._read_view_confirmed
         assert len(b.entry_calls) == 1, "dispatch did not resume once reads recovered"
     finally:
@@ -5151,7 +5167,7 @@ def __test_late_read_failure_blocks_dispatch_in_the_same_sync__():
 
         assert b.entry_calls == [], "order dispatched before the late read failure was collected"
         assert engine._read_backoff_until > time.monotonic(), "late retry_after was discarded"
-        assert not engine.halted, "a recoverable late fault must not kill the run"
+        assert not engine.quarantined, "a recoverable late fault must not kill the run"
 
         # Next cycle, with reads healthy again, dispatch resumes — but only
         # because the guard's re-read actually lands: clearing the backoff is
@@ -5212,7 +5228,7 @@ def __test_read_outage_past_the_grace_keeps_running_and_recovers__(caplog):
     # before anything else runs.
     b.reads_down = True
     engine.sync(BAR_TS)
-    assert not engine.halted, "a transient read outage must not halt inside the grace"
+    assert not engine.quarantined, "a transient read outage must not halt inside the grace"
 
     def outage_errors() -> list[logging.LogRecord]:
         return [
@@ -5223,16 +5239,16 @@ def __test_read_outage_past_the_grace_keeps_running_and_recovers__(caplog):
     engine._reads_unconfirmed_since = time.monotonic() - (READ_STUCK_GRACE_S + 1.0)
     with caplog.at_level(logging.ERROR, logger="pyne_core_logger"):
         engine.sync(BAR_TS)
-        assert not engine.halted, "a read outage is recoverable and must never stop the run"
+        assert not engine.quarantined, "a read outage is recoverable and must never stop the run"
         assert len(outage_errors()) == 1, "outage past the grace was not escalated"
         engine.sync(BAR_TS)
-        assert not engine.halted
+        assert not engine.quarantined
         assert len(outage_errors()) == 1, "outage escalated again inside the same grace window"
 
     # Reads are back: the very next sync confirms the view and the run goes on.
     b.reads_down = False
     engine.sync(BAR_TS + 60_000)
-    assert not engine.halted
+    assert not engine.quarantined
     assert engine._read_view_confirmed, "dispatch not re-enabled after reads recovered"
 
 
@@ -5482,51 +5498,95 @@ def __test_restart_scan_raw_retryable_provider_error_parks_and_retries__(tmp_pat
         assert engine._order_mapping["L"] == ["live-1"]  # type: ignore[attr-defined]
 
 
-# === Write-path backstop: untranslated dispatch transients halt, never dup ===
+# === Write-path backstop: untranslated dispatch transients park, never dup ===
 #
 # The complement of the read backstop. A WRITE drop is disposition-ambiguous: a
 # retry could duplicate a landed order, a blind park could strand a never-sent
 # one. Only the plugin can tell pre-send from post-send, so an *untranslated*
 # transient escaping a direct order write (``execute_*`` / ``modify_*``) is
-# routed by ``_run_async_write`` to a controlled ``BrokerManualInterventionError``
-# halt — strictly better than a raw crash, and only reachable for a contract-
-# violating plugin. A plugin that DOES translate (ExchangeConnectionError /
-# OrderDispositionUnknownError) is unaffected.
+# taken by ``_run_async_write`` as an unknown outcome: the write is parked for
+# venue verification and new entries are blocked under the untranslated-fault
+# cause until a quiet reconcile finds the venue matching the book. A plugin that
+# DOES translate (ExchangeConnectionError / OrderDispositionUnknownError) is
+# unaffected.
 
 
-def __test_write_untranslated_retryable_transient_halts_for_manual_intervention__():
-    """A raw retryable ``ProviderError`` escaping ``execute_entry`` latches a
-    manual-intervention halt and does NOT re-dispatch (no duplicate order)."""
+@pytest.mark.parametrize("fault", [
+    TransientProviderError("link dropped after entry send"),
+    ConnectionError("socket reset mid-dispatch"),
+], ids=["retryable_provider_error", "stdlib_connection_error"])
+def __test_write_untranslated_transient_parks_and_blocks_entries__(fault):
+    """A raw retryable ``ProviderError`` or stdlib ``ConnectionError`` escaping
+    ``execute_entry`` parks the entry under its id for verification, blocks new
+    entries and does NOT re-dispatch (no duplicate order); the run goes on."""
+    expected_coid = _preview_entry_coid("L", limit=50_000.0)
     b = MockBroker()
-    b.raise_on_next_entry = TransientProviderError("link dropped after entry send")
+    b.raise_on_next_entry = fault
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
 
-    # Surfaces now or latches for the next ``raise_if_halted`` — never a silent
-    # re-dispatch.
-    try:
-        engine.sync(BAR_TS)
-    except BrokerManualInterventionError:
-        pass
-    assert engine.halted is True
-    with pytest.raises(BrokerManualInterventionError):
-        engine.raise_if_halted()
+    engine.sync(BAR_TS)
+
+    assert expected_coid in engine.pending_verification
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert 'untranslated_write_fault' in engine._entry_block_causes  # type: ignore[attr-defined]
+    assert not engine.venue_writes_blocked
+    engine.sync(BAR_TS + 60_000)
     # Attempted exactly once — the ambiguous write is not retried.
     assert len(b.entry_calls) == 1
 
 
-def __test_write_stdlib_connection_error_halts_for_manual_intervention__():
-    """A raw stdlib ``ConnectionError`` on a write halts too (same ambiguity)."""
-    b = MockBroker()
-    b.raise_on_next_entry = ConnectionError("socket reset mid-dispatch")
-    engine, pos = _mk_engine(b)
-    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+async def _raise_async(exc: BaseException) -> None:
+    """A write coroutine that fails with ``exc``."""
+    raise exc
 
-    try:
-        engine.sync(BAR_TS)
-    except BrokerManualInterventionError:
-        pass
-    assert engine.halted is True
+
+def __test_untranslated_write_cause_ends_after_a_quiet_reconcile_on_a_matching_venue__():
+    """The untranslated-fault entry block ends by itself.
+
+    The reconcile right after the fault still counts the report and keeps the
+    block; the next one sees no new report and the venue holding what the book
+    holds (both flat), so it ends the cause and with it the quarantine.
+    """
+    b = MockBroker()
+    engine, _pos = _mk_engine(b)
+    with pytest.raises(OrderDispositionUnknownError):
+        engine._run_async_write(  # type: ignore[attr-defined]
+            _raise_async(ConnectionError("socket reset")), client_order_id='coid-u')
+    assert 'untranslated_write_fault' in engine._entry_block_causes  # type: ignore[attr-defined]
+
+    engine.reconcile()
+    assert 'untranslated_write_fault' in engine._entry_block_causes  # type: ignore[attr-defined]
+    engine.reconcile()
+    assert 'untranslated_write_fault' not in engine._entry_block_causes  # type: ignore[attr-defined]
+    assert not engine.quarantined
+
+
+def __test_a_fence_cause_blocks_every_venue_write_of_the_process__():
+    """A held ``fence:`` cause forbids exits and closes too, in this process only.
+
+    The fenced zombie's replacement owns the position: the zombie must not
+    write a single order. The block lives in memory (an entry block), so no
+    other process or restart is caught by it.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(_fill_event('buy', 1.0, 50_000.0, pine_id="L"))  # type: ignore[attr-defined]
+    engine.record_quarantine("lease lost", {}, cause=f"{FENCE_CAUSE_PREFIX}spot_inventory:X")
+    assert engine.venue_writes_blocked
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+
+    pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 60_000)
+    assert b.exit_calls == [] and b.close_calls == []
+
+    assert engine.end_quarantine_cause(f"{FENCE_CAUSE_PREFIX}spot_inventory:X", "test")
+    assert not engine.venue_writes_blocked
 
 
 def __test_write_disposition_unknown_parks_without_halt__():
@@ -5542,21 +5602,103 @@ def __test_write_disposition_unknown_parks_without_halt__():
 
     engine.sync(BAR_TS)
 
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
-def __test_write_non_retryable_provider_error_fails_loud_without_halt__():
-    """A non-retryable ``ProviderError`` on a write is NOT swallowed into a halt —
-    it propagates so a permanent misconfiguration fails loud."""
+def __test_write_non_retryable_provider_error_parks_without_ending_the_run__():
+    """A non-retryable ``ProviderError`` on a write is an unknown outcome, never a crash.
+
+    The plugin did not say whether the request left, so the write is parked
+    for venue verification under its id and never sent again blindly; the
+    contract violation blocks new entries and is logged, and the run goes on.
+    """
+    expected_coid = _preview_entry_coid("L", limit=50_000.0)
     b = MockBroker()
     b.raise_on_next_entry = ProviderError("unsupported order type")  # retryable=False
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
 
-    with pytest.raises(ProviderError) as excinfo:
+    engine.sync(BAR_TS)
+
+    assert expected_coid in engine.pending_verification
+    assert 'untranslated_write_fault' in engine._entry_block_causes  # type: ignore[attr-defined]
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 1
+
+
+def _unclassified_faults() -> list:
+    return [
+        pytest.param(ValueError("bug in the plugin"), id="plugin_bug"),
+        pytest.param(ProviderError("permanent"), id="non_retryable_provider_error"),
+        pytest.param(ExchangeRateLimitError("throttled", 1.0), id="untranslated_rate_limit"),
+        pytest.param(AuthenticationError("401"), id="untranslated_auth_error"),
+        pytest.param(OrderSyncError("diverged"), id="bare_broker_error"),
+    ]
+
+
+def _write_path_setup(path: str, b: MockBroker, engine, pos, fault: Exception):
+    """Drive ``path`` to the write that raises ``fault``; return the write's call list."""
+    if path == 'entry':
+        b.raise_on_next_entry = fault
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
         engine.sync(BAR_TS)
-    assert not isinstance(excinfo.value, BrokerManualInterventionError)
-    assert engine.halted is False
+        return b.entry_calls
+    if path == 'modify_entry':
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        engine.sync(BAR_TS)
+        b.raise_on_next_modify_entry = fault
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_000.0)
+        engine.sync(BAR_TS + 60_000)
+        return b.modify_entry_calls
+    if path == 'cancel':
+        pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+        engine.sync(BAR_TS)
+        b.raise_on_next_cancel = fault
+        del pos.entry_orders["L"]
+        engine.sync(BAR_TS + 60_000)
+        return b.cancel_calls
+    pos.entry_orders["L"] = _entry_order("L", 1.0)
+    engine.sync(BAR_TS)
+    engine._route_event(_fill_event('buy', 1.0, 50_000.0, pine_id="L"))  # type: ignore[attr-defined]
+    if path == 'exit':
+        b.raise_on_next_exit = fault
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+        engine.sync(BAR_TS + 60_000)
+        return b.exit_calls
+    if path == 'modify_exit':
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=49_000.0)
+        engine.sync(BAR_TS + 60_000)
+        b.raise_on_next_modify_exit = fault
+        pos.exit_orders[("L-X", "L")] = _exit_order("L", 1.0, "L-X", stop=48_000.0)
+        engine.sync(BAR_TS + 120_000)
+        return b.modify_exit_calls
+    assert path == 'close'
+    b.raise_on_next_close = fault
+    pos.exit_orders[("Close position order", None)] = Order(
+        None, -1.0, order_type=_order_type_close, exit_id="Close position order",
+    )
+    engine.sync(BAR_TS + 60_000)
+    return b.close_calls
+
+
+@pytest.mark.parametrize('fault', _unclassified_faults())
+@pytest.mark.parametrize('path', ['entry', 'modify_entry', 'cancel', 'exit', 'modify_exit', 'close'])
+def __test_an_unclassified_write_fault_is_an_unknown_outcome_on_every_path__(path, fault):
+    """Any exception outside the classified write outcomes leaves the run going.
+
+    The write may have reached the venue: it is taken as one of unknown
+    outcome (the venue settles it), never sent again blindly, and the plugin's
+    contract violation blocks new entries. Before, the exception escaped the
+    sync and ended the run.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    calls = _write_path_setup(path, b, engine, pos, fault)
+    n_calls = len(calls)
+    assert 'untranslated_write_fault' in engine._entry_block_causes  # type: ignore[attr-defined]
+    assert not engine.venue_writes_blocked
+    engine.sync(BAR_TS + 180_000)
+    assert len(calls) == n_calls, "the write of unknown outcome is not sent again blindly"
 
 
 def __test_restart_adopts_higher_same_bar_retry_over_journal_anchor__(tmp_path):
@@ -5776,7 +5918,6 @@ def __test_exit_reject_over_a_vanished_parent_retires_the_stale_exit__():
     assert ("TP", "L") not in pos.exit_orders
     assert b.close_calls == []
     assert not engine.quarantined
-    assert engine.halted is False
 
 
 def __test_exit_reject_over_a_live_parent_retries_once_under_a_fresh_id__():
@@ -5802,7 +5943,6 @@ def __test_exit_reject_over_a_live_parent_retries_once_under_a_fresh_id__():
     assert engine.order_mapping[key]
     assert b.close_calls == []
     assert not engine.quarantined
-    assert engine.halted is False
 
 
 def __test_exit_rejected_twice_over_a_live_parent_closes_it_defensively__():
@@ -5831,7 +5971,6 @@ def __test_exit_rejected_twice_over_a_live_parent_closes_it_defensively__():
     assert close.side == 'sell' and close.qty == 1.0 and close.immediately
     assert "L" in engine.pending_defensive_close
     assert engine.quarantined
-    assert engine.halted is False
 
     # Quarantine blocks new exposure while the close settles.
     b.always_raise_on_exit = None
@@ -5865,7 +6004,6 @@ def __test_an_exit_refused_over_a_level_the_market_crossed_closes_without_quaran
     assert isinstance(close, CloseIntent) and close.synthetic_kind == 'defensive_close'
     assert close.side == 'sell' and close.qty == 1.0
     assert not engine.quarantined
-    assert engine.halted is False
 
 
 def __test_an_exit_refusal_flagged_level_crossed_closes_without_quarantine__():
@@ -5949,7 +6087,6 @@ def __test_close_reject_retries_per_bar_and_quarantines_after_the_cap__():
         assert len(b.close_calls) == i
         assert "" not in engine.active_intents
         assert engine.quarantined is (i >= _CLOSE_REJECT_QUARANTINE_CAP)
-    assert engine.halted is False
 
     # Entries are blocked, the close still goes out and lands.
     pos.entry_orders["L2"] = _entry_order("L2", 1.0)
@@ -6069,7 +6206,7 @@ def __test_an_entry_turned_market_is_replaced_not_amended__(bar_ts, retry_seq):
     assert replacement.client_order_id('e') != b.entry_calls[0].client_order_id('e')
     assert engine.active_intents["L"].order_type is OrderType.MARKET
     assert engine.order_mapping["L"] == ["xchg-2"]
-    assert engine.halted is False
+    assert not engine.quarantined
     # A fill the cancelled limit still reports is not the market entry's.
     engine.on_order_event(_fill_event(
         'buy', 0.4, 50_000.0, pine_id="L", xchg_id="xchg-1", event_type='partial',
@@ -6113,7 +6250,7 @@ def __test_a_refused_entry_amend_cancels_and_dispatches_afresh__():
     b.raise_on_next_modify_entry = ExchangeOrderRejectedError("illegal value of limitPrice")
     engine.sync(BAR_TS)
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.modify_entry_calls) == 1
     assert len(b.cancel_calls) == 1
     assert "L" not in engine.active_intents
@@ -6147,7 +6284,7 @@ def __test_a_refused_entry_amend_waits_for_its_cancel_to_land__():
     b.raise_on_next_cancel = ExchangeOrderRejectedError("cancel refused")
     engine.sync(BAR_TS + 60_000)
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "L" not in engine.active_intents
     assert engine.order_mapping["L"] == ["xchg-1"]
 
@@ -6156,7 +6293,7 @@ def __test_a_refused_entry_amend_waits_for_its_cancel_to_land__():
     b.false_on_next_cancel = True
     engine.sync(BAR_TS + 180_000)
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.entry_calls) == 1
     assert len(b.modify_entry_calls) == 1
 
@@ -7720,7 +7857,8 @@ def __test_run_event_stream_reopens_after_an_unexpected_error__(monkeypatch, cap
     The stream is the bot's only PUSH channel for fills; abandoning it after
     one transport-layer surprise left a live bot dispatching orders for hours
     without ever seeing their fills. The reopen is paced by
-    ``EVENT_STREAM_RESTART_BACKOFF_S``; the halt and cancel paths still end
+    ``EVENT_STREAM_RESTART_BACKOFF_S``. A plugin's manual-intervention report
+    blocks new entries and is reopened the same way; only cancellation ends
     the task."""
     import logging
     from pynecore.core.broker import sync_engine as se
@@ -7759,25 +7897,34 @@ def __test_run_event_stream_reopens_after_an_unexpected_error__(monkeypatch, cap
     assert engine._event_queue.get_nowait() is fill
     assert sum("reopening in" in r.getMessage() for r in caplog.records) == 2
 
-    # A manual-intervention halt still ends the task (and latches the halt).
-    def _halting():
+    # A plugin's manual-intervention report from the stream blocks new
+    # entries and the stream is reopened like after any other error.
+    reports = 0
+
+    def _reporting():
+        nonlocal reports
+        reports += 1
+        attempt = reports
+
         async def _gen():
-            raise BrokerManualInterventionError("venue says stop")
-            # The dead yield only makes _gen an async generator
-            # noinspection PyUnreachableCode
-            yield  # pragma: no cover — unreachable
+            if attempt == 1:
+                raise BrokerManualInterventionError("venue says stop")
+            yield fill
 
         return _gen()
 
-    b.watch_orders = _halting  # type: ignore[method-assign]
+    slept.clear()
+    b.watch_orders = _reporting  # type: ignore[method-assign]
     engine, _ = _mk_engine(b)
-    try:
-        asyncio.run(engine.run_event_stream())
-    except BrokerManualInterventionError:
-        pass
-    else:
-        raise AssertionError("halt was swallowed by the reopen loop")
-    assert engine.halted
+    asyncio.run(engine.run_event_stream())
+
+    assert reports == 2, "the stream was not reopened after the plugin's report"
+    assert slept == [se.EVENT_STREAM_RESTART_BACKOFF_S[0]]
+    assert engine._event_queue.get_nowait() is fill
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert not engine.venue_writes_blocked
+    assert any(cause is not None and cause.startswith('intervention:')
+               for cause in engine._entry_block_causes)  # type: ignore[attr-defined]
 
 
 def __test_stop_event_stream_waits_for_the_stream_to_fully_unwind__():
@@ -10452,8 +10599,13 @@ def __test_fanned_defensive_close_survives_its_first_leg_fill__():
         "the completing leg did not settle the close"
 
 
-def __test_fanned_defensive_close_leg_reject_after_a_filled_leg_halts__():
-    """A sibling leg rejected after another filled must escalate."""
+def __test_fanned_defensive_close_leg_reject_after_a_filled_leg_queues_a_retry__():
+    """A sibling leg rejected after another filled queues the close again.
+
+    The rejected leg leaves part of the position open and unprotected: the
+    marker is dropped, the close is queued for the next reconcile and new
+    entries are blocked under the entry's defensive-close cause.
+    """
     engine, _pos = _mk_fanned_defensive_close_engine(2.0)
     engine._route_event(_leg_close_fill(1, 1.0))  # type: ignore[attr-defined]
 
@@ -10461,9 +10613,12 @@ def __test_fanned_defensive_close_leg_reject_after_a_filled_leg_halts__():
         _leg_close_fill(2, 1.0), event_type='rejected', fill_qty=0.0,
         fill_price=0.0, fill_id="leg-reject-2",
     )
-    with pytest.raises(BrokerManualInterventionError) as excinfo:
-        engine._route_event(reject)  # type: ignore[attr-defined]
-    assert "Defensive close after bracket attach reject" in str(excinfo.value)
+    engine._route_event(reject)  # type: ignore[attr-defined]
+
+    assert 'Long' not in engine._pending_defensive_close
+    assert 'coid-1' in engine._defensive_close_retries  # type: ignore[attr-defined]
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert 'defensive_close:Long' in engine._entry_block_causes  # type: ignore[attr-defined]
 
 
 def __test_single_order_defensive_close_still_settles_on_its_fill__():
@@ -10810,679 +10965,6 @@ def __test_a_corrected_redelivery_discharges_the_dropped_slice__():
     assert pos.size == 1.0
 
 
-def _arm_prior_run_surplus_close(engine, ctx, *, seq, expected_qty,
-                                 position_coid, target_exchange_id,
-                                 batch_outstanding_delta):
-    """Arm + persist one prior-run surplus-close marker, then dispatch it.
-
-    Mirrors the arm ordering of the retired combined-dispatch correction:
-    marker first, durable ``flip_surplus_close_armed`` event second (when a
-    store ctx is present), corrective dispatch last — so every downstream
-    settle / replay / escalation contract sees exactly the state an older
-    build left behind.
-    """
-    from pynecore.core.broker.sync_engine import _PendingFlipSurplusClose
-
-    close_intent = CloseIntent(
-        pine_id=f"__pyne_flip_surplus_close__{position_coid}__{seq}",
-        symbol=SYMBOL,
-        side='buy',
-        qty=expected_qty,
-        immediately=True,
-        synthetic_kind='defensive_close',
-        target_position_coid=position_coid,
-        target_exchange_id=target_exchange_id,
-        comment="flip-fold surplus close: prior-run correction",
-    )
-    close_key = close_intent.intent_key
-    marker = _PendingFlipSurplusClose(
-        client_order_id=(
-            engine._build_envelope(close_intent).client_order_id('c')
-        ),
-        expected_qty=expected_qty,
-        close_side='buy',
-        position_coid=position_coid,
-        entry_intent_key="S",
-        pre_close_position_size=float(engine._position.size),
-        batch_outstanding_delta=batch_outstanding_delta,
-        pending_since=time.time(),
-    )
-    engine._pending_flip_surplus_closes[close_key] = marker
-    if ctx is not None:
-        ctx.log_event(
-            kind='flip_surplus_close_armed',
-            intent_key=close_key,
-            client_order_id=position_coid,
-            payload=marker.to_payload(),
-        )
-    try:
-        engine._dispatch_new(close_intent)  # type: ignore[attr-defined]
-    except OrderDispositionUnknownError:
-        pass
-    return close_key, marker
-
-
-def _drive_fold_surplus_with_store(ctx, *, park_close: bool = False):
-    """Arm a flip-fold surplus-close marker the way a PRIOR run did.
-
-    New runs never arm these markers (the close-then-open reversal
-    protocol replaced the combined-size fold whose double-settle they
-    corrected), but the durable armed/progress/settle contract must keep
-    working for rows persisted by an older build. The driver reproduces
-    that state through the real machinery: a 2.0 short book holding a 1.0
-    surplus, the marker armed + persisted BEFORE the corrective dispatch,
-    and the corrective close fanned through the port onto the surplus
-    leg. With ``park_close=True`` the corrective dispatch ends with an
-    unknown disposition instead (parked + persisted park row).
-
-    Returns ``(broker, engine, close_key, marker)``.
-    """
-    b = MockBroker()
-    b.position_port = b
-    pos = BrokerPosition()
-    engine = OrderSyncEngine(
-        broker=b, position=pos,  # type: ignore[arg-type]
-        symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
-    )
-    pos.entry_orders["S"] = _entry_order("S", -2.0)
-    engine.sync(BAR_TS)
-    s_deal_id = engine.order_mapping["S"][0]
-    engine._route_event(  # type: ignore[attr-defined]
-        _fill_event('sell', 2.0, 48_990.0, pine_id="S", xchg_id=s_deal_id,
-                    fill_id="s-1"))
-    assert pos.size == -2.0
-    b.raw_legs = [_pleg("8", "sell", 2.0, open_time=2.0)]
-
-    if park_close:
-        async def _timeout_close_leg(symbol, leg_id, volume, coid):
-            b.close_leg_calls.append((leg_id, volume))
-            raise OrderDispositionUnknownError(
-                "close link dropped", client_order_id=coid,
-            )
-        b.close_leg = _timeout_close_leg  # type: ignore[method-assign]
-    close_key, marker = _arm_prior_run_surplus_close(
-        engine, ctx, seq=1, expected_qty=1.0,
-        position_coid=engine._envelopes["S"].client_order_id('e'),
-        target_exchange_id=s_deal_id,
-        batch_outstanding_delta=1.0,
-    )
-    assert engine._pending_flip_surplus_closes == {close_key: marker}
-    return b, engine, close_key, marker
-
-
-def _restarted_engine(ctx):
-    """Fresh broker + engine on the same store ctx — a process restart."""
-    b = MockBroker()
-    b.position_port = b
-    pos = BrokerPosition()
-    engine = OrderSyncEngine(
-        broker=b, position=pos,  # type: ignore[arg-type]
-        symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
-    )
-    return b, engine, pos
-
-
-def _open_t025_run(store):
-    from pynecore.core.broker.run_identity import RunIdentity
-    return store.open_run(
-        RunIdentity(
-            strategy_id="t025", symbol=SYMBOL, timeframe="60",
-            account_id="testbroker-demo", label=None,
-        ),
-        script_source="src",
-        script_path="t025.py",
-    )
-
-
-def __test_parked_surplus_close_rejected_after_restart_still_halts__(tmp_path):
-    """A restart must not launder a rejected surplus correction into silence.
-
-    The corrective close parks with unknown disposition, the process
-    restarts, and the plugin's snapshot recovery resolves the park as
-    ``rejected``: the correction never reached the exchange, the book
-    holds surplus exposure Pine does not know about, and nothing will
-    re-dispatch (``corrected_qty`` already booked it). Without the
-    durable marker replay the post-restart resolution loop finds no
-    armed marker and skips the escalation — the exact silent-exposure
-    hole the persistence closes.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(
-            ctx, park_close=True,
-        )
-        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_armed')
-
-        _b2, engine2, _pos2 = _restarted_engine(ctx)
-        engine2._replay_pending_flip_surplus_closes()
-        replayed = engine2._pending_flip_surplus_closes.get(close_key)
-        assert replayed is not None, "the armed marker did not survive restart"
-        assert replayed.client_order_id == marker.client_order_id
-        assert replayed.expected_qty == marker.expected_qty
-
-        # The park row carries the fan CHILD's coid ({parent}:{leg_id}) —
-        # the one-way emulator parked the corrective's close leg.
-        ctx.record_resolution(f"{marker.client_order_id}:8", 'rejected')
-        with pytest.raises(BrokerManualInterventionError):
-            engine2._consume_plugin_resolutions()
-
-
-def __test_restarted_surplus_close_settles_on_its_late_fill__(tmp_path):
-    """The re-armed marker settles when the correction's fill routes post-restart."""
-    from pynecore.core.broker.storage import BrokerStore
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, _engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
-
-        _b2, engine2, pos2 = _restarted_engine(ctx)
-        pos2.size = -2.0
-        pos2.sign = -1.0
-        pos2.avg_price = 48_990.0
-        engine2._replay_pending_flip_surplus_closes()
-        assert close_key in engine2._pending_flip_surplus_closes
-
-        engine2._route_event(  # type: ignore[attr-defined]
-            _fan_leg_fill(marker.client_order_id, 8, 1.0))
-        assert engine2._pending_flip_surplus_closes == {}
-        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
-
-
-def __test_surplus_close_settled_before_the_crash_is_not_rearmed__(tmp_path):
-    """The settle audit written at FILL time keeps replay from resurrecting the marker."""
-    from pynecore.core.broker.storage import BrokerStore
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
-        engine1._route_event(  # type: ignore[attr-defined]
-            _fan_leg_fill(marker.client_order_id, 8, 1.0))
-        assert engine1._pending_flip_surplus_closes == {}
-        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
-
-        _b2, engine2, _pos2 = _restarted_engine(ctx)
-        engine2._replay_pending_flip_surplus_closes()
-        assert engine2._pending_flip_surplus_closes == {}
-
-
-def __test_stale_replayed_surplus_close_halts_when_broker_still_holds_it__(tmp_path):
-    """Grace expired, broker still at the pre-correction size: halt.
-
-    The snapshot matches the marker's persisted pre-close anchor, so the
-    correction provably never executed — the surplus exposure is live
-    with nothing in flight.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-    from pynecore.core.broker.sync_engine import (
-        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
-    )
-    import time as _time
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, _engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
-
-        _b2, engine2, _pos2 = _restarted_engine(ctx)
-        engine2._replay_pending_flip_surplus_closes()
-        replayed = engine2._pending_flip_surplus_closes[close_key]
-        replayed.pending_since = (
-            _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
-        )
-        snapshot = ExchangePosition(
-            symbol=SYMBOL, side="short", size=2.0, entry_price=48_990.0,
-            unrealized_pnl=0.0, liquidation_price=None,
-            leverage=1.0, margin_mode="isolated",
-        )
-        with pytest.raises(BrokerManualInterventionError):
-            engine2._raise_if_stale_pending_flip_surplus_close(snapshot)
-
-
-def __test_stale_replayed_surplus_close_settles_from_a_corrected_snapshot__(tmp_path):
-    """Grace expired but the broker already reflects the correction: settle.
-
-    The fill was executed during the downtime and its event lost (polled
-    broker, advanced activity cursor); the snapshot matching the
-    pre-close anchor plus the outstanding delta proves it. The marker is
-    settled with the durable audit instead of halting.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-    from pynecore.core.broker.sync_engine import (
-        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
-    )
-    import time as _time
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, _engine1, close_key, _marker = _drive_fold_surplus_with_store(ctx)
-
-        _b2, engine2, _pos2 = _restarted_engine(ctx)
-        engine2._replay_pending_flip_surplus_closes()
-        replayed = engine2._pending_flip_surplus_closes[close_key]
-        replayed.pending_since = (
-            _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
-        )
-        snapshot = ExchangePosition(
-            symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
-            unrealized_pnl=0.0, liquidation_price=None,
-            leverage=1.0, margin_mode="isolated",
-        )
-        engine2._raise_if_stale_pending_flip_surplus_close(snapshot)
-        assert engine2._pending_flip_surplus_closes == {}
-        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
-
-
-def __test_settled_surplus_close_fill_replayed_after_restart_is_dropped__(tmp_path):
-    """A correction settled before the crash must not be booked twice.
-
-    Replay skips the marker on the strength of its settle audit, so the
-    marker — the only in-memory guard for this synthetic close — is gone
-    and ``_seen_fill_ids`` is empty in the fresh process. A WS reconnect
-    replay / polled-orders resync of the same corrective FILL would then
-    reach ``record_fill`` and close the adopted (already corrected)
-    position a second time.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
-        corrective_fill = _fan_leg_fill(marker.client_order_id, 8, 1.0)
-        engine1._route_event(corrective_fill)  # type: ignore[attr-defined]
-        assert engine1._pending_flip_surplus_closes == {}
-        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
-
-        _b2, engine2, pos2 = _restarted_engine(ctx)
-        # Startup adopts the broker's already-corrected exposure.
-        pos2.size = -1.0
-        pos2.sign = -1.0
-        pos2.avg_price = 48_990.0
-        engine2._replay_pending_flip_surplus_closes()
-        assert engine2._pending_flip_surplus_closes == {}
-
-        engine2._route_event(corrective_fill)  # type: ignore[attr-defined]
-        assert pos2.size == -1.0, \
-            "the replayed corrective fill was booked a second time"
-
-
-def _fan_leg_fill(parent_coid: str, leg_id: int, qty: float):
-    """A one-way-emulated correction child: composed coid, own order id.
-
-    Mirrors what :meth:`OneWayEmulator._fan_out_closes` puts on the wire —
-    the leg carries ``{parent_coid}:{leg_id}`` and its own broker order id,
-    and never the close's ``pine_id``.
-    """
-    event = _fill_event(
-        'buy', qty, 48_995.0, pine_id="", leg=LegType.CLOSE,
-        xchg_id=f"xchg-corr-leg{leg_id}", fill_id=f"corr-leg{leg_id}",
-    )
-    return replace(
-        event,
-        order=replace(
-            event.order, client_order_id=f"{parent_coid}:{leg_id}",
-        ),
-    )
-
-
-def __test_settled_fanned_surplus_close_child_replay_is_dropped__(tmp_path):
-    """An EARLIER fan child of a settled correction must not be booked twice.
-
-    The one-way emulator splits the correction across
-    ``{parent_coid}:{leg_id}`` children, each with its own broker order id.
-    Settlement only ever sees the LAST child, so caching the shared parent
-    ids plus that final order id leaves every earlier child unguarded: after
-    restart its redelivery matches no cache, reaches ``record_fill`` and
-    closes the adopted (already corrected) position a second time.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
-        parent_coid = marker.client_order_id
-        leg1 = _fan_leg_fill(parent_coid, 1, 0.5)
-        leg2 = _fan_leg_fill(parent_coid, 2, 0.5)
-        engine1._route_event(leg1)  # type: ignore[attr-defined]
-        engine1._route_event(leg2)  # type: ignore[attr-defined]
-        assert engine1._pending_flip_surplus_closes == {}
-        assert ctx.find_event_by_intent_key(close_key, 'flip_surplus_close_filled')
-
-        _b2, engine2, pos2 = _restarted_engine(ctx)
-        # Startup adopts the broker's already-corrected exposure.
-        pos2.size = -1.0
-        pos2.sign = -1.0
-        pos2.avg_price = 48_990.0
-        engine2._replay_pending_flip_surplus_closes()
-        assert engine2._pending_flip_surplus_closes == {}
-
-        engine2._route_event(leg1)  # type: ignore[attr-defined]
-        assert pos2.size == -1.0, \
-            "the replayed fan child was booked a second time"
-
-
-def __test_fanned_surplus_close_child_replay_after_midfan_restart_is_dropped__(tmp_path):
-    """The child booked BEFORE the crash stays guarded once the fan completes.
-
-    The first leg fills, the process restarts mid-fan (the marker re-arms
-    from its cumulative progress record), the second leg settles the
-    correction in the new process, and only then is the first leg
-    redelivered. Its identities live nowhere but the progress event, so
-    without carrying them onto the re-armed marker — and from there into
-    the settle audit — the replay books the slice a second time.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
-        parent_coid = marker.client_order_id
-        leg1 = _fan_leg_fill(parent_coid, 1, 0.5)
-        leg2 = _fan_leg_fill(parent_coid, 2, 0.5)
-        engine1._route_event(leg1)  # type: ignore[attr-defined]
-        assert engine1._pending_flip_surplus_closes[close_key].filled_qty == 0.5
-
-        _b2, engine2, pos2 = _restarted_engine(ctx)
-        pos2.size = -1.5
-        pos2.sign = -1.0
-        pos2.avg_price = 48_990.0
-        engine2._replay_pending_flip_surplus_closes()
-        assert engine2._pending_flip_surplus_closes[close_key].filled_qty == 0.5
-        engine2._route_event(leg2)  # type: ignore[attr-defined]
-        assert engine2._pending_flip_surplus_closes == {}
-
-        _b3, engine3, pos3 = _restarted_engine(ctx)
-        pos3.size = -1.0
-        pos3.sign = -1.0
-        pos3.avg_price = 48_990.0
-        engine3._replay_pending_flip_surplus_closes()
-        assert engine3._pending_flip_surplus_closes == {}
-
-        engine3._route_event(leg1)  # type: ignore[attr-defined]
-        assert pos3.size == -1.0, \
-            "the pre-crash fan child was booked a second time"
-
-
-def __test_midfan_restart_drops_the_redelivered_child_before_the_fan_ends__(tmp_path):
-    """The pre-crash child is guarded while the fan is STILL outstanding.
-
-    The marker is re-armed (siblings pending), so its leg identities must
-    not enter the settled-close caches — an unfanned correction's next
-    partial reuses the same order id / coid and would be dropped. The
-    broker-native ``fill_id`` is the discriminator that survives that
-    constraint: it names one execution, so reseeding the process-local
-    ``_seen_fill_ids`` ring from the progress record drops exactly the
-    redelivery and nothing else.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
-        parent_coid = marker.client_order_id
-        leg1 = _fan_leg_fill(parent_coid, 1, 0.5)
-        engine1._route_event(leg1)  # type: ignore[attr-defined]
-        assert engine1._pending_flip_surplus_closes[close_key].filled_qty == 0.5
-
-        _b2, engine2, pos2 = _restarted_engine(ctx)
-        # Startup adopts the broker's partially corrected exposure.
-        pos2.size = -1.5
-        pos2.sign = -1.0
-        pos2.avg_price = 48_990.0
-        engine2._replay_pending_flip_surplus_closes()
-        assert engine2._pending_flip_surplus_closes[close_key].filled_qty == 0.5
-
-        # Redelivered BEFORE the second leg completes the fan.
-        engine2._route_event(leg1)  # type: ignore[attr-defined]
-        assert pos2.size == -1.5, \
-            "the redelivered mid-fan child was booked a second time"
-        assert engine2._pending_flip_surplus_closes[close_key].filled_qty == 0.5, \
-            "the redelivered mid-fan child was credited to the marker twice"
-
-
-def __test_midfan_restart_still_accepts_a_fresh_partial_of_the_same_order__(tmp_path):
-    """Reseeding must not swallow the NEXT partial of the same order.
-
-    An unfanned correction fills in slices that all carry the same order
-    id and coid and differ only in ``fill_id``. The replay guard keys on
-    ``fill_id`` precisely so this legitimate continuation still books.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
-        first = _fan_leg_fill(marker.client_order_id, 8, 0.5)
-        second = replace(first, fill_id="corr-2")
-        engine1._route_event(first)  # type: ignore[attr-defined]
-        assert engine1._pending_flip_surplus_closes[close_key].filled_qty == 0.5
-
-        _b2, engine2, pos2 = _restarted_engine(ctx)
-        pos2.size = -1.5
-        pos2.sign = -1.0
-        pos2.avg_price = 48_990.0
-        engine2._replay_pending_flip_surplus_closes()
-        engine2._route_event(second)  # type: ignore[attr-defined]
-        assert engine2._pending_flip_surplus_closes == {}, \
-            "the second partial of the same order was wrongly deduped"
-        assert pos2.size == -1.0
-
-
-def __test_snapshot_settled_surplus_close_drops_an_unobserved_child__(tmp_path):
-    """A child the engine NEVER saw is still guarded after snapshot settle.
-
-    The stale-grace probe settles the correction from the broker snapshot
-    and consumes the outstanding quantity from the book, but the leg lists
-    only hold the children whose events did arrive. The missing child's
-    composed ``{parent_coid}:{leg_id}`` coid never equals the cached parent
-    coid, so an exact-membership gate lets its delayed event through into
-    ``record_fill``.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-    from pynecore.core.broker.sync_engine import (
-        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
-    )
-    import time as _time
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        _b1, engine1, close_key, marker = _drive_fold_surplus_with_store(ctx)
-        parent_coid = marker.client_order_id
-        leg1 = _fan_leg_fill(parent_coid, 1, 0.5)
-        leg2 = _fan_leg_fill(parent_coid, 2, 0.5)
-        engine1._route_event(leg1)  # type: ignore[attr-defined]
-
-        _b2, engine2, pos2 = _restarted_engine(ctx)
-        pos2.size = -1.5
-        pos2.sign = -1.0
-        pos2.avg_price = 48_990.0
-        engine2._replay_pending_flip_surplus_closes()
-        replayed = engine2._pending_flip_surplus_closes[close_key]
-        replayed.pending_since = (
-            _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
-        )
-        # leg2's event was lost; the snapshot proves it executed.
-        engine2._raise_if_stale_pending_flip_surplus_close(ExchangePosition(
-            symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
-            unrealized_pnl=0.0, liquidation_price=None,
-            leverage=1.0, margin_mode="isolated",
-        ))
-        assert engine2._pending_flip_surplus_closes == {}
-        assert pos2.size == -1.0
-
-        engine2._route_event(leg2)  # type: ignore[attr-defined]
-        assert pos2.size == -1.0, \
-            "the never-observed fan child was booked after snapshot settle"
-
-
-def __test_snapshot_settled_surplus_close_ignores_its_late_fill__():
-    """The lost FILL the snapshot settled must be a no-op when it arrives.
-
-    Stale-grace settlement consumes the outstanding correction quantity
-    from the book itself, so the delayed original FILL (the WS gap that
-    caused the stale window closing behind it) must be recognised as
-    already applied.
-    """
-    from pynecore.core.broker.sync_engine import (
-        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
-    )
-    import time as _time
-
-    b, engine, _close_key, marker = _drive_fold_surplus_with_store(None)
-    pos = engine._position
-    marker.pending_since = (
-        _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
-    )
-    b.position = ExchangePosition(
-        symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
-        unrealized_pnl=0.0, liquidation_price=None,
-        leverage=1.0, margin_mode="isolated",
-    )
-    engine.reconcile()
-    assert pos.size == -1.0
-
-    engine._route_event(replace(  # type: ignore[attr-defined]
-        _fan_leg_fill(marker.client_order_id, 8, 1.0),
-        fill_id="corr-late",
-    ))
-    assert pos.size == -1.0, \
-        "the late corrective fill re-applied a correction the snapshot settled"
-
-
-def __test_replayed_surplus_batch_settles_across_incrementally_armed_markers__(tmp_path):
-    """Two corrections armed around a partial fill must share one anchor.
-
-    The second marker's ``pre_close_position_size`` already contains the
-    slice the first correction booked before it was armed. Summing every
-    marker's cumulative ``filled_qty`` on top of that anchor counts the
-    slice twice, so a broker snapshot reflecting BOTH completed
-    corrections matches neither expectation and the run false-halts for
-    manual intervention despite correct venue exposure.
-    """
-    from pynecore.core.broker.storage import BrokerStore
-    from pynecore.core.broker.sync_engine import (
-        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
-    )
-    import time as _time
-
-    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
-        ctx = _open_t025_run(store)
-        b = MockBroker()
-        b.position_port = b
-
-        # The fractional (0.2 / 0.5) corrective slices must survive the
-        # port's volume grid — the default int() quantizer would floor
-        # them to zero and skip the correction.
-        async def _fine_quantizer(_symbol):
-            return lambda u: round(u, 2)
-
-        b.get_volume_quantizer = _fine_quantizer  # type: ignore[method-assign]
-        pos = BrokerPosition()
-        engine = OrderSyncEngine(
-            broker=b, position=pos,  # type: ignore[arg-type]
-            symbol=SYMBOL, run_tag=RUN_TAG, mintick=1.0, store_ctx=ctx,
-        )
-        pos.entry_orders["S"] = _entry_order("S", -2.0)
-        engine.sync(BAR_TS)
-        s_deal_id = engine.order_mapping["S"][0]
-        position_coid = engine._envelopes["S"].client_order_id('e')
-        engine._route_event(  # type: ignore[attr-defined]
-            _fill_event('sell', 1.5, 48_990.0, pine_id="S", xchg_id=s_deal_id,
-                        fill_id="s-1", event_type='partial',
-                        filled_qty=1.5, remaining_qty=0.5))
-        assert pos.size == -1.5
-        # A prior-run correction for the first 0.5 surplus slice.
-        b.raw_legs = [_pleg("8", "sell", 1.5, open_time=2.0)]
-        key1, marker1 = _arm_prior_run_surplus_close(
-            engine, ctx, seq=1, expected_qty=0.5,
-            position_coid=position_coid, target_exchange_id=s_deal_id,
-            batch_outstanding_delta=0.5,
-        )
-
-        # First correction partially fills BEFORE the second is armed —
-        # this slice lands inside the second marker's anchor.
-        engine._route_event(replace(  # type: ignore[attr-defined]
-            _fan_leg_fill(marker1.client_order_id, 8, 0.2),
-            fill_id="corr-1a", event_type='partial',
-        ))
-        assert round(pos.size, 12) == -1.3
-        assert engine._pending_flip_surplus_closes[key1].filled_qty == 0.2
-
-        b.raw_legs = [_pleg("9", "sell", 1.8, open_time=3.0)]
-        engine._route_event(  # type: ignore[attr-defined]
-            _fill_event('sell', 0.5, 48_985.0, pine_id="S", xchg_id=s_deal_id,
-                        fill_id="s-2"))
-        assert round(pos.size, 12) == -1.8
-        # The second prior-run correction: its anchor already contains the
-        # 0.2 slice above, and its batch delta carries its own 0.5 plus the
-        # 0.3 still outstanding on the first.
-        key2, _marker2 = _arm_prior_run_surplus_close(
-            engine, ctx, seq=2, expected_qty=0.5,
-            position_coid=position_coid, target_exchange_id=s_deal_id,
-            batch_outstanding_delta=0.8,
-        )
-        assert len(engine._pending_flip_surplus_closes) == 2
-
-        _b2, engine2, _pos2 = _restarted_engine(ctx)
-        engine2._replay_pending_flip_surplus_closes()
-        assert set(engine2._pending_flip_surplus_closes) == {key1, key2}
-        # Shift both arm times back past the grace window by the same
-        # amount so their real ordering (which picks the anchor) survives.
-        replayed = list(engine2._pending_flip_surplus_closes.values())
-        shift = max(m.pending_since for m in replayed) - (
-            _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
-        )
-        for m in replayed:
-            m.pending_since -= shift
-        # Venue executed both corrections during the downtime: -1.8 plus
-        # the 0.3 still outstanding on the first and the whole 0.5 of the
-        # second.
-        snapshot = ExchangePosition(
-            symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
-            unrealized_pnl=0.0, liquidation_price=None,
-            leverage=1.0, margin_mode="isolated",
-        )
-        engine2._raise_if_stale_pending_flip_surplus_close(snapshot)
-        assert engine2._pending_flip_surplus_closes == {}
-        assert ctx.find_event_by_intent_key(key1, 'flip_surplus_close_filled')
-        assert ctx.find_event_by_intent_key(key2, 'flip_surplus_close_filled')
-
-
-def __test_stale_in_process_surplus_close_settles_and_books_the_outstanding__():
-    """In-process stale settle consumes the outstanding qty from the FIFO book.
-
-    Same-process fill loss (WS gap on a polled broker): the reconcile
-    grace probe proves the correction landed and must book the missing
-    slice exactly as the lost FILL would have — shrinking the surplus
-    trade and adopting the broker size — or the engine view keeps the
-    surplus indefinitely (the periodic reconcile only acts on
-    shrink-to-zero transitions).
-    """
-    from pynecore.core.broker.sync_engine import (
-        DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
-    )
-    import time as _time
-
-    b, engine, _close_key, marker = _drive_fold_surplus_with_store(None)
-    pos = engine._position
-    assert b.close_leg_calls == [("8", 1)]
-    n_close_legs = len(b.close_leg_calls)
-    marker.pending_since = (
-        _time.time() - DEFENSIVE_CLOSE_RESOLUTION_GRACE_S - 10.0
-    )
-    b.position = ExchangePosition(
-        symbol=SYMBOL, side="short", size=1.0, entry_price=48_990.0,
-        unrealized_pnl=0.0, liquidation_price=None,
-        leverage=1.0, margin_mode="isolated",
-    )
-    engine.reconcile()
-    assert engine.halted is False
-    assert engine._pending_flip_surplus_closes == {}
-    assert pos.size == -1.0
-    assert round(sum(t.size for t in pos.open_trades), 12) == -1.0
-    assert len(b.close_leg_calls) == n_close_legs  # no re-dispatch
-
-
 def __test_restart_between_fan_legs_keeps_the_defensive_close_armed__(tmp_path):
     """A crash between fan legs must not settle the whole close.
 
@@ -11581,16 +11063,18 @@ def __test_reconcile_pending_defensive_close_within_grace_does_not_halt__():
         ),
     )
     engine.reconcile()
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
-def __test_reconcile_pending_defensive_close_past_grace_halts__():
-    """A past-grace pending marker halts the run when the broker still reports the position open.
+def __test_reconcile_pending_defensive_close_past_grace_blocks_entries__():
+    """A past-grace pending marker blocks new entries when the broker still reports the position open.
 
-    A pending marker older than the grace window halts the run when
-    the broker still reports the position open — the FILL we are
-    waiting on is not coming and the close was not silently completed
-    server-side."""
+    A pending marker older than the grace window, with the broker still
+    reporting the position open, means the FILL may not come and the close
+    was not silently completed server-side. Its outcome is unknown, so it is
+    not sent again: the marker stays armed, new entries are blocked under the
+    entry's defensive-close cause, and every reconcile reads the venue
+    again. The run goes on."""
     from pynecore.core.broker.sync_engine import (
         DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
     )
@@ -11601,7 +11085,7 @@ def __test_reconcile_pending_defensive_close_past_grace_halts__():
 
     b = MockBroker()
     # Broker still shows the position open — the close did NOT happen
-    # silently on the server, this is a genuine stuck-pending halt.
+    # silently on the server, this is a genuine stuck-pending close.
     b.position = ExchangePosition(
         symbol=SYMBOL, side="long", size=1.0, entry_price=1.0,
         unrealized_pnl=0.0, liquidation_price=None,
@@ -11619,16 +11103,27 @@ def __test_reconcile_pending_defensive_close_past_grace_halts__():
             position_side='buy', qty=1.0, symbol=SYMBOL,
         ),
     )
-    with pytest.raises(BrokerManualInterventionError) as exc:
-        engine.reconcile()
-    assert exc.value.intent_key == '__pyne_defensive_close__coid-1'
-    assert engine.halted is True
+    engine.reconcile()
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert 'defensive_close:Long' in engine._entry_block_causes
+    assert 'Long' in engine._pending_defensive_close
+    assert b.close_calls == [], "a close of unknown outcome was sent again"
+    # The next reconcile reads the venue again; once it shows the close
+    # done (flat), the marker settles, and the reconcile after it (whose
+    # cause pass runs before the probe) ends the block by itself.
+    b.position = None
+    pos.size = 0.0
+    engine.reconcile()
+    assert 'Long' not in engine._pending_defensive_close
+    engine.reconcile()
+    assert 'defensive_close:Long' not in engine._entry_block_causes
+    assert not engine.quarantined
 
 
 def __test_reconcile_pending_defensive_close_past_grace_settles_when_flat__():
-    """A past-grace pending marker does NOT halt when the broker snapshot already shows flat.
+    """A past-grace pending marker does NOT block when the broker snapshot already shows flat.
 
-    A pending marker past the grace window does NOT halt when the
+    A pending marker past the grace window does NOT block when the
     broker snapshot already shows the position flat — the close did
     settle, only the FILL event has not yet been queued (long restart
     gap, poll-based broker)."""
@@ -11656,7 +11151,7 @@ def __test_reconcile_pending_defensive_close_past_grace_settles_when_flat__():
         ),
     )
     engine.reconcile()
-    assert engine.halted is False
+    assert not engine.quarantined
     # Marker is settled — duplicate caches seeded, marker dropped.
     assert 'Long' not in engine._pending_defensive_close
     assert (
@@ -11670,11 +11165,11 @@ def __test_reconcile_pending_defensive_close_past_grace_settles_when_flat__():
     )
 
 
-def __test_reconcile_pending_defensive_close_oldest_drives_halt__():
-    """When multiple stale markers exist, the OLDEST one drives the halt message.
+def __test_reconcile_every_stale_defensive_close_blocks_under_its_own_cause__():
+    """Every stale marker blocks new entries under a cause of its own entry.
 
-    When multiple markers exist, the OLDEST one drives the halt
-    message — so operator triage starts from the longest-stuck close."""
+    Each cause ends by itself once its own entry's close settles, so one
+    stuck close never holds the block for another."""
     from pynecore.core.broker.sync_engine import (
         DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
     )
@@ -11715,9 +11210,10 @@ def __test_reconcile_pending_defensive_close_oldest_drives_halt__():
             position_side='buy', qty=1.0, symbol=SYMBOL,
         ),
     )
-    with pytest.raises(BrokerManualInterventionError) as exc:
-        engine.reconcile()
-    assert exc.value.intent_key == '__pyne_defensive_close__coid-B'  # older one
+    engine.reconcile()
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert {'defensive_close:LongA', 'defensive_close:LongB'} <= set(engine._entry_block_causes)
+    assert set(engine._pending_defensive_close) == {'LongA', 'LongB'}
 
 
 def __test_reconcile_pending_defensive_close_past_grace_settles_when_pyramiding_reduced__():
@@ -11727,7 +11223,7 @@ def __test_reconcile_pending_defensive_close_past_grace_settles_when_pyramiding_
     entry reduces — but does not flatten — the netted aggregate position.
     The stale-grace path must accept "broker matches engine's pre-close
     view minus the closed entry's qty" as proof the close filled, instead
-    of false-halting because the aggregate is not zero."""
+    of falsely blocking because the aggregate is not zero."""
     from pynecore.core.broker.sync_engine import (
         DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
     )
@@ -11758,10 +11254,10 @@ def __test_reconcile_pending_defensive_close_past_grace_settles_when_pyramiding_
             position_side='buy', qty=1.0, symbol=SYMBOL,
         ),
     )
-    # Should NOT halt: broker_signed=+1.0 matches expected
+    # Should NOT block: broker_signed=+1.0 matches expected
     # (pos.size 2.0 minus marker qty 1.0 on the buy side).
     engine.reconcile()
-    assert engine.halted is False
+    assert not engine.quarantined
     assert 'LongB' not in engine._pending_defensive_close
     assert (
         '__pyne_defensive_close__coid-B'
@@ -11776,13 +11272,14 @@ def __test_reconcile_pending_defensive_close_past_grace_settles_when_pyramiding_
     assert pos.sign == 1.0
 
 
-def __test_reconcile_pending_defensive_close_pyramiding_mismatch_still_halts__():
-    """Pyramiding still halts when the broker's leftover qty mismatches the aggregate marker qty.
+def __test_reconcile_pending_defensive_close_pyramiding_mismatch_still_blocks__():
+    """Pyramiding still blocks when the broker's leftover qty mismatches the aggregate marker qty.
 
     Pyramiding extension must NOT accept arbitrary leftover qty. If
     the broker's reduction does not match the stale markers' aggregate
-    qty, the run must still halt — the deviation could mean the close
-    did not fill or an unrelated fill arrived."""
+    qty, the close is not settled and new entries stay blocked — the
+    deviation could mean the close did not fill or an unrelated fill
+    arrived."""
     from pynecore.core.broker.sync_engine import (
         DEFENSIVE_CLOSE_RESOLUTION_GRACE_S,
     )
@@ -11793,7 +11290,7 @@ def __test_reconcile_pending_defensive_close_pyramiding_mismatch_still_halts__()
 
     b = MockBroker()
     # Engine view: 2.0 long. Marker says close qty 1.0. Broker reports
-    # 1.5 long — no clean match (off by 0.5) — must halt.
+    # 1.5 long — no clean match (off by 0.5) — must block.
     b.position = ExchangePosition(
         symbol=SYMBOL, side="long", size=1.5, entry_price=1.0,
         unrealized_pnl=0.0, liquidation_price=None,
@@ -11811,10 +11308,11 @@ def __test_reconcile_pending_defensive_close_pyramiding_mismatch_still_halts__()
             position_side='buy', qty=1.0, symbol=SYMBOL,
         ),
     )
-    with pytest.raises(BrokerManualInterventionError) as exc:
-        engine.reconcile()
-    assert exc.value.intent_key == '__pyne_defensive_close__coid-B'
-    assert engine.halted is True
+    engine.reconcile()
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert 'defensive_close:LongB' in engine._entry_block_causes
+    assert 'LongB' in engine._pending_defensive_close
+    assert pos.size == 2.0
 
 
 def __test_no_fifo_defensive_close_fill_preserves_pyramiding_size__():
@@ -11936,7 +11434,7 @@ def __test_reconcile_plugin_override_grace_window__():
         ),
     )
     engine.reconcile()
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def __test_reconcile_no_change_when_sizes_match__():
@@ -12338,6 +11836,52 @@ def __test_oca_reduce_full_fill_cancels_zero_quantity_sibling__():
     assert len(b.cancel_calls) == 1
     assert b.cancel_calls[0].intent.pine_id == "B"
     assert "B" not in engine.active_intents
+
+
+@pytest.mark.parametrize('deferral', ['connection_lost', 'quarantine', 'refused'])
+def __test_an_oca_reduce_amend_that_does_not_go_out_keeps_the_old_order__(deferral):
+    """The OCA reduce of a sibling that cannot be amended now keeps the old order.
+
+    The quarantine blocks entry amends or the refusal is deferred: the
+    sibling keeps its OLD intent, the event drain goes on, and the next diff
+    amends it to the reduced Pine order. Before, the refusal escaped the event
+    routing. A request that never left ends the sync like any write that did
+    not go out, and the next sync sends the amend again.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine_with_policy(b)
+    pos.entry_orders["A"] = _oca_entry(
+        "A", 0.4, oca_name="G", oca_type=_oca.reduce, limit=50_000.0,
+    )
+    pos.entry_orders["B"] = _oca_entry(
+        "B", 1.0, oca_name="G", oca_type=_oca.reduce, limit=49_000.0,
+    )
+    engine.sync(BAR_TS)
+    if deferral == 'connection_lost':
+        b.raise_on_next_modify_entry = ExchangeConnectionError("link dropped")
+    elif deferral == 'quarantine':
+        engine.record_quarantine("test block", {}, cause="test")
+    else:
+        def _refuse(old, new):
+            raise _RejectedModifyDeferred(new.intent_key)
+        engine._dispatch_modify = _refuse  # type: ignore[method-assign]
+
+    engine.on_order_event(_fill_event("buy", 0.4, 50_000.0, pine_id="A", leg=LegType.ENTRY))
+    if deferral == 'connection_lost':
+        with pytest.raises(ExchangeConnectionError):
+            engine.sync(BAR_TS + 60_000)
+        assert engine.active_intents["B"].qty == 1.0, "the OLD intent stays active"
+        engine.sync(BAR_TS + 120_000)
+    else:
+        engine.sync(BAR_TS + 60_000)
+
+    assert pos.entry_orders["B"].size == pytest.approx(0.6)
+    if deferral == 'connection_lost':
+        assert [new.intent.qty for _old, new in b.modify_entry_calls] == [
+            pytest.approx(0.6), pytest.approx(0.6)]
+        assert engine.active_intents["B"].qty == pytest.approx(0.6)
+    else:
+        assert engine.active_intents["B"].qty == 1.0, "the OLD intent stays active"
 
 
 def __test_standalone_fill_without_oca_group_is_quiet__():
@@ -13245,8 +12789,7 @@ def __test_bracket_reject_dispatches_defensive_close_and_skips_intent__():
     2. Surface the original exit intent as :class:`OrderSkippedByPlugin`
        so the caller drops it from ``_active_intents`` and lets the next
        bar re-evaluate from real state.
-    3. NOT halt — no :class:`BrokerManualInterventionError`, no
-       ``_record_halt`` write.
+    3. NOT block — no quarantine of any kind once the close went out.
     """
     b = MockBroker()
     b.raise_on_next_exit = _bracket_reject_error()
@@ -13272,8 +12815,8 @@ def __test_bracket_reject_dispatches_defensive_close_and_skips_intent__():
     assert close_env.intent.target_exchange_id == 'deal-L'
     assert close_env.intent.target_entry_id is None
 
-    # Did not halt — no manual-intervention record on the engine.
-    assert engine.halted is False
+    # Did not block — no quarantine on the engine.
+    assert not engine.quarantined
 
 
 def __test_bracket_reject_without_exchange_id_still_dispatches_close__():
@@ -13297,7 +12840,7 @@ def __test_bracket_reject_without_exchange_id_still_dispatches_close__():
     assert isinstance(close_intent, CloseIntent)
     assert close_intent.target_position_coid == 'coid-entry'
     assert close_intent.target_exchange_id is None
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def __test_bracket_reject_short_position_close_side_is_buy__():
@@ -13368,7 +12911,7 @@ def __test_bracket_reject_zero_residual_skips_close_and_does_not_halt__():
     # The sync-loop guard against re-dispatching brackets for this
     # entry is still armed, same as on the dispatched-close path.
     assert 'Long' in engine._defensively_closed_entries_this_sync
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def __test_bracket_reject_from_exit_modify_dispatches_defensive_close__():
@@ -13415,7 +12958,7 @@ def __test_bracket_reject_from_exit_modify_dispatches_defensive_close__():
     assert close_env.intent.immediately is True
     # The exit slot was dropped so the next bar re-evaluates from scratch.
     assert "Bracket\0L" not in engine.active_intents
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def __test_bracket_reject_zero_residual_from_exit_modify_does_not_halt__():
@@ -13454,14 +12997,14 @@ def __test_bracket_reject_zero_residual_from_exit_modify_does_not_halt__():
     # FILL will ever arrive to settle one).
     assert 'L' not in engine._pending_defensive_close
     assert "Bracket\0L" not in engine.active_intents
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
-def __test_bracket_reject_defensive_close_timeout_does_not_halt__():
-    """A parked (timed-out) defensive close does not escalate to a halt.
+def __test_bracket_reject_defensive_close_timeout_does_not_block__():
+    """A parked (timed-out) defensive close does not block new entries.
 
     Defensive close itself parks (timeout) — at worst the position
-    stays open until the next reconcile. Don't escalate to halt."""
+    stays open until the next reconcile, and the grace probe follows it."""
     b = MockBroker()
     b.raise_on_next_exit = _bracket_reject_error()
 
@@ -13480,19 +13023,104 @@ def __test_bracket_reject_defensive_close_timeout_does_not_halt__():
     with pytest.raises(OrderSkippedByPlugin):
         engine._dispatch_new(intent)
 
-    assert engine.halted is False
+    assert not engine.quarantined
 
     # Cleanup so other tests (if MockBroker was shared, which it isn't here)
     # don't trip — defensive belt-and-suspenders.
     b.execute_close = original_close  # type: ignore[method-assign]
 
 
-def __test_bracket_reject_defensive_close_unexpected_failure_halts__():
-    """An unexpected defensive-close failure escalates to manual intervention and records the halt.
+def __test_bracket_reject_defensive_close_that_did_not_go_out_queues_a_retry__():
+    """A defensive close the plugin says never left queues the close again and blocks new entries.
 
-    Defensive close fails with an unexpected exception (not park, not
-    skip, not already a manual-intervention) — escalate to manual
-    intervention and record the halt so the runner stops gracefully."""
+    The close did not go out (the request never left the client), so no
+    marker stays armed, the close is queued for the next reconcile and new
+    entries are blocked under the entry's defensive-close cause. The exit is
+    surfaced as skipped and the run goes on."""
+    b = MockBroker()
+    b.raise_on_next_exit = _bracket_reject_error()
+
+    async def _broken_close(envelope):
+        raise ExchangeConnectionError("close request never left")
+
+    b.execute_close = _broken_close  # type: ignore[method-assign]
+    engine, _pos = _mk_engine(b)
+
+    intent = _bracket_reject_exit_intent()
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        engine._dispatch_new(intent)
+
+    assert exc.value.intent_key == intent.intent_key
+    assert 'Long' not in engine._pending_defensive_close
+    retry = engine._defensive_close_retries['coid-entry']  # type: ignore[attr-defined]
+    assert retry.context.position_deal_id == 'deal-L'
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert 'defensive_close:Long' in engine._entry_block_causes
+    assert not engine.venue_writes_blocked
+
+
+def __test_a_defensive_close_retry_survives_a_restart__(tmp_path):
+    """A defensive close owed when the process stops is sent again by the next one.
+
+    The retry is stored on the position's journal row; the restart holds it
+    again, blocks new entries under the entry's cause, waits for an attempt
+    of the earlier process to settle, and then sends the close sized from the
+    venue position under a fresh attempt id.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name="testbroker") as store:
+        ctx = store.open_run(
+            RunIdentity(strategy_id="t025", symbol=SYMBOL, timeframe="60",
+                        account_id="testbroker-demo", label=None),
+            script_source="src", script_path="t025.py",
+        )
+        ctx.upsert_order(
+            'coid-entry', symbol=SYMBOL, side='buy', qty=1.0,
+            state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+            extras={'kind': 'position'},
+        )
+        b1 = MockBroker()
+        b1.raise_on_next_exit = _bracket_reject_error()
+        b1.raise_on_next_close = ExchangeConnectionError("close request never left")
+        engine1, _pos1 = _mk_engine(b1, store_ctx=ctx)
+        with pytest.raises(OrderSkippedByPlugin):
+            engine1._dispatch_new(_bracket_reject_exit_intent())
+        assert 'coid-entry' in engine1._defensive_close_retries  # type: ignore[attr-defined]
+        stored = ctx.get_order('coid-entry')
+        assert stored is not None and 'defensive_close_retry' in (stored.extras or {})
+
+        b2 = MockBroker()
+        engine2, pos2 = _mk_engine(b2, store_ctx=ctx)
+        engine2._replay_pending_defensive_closes()  # type: ignore[attr-defined]
+        retry = engine2._defensive_close_retries['coid-entry']  # type: ignore[attr-defined]
+        assert retry.context.position_deal_id == 'deal-L'
+        assert 'defensive_close:Long' in engine2._entry_block_causes  # type: ignore[attr-defined]
+
+        pos2.entry_orders["Long"] = _entry_order("Long", 1.0)
+        engine2.sync(BAR_TS)
+        engine2._route_event(_fill_event('buy', 1.0, 50_000.0, pine_id="Long"))  # type: ignore[attr-defined]
+        b2.position = ExchangePosition(
+            symbol=SYMBOL, side="long", size=1.0, entry_price=50_000.0,
+            unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+        )
+        engine2._drive_defensive_close_retries(now_ms=int(time.time() * 1000))  # type: ignore[attr-defined]
+        assert b2.close_calls == [], "an attempt of the earlier process may still settle"
+        engine2._drive_defensive_close_retries(  # type: ignore[attr-defined]
+            now_ms=int(time.time() * 1000) + 3_600_000)
+        assert len(b2.close_calls) == 1
+        assert b2.close_calls[0].intent.qty == 1.0
+        assert b2.close_calls[0].intent.pine_id.endswith("__retry1")
+        stored = ctx.get_order('coid-entry')
+        assert stored is not None and 'defensive_close_retry' not in (stored.extras or {})
+
+
+def __test_bracket_reject_defensive_close_that_raised_raw_is_an_unknown_outcome__():
+    """A raw exception escaping the defensive close may have landed: it is parked, never resent.
+
+    The marker stays armed and the close waits for the venue's verdict (the
+    grace probe), and the plugin's contract violation blocks new entries.
+    Before, the raw exception was read as "did not go out" and the close was
+    queued to go out again, which could have closed the position twice.
+    """
     b = MockBroker()
     b.raise_on_next_exit = _bracket_reject_error()
 
@@ -13502,15 +13130,161 @@ def __test_bracket_reject_defensive_close_unexpected_failure_halts__():
     b.execute_close = _broken_close  # type: ignore[method-assign]
     engine, _pos = _mk_engine(b)
 
-    intent = _bracket_reject_exit_intent()
-    with pytest.raises(BrokerManualInterventionError) as exc:
-        engine._dispatch_new(intent)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._dispatch_new(_bracket_reject_exit_intent())
 
-    assert "Defensive close after bracket attach reject failed" in str(exc.value)
-    assert exc.value.intent_key == intent.intent_key
-    assert exc.value.context['position_deal_id'] == 'deal-L'
-    # Halt recorded so subsequent syncs return early via the halt flag.
-    assert engine.halted is True
+    assert 'Long' in engine._pending_defensive_close
+    assert 'coid-entry' not in engine._defensive_close_retries  # type: ignore[attr-defined]
+    assert 'untranslated_write_fault' in engine._entry_block_causes  # type: ignore[attr-defined]
+    assert engine.pending_verification
+
+
+def __test_helper_reject_bracket_of_open_long(b, engine, venue_qty):
+    """Open long ``L`` (1 unit), its bracket refused after the fill; the venue holds ``venue_qty``.
+
+    :return: The pending defensive-close marker of ``L``.
+    """
+    pos = engine._position  # type: ignore[attr-defined]
+    _open_long(b, engine, pos)
+    b.position = ExchangePosition(
+        symbol=SYMBOL, side="long", size=venue_qty, entry_price=50_000.0,
+        unrealized_pnl=0.0, liquidation_price=None, leverage=1.0, margin_mode="isolated",
+    )
+    reject = BracketAttachAfterFillRejectedError(
+        "bracket attach reject", position_deal_id='deal-L', position_coid='coid-L',
+        symbol=SYMBOL, position_side='buy', qty=1.0, from_entry='L',
+    )
+    exit_l = ExitIntent(pine_id='L-X', from_entry='L', symbol=SYMBOL, side='sell',
+                        qty=1.0, tp_price=51_000.0, sl_price=49_000.0)
+    with pytest.raises(OrderSkippedByPlugin):
+        engine._handle_bracket_attach_after_fill_reject(exit_l, reject)  # type: ignore[attr-defined]
+    return engine._pending_defensive_close['L']  # type: ignore[attr-defined]
+
+
+def __test_helper_close_cancelled_event(marker, close_order_id):
+    """The venue's ``cancelled`` event of ``marker``'s defensive close order."""
+    event = _cancelled_event(close_order_id, pine_id=marker.close_intent_key)
+    return replace(event, order=replace(event.order, side='sell',
+                                        client_order_id=marker.close_client_order_id))
+
+
+@pytest.mark.parametrize("venue_qty", [1.0, 0.6])
+def __test_a_defensive_close_the_venue_cancelled_goes_out_again_sized_from_the_venue__(
+        venue_qty):
+    """A defensive close the venue ended unfilled is sent again by the next reconcile.
+
+    The position is open and unprotected with nothing in flight: the marker
+    is dropped, new entries are blocked under the entry's cause, and the
+    next reconcile sends the close again as the same targeted, reduce-only
+    defensive close under an id of its own, sized from the venue position
+    read right before (never more than the position's own quantity or what
+    the book holds of the entry). Its fill flattens the book, and the block
+    ends by itself.
+    """
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    marker = __test_helper_reject_bracket_of_open_long(b, engine, venue_qty)
+    assert len(b.close_calls) == 1
+    close_order_id = engine.order_mapping[marker.close_intent_key][0]
+
+    engine._route_event(  # type: ignore[attr-defined]
+        __test_helper_close_cancelled_event(marker, close_order_id))
+    assert 'L' not in engine._pending_defensive_close
+    assert 'defensive_close:L' in engine._entry_block_causes
+    assert len(b.close_calls) == 1, "the close went out again before the venue was read"
+
+    engine.reconcile()
+    assert len(b.close_calls) == 2
+    retry = b.close_calls[1].intent
+    assert isinstance(retry, CloseIntent)
+    assert retry.synthetic_kind == 'defensive_close'
+    assert retry.side == 'sell' and retry.qty == venue_qty
+    assert retry.target_position_coid == 'coid-L'
+    assert retry.pine_id == '__pyne_defensive_close__coid-L__retry1'
+    rearmed = engine._pending_defensive_close['L']
+    assert rearmed.close_intent_key == retry.intent_key
+    assert engine._defensive_close_retries == {}  # type: ignore[attr-defined]
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+
+    if venue_qty == 1.0:
+        retry_order_id = engine.order_mapping[retry.intent_key][0]
+        engine._route_event(replace(  # type: ignore[attr-defined]
+            _fill_event('sell', 1.0, 50_500.0, pine_id=retry.intent_key,
+                        leg=LegType.CLOSE, xchg_id=retry_order_id),
+            order=replace(_fill_event('sell', 1.0, 50_500.0, pine_id="").order,
+                          id=retry_order_id,
+                          client_order_id=rearmed.close_client_order_id),
+        ))
+        assert 'L' not in engine._pending_defensive_close
+        assert pos.size == 0.0
+        b.position = None
+        engine.reconcile()
+        assert 'defensive_close:L' not in engine._entry_block_causes
+        assert not engine.quarantined
+
+
+def __test_a_defensive_close_retry_never_sends_against_a_venue_without_the_position__():
+    """A retry whose venue holds nothing on the position's side ends with nothing sent."""
+    b = MockBroker()
+    engine, _pos = _mk_engine(b)
+    marker = __test_helper_reject_bracket_of_open_long(b, engine, 1.0)
+    close_order_id = engine.order_mapping[marker.close_intent_key][0]
+    engine._route_event(  # type: ignore[attr-defined]
+        __test_helper_close_cancelled_event(marker, close_order_id))
+
+    b.position = None
+    engine.reconcile()
+
+    assert len(b.close_calls) == 1, "a close went out against a flat venue"
+    assert engine._defensive_close_retries == {}  # type: ignore[attr-defined]
+
+
+def __test_a_failed_residual_cleanup_is_retried_by_the_next_reconcile__():
+    """Residual orders a defensive close could not cancel are cancelled again.
+
+    The cleanup is queued with an entry block of its own cause; the next
+    reconcile cancels the residuals, and with nothing of the entry held the
+    block ends by itself.
+    """
+    b = MockBroker()
+    engine, _pos = _mk_engine(b)
+    context = BracketAttachRejectContext(
+        intent_key='Bracket\0L', position_coid='coid-L', position_side='buy',
+        qty=1.0, symbol=SYMBOL, from_entry='L',
+    )
+    engine._schedule_residual_cleanup_retry(context, "cancel failed")  # type: ignore[attr-defined]
+    assert 'coid-L#residuals' in engine._defensive_close_retries  # type: ignore[attr-defined]
+    assert 'defensive_close:L' in engine._entry_block_causes
+
+    engine.reconcile()
+    assert engine._defensive_close_retries == {}  # type: ignore[attr-defined]
+    engine.reconcile()
+    assert 'defensive_close:L' not in engine._entry_block_causes
+    assert not engine.quarantined
+
+
+def __test_a_plugin_report_on_dispatch_parks_the_write__():
+    """A ``BrokerManualInterventionError`` from ``execute_entry`` parks the entry.
+
+    The plugin could not tell what the write did: the entry is parked under
+    its id for venue verification (never sent again blindly), and the report
+    blocks new entries without stopping the run or the venue writes.
+    """
+    expected_coid = _preview_entry_coid("L", limit=50_000.0)
+    b = MockBroker()
+    b.raise_on_next_entry = BrokerManualInterventionError("venue answer not understood")
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+
+    engine.sync(BAR_TS)
+
+    assert expected_coid in engine.pending_verification
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert not engine.venue_writes_blocked
+    assert any(cause is not None and cause.startswith('intervention:')
+               for cause in engine._entry_block_causes)
+    engine.sync(BAR_TS + 60_000)
+    assert len(b.entry_calls) == 1
 
 
 def __test_bracket_reject_defensive_close_stamps_natural_close_on_entry__(
@@ -13765,7 +13539,7 @@ def __test_bracket_reject_defensive_close_without_broker_order_drops_marker__():
         f"__pyne_defensive_close____pyne_orphan__{SYMBOL}__Long"] == []
     # No marker survives to time out into a manual-intervention halt.
     assert engine.pending_defensive_close == {}
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def __test_bracket_reject_defensive_close_cleanup_deferred_to_fill__(
@@ -13934,7 +13708,7 @@ def __test_bracket_reject_skips_sibling_exit_for_same_from_entry_in_diff_loop__(
         assert 'BracketA\0Long' not in engine.active_intents
         assert 'BracketB\0Long' not in engine.active_intents
         # No halt — defensive recovery completed and absorbed both siblings.
-        assert engine.halted is False
+        assert not engine.quarantined
 
 
 def __test_bracket_reject_marker_survives_apply_async_events_to_sync__(tmp_path):
@@ -14007,7 +13781,7 @@ def __test_bracket_reject_marker_survives_apply_async_events_to_sync__(tmp_path)
     assert len(b.close_calls) == 1
     # And cleared at end of sync — fresh bar starts clean.
     assert 'Long' not in engine._defensively_closed_entries_this_sync
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def _bracket_reject_scenario(tmp_path, mock_broker=None):
@@ -14774,13 +14548,14 @@ def __test_drive_native_failsafe_records_single_failure_per_dispatch__():
     assert len(calls) == 3
 
 
-def __test_drive_native_failsafe_dispatcher_manual_intervention_halts__():
-    """A dispatcher ``BrokerManualInterventionError`` records the halt and re-raises, not degrades.
+def __test_drive_native_failsafe_dispatcher_manual_intervention_blocks_entries__():
+    """A dispatcher ``BrokerManualInterventionError`` blocks new entries and counts as a failed PUT.
 
-    A dispatcher raising ``BrokerManualInterventionError`` is a terminal
-    halt, not a retryable PUT failure: the drive must record the halt and
-    re-raise instead of degrading the budget and letting the strategy
-    continue on an unsafe broker state."""
+    A dispatcher raising ``BrokerManualInterventionError`` is the plugin's
+    report that it cannot place the fail-safe: the drive latches the
+    report's entry block (so no new exposure opens on an unsafe broker
+    state), books the attempt as a failed PUT for the retry budget, and
+    returns. Nothing propagates and the run goes on."""
     engine, _ = _mk_engine(MockBroker())
     mgr = engine._native_failsafe_manager
     ref = "run-pi-bar-e0"
@@ -14789,20 +14564,27 @@ def __test_drive_native_failsafe_dispatcher_manual_intervention_halts__():
     mgr.recompute_worst_sl(parent_entry_dispatch_ref=ref,
                            active_sl_levels=[90.0], now_ms=1000.0)
 
-    def _halting_dispatcher(_snapshot):
+    calls: list[object] = []
+
+    def _reporting_dispatcher(snapshot):
+        calls.append(snapshot)
         raise BrokerManualInterventionError(
             "cannot resolve parent dealId", intent_key=ref,
         )
 
-    engine.set_native_bracket_dispatcher(_halting_dispatcher)
+    engine.set_native_bracket_dispatcher(_reporting_dispatcher)
 
-    with pytest.raises(BrokerManualInterventionError):
-        engine.drive_native_failsafe(now_ms=1000.0)
+    engine.drive_native_failsafe(now_ms=1000.0)
 
-    # Halt latched (so the engine stops dispatching) and the fail-safe was
-    # NOT degraded as if a retryable PUT failure had occurred.
-    assert engine.halted is True
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert not engine.venue_writes_blocked
+    assert any(cause is not None and cause.startswith('intervention:')
+               for cause in engine._entry_block_causes)
+    # One failed PUT is inside the retry budget: the state is still healthy
+    # and the snapshot is dispatched again by the next drive.
     assert mgr.get_state(ref).health is FailsafeHealth.HEALTHY
+    engine.drive_native_failsafe(now_ms=1000.0)
+    assert len(calls) == 2
 
 
 # === §2.6.7 native fail-safe observed recovery feed ===
@@ -14873,8 +14655,9 @@ def __test_native_failsafe_external_edit_follows_the_unexpected_cancel_policy__(
     """A moved fail-safe stop gets the configured policy, like any external edit.
 
     ``ignore`` / ``re_place`` leave the run trading (ownership still flips to
-    UNKNOWN, so the edit is not overwritten); ``halt`` records the
-    process-exiting halt instead of a quarantine.
+    UNKNOWN, so the edit is not overwritten). ``halt`` is no policy any more:
+    an unknown policy fails closed into the external-intervention
+    quarantine, and the process keeps running.
     """
     b = MockBroker()
     b.on_unexpected_cancel = policy
@@ -14893,23 +14676,22 @@ def __test_native_failsafe_external_edit_follows_the_unexpected_cancel_policy__(
         now_ms=2000.0,
     )
     assert mgr.get_state(ref).owner is FailsafeOwner.UNKNOWN
-    assert not engine.quarantined
-    assert not engine.venue_writes_blocked
     if policy == 'halt':
-        with pytest.raises(BrokerManualInterventionError, match="someone else"):
-            engine.raise_if_halted()
+        assert engine.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+        assert engine.venue_writes_blocked
     else:
-        engine.raise_if_halted()
+        assert not engine.quarantined
+        assert not engine.venue_writes_blocked
 
 
-def __test_finalize_halt_books_the_queued_close_without_venue_writes__():
-    """A fill queued before an async halt is booked while the run unwinds.
+def __test_a_queued_close_is_booked_under_an_external_report_without_venue_writes__():
+    """A fill queued before an external-intervention report is booked by the next drain.
 
     The reported shape: a plugin yields the fill of a manual close, then its
-    ``report_external_intervention`` raises the ``halt``. The fill sits in the
-    queue, and ``apply_async_events`` refuses to drain a halted engine, so the
-    runner's halt unwind books it through ``finalize_halt`` -- without letting
-    the booking cancel the now orphaned stop, or write anything else.
+    ``report_external_intervention`` delivers the signal. The engine latches
+    the external-intervention quarantine and keeps running, so the next
+    ``apply_async_events`` books the queued close -- without letting the
+    booking cancel the now orphaned stop, or write anything else.
     """
     b = MockBroker()
     engine, pos = _mk_engine(b)
@@ -14922,33 +14704,16 @@ def __test_finalize_halt_books_the_queued_close_without_venue_writes__():
                     xchg_id="manual-1"),
         pine_id=None, from_entry="L",
     ))
-    engine._record_halt(BrokerManualInterventionError(  # type: ignore[attr-defined]
-        "position closed by someone else"))
-    with pytest.raises(BrokerManualInterventionError):
-        engine.apply_async_events()
+    engine._quarantine_intervention(  # type: ignore[attr-defined]
+        UnexpectedCancelError("position closed by someone else"))
+    assert engine.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
     assert pos.size == 1.0
 
-    engine.finalize_halt()
+    engine.apply_async_events()
     assert pos.size == 0.0
     assert engine.venue_writes_blocked
     assert (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
             len(b.cancel_calls)) == writes_before
-    with pytest.raises(BrokerManualInterventionError):
-        engine.raise_if_halted()
-
-
-def __test_finalize_halt_is_a_no_op_without_a_halt__():
-    b = MockBroker()
-    engine, pos = _mk_engine(b)
-    _open_long_with_bracket(b, engine, pos)
-    engine.on_order_event(replace(
-        _fill_event('sell', 1.0, 49_500.0, pine_id="", leg=LegType.CLOSE,
-                    xchg_id="manual-1"),
-        pine_id=None, from_entry="L",
-    ))
-    engine.finalize_halt()
-    assert pos.size == 1.0
-    assert not engine.venue_writes_blocked
 
 
 def __test_enqueue_native_bracket_observed_recovers_on_drive__():
@@ -15859,14 +15624,15 @@ def __test_emulated_close_routes_through_position_port__():
     assert engine.order_mapping[close.intent_key] == [f"{parent_coid}:1"]
 
 
-def __test_emulated_close_transient_fault_halts_controlled_not_raw__():
-    """A raw ``TimeoutError`` escaping a port-path dispatch must become the
-    controlled manual-intervention halt, never a naked crash.
+def __test_emulated_close_transient_fault_parks_controlled_not_raw__():
+    """A raw ``TimeoutError`` escaping a port-path dispatch must become a
+    parked write of unknown outcome, never a naked crash.
 
     The port-path dispatches (run_close / run_reversal / run_exit_bracket)
     ride the same classified write bridge as their ``execute_*`` siblings —
     a bybit reversal close once let the raw bridge ``TimeoutError`` escape
-    and kill the run outright.
+    and kill the run outright. The close is parked for venue verification
+    and new entries are blocked under the untranslated-fault cause.
     """
     b = MockBroker()
     b.position_port = b
@@ -15878,8 +15644,11 @@ def __test_emulated_close_transient_fault_halts_controlled_not_raw__():
 
     b.close_leg = _timeout_close
     close = CloseIntent(pine_id="x", symbol=SYMBOL, side="sell", qty=2.0)
-    with pytest.raises(BrokerManualInterventionError):
-        engine._dispatch_new(close)
+    engine._dispatch_new(close)
+
+    assert engine.pending_verification, "the close of unknown outcome was not parked"
+    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+    assert 'untranslated_write_fault' in engine._entry_block_causes
 
 
 def __test_emulated_exit_routes_through_position_port__():
@@ -16347,7 +16116,7 @@ def __test_a_storage_failure_in_the_restart_settle_is_retried_not_raised__(tmp_p
         assert failed == [1]
         assert engine._pine_bracket_reconstruct_done is False  # type: ignore[attr-defined]
         assert engine._storage_failed_syncs == 1  # type: ignore[attr-defined]
-        assert not engine.halted and not engine.quarantined
+        assert not engine.quarantined
 
         engine.settle_restart_state(BAR_TS + 60_000)
         assert engine._pine_bracket_reconstruct_done is True  # type: ignore[attr-defined]
@@ -16954,7 +16723,7 @@ def _restart_cancel_matrix_run(tmp_path, monkeypatch, *, shape: str, cancel: str
         engine.sync(BAR_TS + 180_000)
         assert engine._pine_bracket_reconstruct_done is True  # type: ignore[attr-defined]
         assert pos.restart_cancels is None
-        assert not engine.halted and not engine.quarantined
+        assert not engine.quarantined
         if outcome == "reconstruct_fault" or (
                 outcome == "retire_fault" and _restart_cancel_superseded(rows, cancel, action)):
             assert faults, "the store fault was never reached"
@@ -18273,9 +18042,8 @@ def __test_quarantine_blocks_new_entry_but_sync_keeps_running__():
     running — the process stays alive, unlike the halt latch."""
     b = MockBroker()
     engine, pos = _mk_engine(b)
-    engine.record_quarantine("external cancel detected")
+    engine.record_quarantine("external cancel detected", cause="test")
     assert engine.quarantined is True
-    assert engine.halted is False
 
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
     engine.sync(BAR_TS)  # must not raise
@@ -18299,7 +18067,7 @@ def __test_quarantine_allows_exit_close_and_cancel__():
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1
 
-    engine.record_quarantine("external cancel detected")
+    engine.record_quarantine("external cancel detected", cause="test")
 
     # Protective exit for an open trade dispatches.
     pos.size = 1.0
@@ -18326,7 +18094,7 @@ def __test_quarantine_blocks_entry_modify_and_keeps_old_intent__():
     engine.sync(BAR_TS)
     assert len(b.entry_calls) == 1
 
-    engine.record_quarantine("external cancel detected")
+    engine.record_quarantine("external cancel detected", cause="test")
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=49_500.0)
     engine.sync(BAR_TS)
 
@@ -18339,8 +18107,8 @@ def __test_record_quarantine_is_idempotent_and_emits_once__():
     b = MockBroker()
     events: list[BrokerEvent] = []
     engine, _pos = _mk_engine_with_sink(b, events)
-    engine.record_quarantine("first reason", {'origin': 'test'})
-    engine.record_quarantine("second reason")
+    engine.record_quarantine("first reason", {'origin': 'test'}, cause="first")
+    engine.record_quarantine("second reason", cause="second")
 
     entered = [e for e in events if isinstance(e, QuarantineEnteredEvent)]
     assert len(entered) == 1
@@ -18361,7 +18129,7 @@ def __test_record_quarantine_concurrent_callers_latch_once__():
 
     def _caller(i: int) -> None:
         barrier.wait()
-        engine.record_quarantine(f"reason-{i}", {'origin': i})
+        engine.record_quarantine(f"reason-{i}", {'origin': i}, cause=f"cause-{i}")
 
     threads = [threading.Thread(target=_caller, args=(i,)) for i in range(n)]
     for t in threads:
@@ -18420,7 +18188,6 @@ def __test_push_external_cancel_stop_quarantines_and_blocks_replace__():
     engine._route_event(_cancelled_event(deal_id))
 
     assert engine.quarantined is True
-    assert engine.halted is False
     assert "L" not in engine.order_mapping
     assert "L" not in engine.active_intents
 
@@ -18445,7 +18212,7 @@ def __test_push_cancel_for_fully_filled_order_is_benign_echo__():
     engine._route_event(_cancelled_event(deal_id, filled_qty=1.0))
 
     assert engine.quarantined is False
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "L" in engine.order_mapping
     assert "L" in engine.active_intents
 
@@ -18471,7 +18238,7 @@ def __test_native_cancel_all_expected_no_quarantine__():
     engine._drain_events()
 
     assert engine.quarantined is False
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "L" not in engine.order_mapping
     assert "L2" not in engine.order_mapping
     assert "L" not in engine.active_intents
@@ -18507,10 +18274,11 @@ def __test_native_cancel_all_expected_is_precise_one_shot__():
     assert "L3" not in engine.order_mapping
 
 
-def __test_push_external_cancel_halt_raises_gracefully__():
-    """Under 'halt' a push-detected external cancel records the halt and
-    raises :class:`UnexpectedCancelError` out of the event-application
-    path so the engine performs its graceful stop."""
+def __test_push_external_cancel_under_an_unknown_policy_fails_closed_into_quarantine__():
+    """'halt' is no policy any more: under an unknown policy a push-detected
+    external cancel fails closed into the external-intervention quarantine,
+    nothing propagates out of the event-application path, and the run goes
+    on alive but inert."""
     b = MockBroker()
     b.on_unexpected_cancel = "halt"
     engine, pos = _mk_engine(b)
@@ -18518,11 +18286,10 @@ def __test_push_external_cancel_halt_raises_gracefully__():
     engine.sync(BAR_TS)
     deal_id = engine.order_mapping["L"][0]
 
-    with pytest.raises(UnexpectedCancelError):
-        engine._route_event(_cancelled_event(deal_id))
+    engine._route_event(_cancelled_event(deal_id))
 
-    assert engine.halted is True
-    assert engine.quarantined is False
+    assert engine.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+    assert engine.venue_writes_blocked
     assert "L" not in engine.order_mapping
 
 
@@ -18548,7 +18315,7 @@ def __test_engine_initiated_cancel_does_not_trigger_policy__():
     engine._route_event(_cancelled_event(deal_id))
 
     assert engine.quarantined is False
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def __test_tracker_synthesized_cancel_does_not_reapply_policy__():
@@ -18569,7 +18336,7 @@ def __test_tracker_synthesized_cancel_does_not_reapply_policy__():
     assert "L" not in engine.order_mapping
     # ...but the engine did NOT re-apply the policy.
     assert engine.quarantined is False
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def __test_parked_modify_predecessor_cancel_is_not_unexpected__():
@@ -18599,7 +18366,7 @@ def __test_parked_modify_predecessor_cancel_is_not_unexpected__():
     engine._route_event(_cancelled_event(deal_id))
 
     assert engine.quarantined is False
-    assert engine.halted is False
+    assert not engine.quarantined
     # The stale predecessor id was trimmed from the mapping, while the
     # parked verification state survives to resolve the replacement.
     assert "L" not in engine.order_mapping
@@ -18670,7 +18437,6 @@ def __test_parked_modify_declared_atomic_amend_cancel_fires_policy__():
     engine._route_event(_cancelled_event(deal_id))
 
     assert engine.quarantined is True
-    assert engine.halted is False
     assert "L" not in engine.order_mapping
     assert "L" not in engine.active_intents
 
@@ -18698,7 +18464,7 @@ def __test_parked_modify_declared_predecessor_ids_consumed__():
     engine._route_event(_cancelled_event(deal_id))
 
     assert engine.quarantined is False
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "L" not in engine.order_mapping
     assert "L" in engine.active_intents
     assert len(engine.pending_verification) == 1
@@ -18756,34 +18522,38 @@ def _order_order(order_id, size, **kw) -> Order:
     return Order(order_id, size, order_type=_order_type_normal, **kw)
 
 
-def __test_short_gate_halts_entry_short_from_flat__():
+def __test_short_gate_refuses_entry_short_from_flat__():
     """A ``strategy.entry`` short on a flat book targets a negative position
-    — graceful halt, no broker call."""
+    — refused like a venue reject, no broker call, the run goes on."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
     pos.entry_orders["S"] = _entry_order("S", -1.0)
 
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS)
+    engine.sync(BAR_TS)
 
-    assert engine.halted is True
+    assert not engine.quarantined
     assert b.entry_calls == []
 
 
-def __test_short_gate_halts_entry_reversal_on_spot__():
-    """A reversing MARKET ``strategy.entry`` is judged on its FOLDED
-    quantity — the combined stop-and-reverse always projects negative."""
+def __test_short_gate_runs_the_close_leg_of_a_reversal_on_spot__():
+    """A reversing MARKET ``strategy.entry`` on spot runs its close leg.
+
+    The strategy asked to close the long: the close leg goes out for the
+    whole long, and only the short side, which the venue cannot hold, waits
+    for the flat book (where the gate refuses it). No entry is sent and
+    nothing blocks the run."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
     pos.size = 0.0004
     pos.sign = 1.0
     pos.entry_orders["S"] = _entry_order("S", -0.0002)
 
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS)
+    engine.sync(BAR_TS)
 
-    assert engine.halted is True
+    assert not engine.quarantined
     assert b.entry_calls == []
+    assert [(c.intent.side, c.intent.qty) for c in b.close_calls] == [('sell', 0.0004)]
+    assert "S" in engine._pending_reversal_opens
 
 
 def __test_short_gate_strategy_order_reduce_passes__():
@@ -18797,12 +18567,12 @@ def __test_short_gate_strategy_order_reduce_passes__():
 
     engine.sync(BAR_TS)
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.entry_calls) == 1
     assert b.entry_calls[0].intent.qty == 3.0
 
 
-def __test_short_gate_halts_strategy_order_flip__():
+def __test_short_gate_refuses_strategy_order_flip__():
     """A ``strategy.order`` sell larger than the position projects negative."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
@@ -18810,10 +18580,9 @@ def __test_short_gate_halts_strategy_order_flip__():
     pos.sign = 1.0
     pos.entry_orders["Sell"] = _order_order("Sell", -8.0)
 
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS)
+    engine.sync(BAR_TS)
 
-    assert engine.halted is True
+    assert not engine.quarantined
     assert b.entry_calls == []
 
 
@@ -18826,14 +18595,13 @@ def __test_short_gate_aggregates_active_sell_intents__():
     pos.sign = 1.0
     pos.entry_orders["S1"] = _order_order("S1", -3.0, limit=50_000.0)
     engine.sync(BAR_TS)  # 5 - 3 = 2: passes
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.entry_calls) == 1
 
     pos.entry_orders["S2"] = _order_order("S2", -3.0, limit=51_000.0)
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS + 60_000)  # 5 - 3 - 3 = -1: halt
+    engine.sync(BAR_TS + 60_000)  # 5 - 3 - 3 = -1: refused
 
-    assert engine.halted is True
+    assert not engine.quarantined
     assert len(b.entry_calls) == 1
 
 
@@ -18851,7 +18619,7 @@ def __test_short_gate_allows_exits_and_closes__():
 
     engine.sync(BAR_TS)
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.exit_calls) == 1
 
 
@@ -18863,11 +18631,11 @@ def __test_short_gate_ignores_buy_entries__():
 
     engine.sync(BAR_TS)
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.entry_calls) == 1
 
 
-def __test_short_gate_modify_qty_raise_halts__():
+def __test_short_gate_modify_qty_raise_is_refused__():
     """An entry amend that raises a resting sell's qty past the inventory
     projects negative — same gate, OLD qty excluded from the aggregation."""
     b = _spot_broker()
@@ -18882,14 +18650,13 @@ def __test_short_gate_modify_qty_raise_halts__():
     # not stacked: 5 - 4 = 1).
     pos.entry_orders["S"] = _order_order("S", -4.0, limit=50_000.0)
     engine.sync(BAR_TS + 60_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.modify_entry_calls) == 1
 
     pos.entry_orders["S"] = _order_order("S", -6.0, limit=50_000.0)
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS + 120_000)  # 5 - 6 = -1: halt
+    engine.sync(BAR_TS + 120_000)  # 5 - 6 = -1: refused
 
-    assert engine.halted is True
+    assert not engine.quarantined
     assert len(b.modify_entry_calls) == 1
 
 
@@ -18919,16 +18686,16 @@ def __test_short_gate_modify_replace_resets_fill_ledger__():
     # a replace-style modify). 4 - 4 = 0: the amend itself passes.
     pos.entry_orders["S"] = _order_order("S", -4.0, limit=51_000.0)
     engine.sync(BAR_TS + 60_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.modify_entry_calls) == 1
 
-    # An added sell-1 must halt: the replacement "S" now works 4 units in
+    # An added sell-1 must be refused: the replacement "S" now works 4 units in
     # full (ledger reseeded to 0), so 4 - 4 - 1 = -1. A stale filled=1 leak
     # would reserve only 3 and let 5 working units oversell the inventory.
     pos.entry_orders["G"] = _order_order("G", -1.0)
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS + 120_000)
-    assert engine.halted is True
+    engine.sync(BAR_TS + 120_000)
+
+    assert not engine.quarantined
     assert len(b.entry_calls) == 1
 
 
@@ -18959,7 +18726,7 @@ def __test_short_gate_modify_late_old_order_fill_not_credited__():
     # resting sell of 3 under a NEW order id (xchg-2); the old xchg-1 is retired.
     pos.entry_orders["S"] = _order_order("S", -3.0, limit=51_000.0)
     engine.sync(BAR_TS + 60_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.modify_entry_calls) == 1
 
     # A straggling fill from the CANCELLED old order (xchg-1) arrives after the
@@ -18972,13 +18739,13 @@ def __test_short_gate_modify_late_old_order_fill_not_credited__():
     engine.apply_async_events()
     assert pos.size == 3.0
 
-    # An added sell-1 must halt: the replacement "S" still works all 3 units
+    # An added sell-1 must be refused: the replacement "S" still works all 3 units
     # (ledger correctly stayed 0), so 3 - 3 - 1 = -1. A leaked filled=1 credit
     # would reserve only 2 and pass 3 - 2 - 1 = 0 — a 4-unit oversell of 3.
     pos.entry_orders["G"] = _order_order("G", -1.0)
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS + 120_000)
-    assert engine.halted is True
+    engine.sync(BAR_TS + 120_000)
+
+    assert not engine.quarantined
     assert len(b.entry_calls) == 1
 
 
@@ -19000,7 +18767,7 @@ def __test_short_gate_fill_time_reconcile_cancels_unbacked_sell__():
     # fresh resting sell of 5 lands under xchg-2, the fill ledger resets to 0.
     pos.entry_orders["S"] = _order_order("S", -5.0, limit=51_000.0)
     engine.sync(BAR_TS + 60_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.modify_entry_calls) == 1
 
     # A straggling fill of 2 from the CANCELLED old order (xchg-1) arrives.
@@ -19018,7 +18785,7 @@ def __test_short_gate_fill_time_reconcile_cancels_unbacked_sell__():
     # broker (xchg-2) so it can never fill into the oversell — and kept the
     # bot running (no halt). Without the fix "S" stays live and cancel_calls
     # is empty.
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.cancel_calls) == 1
     assert b.cancel_calls[0].intent.pine_id == "S"
     assert "S" not in engine.active_intents
@@ -19048,7 +18815,7 @@ def __test_short_gate_fill_time_reconcile_noop_when_still_backed__():
     engine.apply_async_events()
     assert pos.size == 4.0
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert b.cancel_calls == []
     assert "S" in engine.active_intents
 
@@ -19076,7 +18843,7 @@ def __test_short_gate_fill_time_reconcile_noop_on_short_capable_venue__():
     assert pos.size == 3.0
 
     # Short selling is supported: no reconcile, the resting sell stays live.
-    assert engine.halted is False
+    assert not engine.quarantined
     assert b.cancel_calls == []
     assert "S" in engine.active_intents
 
@@ -19118,7 +18885,7 @@ def __test_short_gate_reconcile_failed_cancel_parks_and_retries__():
 
     # Cancel attempted once and failed -> parked, bot still running, and the
     # order is NOT silently kept active.
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" in engine._forced_cancel_pending
     assert "S" not in engine.active_intents
     assert len(b.cancel_calls) == 1
@@ -19129,7 +18896,7 @@ def __test_short_gate_reconcile_failed_cancel_parks_and_retries__():
     # halt. It defers; the retry re-attempts the cancel.
     b.raise_on_next_cancel = ExchangeConnectionError("still down")
     engine.sync(BAR_TS + 120_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" not in engine.active_intents          # adoption guard held
     assert "S" in engine._forced_cancel_pending
     assert len(b.cancel_calls) == 2                   # retry attempted
@@ -19138,7 +18905,7 @@ def __test_short_gate_reconcile_failed_cancel_parks_and_retries__():
     # key is released — no halt, no lingering unbacked order.
     pos.entry_orders.pop("S")
     engine.sync(BAR_TS + 180_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" not in engine._forced_cancel_pending
     assert "S" not in engine.active_intents
     assert len(b.cancel_calls) == 3                   # cancel landed
@@ -19148,7 +18915,7 @@ def __test_short_gate_reconcile_unknown_disposition_parks_no_premature_halt__():
     """F1 regression: an ambiguous cancel timeout
     (``OrderDispositionUnknownError``) means the resting sell MAY still be live.
     Pre-fix, ``_dispatch_cancel`` swallowed it and dropped the mapping, so the
-    next sync re-dispatched into a dispatch-time halt while the order might
+    next sync re-dispatched into a dispatch-time refusal while the order might
     still rest. The durable path parks it and keeps retrying without halting
     until the disposition provably resolves."""
     b, engine, pos = _reconcile_deficit_setup()
@@ -19162,7 +18929,7 @@ def __test_short_gate_reconcile_unknown_disposition_parks_no_premature_halt__():
     ))
     engine.apply_async_events()
     assert pos.size == 3.0
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" in engine._forced_cancel_pending
     assert "S" not in engine.active_intents
     assert len(b.cancel_calls) == 1
@@ -19174,7 +18941,7 @@ def __test_short_gate_reconcile_unknown_disposition_parks_no_premature_halt__():
         "cancel still ambiguous", client_order_id="xchg-2",
     )
     engine.sync(BAR_TS + 120_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" in engine._forced_cancel_pending
     assert "S" not in engine.active_intents
     assert len(b.cancel_calls) == 2
@@ -19182,7 +18949,7 @@ def __test_short_gate_reconcile_unknown_disposition_parks_no_premature_halt__():
     # The cancel is finally confirmed and the strategy drops "S": released.
     pos.entry_orders.pop("S")
     engine.sync(BAR_TS + 180_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" not in engine._forced_cancel_pending
     assert len(b.cancel_calls) == 3
 
@@ -19207,7 +18974,7 @@ def __test_short_gate_reconcile_false_cancel_parks_and_retries__():
 
     # Cancel attempted once, returned False -> parked, bot still running, the
     # order is NOT treated as cancelled.
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" in engine._forced_cancel_pending
     assert "S" not in engine.active_intents
     assert len(b.cancel_calls) == 1
@@ -19218,7 +18985,7 @@ def __test_short_gate_reconcile_false_cancel_parks_and_retries__():
     # the retry re-attempts the cancel (once per sync).
     b.false_on_next_cancel = True
     engine.sync(BAR_TS + 120_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" not in engine.active_intents          # adoption guard held
     assert "S" in engine._forced_cancel_pending
     assert len(b.cancel_calls) == 2                   # single retry this sync
@@ -19227,7 +18994,7 @@ def __test_short_gate_reconcile_false_cancel_parks_and_retries__():
     # no halt, no lingering unbacked order.
     pos.entry_orders.pop("S")
     engine.sync(BAR_TS + 180_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "S" not in engine._forced_cancel_pending
     assert "S" not in engine.active_intents
     assert len(b.cancel_calls) == 3                   # cancel landed
@@ -19272,7 +19039,7 @@ def __test_short_gate_reconcile_failed_first_cancel_continues_to_next__():
     # to cancel "S1" too (which landed). Confirmed-remaining exposure is the
     # parked "S2" (4) alone against a position of 5 — backed. Both orders were
     # cancelled at the broker; neither is left adopted as a healthy sell.
-    assert engine.halted is False
+    assert not engine.quarantined
     assert [c.intent.pine_id for c in b.cancel_calls] == ["S2", "S1"]
     assert "S2" in engine._forced_cancel_pending      # parked, retried
     assert "S1" not in engine.active_intents          # cancel landed
@@ -19302,14 +19069,13 @@ def __test_short_gate_dispatch_counts_parked_forced_cancel_sell__():
     # A DIFFERENT sell "S2" of 3 is emitted while "S" stays parked-but-live.
     # A bare active-only aggregation would see reserved=0 and pass (3 - 3 = 0);
     # counting the still-live parked "S" (works 5) projects 3 - 5 - 3 = -5, so
-    # the gate halts and never dispatches "S2" — preventing the S + S2 oversell.
+    # the gate refuses and never dispatches "S2" — preventing the S + S2 oversell.
     # Keep "S"'s retry from landing this sync so it stays counted.
     b.false_on_next_cancel = True
     pos.entry_orders["S2"] = _order_order("S2", -3.0, limit=52_000.0)
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS + 120_000)
+    engine.sync(BAR_TS + 120_000)
 
-    assert engine.halted is True
+    assert not engine.quarantined
     assert "S2" not in engine.active_intents  # blocked before the broker call
     assert len(b.entry_calls) == 1            # only the original "S" dispatch
 
@@ -19319,7 +19085,7 @@ def __test_short_gate_filled_sell_entry_not_double_reserved__():
     the diff sentinel for the sticky Pine order) while ``record_fill`` already
     moved its qty into ``_position.size`` — the gate must reserve only the
     working residual, otherwise a legitimate later flatten is double-counted
-    into a false halt."""
+    into a false refusal."""
     b = _spot_broker()
     engine, pos = _mk_engine(b)
     _book_long_entries(pos, ("L", 5.0))
@@ -19337,7 +19103,7 @@ def __test_short_gate_filled_sell_entry_not_double_reserved__():
     pos.entry_orders["F"] = _order_order("F", -2.0)
     engine.sync(BAR_TS + 60_000)
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.entry_calls) == 2
 
 
@@ -19361,14 +19127,13 @@ def __test_short_gate_partial_fill_reserves_working_residual__():
     # 4 - (3 - 1 filled) - 2 = 0: passes.
     pos.entry_orders["F"] = _order_order("F", -2.0)
     engine.sync(BAR_TS + 60_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.entry_calls) == 2
 
-    # Both working residuals aggregate: 4 - 2 - 2 - 1 = -1 halts.
+    # Both working residuals aggregate: 4 - 2 - 2 - 1 = -1 is refused.
     pos.entry_orders["G"] = _order_order("G", -1.0)
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS + 120_000)
-    assert engine.halted is True
+    engine.sync(BAR_TS + 120_000)
+    assert not engine.quarantined
     assert len(b.entry_calls) == 2
 
 
@@ -19397,12 +19162,11 @@ def __test_short_gate_reused_pine_id_reseeds_fill_ledger__():
     engine.sync(BAR_TS + 120_000)
     assert len(b.entry_calls) == 2
 
-    # 2 - 2 (fresh working "S") - 1 = -1: halts. With a leaked ledger the
+    # 2 - 2 (fresh working "S") - 1 = -1: refused. With a leaked ledger the
     # projection would be +1 and the oversell would dispatch.
     pos.entry_orders["G"] = _order_order("G", -1.0)
-    with pytest.raises(BrokerManualInterventionError):
-        engine.sync(BAR_TS + 180_000)
-    assert engine.halted is True
+    engine.sync(BAR_TS + 180_000)
+    assert not engine.quarantined
     assert len(b.entry_calls) == 2
 
 
@@ -19410,7 +19174,7 @@ def __test_short_gate_restart_recovered_entry_seeds_fill_ledger__(tmp_path):
     """A cross-restart recovered parked sell entry seeds the fill ledger from
     the broker's cumulative ``filled_qty`` — the adopted position already
     contains the filled slice, and the pre-crash fill events never replay,
-    so a full-qty reservation would double-count and falsely halt."""
+    so a full-qty reservation would double-count and falsely refuse."""
     from pynecore.core.broker.storage import BrokerStore
     from pynecore.core.broker.idempotency import build_client_order_id, KIND_ENTRY
 
@@ -19463,13 +19227,13 @@ def __test_short_gate_restart_recovered_entry_seeds_fill_ledger__(tmp_path):
         pos2.sign = 1.0
         pos2.open_trades.append(_long_trade("L", 3.0))
         # Script re-emits the sticky sell entry plus a legit flatten of the
-        # rest: 3 - (3 - 2 filled) - 2 = 0 — must dispatch, not halt.
+        # rest: 3 - (3 - 2 filled) - 2 = 0 — must dispatch, not be refused.
         pos2.entry_orders["S"] = _order_order("S", -3.0, limit=50_000.0)
         pos2.entry_orders["F"] = _order_order("F", -2.0)
 
         engine2.sync(BAR_TS + 60_000)
 
-        assert engine2.halted is False
+        assert not engine2.quarantined
         # Only the flatten dispatches fresh; "S" adopts the recovered order.
         assert len(b2.entry_calls) == 1
         assert b2.entry_calls[0].intent.pine_id == "F"
@@ -19544,7 +19308,7 @@ def __test_short_gate_restart_recovered_unbacked_sell_cancelled_same_sync__(tmp_
 
         # The recovered unbacked sell is cancelled in THIS sync (post-diff
         # pass), never halting, and not left as a healthy adopted order.
-        assert engine2.halted is False
+        assert not engine2.quarantined
         assert len(b2.cancel_calls) == 1
         assert b2.cancel_calls[0].intent.pine_id == "S"
         assert "S" not in engine2.active_intents
@@ -19614,7 +19378,7 @@ def __test_forced_cancel_survives_restart_reissued_from_journal__(tmp_path):
 
         # The first post-restart sync re-drives and lands the cancel —
         # never halting — and the journal row dies with the envelope.
-        assert engine2.halted is False
+        assert not engine2.quarantined
         assert len(b2.cancel_calls) == 1
         assert b2.cancel_calls[0].intent.pine_id == "S"
         assert "S" not in engine2._forced_cancel_pending
@@ -19631,7 +19395,7 @@ def __test_forced_cancel_restart_recovers_working_sell_qty_from_orders__(tmp_pat
     placeholder — so a DIFFERENT sell passed the short gate and both could fill,
     an oversell on a short-incapable venue. The working residual is now
     recovered from the authoritative ``orders`` table (side + qty + filled_qty),
-    so the parked exposure is reserved and the second sell halts."""
+    so the parked exposure is reserved and the second sell is refused."""
     from pynecore.core.broker.storage import BrokerStore
     from pynecore.core.broker.models import EntryIntent
 
@@ -19693,14 +19457,15 @@ def __test_forced_cancel_restart_recovers_working_sell_qty_from_orders__(tmp_pat
         # A DIFFERENT sell "S2" of 3 against the eroded long of 3 would pass a
         # bare active-only gate (3 - 3 = 0) and oversell alongside the parked
         # "S"; counting the recovered parked 5 projects 3 - 5 - 3 = -5, so the
-        # dispatch gate halts before the broker call.
+        # dispatch gate refuses it before the broker call.
         s2 = EntryIntent(
             pine_id="S2", symbol=SYMBOL, side='sell', qty=3.0,
             order_type=OrderType.MARKET,
         )
-        with pytest.raises(BrokerManualInterventionError):
+        with pytest.raises(OrderSkippedByPlugin) as refused:
             engine2._enforce_short_gate(s2)
-        assert engine2.halted is True
+        assert refused.value.reason == "short_selling_unsupported"
+        assert not engine2.quarantined
 
 
 def __test_general_cancel_false_parks_defers_reemit_no_double_open__():
@@ -19725,7 +19490,7 @@ def __test_general_cancel_false_parks_defers_reemit_no_double_open__():
     pos.entry_orders.pop("E")
     b.false_on_next_cancel = True
     engine.sync(BAR_TS + 60_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "E" in engine._forced_cancel_pending
     assert len(b.cancel_calls) == 1
     # The strict path kept the tracking state — the order is still live and
@@ -19738,7 +19503,7 @@ def __test_general_cancel_false_parks_defers_reemit_no_double_open__():
     pos.entry_orders["E"] = _order_order("E", 3.0, limit=100.0)
     b.false_on_next_cancel = True
     engine.sync(BAR_TS + 120_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert len(b.cancel_calls) == 2                   # retry, still False
     assert len(b.entry_calls) == 1                    # NO double-open
     assert "E" in engine._forced_cancel_pending
@@ -19747,7 +19512,7 @@ def __test_general_cancel_false_parks_defers_reemit_no_double_open__():
     # The cancel finally lands: the key is released, the teardown runs, and
     # the still-wanted entry re-dispatches fresh on the same sync's diff.
     engine.sync(BAR_TS + 180_000)
-    assert engine.halted is False
+    assert not engine.quarantined
     assert "E" not in engine._forced_cancel_pending
     assert len(b.cancel_calls) == 3                   # landed
     assert len(b.entry_calls) == 2                    # re-dispatched after
@@ -20071,7 +19836,6 @@ def __test_exit_modify_reject_with_the_old_legs_gone_redispatches_fresh__():
     assert b.close_calls[0].intent.synthetic_kind == 'defensive_close'
     assert "L1" in engine.pending_defensive_close
     assert engine.quarantined
-    assert engine.halted is False
 
 
 def _native_bracket_long_with_stop(stop: float) -> tuple[MockBroker, OrderSyncEngine,
@@ -20114,7 +19878,6 @@ def __test_an_exit_amend_refused_over_a_level_the_market_crossed_closes_at_marke
     assert "L1" in engine.pending_defensive_close
     assert key not in engine._rejected_exit_modifies  # noqa: SLF001
     assert not engine.quarantined
-    assert engine.halted is False
 
 
 def __test_an_exit_amend_refusal_flagged_level_crossed_closes_at_market__():
@@ -20161,7 +19924,7 @@ def __test_an_exit_amend_declined_by_a_closed_market_keeps_the_old_stop_and_retr
     b.raise_on_next_close = MarketClosedError("market closed")
     engine.sync(BAR_TS + 60_000, last_price=last_price)
 
-    assert engine.halted is False
+    assert not engine.quarantined
     assert b.close_calls == []
     assert key not in engine._rejected_exit_modifies  # noqa: SLF001
     assert engine.active_intents[key].sl_price == 49_000.0
@@ -20228,7 +19991,7 @@ def __test_partial_trigger_close_skipped_by_plugin_logs_warning_and_rearms__(cap
     with caplog.at_level(logging.WARNING, logger="pyne_core_logger"):
         engine._dispatch_partial_bracket_close(leg)  # type: ignore[attr-defined]
     assert len(b.close_calls) == 1
-    assert not engine.halted
+    assert not engine.quarantined
     assert leg.leg_state == LEG_STATE_ARMED
     assert leg.extras['trigger_failed_reason'] == 'plugin_skipped:nothing_to_close'
     records = [r for r in caplog.records if 'partial bracket close skipped' in r.getMessage()]
@@ -20271,7 +20034,7 @@ def __test_stale_pending_partial_legs_retired_on_new_parent_fill_deferred_whole_
         ))
         engine.sync(BAR_TS + 60_000)  # must not raise
 
-        assert not engine.halted
+        assert not engine.quarantined
         assert not engine._partial_bracket_engine.has_active_legs_for_intent("S-X1\0L")  # type: ignore[attr-defined]
         assert len(b.exit_calls) == 1, "whole-row exit did not dispatch on the new parent"
         assert b.exit_calls[0].intent.sl_price == 49_950.0
@@ -20299,7 +20062,7 @@ def __test_stale_pending_partial_legs_retired_before_same_sync_whole_row_exit__(
         pos.exit_orders[("L-X", "L")] = _exit_order("L", -1.0, "L-X", stop=49_000.0)
         engine.sync(BAR_TS)  # must not raise
 
-        assert not engine.halted
+        assert not engine.quarantined
         assert len(b.entry_calls) == 1
         assert len(b.exit_calls) == 1, "whole-row exit refused by stale pending legs"
         assert "L-X\0L" in engine.active_intents
@@ -20378,13 +20141,13 @@ def __test_whole_row_exit_conflicting_with_live_partial_legs_is_skipped_not_fata
 
         with caplog.at_level(logging.ERROR, logger="pyne_core_logger"):
             engine.sync(BAR_TS)  # must not raise
-            assert not engine.halted
+            assert not engine.quarantined
             assert b.exit_calls == [], "conflicting whole-row exit was dispatched"
             assert "Y\0L" not in engine.active_intents
             assert engine._partial_bracket_engine.has_active_legs_for_intent("X\0L")  # type: ignore[attr-defined]
             assert len(conflict_errors()) == 1
             engine.sync(BAR_TS + 60_000)
-            assert not engine.halted
+            assert not engine.quarantined
             assert b.exit_calls == []
             assert len(conflict_errors()) == 1, "conflict escalated again for the same key"
 
@@ -20570,7 +20333,7 @@ def __test_venue_driven_cancel_of_a_resting_entry_retires_it_without_policy__(tm
         ))
 
         assert engine.quarantined is False
-        assert engine.halted is False
+        assert not engine.quarantined
         assert "L" not in engine.order_mapping
         assert "L" not in engine.active_intents
         audited = list(ctx.iter_events_by_kind_since('venue_driven_cancel', 0))
@@ -20613,7 +20376,7 @@ def __test_a_failed_audit_never_cuts_the_routing_short_and_lands_once__(tmp_path
         audited = list(ctx.iter_events_by_kind_since('venue_driven_cancel', 0))
         assert [e['cancel_reason'] for e in audited] == [CANCEL_REASON_VENUE_REJECTED]
         assert len(b.entry_calls) == 2
-        assert not engine.halted and not engine.quarantined
+        assert not engine.quarantined
         ctx.log_event = real_log_event  # type: ignore[method-assign]
         ctx.close()
 
@@ -20648,7 +20411,7 @@ def __test_venue_driven_cancel_of_a_partially_filled_entry_consumes_it__(tmp_pat
         ))
 
         assert engine.quarantined is False
-        assert engine.halted is False
+        assert not engine.quarantined
         assert "L" not in engine.order_mapping
         assert engine.active_intents["L"].qty == 0.4
         audited = list(ctx.iter_events_by_kind_since('venue_driven_cancel', 0))
@@ -20788,7 +20551,7 @@ def __test_read_outage_warnings_are_throttled_across_tick_syncs__(caplog):
         # A burst of tick syncs inside one outage: reported exactly once.
         for i in range(6):
             engine.sync(BAR_TS + 1_000 * i)
-        assert not engine.halted
+        assert not engine.quarantined
         assert len(outage_warnings()) == 1, "burst syncs re-reported the same outage"
         assert not engine._read_view_confirmed
 
@@ -21090,7 +20853,7 @@ def __test_an_entry_block_escalates_on_the_same_id_and_never_downgrades__():
     engine, _pos = _mk_engine(b)
     engine._broker_event_sink = events.append  # noqa
 
-    engine.record_quarantine("close_rejected_repeatedly")
+    engine.record_quarantine("close_rejected_repeatedly", cause="close_rejected:L")
     first_id = engine.quarantine_id
     assert engine.quarantined and not engine.venue_writes_blocked
 
@@ -21098,7 +20861,7 @@ def __test_an_entry_block_escalates_on_the_same_id_and_never_downgrades__():
     assert engine.quarantine_id == first_id
     assert engine.venue_writes_blocked
 
-    engine.record_quarantine("protective_exit_rejected")
+    engine.record_quarantine("protective_exit_rejected", cause="protective_exit_rejected:L")
     assert engine.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
     entered = [e for e in events if isinstance(e, QuarantineEnteredEvent)]
     assert [e.kind for e in entered] == [
@@ -21115,7 +20878,7 @@ def __test_an_entry_block_quarantine_keeps_protection_running__():
     engine.sync(BAR_TS)
     engine.on_order_event(_fill_event("buy", 1.0, 50_000.0, pine_id="L"))
     engine.sync(BAR_TS + 60_000)
-    engine.record_quarantine("close_rejected_repeatedly")
+    engine.record_quarantine("close_rejected_repeatedly", cause="close_rejected:L")
     entries_before = len(b.entry_calls)
 
     pos.entry_orders["L2"] = _entry_order("L2", 1.0)
@@ -21129,9 +20892,8 @@ def __test_an_entry_block_quarantine_keeps_protection_running__():
 
 
 
-def _halt_cancel_then_fill_queued(b):
+def _external_cancel_then_fill_queued(b):
     """Resting entries L and L2; the venue queues an external cancel of L, then L2's fill."""
-    b.on_unexpected_cancel = "halt"
     engine, pos = _mk_engine(b)
     pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
     pos.entry_orders["L2"] = _entry_order("L2", 1.0, limit=49_000.0)
@@ -21143,41 +20905,42 @@ def _halt_cancel_then_fill_queued(b):
     return engine, pos
 
 
-def __test_a_halt_mid_batch_keeps_the_rest_of_the_batch_for_finalize_halt__():
-    """The fill queued behind a halting cancel is booked by the halt unwind."""
+def __test_an_external_cancel_mid_batch_books_the_rest_of_the_batch__():
+    """The fill queued behind an external cancel is booked in the same drain.
+
+    The cancel latches the external-intervention quarantine and the drain
+    goes on: the fill behind it is booked once, with no venue write.
+    """
     b = MockBroker()
-    engine, pos = _halt_cancel_then_fill_queued(b)
+    engine, pos = _external_cancel_then_fill_queued(b)
     writes_before = (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
                      len(b.cancel_calls))
-    with pytest.raises(UnexpectedCancelError):
-        engine.apply_async_events()
-    assert engine.halted
-    assert pos.size == 0.0
+    engine.apply_async_events()
 
-    engine.finalize_halt()
-    assert pos.size == 1.0
-    assert (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
-            len(b.cancel_calls)) == writes_before
-    engine.finalize_halt()
-    assert pos.size == 1.0
-
-
-def __test_finalize_halt_books_past_a_further_halting_event__():
-    """Already halted: a halting cancel met while finalizing does not end the booking."""
-    b = MockBroker()
-    engine, pos = _halt_cancel_then_fill_queued(b)
-    writes_before = (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
-                     len(b.cancel_calls))
-    engine._record_halt(BrokerManualInterventionError(  # type: ignore[attr-defined]
-        "position closed by someone else"))
-
-    engine.finalize_halt()
+    assert engine.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
     assert pos.size == 1.0
     assert "L" not in engine.order_mapping
     assert (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
             len(b.cancel_calls)) == writes_before
-    with pytest.raises(BrokerManualInterventionError, match="someone else"):
-        engine.raise_if_halted()
+    engine.apply_async_events()
+    assert pos.size == 1.0
+
+
+def __test_a_further_external_event_under_a_held_latch_does_not_end_the_booking__():
+    """Already latched: an external cancel met while booking does not end the drain."""
+    b = MockBroker()
+    engine, pos = _external_cancel_then_fill_queued(b)
+    writes_before = (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+                     len(b.cancel_calls))
+    engine._quarantine_intervention(  # type: ignore[attr-defined]
+        UnexpectedCancelError("position closed by someone else"))
+
+    engine.apply_async_events()
+    assert engine.quarantine_kind is QuarantineKind.EXTERNAL_INTERVENTION
+    assert pos.size == 1.0
+    assert "L" not in engine.order_mapping
+    assert (len(b.entry_calls), len(b.exit_calls), len(b.close_calls),
+            len(b.cancel_calls)) == writes_before
 
 
 # === One-way: sized protection and unsettled protection writes ===
@@ -21419,7 +21182,7 @@ def __test_a_partial_close_on_a_whole_leg_only_venue_closes_the_whole_leg__():
         pine_id=None, from_entry="L",
     ))
     assert pos.size == 0.0
-    assert engine.halted is False
+    assert not engine.quarantined
 
 
 def __test_a_partial_exit_trigger_on_a_whole_leg_only_venue_closes_the_whole_leg__():
@@ -21452,7 +21215,7 @@ def __test_a_partial_exit_trigger_on_a_whole_leg_only_venue_closes_the_whole_leg
 
     engine._dispatch_partial_bracket_close(leg)  # type: ignore[attr-defined]
     assert b.close_leg_calls == [("1", 3)]
-    assert not engine.halted
+    assert not engine.quarantined
 
     b.raw_legs = []
     b.position = None
@@ -21464,7 +21227,7 @@ def __test_a_partial_exit_trigger_on_a_whole_leg_only_venue_closes_the_whole_leg
     assert pos.size == 0.0
     assert pos.open_trades == []
     engine.sync(BAR_TS + 60_000, last_price=49_900.0)
-    assert not engine.halted
+    assert not engine.quarantined
     assert list(pbe.iter_legs()) == []
 
 
@@ -21513,7 +21276,7 @@ def __test_a_storage_failure_ends_the_sync_and_retries_it__():
     engine.sync(BAR_TS)
 
     assert len(b.entry_calls) == 1
-    assert not engine.halted
+    assert not engine.quarantined
     # Nothing uncommitted is kept: the entry is not taken for live.
     assert "L" not in engine.active_intents
     assert "L" not in engine.order_mapping
@@ -21539,12 +21302,41 @@ def __test_a_persistent_storage_failure_quarantines_after_the_bounded_retry__():
     engine.sync(BAR_TS)
     assert engine.quarantined
     assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
-    assert not engine.halted
     # Alive but opening nothing: the next sync runs and sends no entry.
     calls = len(b.entry_calls)
     engine.sync(BAR_TS + 60_000)
     assert len(b.entry_calls) == calls
-    assert not engine.halted
+    assert not engine.quarantined
+
+
+def __test_a_storage_quarantine_ends_by_itself_once_the_store_works_again__():
+    """The store recovers: the first sync whose writes all land ends the quarantine.
+
+    No operator resume: the bot dispatches the strategy's entries again from
+    the next sync on, in the same process. A store that fails again under an
+    other cause keeps its own cause, so that latch does not end early.
+    """
+    import sqlite3
+    from pynecore.core.broker.sync_engine import STORAGE_FAILURE_HALT_SYNCS
+    b = MockBroker()
+    engine, pos = _mk_engine(b)
+    pos.entry_orders["L"] = _entry_order("L", 1.0, limit=50_000.0)
+    for _ in range(STORAGE_FAILURE_HALT_SYNCS):
+        b.raise_on_next_entry = sqlite3.OperationalError("database or disk is full")
+        engine.sync(BAR_TS)
+    assert engine.quarantined
+    engine.sync(BAR_TS + 60_000)
+    assert not engine.quarantined
+    calls = len(b.entry_calls)
+    engine.sync(BAR_TS + 120_000)
+    assert len(b.entry_calls) == calls + 1
+    assert engine.active_intents.keys() == {"L"}
+
+    engine.record_quarantine("own trouble", cause="other")
+    for _ in range(STORAGE_FAILURE_HALT_SYNCS):
+        engine._note_storage_failure(sqlite3.OperationalError("disk I/O error"))
+    engine.end_quarantine_cause("other", "resolved")
+    assert engine.quarantined, "the storage cause still holds"
 
 
 def __test_a_clean_sync_resets_the_storage_failure_count__():
@@ -21562,7 +21354,7 @@ def __test_a_clean_sync_resets_the_storage_failure_count__():
     pos.entry_orders["S"] = _entry_order("S", 1.0, limit=50_000.0)
     b.raise_on_next_entry = sqlite3.OperationalError("disk I/O error")
     engine.sync(BAR_TS)
-    assert not engine.halted
+    assert not engine.quarantined
 
 
 # === Storage fault injection over a multi-bar scenario ===================
@@ -21919,7 +21711,7 @@ def _run_storage_fault_scenario(tmp_path, fail_at: int | None, *, crash: bool = 
             'size': pos2.size, 'open': [(t.entry_id, t.size) for t in pos2.open_trades],
             'open_commission': pos2.open_commission, 'netprofit': pos2.netprofit,
             'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
-            'halted': engine2.halted, 'quarantined': engine2.quarantined,
+            'quarantined': engine2.quarantined,
             'journal': _journal_view(ctx2),
             'receipts': sorted(
                 (fill_id, receipt.booked, receipt.fee)
@@ -22100,7 +21892,7 @@ def _run_software_guard_trail_scenario(tmp_path, fail_at: int | None, *,
             'restart_closes': b.close_leg_calls[:restart_closes],
             'closes': list(b.close_leg_calls),
             'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
-            'halted': engine2.halted, 'quarantined': engine2.quarantined,
+            'quarantined': engine2.quarantined,
         }
         out['port_writes'] = list(b.port_writes)
         out['writes'] = faulty.writes
@@ -22264,7 +22056,6 @@ def _run_resting_reversal(tmp_path, *, hedging: bool, old: float = 2.0,
         out['guards'] = sorted(
             leg_id for (_symbol, leg_id) in
             engine._one_way_emulator._software_guards)  # type: ignore[attr-defined]
-        out['halted'] = engine.halted
         out['engine'] = engine
         ctx.close()
     return out
@@ -22296,7 +22087,7 @@ def __test_a_resting_reversal_fill_nets_the_hedging_account_to_the_one_way_books
     net = old - sum(slices)
     assert _net_legs(hedged['legs']) == pytest.approx(net)
     assert len({side for _leg_id, side, _qty in hedged['legs']}) <= 1, hedged['legs']
-    assert not hedged['nettings_live'] and not hedged['halted']
+    assert not hedged['nettings_live']
     assert len(hedged['sent_closes']) == len({coid for coid, _l, _v in hedged['sent_closes']})
 
 
@@ -22313,12 +22104,17 @@ def __test_a_resting_reversal_fill_without_an_execution_id_is_netted__(tmp_path,
         assert hedged[key] == one_way[key], key
     assert _net_legs(hedged['legs']) == pytest.approx(old - sum(slices))
     assert len({side for _leg_id, side, _qty in hedged['legs']}) <= 1, hedged['legs']
-    assert not hedged['nettings_live'] and not hedged['halted']
+    assert not hedged['nettings_live']
     assert not hedged['engine'].quarantined
 
 
-def __test_a_resting_fill_that_cannot_be_netted_quarantines_the_run__():
-    """A resting fill on a hedging account with nothing to key its netting by is not left silent."""
+def __test_a_resting_fill_without_any_id_is_netted_by_its_own_content__():
+    """A resting fill on a hedging account with no id of its own is netted all the same.
+
+    Nothing of the venue names the slice, so its netting record is keyed by
+    the event's content: the bot nets the two sides itself instead of being
+    quarantined until an operator nets them on the venue.
+    """
     b = _NettingHedgeBroker()
     b.position_port = b
     engine, pos = _mk_engine(b)
@@ -22331,9 +22127,8 @@ def __test_a_resting_fill_that_cannot_be_netted_quarantines_the_run__():
     engine.on_order_event(event)
     engine.apply_async_events()
 
-    assert engine.quarantined
-    assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
-    assert not engine._one_way_emulator.netting_in_flight()  # type: ignore[attr-defined]
+    assert not engine.quarantined
+    assert engine._one_way_emulator.netting_in_flight()  # type: ignore[attr-defined]
 
 
 def __test_the_netting_closes_book_their_fees_and_no_trade__(tmp_path):
@@ -22381,7 +22176,7 @@ def __test_a_whole_leg_port_nets_without_ever_holding_more_than_the_books__(
     assert len({side for _leg_id, side, _qty in hedged['legs']}) <= 1, hedged['legs']
     assert hedged['size'] == pytest.approx(net_after)
     assert abs(net_after) <= abs(old - sum(slices)) + 1e-9
-    assert not hedged['nettings_live'] and not hedged['halted']
+    assert not hedged['nettings_live']
 
 
 def __test_a_netting_close_fill_is_told_from_other_closes_by_its_close_id__():
@@ -22826,7 +22621,7 @@ def _run_netting_fault_scenario(tmp_path, fail_at: int | None, *,
             'legs': sorted((leg.leg_id, leg.side, leg.qty) for leg in b.raw_legs),
             'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
             'nettings': engine2._one_way_emulator.netting_in_flight(),  # type: ignore[attr-defined]
-            'halted': engine2.halted, 'quarantined': engine2.quarantined,
+            'quarantined': engine2.quarantined,
         }
         out['sent_closes'] = list(b.sent_closes)
         out['writes'] = faulty.writes
@@ -23308,7 +23103,7 @@ def __test_a_crash_at_any_hedging_store_write_redelivers_every_fill_once__(
     assert run['crashed'] and run['raised'] == []
     assert run['redelivered_size'] == run['restart_size']
     second = run['second']
-    assert second['owed'] == [] and not second['halted']
+    assert second['owed'] == []
     assert [fill_id for fill_id, booked, _ in second['receipts'] if booked] == [
         fill_id for fill_id, _, _ in second['receipts']]
     if 'f-S' in run['flagged'] and second['open'] == [('S', -1.0)]:
@@ -23347,7 +23142,7 @@ def __test_a_crash_at_any_software_guard_store_write_never_loosens_the_trail__(
     assert (run['second']['closes'] == [("7", 3)]) == (persisted == 112.0)
     assert run['second']['closes'] in ([], [("7", 3)])
     second = run['second']
-    assert second['owed'] == [] and not second['halted'] and not second['quarantined']
+    assert second['owed'] == [] and not second['quarantined']
 
 
 @pytest.mark.parametrize('crash_at', range(72))
@@ -23391,28 +23186,28 @@ def __test_a_crash_at_any_partial_bracket_store_write_restarts_to_a_settled_end_
         _LEG_STATE_TRIGGERING, LEG_STATE_TRIGGERED_FAILED, LEG_STATE_TRIGGERED_UNKNOWN,
         LEG_STATE_CANCEL_TENTATIVE)]
     assert second['tentative'] == [] and second['owed'] == []
-    assert not second['halted'] and not second['quarantined']
+    assert not second['quarantined']
 
 
 @pytest.mark.parametrize('executed', [True, False], ids=['executed', 'not_executed'])
-def __test_the_operator_settles_a_held_close_no_venue_record_can_settle__(
+def __test_the_bot_settles_a_held_close_no_journal_record_settles_from_the_venue__(
         tmp_path, caplog, executed):
-    """An undecidable hold names its close and the command that settles it.
+    """An undecidable hold is settled by the bot from the venue's order history.
 
     The process dies right after the venue took the TP's close, and nothing
     journals the close: the restart holds the leg and quarantines, and the
-    ERROR names the close's client order id with the exact resume command for
-    either outcome. The operator records the outcome with the resume; the
-    restarted bot settles the leg with it and journals that it did: executed
-    -> the leg ends ``triggered`` and its SL sibling cascades, with no second
-    TP close; not executed -> the leg re-arms, and its next cross sends a TP
-    close under a fresh client order id. Nothing quarantines again.
+    ERROR names the close's client order id and says the bot reads it from
+    the venue. The venue's order history answers (no operator); the next
+    process settles the leg with it: executed -> the leg ends ``triggered``
+    and its SL sibling cascades, with no second TP close; not executed -> the
+    leg re-arms, and its next cross sends a TP close under a fresh client
+    order id. Nothing quarantines again.
     """
     import logging
     caplog.set_level(logging.WARNING)
     run = _run_partial_bracket_fault_scenario(
         tmp_path, None, crash_after_tp_close=True, close_journal='none',
-        operator_decision=executed)
+        venue_answer=executed)
     assert run['crashed'] and run['raised'] == []
     tp_closes = _tp_close_coids(run)
     decided = run['decided']
@@ -23421,14 +23216,12 @@ def __test_the_operator_settles_a_held_close_no_venue_record_can_settle__(
     assert decided['quarantined'] and decided['held_coids'] == [held_coid]
     errors = _held_partial_bracket_errors(caplog)
     assert errors and all(held_coid in error for error in errors)
-    resume = f"pyne broker resume '{_restart_identity().run_id}' {decided['quarantine_id']}"
-    assert f'"{resume} --close-executed {held_coid}"' in errors[0]
-    assert f'"{resume} --close-not-executed {held_coid}"' in errors[0]
+    assert "BrokerPlugin.fetch_order_execution" in errors[0]
+    assert "pyne broker resume" not in errors[0]
     second = run['second']
     assert second['legs'] == second['leg_rows']
     assert _LEG_STATE_TRIGGERING not in [leg[1] for leg in second['legs']]
-    assert ('operator_close_decision_applied', held_coid) in second['journal']['events']
-    assert not second['quarantined'] and not second['halted'] and second['owed'] == []
+    assert not second['quarantined'] and second['owed'] == []
     closed = collections.Counter(pine_id.split('\0')[2] for pine_id in run['accepted_closes'])
     if executed:
         assert closed == {'tp_partial': 1, 'trail_partial': 1}
@@ -23481,7 +23274,7 @@ def __test_a_crash_at_any_write_around_an_acknowledged_partial_close_never_over_
         _LEG_STATE_TRIGGERING, LEG_STATE_TRIGGERED_FAILED, LEG_STATE_TRIGGERED_UNKNOWN,
         LEG_STATE_CANCEL_TENTATIVE)]
     assert second['tentative'] == [] and second['owed'] == []
-    assert not second['halted'] and not second['quarantined']
+    assert not second['quarantined']
 
 
 @pytest.mark.parametrize('close_journal', list(_ACKED_CLOSE_MODES))
@@ -23530,7 +23323,7 @@ def __test_an_acknowledged_partial_close_holds_its_leg_until_the_venue_settles_i
         assert run[key]['legs'] == run[key]['leg_rows'] == base[key]['legs'], key
         assert run[key]['owed'] == [], key
     assert _held_partial_bracket_errors(caplog) == []
-    assert not run['second']['quarantined'] and not run['second']['halted']
+    assert not run['second']['quarantined']
 
 
 def _partial_bracket_view(engine) -> list[tuple]:
@@ -23559,7 +23352,7 @@ def _run_partial_bracket_fault_scenario(
         tmp_path, fail_at: int | None, *, crash: bool = False,
         crash_after_tp_close: bool = False, close_journal: str = 'row',
         after_first_restart_bar: Callable[[Any], None] | None = None,
-        operator_decision: bool | None = None) -> dict:
+        venue_answer: bool | None = None) -> dict:
     """Partial brackets (pending, armed, trail, trigger, cascade), a cancel-tentative, restart.
 
     With ``crash`` the ``fail_at``-th write kills the first process instead of
@@ -23591,10 +23384,10 @@ def _run_partial_bracket_fault_scenario(
     next close executes that). ``executed`` lists ``(pine id, quantity)`` of
     every close the venue executed.
     ``after_first_restart_bar`` runs with the restarted run's store after its
-    first bar. With ``operator_decision`` the operator then resumes the
-    restarted run's quarantine, recording for every held close that it
-    executed (``True``) or did not (``False``), and the run restarts once more
-    (``decided`` records the state the operator saw).
+    first bar. With ``venue_answer`` the venue's order history then answers
+    for every held close that it executed in full (``True``) or not at all
+    (``False``), and the run restarts once more (``decided`` records the
+    state before the venue answered).
     """
     out: dict = {'raised': [], 'crashed': False, 'tp_ack_lost': False,
                  'journal_failed': None, 'executed': []}
@@ -23891,15 +23684,29 @@ def _run_partial_bracket_fault_scenario(
                 bar(110.0)
                 if restart_bars:
                     bar(110.0)
-                if operator_decision is not None and 'decided' not in out:
-                    held_coids = sorted(store.held_trigger_close_coids(ctx2.run_id))
+                if venue_answer is not None and 'decided' not in out:
+                    held = {leg.close_attempt_coid: leg.qty for leg in
+                            engine2._partial_bracket_engine.iter_held_trigger_legs()}  # type: ignore[attr-defined]
                     out['decided'] = {'quarantine_id': engine2.quarantine_id,
                                       'quarantined': engine2.quarantined,
-                                      'held_coids': held_coids}
+                                      'held_coids': sorted(held)}
                     assert engine2.quarantine_id is not None
-                    store.request_quarantine_resume(
-                        ctx2.run_id, engine2.quarantine_id,
-                        {coid: operator_decision for coid in held_coids})
+
+                    async def fetch_order_execution(order_id, client_order_id, _held=held):
+                        qty = _held.get(client_order_id)
+                        if qty is None:
+                            return None
+                        filled = qty if venue_answer else 0.0
+                        return OrderExecution(order=ExchangeOrder(
+                            id=f"venue-{client_order_id}", symbol=SYMBOL, side='sell',
+                            order_type=OrderType.MARKET, qty=qty, filled_qty=filled,
+                            remaining_qty=qty - filled, price=None, stop_price=None,
+                            average_fill_price=120.0 if venue_answer else None,
+                            status=OrderStatus.FILLED if venue_answer else OrderStatus.CANCELLED,
+                            timestamp=0.0, fee=0.0, fee_currency='USDT',
+                            client_order_id=client_order_id))
+
+                    b.fetch_order_execution = fetch_order_execution  # type: ignore[attr-defined]
                     ctx2.close()
                     continue
                 break
@@ -23913,7 +23720,7 @@ def _run_partial_bracket_fault_scenario(
             'leg_rows': _partial_bracket_rows(ctx2),
             'tentative': sorted(engine2._cancel_disposition_pending),  # type: ignore[attr-defined]
             'owed': list(engine2._owed_store_writes),  # type: ignore[attr-defined]
-            'halted': engine2.halted, 'quarantined': engine2.quarantined,
+            'quarantined': engine2.quarantined,
             'journal': _journal_view(ctx2),
         }
         out['calls'] = {
@@ -23966,7 +23773,7 @@ def __test_a_restart_settles_a_partial_close_the_venue_executed_without_sending_
     assert closed == {'tp_partial': 1, 'trail_partial': 1}
     second = run['second']
     assert second['legs'] == second['leg_rows'] == []
-    assert second['owed'] == [] and not second['halted'] and not second['quarantined']
+    assert second['owed'] == [] and not second['quarantined']
 
 
 @pytest.mark.parametrize('close_journal', ['none', 'event', 'cancelled'])
@@ -24000,7 +23807,7 @@ def __test_a_restart_holds_a_partial_close_no_venue_record_can_settle__(
     assert closed == {'tp_partial': 1, 'trail_partial': 1}
     errors = _held_partial_bracket_errors(caplog)
     assert len(errors) == 1 and tp_closes[-1] in errors[0]
-    assert second['quarantined'] and not second['halted'] and second['owed'] == []
+    assert second['quarantined'] and second['owed'] == []
 
 
 def __test_a_restart_holds_a_partial_close_until_the_plugin_journal_answers__(
@@ -24029,7 +23836,7 @@ def __test_a_restart_holds_a_partial_close_until_the_plugin_journal_answers__(
     second = held_run['second']
     assert second['legs'] == second['leg_rows']
     assert [leg[1] for leg in second['legs']].count(_LEG_STATE_TRIGGERING) == 1
-    assert not second['quarantined'] and not second['halted']
+    assert not second['quarantined']
     errors = _held_partial_bracket_errors(caplog)
     assert len(errors) == 1 and tp_closes[-1] in errors[0]
 
@@ -24044,7 +23851,7 @@ def __test_a_restart_holds_a_partial_close_until_the_plugin_journal_answers__(
     second = refused_run['second']
     assert second['legs'] == second['leg_rows']
     assert _LEG_STATE_TRIGGERING not in [leg[1] for leg in second['legs']]
-    assert not second['quarantined'] and not second['halted'] and second['owed'] == []
+    assert not second['quarantined'] and second['owed'] == []
 
 
 def __test_a_partial_close_whose_answer_was_lost_is_held_in_process_and_across_a_restart__(
@@ -24086,7 +23893,7 @@ def __test_a_partial_close_whose_answer_was_lost_is_held_in_process_and_across_a
     assert _LEG_STATE_TRIGGERING not in [leg[1] for leg in second['legs']]
     closed = collections.Counter(pine_id.split('\0')[2] for pine_id in run['accepted_closes'])
     assert closed == {'tp_partial': 1, 'trail_partial': 1}
-    assert second['owed'] == [] and not second['halted'] and not second['quarantined']
+    assert second['owed'] == [] and not second['quarantined']
 
 
 def __test_a_partial_close_the_plugin_journal_failed_to_record_re_arms_without_a_hold__(
@@ -24118,7 +23925,7 @@ def __test_a_partial_close_the_plugin_journal_failed_to_record_re_arms_without_a
     for key in ('first', 'second'):
         assert run[key]['legs'] == run[key]['leg_rows'] == base[key]['legs'], key
         assert run[key]['owed'] == [], key
-    assert not run['second']['quarantined'] and not run['second']['halted']
+    assert not run['second']['quarantined']
 
 
 def __test_a_partial_close_whose_fan_out_journal_failed_after_a_sent_leg_stays_held__(
@@ -24144,7 +23951,7 @@ def __test_a_partial_close_whose_fan_out_journal_failed_after_a_sent_leg_stays_h
     assert [leg[1] for leg in second['legs']].count(_LEG_STATE_TRIGGERING) == 1
     errors = _held_partial_bracket_errors(caplog)
     assert len(errors) == 2 and all(failed_coid in error for error in errors)
-    assert second['quarantined'] and not second['halted'] and second['owed'] == []
+    assert second['quarantined'] and second['owed'] == []
 
 
 
@@ -24161,7 +23968,17 @@ def _held_close_evidence_double(tmp_path, *, port=None, acknowledged=()):
         lambda coid: OrderSyncEngine._held_order_close_outcome(engine, coid))
     engine._held_fan_close_outcome = (
         lambda coid, p: OrderSyncEngine._held_fan_close_outcome(engine, coid, p))
-    return ctx, lambda coid: OrderSyncEngine._held_trigger_close_outcome(engine, coid)
+    # The venue cannot answer for the close, and the fan's leg settlement is
+    # recorded only (both are covered apart).
+    engine._venue_close_outcome = lambda coid: None
+    replayed: list[str] = []
+    engine._replay_held_fan_close = lambda coid, _port: replayed.append(coid)
+
+    def outcome_of(coid):
+        return OrderSyncEngine._held_trigger_close_outcome(engine, coid)
+
+    outcome_of.replayed = replayed  # type: ignore[attr-defined]
+    return ctx, outcome_of
 
 
 @pytest.mark.parametrize(('absent', 'expected'), [(True, 'unknown'), (False, 'refused')],
@@ -24178,7 +23995,7 @@ def __test_a_close_rejected_only_on_its_absence_settles_nothing__(tmp_path, abse
     ctx.close_order('close-1')
     evidence = outcome_of('close-1')
     assert evidence.outcome == expected
-    assert evidence.operator_may_decide
+    assert not evidence.replay_owed
     ctx.close()
 
 
@@ -24225,26 +24042,24 @@ def __test_a_held_fan_close_settles_from_what_each_leg_close_executed__(
     ctx.close()
 
 
-@pytest.mark.parametrize(('acknowledged', 'expected', 'operator_may_decide'), [
-    (True, 'pending', True), (False, 'unknown', False),
+@pytest.mark.parametrize(('acknowledged', 'expected', 'replay_owed'), [
+    (True, 'pending', False), (False, 'unknown', True),
 ], ids=['this_process', 'inherited'])
 def __test_a_fan_leg_whose_send_is_unsettled_leaves_the_close_to_the_emulator__(
-        tmp_path, acknowledged, expected, operator_may_decide):
+        tmp_path, acknowledged, expected, replay_owed):
     """A close-leg row still pending is the emulator's to settle: in a fan this
-    process completed the close is ``'pending'``; an inherited one is
-    ``'unknown'`` without an operator decision (the resume's restart lets the
-    replay settle the send first), and an operator decision on record is not
-    applied to it."""
+    process completed the close is ``'pending'``; otherwise it is ``'unknown'``
+    with the emulator's leg settlement owed, which the bot runs itself in this
+    process (:meth:`OrderSyncEngine._replay_held_fan_close`), not at a restart."""
     port = _FanPort({'L1': 100})
     ctx, outcome_of = _held_close_evidence_double(
         tmp_path, port=port, acknowledged=('close-1',) if acknowledged else ())
     _create_close_leg_row(ctx, coid='close-1:L1', symbol='BTCUSDT', side='sell', qty=0.1,
                           intent_key='X', pine_entry_id='X', parent_close_coid='close-1',
                           leg_id='L1', leg_volume=100, leg_pre_volume=100)
-    ctx.operator_close_decision = lambda _coid: True
     evidence = outcome_of('close-1')
-    assert (evidence.outcome, evidence.operator_may_decide) == (expected, operator_may_decide)
-    assert not evidence.operator
+    assert (evidence.outcome, evidence.replay_owed) == (expected, replay_owed)
+    assert outcome_of.replayed == (['close-1'] if replay_owed else [])
     assert port.asked == []
     ctx.close()
 
@@ -24414,6 +24229,6 @@ def __test_a_crash_at_any_netting_store_write_restarts_to_one_netted_side__(
     assert len(sends) == len(set(sends)), sends
     second = run['second']
     assert second['owed'] == [] and not second['nettings']
-    assert not second['halted'] and not second['quarantined']
+    assert not second['quarantined']
     assert second['legs'] in ([('70', 'buy', 1.0)], [('70', 'buy', 2.0)]), second['legs']
     assert second['size'] == sum(qty for _leg_id, _side, qty in second['legs'])

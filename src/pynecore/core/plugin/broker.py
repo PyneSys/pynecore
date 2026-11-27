@@ -16,6 +16,7 @@ design, in particular the rationale for the high-level intent API.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from typing import TYPE_CHECKING, Protocol, TypeVar
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
         ExchangePosition,
         ExchangeCapabilities,
         OrderEvent,
+        OrderExecution,
         PositionLeg,
         Quote,
     )
@@ -372,18 +374,19 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
       auth probe is outside this net (it runs before the per-bar engine loop, so
       there is no cycle to park onto); a raw transient there aborts startup.
     - On a direct order write (``execute_*`` / ``modify_*`` /
-      :meth:`cancel_broker_order_ref`) it is unrecoverable centrally — the engine
-      cannot tell a never-sent request from a landed one — so an untranslated
-      retryable ``ProviderError`` or ``ConnectionError`` raises
-      :class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError` (a
-      controlled halt) rather than risk a duplicate fill. A raw write-side
-      ``TimeoutError`` is the exception: the dispatch bridge cannot cancel the
-      still-running coroutine, so the order may yet land and the timeout stays
-      fatal rather than being latched as a halt.
+      :meth:`cancel_broker_order_ref`) the engine cannot tell a never-sent
+      request from a landed one, so an untranslated retryable ``ProviderError``,
+      ``ConnectionError`` or ``TimeoutError`` (and a write still unresolved past
+      the bridge's classification grace) is taken as an
+      :class:`~pynecore.core.broker.exceptions.OrderDispositionUnknownError`:
+      the dispatch is parked for verification, never sent again blindly. The
+      contract violation also latches an ``entry_block`` quarantine that ends
+      by itself once a reconcile passes without another one and the venue
+      holds what the book holds.
 
     The net only catches contract violations; a plugin SHOULD still classify
     explicitly, which keeps the recoverable read path parking and the ambiguous
-    write path parked-for-verification instead of halting.
+    write path parked-for-verification without blocking entries.
     """
 
     client_order_id_max_len: int = CLIENT_ORDER_ID_MAX_LEN
@@ -405,9 +408,10 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     """
     Grace window (seconds) for a defensive close FILL to settle after
     :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine._handle_bracket_attach_after_fill_reject`
-    dispatches it. The engine halts the run when a pending marker
-    survives this window — the missing FILL means an operator must
-    intervene.
+    dispatches it. A marker that survives this window has the venue
+    position probed: a venue that shows the close done settles the marker,
+    otherwise the marker stays armed and the engine blocks new entries until
+    the close settles (it never sends the close again blindly).
 
     ``None`` (default) uses the engine's built-in default
     (``DEFENSIVE_CLOSE_RESOLUTION_GRACE_S``, currently 30 seconds).
@@ -433,15 +437,38 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     knows its venue's worst case declares it.
     """
 
+    supports_held_execution_close: bool = False
+    """
+    Whether :meth:`execute_close` honours a ``held_execution_close``
+    :class:`~pynecore.core.broker.models.CloseIntent` on a netting account.
+
+    The engine sends that close when an entry's execution evidence never
+    arrived within :attr:`fill_report_grace_s` and the strategy asked to close
+    or reverse the exposure the entry is on. Its ``qty`` is the venue position
+    the engine read from :meth:`get_position` right before, which can include
+    an execution no journal row of the plugin owns (the entry's order ended
+    without the venue's executed quantity). A plugin that sets this to ``True``
+    reduces the symbol's venue position by ``intent.qty`` in a form that cannot
+    open or grow opposite exposure (a native reduce-only market order, a close
+    of the venue position by its own quantity), whatever its journal rows
+    hold, journals the close under ``envelope.client_order_id(KIND_CLOSE)`` and
+    reports its fills as ``LegType.CLOSE`` fills of that order.
+
+    ``False`` (default): the engine closes only what the book holds, with the
+    symbol-wide ``reversal_close``, and tells the operator what is left on the
+    venue. A hedging account (:attr:`position_port`) needs no opt-in: the
+    core's one-way emulator closes the venue legs itself.
+    """
+
     on_unexpected_cancel: str = "stop"
     """
     Policy for bot-owned orders that disappear without the bot cancelling them.
 
     One of ``"stop"`` (external-intervention quarantine: the bot leaves the
     venue untouched, the process stays alive as a live observer — default),
-    ``"re_place"`` (auto-replace protective orders), ``"ignore"`` (continue), or
-    ``"halt"`` (exit the process via the graceful manual-intervention
-    path).  The class-level default is the quarantining fallback used by
+    ``"re_place"`` (auto-replace protective orders) or ``"ignore"``
+    (continue). No policy ends the process: the bot runs unattended and
+    stays alive in every outcome.  The class-level default is the quarantining fallback used by
     test paths that construct plugins without the CLI.  In production
     the value comes from the cross-broker ``workdir/config/brokers.toml``
     via :class:`~pynecore.core.broker.defaults.BrokerDefaults` — the
@@ -507,7 +534,9 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     PUT retry whose success report could not be confirmed directly) flips back
     to ``HEALTHY`` once the broker is observed carrying the desired worst-SL.
     Without the feed the stale-window timer escalates ``DEGRADING -> DEGRADED``,
-    blocking new entries / partial brackets until a manual ``reset_to_engine``.
+    blocking new entries / partial brackets; the bot then re-arms the stop with
+    a backoff (:meth:`~pynecore.core.broker.native_failsafe_manager.NativeFailsafeManager.heal_degraded`),
+    and only this feed's confirmation of the re-armed stop lifts the block.
 
     The callee is keyed by ``parent_entry_dispatch_ref`` (the entry order's
     ``client_order_id``) and the engine no-ops for refs it does not track, so
@@ -535,11 +564,27 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     then on the engine and the plugin's transport refuse every venue write
     (see :attr:`venue_writes_blocked`). The default ``ENTRY_BLOCK`` kind only
     blocks new exposure. ``None`` when the runner has not wired it
-    (state-only test paths); the tracker then falls back to the
-    process-exiting halt, which is fail-safe, never fail-open.
+    (state-only test paths); the tracker then falls back to raising
+    :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`, which
+    the engine answers with the same quarantine: fail-safe, never
+    fail-open, and never a process exit.
+
+    An ``ENTRY_BLOCK`` request is the bot's own trouble, and the bot must get
+    out of it by itself: pass ``cause`` (a key unique to the condition, e.g.
+    ``'vanished_order:<order id>'``) and call :attr:`quarantine_release_sink`
+    with it once the condition is gone (the plugin closed what it had to, or
+    the venue's records proved the outcome); the latch ends with its last
+    cause. ``cause`` is mandatory for an ``ENTRY_BLOCK``: a request without
+    one latches nothing and raises :class:`ValueError`, since nothing could
+    ever end it. A cause that
+    starts with :data:`~pynecore.core.broker.models.FENCE_CAUSE_PREFIX` also
+    forbids every venue write of this process while it is held, exits and
+    closes included (a process that must not write at all, such as a fenced
+    zombie whose replacement instance owns the account).
 
     Signature: ``sink(reason: str, context: dict | None = None, *,
-    kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK) -> bool``. It returns
+    kind: QuarantineKind = QuarantineKind.ENTRY_BLOCK,
+    cause: str | None = None) -> bool``. It returns
     ``False`` only when the request repeats an intervention already recorded
     under the held latch (the caller skips its own audit event), ``True``
     otherwise.
@@ -551,6 +596,18 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     ``EXTERNAL_INTERVENTION`` latch (a row whose retirement only the latch
     guards) requests it through :meth:`request_durable_intervention_quarantine`
     and retires only on ``True``.
+    """
+
+    quarantine_release_sink: Callable[[str, str], bool] | None = None
+    """Optional release of an ``ENTRY_BLOCK`` quarantine cause the plugin latched.
+
+    The :class:`~pynecore.core.script_runner.ScriptRunner` wires this to
+    :meth:`~pynecore.core.broker.sync_engine.OrderSyncEngine.end_quarantine_cause`.
+    Signature: ``sink(cause, resolution) -> bool``: ``cause`` is the key the
+    plugin passed to :attr:`quarantine_sink`, ``resolution`` says what
+    resolved it (logged); it returns whether the latch ended. A cause not held
+    is a no-op, so a plugin may release on every pass that finds the condition
+    gone. Thread-safe. ``None`` when the runner has not wired it.
     """
 
     venue_writes_blocked: Callable[[], bool] | None = None
@@ -637,8 +694,7 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     Only meaningful for plugins that opt into the core spot inventory
     layer (:attr:`spot_inventory_port`). ``"quarantine"`` (default)
     latches the engine's quarantine — trading stops, the process stays
-    alive as an observer; ``"halt"`` exits via the graceful
-    manual-intervention path. Deliberately narrower than
+    alive as an observer. It is the only policy. Deliberately narrower than
     :attr:`on_unexpected_cancel`: ``re_place`` would buy back an
     operator's withdrawal and ``ignore`` would trade on corrupt books,
     so neither applies to an attribution conflict. In production the
@@ -755,6 +811,77 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
             return True
         return store_ctx.intervention_latch_stored()
 
+    def request_execution_hold(self, client_order_id: str, order_id: str) -> bool:
+        """Hand an entry whose execution the stream will not report to the engine.
+
+        Call it when the plugin proved that an entry's order reached the venue
+        as ``order_id`` and ended there, and the stream can never deliver that
+        order's execution: the order, or the position it opened, is closed
+        since, and the venue does not list it any more. It applies to a live
+        entry row
+        (:meth:`~pynecore.core.broker.storage.RunContext.execution_hold_applies`)
+        of two kinds:
+
+        - a dispatch whose outcome waits for the venue's answer (parked with
+          an unknown disposition, or left pending by an earlier process): the
+          engine's verification promotes only an order the venue still lists
+          open, so without this the dispatch stays pending and the intent's
+          entry stays held for the whole run;
+        - a taken-over working order (its row has its venue order id) that
+          executed while no process of the run was watching: no fill of it
+          reaches the engine, and after a restart nothing maps the order to
+          its entry.
+
+        The request is stored
+        (:meth:`~pynecore.core.broker.storage.RunContext.request_execution_hold`)
+        and the engine takes it at its next sync: a pending row gets
+        ``order_id`` and the ``confirmed`` state (nothing is sent again), a park
+        of the row is retired, and the entry is held for its execution over
+        ``order_id``, with or without its Pine intent active; a re-declared
+        entry adopts the held order instead of being sent afresh. From then on
+        the held-execution recovery owns it: new entries are blocked (cause
+        ``fill_evidence:<intent key>``), the engine reads the order's execution
+        with :meth:`fetch_order_execution` (``order_id``, no client order id)
+        until it can book it, with no deadline, and the block ends once the
+        book holds what the order executed and the venue holds what the book
+        holds. A close or reversal the strategy asks for over the entry
+        meanwhile closes the venue position as read from the venue, never more.
+
+        The plugin owes the close of the position the execution opened: its
+        ``CLOSE`` fills, labelled with the entry (``pine_id`` or
+        ``from_entry``), with the venue's figures, whenever it knows them (one
+        that arrives before the execution is booked waits for it). Without
+        them the engine closes the handed-over exposure the venue no longer
+        holds out by itself after the fill-report grace, at the entries'
+        average price (commission-only, approximate P&L; audited as
+        ``held_execution_close_adopted``), and a close fill delivered later
+        re-prices that close.
+
+        Called outside every store transaction, so the request commits on its
+        own. Asking again for the same row replaces the request.
+
+        :param client_order_id: The entry row's client order id.
+        :param order_id: The venue order id the execution is read under
+            (:meth:`fetch_order_execution` gets it, with no client order id).
+        :return: ``True`` once the request is stored; ``False`` without a store,
+            when the row is no live entry row the hold applies to (it was
+            settled meanwhile, logged), or when the store write failed
+            (logged; ask again on a later pass).
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return False
+        try:
+            store_ctx.request_execution_hold(client_order_id, order_id)
+        except ValueError as exc:
+            logger.warning("execution hold not requested: %s", exc)
+            return False
+        except sqlite3.Error as exc:
+            logger.warning("execution hold of %s on venue order %s not stored (%s: %s); "
+                           "ask again", client_order_id, order_id, type(exc).__name__, exc)
+            return False
+        return True
+
     def report_external_intervention(
             self,
             reason: str,
@@ -774,8 +901,8 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         exactly as for an unexpected cancel: ``stop`` latches the
         external-intervention quarantine through :attr:`quarantine_sink`,
         ``ignore`` / ``re_place`` only write an ``external_intervention_*``
-        audit event, ``halt`` (or a quarantining policy without a working sink)
-        raises.
+        audit event, and ``stop`` without a working sink raises the
+        fail-safe signal the engine latches the same quarantine on.
 
         A change the venue dates at or before :attr:`operator_resume_ts_ms` was
         accepted by the operator's resume: it is logged as a WARNING and
@@ -789,8 +916,8 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         :param exchange_order_id: The affected venue ref, for the audit event.
         :param changed_at_ms: The venue's time of the change (Unix ms), when
             known.
-        :raises UnexpectedCancelError: When the policy requires the
-            process-exiting halt.
+        :raises UnexpectedCancelError: When ``stop`` could not latch the
+            quarantine through :attr:`quarantine_sink`.
         """
         store_ctx = self.store_ctx
         resume_ts_ms = self.operator_resume_ts_ms if changed_at_ms is not None else None
@@ -1048,8 +1175,8 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
           so the engine can retry on the next reconcile / restart.
         - Any other exchange-side rejection (e.g.
           :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`)
-          MUST propagate — the engine treats it as an operator-attention
-          condition and halts.
+          MUST propagate — the engine keeps the cleanup pending, retries it
+          on the next reconcile and blocks new entries until it is done.
 
         The default implementation raises :class:`NotImplementedError`
         — plugins that return non-empty lists from
@@ -1141,6 +1268,57 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
     async def get_balance(self) -> dict[str, float]:
         """Get available balance per currency."""
 
+    @abstractmethod
+    async def fetch_order_execution(
+            self, order_id: str | None, client_order_id: str | None,
+    ) -> 'OrderExecution | None':
+        """Read what the venue executed of one order, from its order and execution history.
+
+        The engine's own recovery, with no human involved: it calls this,
+        with a backoff capped at a few minutes and no deadline, for an order
+        whose execution the stream never delivered:
+
+        - an entry whose terminal event did not carry the executed quantity,
+          or whose reported execution was never followed by its fill (the
+          fill-evidence hold, ``OrderSyncEngine._recover_held_executions``);
+        - a partial-bracket close whose outcome no journal record shows
+          (looked up by ``client_order_id`` only).
+
+        Return the venue's record (:class:`~pynecore.core.broker.models.OrderExecution`):
+        the order with its cumulative ``filled_qty`` (``filled_qty_known``
+        ``True``), ``average_fill_price`` and cumulative ``fee``, and, when the
+        venue keeps them, every execution as the fill events the stream would
+        have delivered, with the SAME ``fill_id`` the stream uses (the engine
+        takes a fill id once, so a late stream delivery of the same execution
+        is not booked twice). A venue that keeps only totals returns
+        ``fills=None``: the engine then books an order nothing of which is
+        booked yet at the venue's average price, and only that (a partly
+        booked order needs the executions; the average alone does not give
+        the price of the rest). ``journal_fill_qty`` must be in the unit
+        ``filled_qty`` is in; a plugin whose position unit differs from it
+        (a fee-net spot fill, an inverse contract) returns the executions.
+        Set ``fee_reported=False`` when the venue does not report the
+        commission: the engine books the execution with the fee marked
+        unreported, never as a silent zero.
+
+        Return ``OrderExecution(order=None)`` only when the venue proves no
+        order exists under the ids (it never reached the venue). Return
+        ``None`` when the venue cannot answer now (the engine asks again
+        later). Raise to report a failed read (the engine asks again later).
+
+        Read-only: never write to the venue here. Called on the engine's
+        thread through the plugin's event loop, under every quarantine kind.
+
+        Every plugin implements it: it is the bot's only way out of a lost
+        execution without a human.
+
+        :param order_id: The venue order id, ``None`` when only the client
+            order id is known.
+        :param client_order_id: The client order id the order was sent with,
+            ``None`` when unknown.
+        :return: The venue's record, or ``None`` when it cannot answer now.
+        """
+
     async def get_quote(self, symbol: str) -> 'Quote | None':
         """Read the venue's current bid and ask for ``symbol``, fresh.
 
@@ -1185,12 +1363,12 @@ class BrokerPlugin(LiveProviderPlugin[BrokerConfigT], ABC):
         a fill against :meth:`get_position` instead. A fill that opened
         exposure must carry ``LegType.ENTRY``.
 
-        Plugins that decide a disappearance warrants a graceful halt
-        instead of a soft cancel should raise
+        A plugin whose quarantine hook could not latch a confirmed
+        disappearance raises
         :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`
-        from the same generator — the engine catches it on the broker
-        thread and latches a halt flag so the next runner tick exits via
-        its ``finally`` block.
+        from the same generator: the engine latches the external-intervention
+        quarantine on the broker thread and reopens the stream, and the
+        process stays alive.
         """
         raise NotImplementedError
 

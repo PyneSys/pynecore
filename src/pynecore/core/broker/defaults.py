@@ -1,7 +1,7 @@
 """
 Cross-broker runtime defaults loaded from ``workdir/config/brokers.toml``.
 
-Holds policies that are broker-agnostic by design — the four
+Holds policies that are broker-agnostic by design — the three
 ``on_unexpected_cancel`` modes, for instance, share identical semantics
 regardless of which exchange the plugin talks to. Living here rather than
 in each plugin's own config keeps the user-facing knob in a single place
@@ -30,12 +30,10 @@ VALID_UNEXPECTED_CANCEL_POLICIES = frozenset({
     "stop",
     "re_place",
     "ignore",
-    "halt",
 })
 
 VALID_INVENTORY_CONFLICT_POLICIES = frozenset({
     "quarantine",
-    "halt",
 })
 
 
@@ -61,17 +59,17 @@ class BrokerDefaults:
     the protective order on the next diff cycle.
     ``"ignore"`` — silently continue. Only safe when manual external
     cancellations are an expected part of the operational workflow.
-    ``"halt"`` — exit the process via the graceful manual-intervention
-    path, leaving any remaining orders unsupervised until restart.
     """
 
     on_inventory_conflict: str = "quarantine"
     """Policy for a confirmed spot balance-invariant conflict.
 
     Only used by plugins that opt into the core spot inventory layer.
-    ``"quarantine"`` (default) — trading stops, the process stays alive
-    as an observer; a restart recovers on a fresh venue-balance baseline.
-    ``"halt"`` — exit via the graceful manual-intervention path.
+    ``"quarantine"`` (default, and the only one) — new entries stop and
+    the process stays alive; the bot's own measurement trouble recovers
+    in-process by re-measuring the venue balance, a balance someone else
+    took waits for an operator resume. No policy ends the process: the
+    bot runs unattended, so it stays alive in every outcome.
     The set is deliberately narrower than ``on_unexpected_cancel``:
     an attribution conflict has no safe ``re_place`` or ``ignore``
     analogue (the former would buy back an operator's withdrawal, the

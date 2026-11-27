@@ -700,7 +700,9 @@ def __test_report_external_intervention_quarantines_under_stop__():
     assert kind is QuarantineKind.EXTERNAL_INTERVENTION
 
 
-def __test_report_external_intervention_halts_without_a_sink_or_under_halt__():
+def __test_report_external_intervention_raises_the_signal_without_a_sink_or_policy__():
+    """Fail-closed: ``stop`` without a working sink, and an unknown policy
+    value, raise the signal the engine latches the quarantine on."""
     with pytest.raises(UnexpectedCancelError):
         BrokerPlugin.report_external_intervention(  # type: ignore[arg-type]
             _plugin('stop'), "SL moved")

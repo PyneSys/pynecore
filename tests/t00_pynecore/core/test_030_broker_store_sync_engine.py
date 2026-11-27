@@ -18,8 +18,10 @@ Unit tests for the ``BrokerStore`` API itself live in
 the two layers.
 """
 import asyncio
+import inspect
 import logging
 import signal
+import sqlite3
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -40,6 +42,7 @@ from pynecore.core.broker.parked_dispatch import (
     ParkedDispatchResolver,
     ParkedOutcome,
     ParkedVerdict,
+    inherited_dispatch_in_flight,
 )
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.protection_guard import (
@@ -51,7 +54,7 @@ from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import (
     ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND,
     ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND,
-    FILL_EVIDENCE_OPERATOR_RELEASE_FIELD,
+    EXECUTION_HOLD_REQUEST_EVENT_KIND,
     BrokerStore,
     OrderRow,
     RunContext,
@@ -71,21 +74,21 @@ from pynecore.core.broker.models import (
     ExitIntent,
     LegType,
     OrderEvent,
+    OrderExecution,
     OrderStatus,
     OrderType,
 )
+from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.broker.software_partial_bracket_engine import (
     PartialBracketLeg,
 )
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
-    EXTRAS_KEY_LEG_STATE,
-    EXTRAS_KEY_TRIGGER_CLOSE_COID,
+    ENTRY_KIND_WORKING,
     LEG_KIND_SL_PARTIAL,
     LEG_STATE_ARMED,
-    LEG_STATE_TRIGGERING,
+    STATE_CONFIRMED,
     STATE_DISPOSITION_UNKNOWN,
-    STATE_PARTIAL_BRACKET_LEG,
     create_entry_order_row,
 )
 from pynecore.lib.strategy import Order, _order_type_entry
@@ -2882,7 +2885,7 @@ def __test_an_entry_block_quarantine_ends_at_restart__(tmp_path: Path) -> None:
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         first = _open_ctx(store)
         engine, _pos = _mk_engine(_MockBroker(), first)
-        engine.record_quarantine("close_rejected_repeatedly")
+        engine.record_quarantine("close_rejected_repeatedly", cause="close_rejected:L")
         quarantine_id = engine.quarantine_id
         assert quarantine_id is not None
         first.close()
@@ -3087,123 +3090,22 @@ def __test_the_resume_command_stamps_the_request_and_lists_open_latches_on_a_mis
         assert row is not None and row.resume_requested_ts_ms is not None
 
 
-def __test_the_resume_command_records_a_decision_only_on_a_held_close__(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+def __test_the_resume_command_takes_no_statement_about_the_bots_own_trouble__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--close-executed`` / ``--close-not-executed`` name a close the run
-    holds: an unknown one fails listing the held ones, one named both ways
-    fails, and neither records anything or stamps the resume. A valid
-    decision is recorded with the resume request, and only on an open latch."""
-    monkeypatch.setattr(app_state, '_workdir', tmp_path)
-    store_path = tmp_path / "output" / "logs" / "broker.sqlite"
-    with BrokerStore(store_path, plugin_name=PLUGIN) as store:
-        ctx = _open_ctx(store)
-        ctx.upsert_order("leg-tp", symbol=SYMBOL, side="sell", qty=0.5,
-                         state=STATE_PARTIAL_BRACKET_LEG,
-                         extras={EXTRAS_KEY_LEG_STATE: LEG_STATE_TRIGGERING,
-                                 EXTRAS_KEY_TRIGGER_CLOSE_COID: "close-held"})
-        ctx.upsert_order("leg-sl", symbol=SYMBOL, side="sell", qty=0.5,
-                         state=STATE_PARTIAL_BRACKET_LEG,
-                         extras={EXTRAS_KEY_LEG_STATE: LEG_STATE_ARMED,
-                                 EXTRAS_KEY_TRIGGER_CLOSE_COID: "close-armed"})
-        assert store.held_trigger_close_coids(ctx.run_id) == {"close-held"}
-        engine, _pos = _mk_engine(_MockBroker(), ctx)
-        quarantine_id = _latch_external(engine)
+    """The resume names the run and the quarantine only; the store keeps no operator decisions.
 
-        with pytest.raises(Exit):
-            cli_resume(ctx.run_id, quarantine_id, close_executed=["close-armed"])
-        assert "close-held" in capsys.readouterr().err
-        with pytest.raises(Exit):
-            cli_resume(ctx.run_id, quarantine_id, close_executed=["close-held"],
-                       close_not_executed=["close-held"])
-        row = ctx.get_quarantine(quarantine_id)
-        assert row is not None and row.resume_requested_ts_ms is None
-        assert ctx.operator_close_decision("close-held") is None
-
-        assert store.request_quarantine_resume(
-            ctx.run_id, "deadbeef", {"close-held": True}) is None
-        assert ctx.operator_close_decision("close-held") is None
-
-        cli_resume(ctx.run_id, quarantine_id, close_not_executed=["close-held"])
-        assert ctx.operator_close_decision("close-held") is False
-        row = ctx.get_quarantine(quarantine_id)
-        assert row is not None and row.resume_requested_ts_ms is not None
-
-
-def __test_the_resume_command_releases_only_a_held_entry__(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
-) -> None:
-    """``--entry-not-executed`` names an entry the run holds for its execution evidence.
-
-    An unknown entry fails listing the held ones and records nothing, nor
-    stamps the resume. A held one is marked released on its hold event, with
-    the resume request.
+    The bot settles a held close and a held entry from the venue itself, so
+    the command has no option that states an outcome, and the schema has no
+    table for one.
     """
     monkeypatch.setattr(app_state, '_workdir', tmp_path)
+    assert list(inspect.signature(cli_resume).parameters) == ['run_id', 'quarantine_id']
     store_path = tmp_path / "output" / "logs" / "broker.sqlite"
     with BrokerStore(store_path, plugin_name=PLUGIN) as store:
-        ctx = _open_ctx(store)
-        ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND,
-                                 {"Long": {'order_ids': ['x-1'], 'since_ms': 1,
-                                           'expired': True}})
-        assert store.held_fill_evidence_entries(ctx.run_id) == {"Long"}
-        engine, _pos = _mk_engine(_MockBroker(), ctx)
-        quarantine_id = _latch_external(engine)
-
-        with pytest.raises(Exit):
-            cli_resume(ctx.run_id, quarantine_id, entry_not_executed=["Short"])
-        assert "Long" in capsys.readouterr().err
-        row = ctx.get_quarantine(quarantine_id)
-        assert row is not None and row.resume_requested_ts_ms is None
-        assert FILL_EVIDENCE_OPERATOR_RELEASE_FIELD not in ctx.keyed_events_for_run_id(
-            ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND)["Long"]
-
-        cli_resume(ctx.run_id, quarantine_id, entry_not_executed=["Long"])
-        hold = ctx.keyed_events_for_run_id(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND)["Long"]
-        assert hold[FILL_EVIDENCE_OPERATOR_RELEASE_FIELD] == quarantine_id
-        assert hold['order_ids'] == ['x-1']
-        row = ctx.get_quarantine(quarantine_id)
-        assert row is not None and row.resume_requested_ts_ms is not None
-
-
-@pytest.mark.parametrize("evidence", ["awaiting-execution", "stored-arrival"])
-def __test_the_resume_command_refuses_an_entry_the_venue_reported_executed__(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
-        evidence: str,
-) -> None:
-    """``--entry-not-executed`` is refused once the store holds the venue's report of an execution.
-
-    The hold names the reported quantity (``awaiting_execution``), or a
-    stored arrival of its order reports a positive executed quantity: the
-    entry did execute. The command fails naming the quantity, records
-    nothing and does not stamp the resume.
-    """
-    monkeypatch.setattr(app_state, '_workdir', tmp_path)
-    store_path = tmp_path / "output" / "logs" / "broker.sqlite"
-    with BrokerStore(store_path, plugin_name=PLUGIN) as store:
-        ctx = _open_ctx(store)
-        engine, _pos = _mk_engine(_MockBroker(), ctx)
-        quarantine_id = _latch_external(engine)
-        # Written by the earlier process of the run (the arrival only as far
-        # as the store's read of it goes).
-        hold = {'order_ids': ['x-1'], 'since_ms': 1, 'expired': True}
-        if evidence == "awaiting-execution":
-            hold['awaiting_execution'] = ['x-1', 0.4]
-        else:
-            ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_ARRIVAL_EVENT_KIND,
-                                     {'x-1': {'event_type': 'cancelled',
-                                              'order': {'id': 'x-1', 'filled_qty': 0.4}}})
-        ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {"Long": hold})
-        assert store.fill_evidence_entries_reported_executed(ctx.run_id) == {"Long": 0.4}
-
-        with pytest.raises(Exit):
-            cli_resume(ctx.run_id, quarantine_id, entry_not_executed=["Long"])
-        assert "0.4" in capsys.readouterr().err
-        row = ctx.get_quarantine(quarantine_id)
-        assert row is not None and row.resume_requested_ts_ms is None
-        assert FILL_EVIDENCE_OPERATOR_RELEASE_FIELD not in ctx.keyed_events_for_run_id(
-            ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND)["Long"]
-
+        tables = {row[0] for row in store._conn.execute(  # noqa: SLF001
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert 'operator_close_decisions' not in tables
 
 
 @pytest.mark.parametrize(
@@ -3315,7 +3217,7 @@ def __test_an_entry_block_resume_never_resumes_the_intervention_it_escalated_to_
     with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
         ctx = _open_ctx(store)
         engine, _pos = _mk_engine(_MockBroker(), ctx)
-        engine.record_quarantine("close_rejected_repeatedly")
+        engine.record_quarantine("close_rejected_repeatedly", cause="close_rejected:L")
         quarantine_id = engine.quarantine_id
         assert quarantine_id is not None
         assert store.request_quarantine_resume(ctx.run_id, quarantine_id) is not None
@@ -3395,7 +3297,7 @@ def __test_a_late_entry_block_write_never_downgrades_a_persisted_escalation__(
             original(*args, **kwargs)
 
         monkeypatch.setattr(ctx, 'record_quarantine', _escalate_while_in_flight)
-        engine.record_quarantine("close_rejected_repeatedly")
+        engine.record_quarantine("close_rejected_repeatedly", cause="close_rejected:L")
         quarantine_id = engine.quarantine_id
         assert quarantine_id is not None
 
@@ -3432,7 +3334,7 @@ def __test_a_late_write_of_an_older_latch_does_not_mark_the_escalation_persisted
             original(*args, **kwargs)
 
         monkeypatch.setattr(ctx, 'record_quarantine', _escalation_write_fails)
-        engine.record_quarantine("close_rejected_repeatedly")
+        engine.record_quarantine("close_rejected_repeatedly", cause="close_rejected:L")
 
         assert calls == [QuarantineKind.ENTRY_BLOCK, QuarantineKind.EXTERNAL_INTERVENTION]
         assert not engine._quarantine_persisted, (  # noqa
@@ -3477,7 +3379,7 @@ def __test_a_storage_failure_before_a_fill_is_booked_keeps_the_fill__(
         engine.sync(BAR_TS + 60_000)
         assert failed == [coid]
         assert pos.size == 0.0
-        assert not engine.halted
+        assert not engine.quarantined
 
         engine.sync(BAR_TS + 120_000)
         assert pos.size == 1.0
@@ -3520,7 +3422,7 @@ def __test_a_storage_failure_before_a_slice_id_fill_is_booked_keeps_the_fill__(
         assert pos.size == 0.0
         receipt = ctx.fill_receipt(slice_id)
         assert receipt is None or not receipt.booked
-        assert not engine.halted
+        assert not engine.quarantined
 
         engine.sync(BAR_TS + 120_000)
         assert pos.size == 1.0
@@ -3559,7 +3461,6 @@ def __test_a_binding_book_that_keeps_failing_quarantines_after_the_bounded_retry
         assert pos.size == 1.0
         engine.sync(ts + 60_000)
         assert engine.quarantined
-        assert not engine.halted
         ctx.log_event = real_log_event  # type: ignore[method-assign]
         ctx.close()
 
@@ -3594,7 +3495,7 @@ def __test_a_binding_book_that_lands_again_resets_the_storage_count__(
         for _ in range(STORAGE_FAILURE_HALT_SYNCS - 1):
             ts += 60_000
             engine.sync(ts + 60_000)
-        assert not engine.halted
+        assert not engine.quarantined
         ctx.log_event = real_log_event  # type: ignore[method-assign]
         ctx.close()
 
@@ -3629,7 +3530,7 @@ def __test_a_failed_envelope_write_takes_no_envelope_and_sends_nothing__(
         assert len(calls) == 1
         assert broker.entry_calls == []
         assert "L" not in engine._envelopes
-        assert not engine.halted
+        assert not engine.quarantined
 
         engine.sync(BAR_TS)
         assert len(broker.entry_calls) == 1
@@ -3652,7 +3553,7 @@ def __test_a_failed_park_write_keeps_the_park_and_lands_it_next_sync__(
         assert len(calls) == 1
         assert coid in engine.pending_verification
         assert coid not in ctx.replay()[1]
-        assert not engine.halted
+        assert not engine.quarantined
 
         engine.sync(BAR_TS + 60_000)
         assert coid in ctx.replay()[1]
@@ -3709,7 +3610,7 @@ def __test_a_failed_complete_marker_never_resurrects_the_retired_anchor__(
         assert len(broker.cancel_calls) == 1
         assert calls and calls[0] == ("L",)
         assert "L" not in engine._envelopes
-        assert not engine.halted
+        assert not engine.quarantined
 
         engine.sync(BAR_TS + 120_000)
         assert "L" not in ctx.replay()[0]
@@ -3742,7 +3643,6 @@ def __test_an_owed_write_that_keeps_failing_quarantines_after_the_bounded_retry_
         ts += 60_000
         engine.sync(ts)
         assert engine.quarantined
-        assert not engine.halted
         ctx.record_park = real_park  # type: ignore[method-assign]
         engine.sync(ts + 60_000)
         assert coid in ctx.replay()[1]
@@ -4087,4 +3987,495 @@ def __test_a_plugin_verdict_at_the_park_commit_is_kept__(tmp_path: Path) -> None
         marker._plugin.join()
         resolutions = {rec.coid: rec.resolution for rec in ctx.iter_pending_resolutions()}
         assert resolutions == {"c-1": 'rejected'}
+        ctx.close()
+
+
+# === A landed send whose execution the stream will not report ===============
+
+_DEAL = "deal-1"
+
+
+def _landed_order(filled_qty: float = 1.0) -> ExchangeOrder:
+    """The venue's record of the landed entry: executed, its deal closed since."""
+    return ExchangeOrder(
+        id=_DEAL, symbol=SYMBOL, side="buy", order_type=OrderType.MARKET, qty=1.0,
+        filled_qty=filled_qty, remaining_qty=round(1.0 - filled_qty, 12), price=None,
+        stop_price=None, average_fill_price=100.0 if filled_qty > 0.0 else None,
+        status=OrderStatus.FILLED if filled_qty > 0.0 else OrderStatus.CANCELLED,
+        timestamp=BAR_TS / 1000.0, fee=0.1, fee_currency="USDT",
+    )
+
+
+def _venue_reads(broker: _MockBroker, answers: list[OrderExecution | None]) -> list[tuple]:
+    """Answer ``fetch_order_execution`` from ``answers`` (the last one repeats)."""
+    asked: list[tuple] = []
+
+    async def fetch_order_execution(order_id, client_order_id):
+        asked.append((order_id, client_order_id))
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    broker.fetch_order_execution = fetch_order_execution  # type: ignore[attr-defined]
+    return asked
+
+
+def _request_hold(ctx: RunContext, coid: str) -> bool:
+    plugin = SimpleNamespace(store_ctx=ctx)
+    return BrokerPlugin.request_execution_hold(plugin, coid, _DEAL)  # type: ignore[arg-type]
+
+
+def _long(size: float) -> ExchangePosition:
+    return ExchangePosition(symbol=SYMBOL, side="long", size=size, entry_price=100.0,
+                            unrealized_pnl=0.0, liquidation_price=None, leverage=1.0,
+                            margin_mode="isolated")
+
+
+def _read_and_book(engine: OrderSyncEngine) -> None:
+    """One reconcile reads the venue and queues its record; the next books it and ends the block."""
+    engine.reconcile()
+    engine.apply_async_events()
+    engine.reconcile()
+
+
+def _taken_over_working_order(store: BrokerStore) -> str:
+    """An earlier process placed limit entry ``L``, the venue took it, and the process stopped.
+
+    The row is ``confirmed`` with its venue order id: the order rested on the
+    venue, and it executed (and its position closed) while no process ran.
+
+    :return: The row's client order id.
+    """
+    ctx = _open_ctx(store)
+    coid = DispatchEnvelope(
+        intent=SimpleNamespace(pine_id="L"),  # type: ignore[arg-type]
+        run_tag=ctx.run_tag, bar_ts_ms=BAR_TS, retry_seq=0,
+    ).client_order_id('e')
+    ctx.record_envelope("L", BAR_TS, 0)
+    create_entry_order_row(ctx, coid=coid, symbol=SYMBOL, side="buy", qty=1.0,
+                           intent_key="L", pine_entry_id="L",
+                           kind=ENTRY_KIND_WORKING, order_type="limit")
+    ctx.upsert_order(coid, state=STATE_CONFIRMED, exchange_order_id=_DEAL)
+    ctx.close()
+    return coid
+
+
+def _restarted_engine(store: BrokerStore, *, intent: bool, row: str = 'parked'):
+    """The run restarted over entry ``L``'s unsettled row.
+
+    :param row: ``'crash_before_answer'`` / ``'parked'``: an inherited send;
+        ``'taken_over_working'``: a confirmed working order.
+    """
+    if row == 'taken_over_working':
+        coid = _taken_over_working_order(store)
+    else:
+        coid = _crashed_send(store, park=row == 'parked')
+    ctx = _open_ctx(store)
+    engine, broker = _engine_after_restart(ctx, CapabilityLevel.SOFTWARE)
+    if row == 'taken_over_working':
+        engine._position.entry_orders["L"] = Order(  # noqa: SLF001
+            "L", 1.0, order_type=_order_type_entry, limit=99.0)
+    if not intent:
+        engine._position.entry_orders.clear()  # noqa: SLF001
+    return coid, ctx, engine, broker
+
+
+_ROWS = ['crash_before_answer', 'parked', 'taken_over_working']
+
+
+def _sync_before_the_request(engine: OrderSyncEngine, row: str) -> None:
+    """An inherited send holds its entry through a first sync; the request comes later.
+
+    A taken-over working order is handed over by the plugin's startup recovery,
+    before the engine's first sync, so nothing syncs ahead of the request.
+    """
+    if row != 'taken_over_working':
+        engine.sync(BAR_TS + 3_600_000)
+        assert engine._broker.entry_calls == []  # noqa: SLF001
+
+
+@pytest.mark.parametrize('intent', [True, False], ids=['intent_active', 'intent_gone'])
+@pytest.mark.parametrize('row', _ROWS)
+def __test_a_landed_send_the_stream_cannot_report_is_booked_from_the_venue__(
+        tmp_path: Path, intent: bool, row: str,
+) -> None:
+    """The plugin proved the order reached the venue and ended there: the engine books it.
+
+    Whether the row is an inherited send or a working order taken over before
+    the restart, which executed into a position that closed while no process
+    ran: the order is not sent again, a pending row gets the deal and leaves
+    the pending states, new entries wait under ``fill_evidence:L`` while the
+    bot reads the deal's execution from the venue, the execution is booked
+    once with the venue's figures, and the block ends once the venue holds
+    what the book holds. Whether the script still emits the entry does not
+    matter. Before, an inherited row stayed pending for the whole run and the
+    entry was held behind it for good, and a confirmed working row could not
+    be handed over at all.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid, ctx, engine, broker = _restarted_engine(store, intent=intent, row=row)
+        asked = _venue_reads(broker, [OrderExecution(order=_landed_order())])
+        assert _request_hold(ctx, coid)
+        if row != 'taken_over_working':
+            engine.sync(BAR_TS + 3_600_000)
+            assert broker.entry_calls == []
+        engine.sync(BAR_TS + 7_200_000)
+
+        stored = ctx.get_order(coid)
+        assert stored is not None
+        assert (stored.state, stored.exchange_order_id) == (STATE_CONFIRMED, _DEAL)
+        assert inherited_dispatch_in_flight(ctx, "L") is None
+        assert coid not in ctx.replay()[1]
+        assert ctx.execution_hold_requests() == {}
+        assert ctx.fill_evidence_holds() == {"L": (_DEAL,)}
+        assert broker.entry_calls == []
+
+        broker.position = _long(1.0)
+        _read_and_book(engine)
+        assert asked == [(_DEAL, None)]
+        assert engine._position.fill_cursor([_DEAL]) == pytest.approx(1.0)  # noqa: SLF001
+        assert engine._position.size == pytest.approx(1.0)  # noqa: SLF001
+        assert not engine._entry_execution_unresolved("L")  # noqa: SLF001
+        assert ctx.fill_evidence_holds() == {}
+        assert "fill_evidence:L" not in engine._entry_block_causes  # noqa: SLF001
+
+        engine.sync(BAR_TS + 10_800_000)
+        assert broker.entry_calls == [], "the landed entry was sent a second time"
+        ctx.close()
+
+
+@pytest.mark.parametrize('row', ['parked', 'taken_over_working'])
+def __test_a_landed_send_whose_deal_closed_since_ends_flat__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str,
+) -> None:
+    """The venue shows no position any more: the booked entry is closed out as external.
+
+    The execution is booked from the venue's record; no close fill of it
+    comes, so once the fill-report grace passed the position is closed out at
+    its entry price (the trade is closed, not wiped, and audited), with no
+    unattributed-change report, and the entry block ends with the book flat.
+    Nothing is sent: neither the entry again nor a close of a position the
+    venue does not hold.
+    """
+    wall = [time.time()]
+    mono = [1000.0]
+    monkeypatch.setattr(sync_engine_module.time, 'time', lambda: wall[0])
+    monkeypatch.setattr(sync_engine_module.time, 'monotonic', lambda: mono[0])
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid, ctx, engine, broker = _restarted_engine(store, intent=True, row=row)
+        events: list = []
+        engine._broker_event_sink = events.append  # noqa: SLF001
+        _sync_before_the_request(engine, row)
+        _venue_reads(broker, [OrderExecution(order=_landed_order())])
+        assert _request_hold(ctx, coid)
+        engine.sync(BAR_TS + 7_200_000)
+
+        booked = False
+        for _ in range(8):
+            engine.reconcile()
+            engine.apply_async_events()
+            booked = booked or engine._position.fill_cursor([_DEAL]) == pytest.approx(1.0)  # noqa: SLF001
+            wall[0] += 60.0
+            mono[0] += 60.0
+        assert booked
+        assert engine._position.size == 0.0  # noqa: SLF001
+        assert not engine.quarantined
+        _assert_closed_out_at_entry(engine, ctx, events)
+        engine.sync(BAR_TS + 10_800_000)
+        assert broker.entry_calls == []
+        ctx.close()
+
+
+def _assert_closed_out_at_entry(engine: OrderSyncEngine, ctx: RunContext, events: list) -> None:
+    """The handed-over position was closed out at its entry price, audited, not reported."""
+    (trade,) = engine._position.closed_trades  # noqa: SLF001
+    assert trade.exit_price == pytest.approx(100.0)
+    assert engine._position.netprofit == pytest.approx(-0.1)  # noqa: SLF001
+    assert len(list(ctx.iter_events_by_kind_for_run_id('held_execution_close_adopted'))) == 1
+    assert not any(type(event).__name__ == 'UnattributedPositionChangeEvent'
+                   for event in events)
+
+
+class _ClockedRun:
+    """A running engine that dispatched entry ``L`` itself; its reply was lost.
+
+    The plugin then proves the send landed on a deal that closed since and
+    hands it over. Wall and monotonic clocks advance by hand.
+    """
+
+    def __init__(self, store: BrokerStore, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.wall = [time.time()]
+        self.mono = [1000.0]
+        monkeypatch.setattr(sync_engine_module.time, 'time', lambda: self.wall[0])
+        monkeypatch.setattr(sync_engine_module.time, 'monotonic', lambda: self.mono[0])
+        self.ctx = _open_ctx(store)
+        self.broker = _MockBroker()
+        ctx, broker = self.ctx, self.broker
+
+        async def reply_lost(envelope):
+            intent = envelope.intent
+            coid = envelope.client_order_id('e')
+            create_entry_order_row(ctx, coid=coid, symbol=SYMBOL, side="buy", qty=1.0,
+                                   intent_key=intent.intent_key, pine_entry_id=intent.pine_id,
+                                   kind=ENTRY_KIND_POSITION, order_type="market")
+            ctx.set_order_state(coid, STATE_DISPOSITION_UNKNOWN)
+            broker.entry_calls.append(envelope)
+            raise OrderDispositionUnknownError("reply lost", client_order_id=coid)
+
+        broker.execute_entry = reply_lost  # type: ignore[method-assign]
+        self.engine, self.pos = _mk_engine(broker, ctx)
+        self.events: list = []
+        self.engine._broker_event_sink = self.events.append  # noqa: SLF001
+        self.pos.entry_orders["L"] = Order("L", 1.0, order_type=_order_type_entry)
+        self.engine.sync(BAR_TS)
+        self.coid = broker.entry_calls[0].client_order_id('e')
+        _venue_reads(broker, [OrderExecution(order=_landed_order())])
+        assert _request_hold(ctx, self.coid)
+        self.engine.sync(BAR_TS + 60_000)
+        broker.position = None
+
+    def reconcile(self, times: int = 1) -> None:
+        for _ in range(times):
+            self.engine.reconcile()
+            self.engine.apply_async_events()
+            self.wall[0] += 30.0
+            self.mono[0] += 30.0
+
+    def close_fill(self) -> OrderEvent:
+        """The close of the deal as the plugin reports it, with the venue's figures."""
+        return OrderEvent(
+            order=ExchangeOrder(
+                id="deal-1-close", symbol=SYMBOL, side="sell", order_type=OrderType.MARKET,
+                qty=1.0, filled_qty=1.0, remaining_qty=0.0, price=None, stop_price=None,
+                average_fill_price=110.0, status=OrderStatus.FILLED, timestamp=self.wall[0],
+                fee=0.1, fee_currency="USDT"),
+            event_type='filled', fill_price=110.0, fill_qty=1.0, timestamp=self.wall[0],
+            pine_id="L", leg_type=LegType.CLOSE, fee=0.1, fee_currency="USDT",
+            fill_id="close-1", journal_fill_qty=1.0,
+        )
+
+
+@pytest.mark.parametrize('when', ['before_the_booking', 'after_the_booking'])
+def __test_a_handed_over_close_fill_books_the_real_round_trip__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str,
+) -> None:
+    """The plugin delivers the deal's close: the round trip is booked with the venue's prices.
+
+    A close fill arriving while the entry's execution is still being read from
+    the venue waits for it, then closes it; the entry block ends with the book
+    flat like the venue, and nothing is closed out or reported as unexplained.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        run = _ClockedRun(store, monkeypatch)
+        if when == 'before_the_booking':
+            run.engine.on_order_event(run.close_fill())
+            run.engine.apply_async_events()
+            assert run.pos.size == 0.0 and len(run.pos.closed_trades) == 0
+        run.reconcile()
+        if when == 'after_the_booking':
+            assert run.pos.size == pytest.approx(1.0)
+            run.engine.on_order_event(run.close_fill())
+        run.reconcile(3)
+
+        assert run.pos.size == 0.0
+        (trade,) = run.pos.closed_trades
+        assert (trade.entry_price, trade.exit_price) == (pytest.approx(100.0), pytest.approx(110.0))
+        assert run.pos.netprofit == pytest.approx(9.8)
+        assert not run.engine.quarantined
+        assert list(run.ctx.iter_events_by_kind_for_run_id('held_execution_close_adopted')) == []
+        assert not any(type(event).__name__ == 'UnattributedPositionChangeEvent'
+                       for event in run.events)
+        run.engine.sync(BAR_TS + 120_000)
+        assert len(run.broker.entry_calls) == 1
+        run.ctx.close()
+
+
+def __test_a_handed_over_position_closed_without_evidence_is_closed_out_and_repriced__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No close fill comes in the grace: the bot closes the position out by itself.
+
+    The flat venue is adopted as the reduction the handed-over execution was
+    expected to end in: the trade is closed at its entry price (commission
+    only, approximate), audited, logged as a WARNING without the
+    "no fill explains it" ERROR or an unattributed-change report, and the
+    entry block ends. The close fill the plugin delivers later is not booked
+    again: it re-prices that close.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        run = _ClockedRun(store, monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            run.reconcile(8)
+        assert run.pos.size == 0.0
+        assert not run.engine.quarantined
+        _assert_closed_out_at_entry(run.engine, run.ctx, run.events)
+        assert not any("no fill explains it" in record.getMessage() for record in caplog.records)
+
+        run.engine.on_order_event(run.close_fill())
+        run.reconcile(12)
+        assert run.pos.size == 0.0
+        (trade,) = run.pos.closed_trades
+        assert trade.exit_price == pytest.approx(110.0)
+        assert run.pos.netprofit == pytest.approx(9.8)
+        assert not run.engine.quarantined
+        run.ctx.close()
+
+
+def __test_a_restart_after_the_booking_adopts_the_flat_venue_at_startup__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart between the booking and the close-out keeps the startup rule.
+
+    The book the journal resumes holds the booked execution; the startup
+    reconcile adopts the venue as it does for every resumed position, and
+    nothing of the in-run close-out runs.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        run = _ClockedRun(store, monkeypatch)
+        run.broker.position = _long(1.0)
+        _read_and_book(run.engine)
+        assert run.pos.size == pytest.approx(1.0)
+        run.ctx.close()
+
+        ctx = _open_ctx(store)
+        engine, _broker = _engine_after_restart(ctx, CapabilityLevel.SOFTWARE)
+        engine._position.entry_orders.clear()  # noqa: SLF001
+        engine.reconcile()
+        engine.sync(BAR_TS + 3_600_000)
+        assert engine._position.size == 0.0  # noqa: SLF001
+        assert list(ctx.iter_events_by_kind_for_run_id('held_execution_close_adopted')) == []
+        ctx.close()
+
+
+@pytest.mark.parametrize('row', ['parked', 'taken_over_working'])
+def __test_a_landed_send_without_evidence_blocks_entries_and_is_read_again__(
+        tmp_path: Path, row: str,
+) -> None:
+    """The venue cannot tell the execution yet: entries wait and the bot keeps asking.
+
+    No deadline ends the wait and nothing is booked or sent meanwhile; the
+    first answer that tells the execution books it.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid, ctx, engine, broker = _restarted_engine(store, intent=True, row=row)
+        _sync_before_the_request(engine, row)
+        asked = _venue_reads(broker, [None])
+        assert _request_hold(ctx, coid)
+        engine.sync(BAR_TS + 7_200_000)
+
+        now = int(time.time() * 1000)
+        cap_ms = int(sync_engine_module._VENUE_RECOVERY_CAP_S * 1000)
+        engine._expire_fill_evidence_holds(now_ms=now)  # noqa: SLF001
+        for step in range(3):
+            engine._recover_held_executions(now_ms=now + step * cap_ms)  # noqa: SLF001
+            engine.apply_async_events()
+        assert len(asked) == 3
+        assert engine.quarantine_kind is QuarantineKind.ENTRY_BLOCK
+        assert "fill_evidence:L" in engine._entry_block_causes  # noqa: SLF001
+        assert engine._entry_execution_unresolved("L")  # noqa: SLF001
+        assert engine._position.size == 0.0  # noqa: SLF001
+
+        _venue_reads(broker, [OrderExecution(order=_landed_order(0.4))])
+        broker.position = _long(0.4)
+        engine._recover_held_executions(now_ms=now + 4 * cap_ms)  # noqa: SLF001
+        engine.apply_async_events()
+        engine._resolve_entry_block_causes(now_ms=now + 4 * cap_ms)  # noqa: SLF001
+        assert engine._position.size == pytest.approx(0.4)  # noqa: SLF001
+        assert not engine._entry_execution_unresolved("L")  # noqa: SLF001
+        assert broker.entry_calls == []
+        ctx.close()
+
+
+@pytest.mark.parametrize('row', ['parked', 'taken_over_working'])
+@pytest.mark.parametrize('taken', [False, True], ids=['request_stored', 'hold_stored'])
+def __test_a_landed_send_hold_survives_a_restart__(
+        tmp_path: Path, taken: bool, row: str,
+) -> None:
+    """A restart before or after the engine took the request holds the entry the same way."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid, ctx, engine, broker = _restarted_engine(store, intent=True, row=row)
+        _sync_before_the_request(engine, row)
+        assert _request_hold(ctx, coid)
+        if taken:
+            engine.sync(BAR_TS + 7_200_000)
+            assert ctx.fill_evidence_holds() == {"L": (_DEAL,)}
+        ctx.close()
+
+        ctx = _open_ctx(store)
+        engine, broker = _engine_after_restart(ctx, CapabilityLevel.SOFTWARE)
+        if row == 'taken_over_working':
+            engine._position.entry_orders["L"] = Order(  # noqa: SLF001
+                "L", 1.0, order_type=_order_type_entry, limit=99.0)
+        asked = _venue_reads(broker, [OrderExecution(order=_landed_order())])
+        broker.position = _long(1.0)
+        engine.sync(BAR_TS + 10_800_000)
+        assert broker.entry_calls == []
+        assert ctx.fill_evidence_holds() == {"L": (_DEAL,)}
+
+        _read_and_book(engine)
+        assert asked == [(_DEAL, None)]
+        assert engine._position.size == pytest.approx(1.0)  # noqa: SLF001
+        assert ctx.fill_evidence_holds() == {}
+        engine.sync(BAR_TS + 14_400_000)
+        assert broker.entry_calls == []
+        ctx.close()
+
+
+def __test_a_hold_request_that_is_not_stored_changes_nothing__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed store write answers ``False``; so does a row that is no pending send.
+
+    The dispatch stays pending, its park stays, the entry stays held behind
+    it, and asking again later works.
+    """
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid, ctx, engine, broker = _restarted_engine(store, intent=True)
+        engine.sync(BAR_TS + 3_600_000)
+
+        def broken(*_args, **_kwargs):
+            raise sqlite3.OperationalError("disk I/O error (injected)")
+
+        monkeypatch.setattr(ctx, 'replace_keyed_events', broken)
+        assert not _request_hold(ctx, coid)
+        monkeypatch.undo()
+        assert ctx.execution_hold_requests() == {}
+        assert not _request_hold(ctx, "coid-unknown")
+        engine.sync(BAR_TS + 7_200_000)
+        row = ctx.get_order(coid)
+        assert row is not None and row.exchange_order_id is None
+        assert inherited_dispatch_in_flight(ctx, "L") == coid
+        assert ctx.fill_evidence_holds() == {}
+        assert broker.entry_calls == []
+
+        assert _request_hold(ctx, coid)
+        assert set(ctx.keyed_events_for_run_id(EXECUTION_HOLD_REQUEST_EVENT_KIND)) == {coid}
+        ctx.close()
+
+
+def __test_an_engine_that_cannot_store_the_hold_takes_the_request_next_sync__(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The take-over is one transaction: a failed write leaves memory and store as they were."""
+    with BrokerStore(tmp_path / "broker.sqlite", plugin_name=PLUGIN) as store:
+        coid, ctx, engine, broker = _restarted_engine(store, intent=True)
+        engine.sync(BAR_TS + 3_600_000)
+        assert _request_hold(ctx, coid)
+        real_unpark = ctx.record_unpark
+
+        def broken(_coid):
+            raise sqlite3.OperationalError("disk I/O error (injected)")
+
+        monkeypatch.setattr(ctx, 'record_unpark', broken)
+        with pytest.raises(sqlite3.OperationalError):
+            engine._consume_execution_hold_requests()  # noqa: SLF001
+        row = ctx.get_order(coid)
+        assert row is not None and row.exchange_order_id is None
+        assert set(ctx.execution_hold_requests()) == {coid}
+        assert not engine._entry_execution_unresolved("L")  # noqa: SLF001
+        assert "L" not in engine._order_mapping  # noqa: SLF001
+
+        monkeypatch.setattr(ctx, 'record_unpark', real_unpark)
+        engine.sync(BAR_TS + 7_200_000)
+        assert ctx.fill_evidence_holds() == {"L": (_DEAL,)}
+        assert engine._entry_execution_unresolved("L")  # noqa: SLF001
+        assert broker.entry_calls == []
         ctx.close()

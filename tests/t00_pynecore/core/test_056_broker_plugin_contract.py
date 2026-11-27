@@ -14,10 +14,7 @@ from pynecore.core.broker.models import (
     ExchangeCapabilities,
 )
 from pynecore.core.broker.disappearance import MISSING_PENDING_EXTRA
-from pynecore.core.broker.exceptions import (
-    BrokerManualInterventionError,
-    VenueWritesQuarantinedError,
-)
+from pynecore.core.broker.exceptions import VenueWritesQuarantinedError
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.sync_engine import OrderSyncEngine
@@ -113,6 +110,9 @@ class _ConformingPlugin(BrokerPlugin):
 
     async def get_balance(self):
         return {}
+
+    async def fetch_order_execution(self, order_id, client_order_id):
+        return None
 
     async def watch_orders(self):
         return
@@ -361,7 +361,11 @@ def __test_position_port_surface_checked__():
 
 def __test_port_set_after_the_startup_probe_is_checked_by_the_engine__():
     """A plugin wires its ports in ``connect()``, after the startup probe ran:
-    the engine probes a port the first time it sees it, and only then."""
+    the engine probes a port the first time it sees it, and only then.
+
+    A port that fails the probe leaves the bot alive but inert: the probe
+    answers ``False``, the engine latches the port-contract cause, and every
+    later sync probes again until a sound port ends the cause."""
     class _HalfPort:
         async def fetch_raw_positions(self, symbol):
             return []
@@ -372,19 +376,36 @@ def __test_port_set_after_the_startup_probe_is_checked_by_the_engine__():
         def __init__(self, broker):
             self._broker = broker
             self._checked_ports = (None, None)
+            self._ports_unsound = False
+            self.recorded: list[tuple[str, str | None]] = []
+            self.ended: list[str] = []
+
+        def record_quarantine(self, reason, context=None, *, cause=None, **_kw):
+            self.recorded.append((reason, cause))
+
+        def end_quarantine_cause(self, cause, _why):
+            self.ended.append(cause)
 
     plugin = _ConformingPlugin()
     assert validate_plugin_contract(plugin)[0] == []      # no port yet at startup
     engine = _Engine(plugin)
-    engine._check_plugin_ports()
+    assert engine._check_plugin_ports() is True
 
     plugin.position_port = _HalfPort()
     assert any('close_leg' in e for e in validate_plugin_ports(plugin))
-    with pytest.raises(BrokerManualInterventionError, match='close_leg'):
-        engine._check_plugin_ports()
+    assert engine._check_plugin_ports() is False
+    assert engine._ports_unsound is True
+    [(reason, cause)] = engine.recorded
+    assert 'close_leg' in reason and cause == 'plugin_port_contract'
+    assert engine._check_plugin_ports() is False          # probed again, latched once
+    assert len(engine.recorded) == 1
+
+    plugin.position_port = _CompletePort()
+    assert engine._check_plugin_ports() is True
+    assert engine._ports_unsound is False
+    assert engine.ended == ['plugin_port_contract']
 
     sound = _Engine(plugin)
-    plugin.position_port = _CompletePort()
     sound._check_plugin_ports()
     calls = []
     plugin.get_capabilities = lambda: calls.append(1) or _caps()
