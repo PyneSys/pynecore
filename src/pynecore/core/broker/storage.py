@@ -76,6 +76,7 @@ __all__ = [
     'HEARTBEAT_INTERVAL_MS',
     'STALE_THRESHOLD_MS',
     'RETENTION_DAYS',
+    'STRATEGY_CLOSED_TRADES_LIMIT',
     'PURGE_INTERVAL_MS',
     'ENTRY_BOOK_EVENT_KIND',
     'ENTRY_BOOK_CURSOR_EVENT_KIND',
@@ -95,10 +96,17 @@ HEARTBEAT_INTERVAL_MS: Final[int] = 60_000  # 1 minute
 # parameterise a VIEW); ``_heal_live_runs_view`` recreates the VIEW on
 # open whenever the stored threshold drifts from this constant.
 STALE_THRESHOLD_MS: Final[int] = 5 * HEARTBEAT_INTERVAL_MS  # 5 minutes
-# Retention window for historical rows (events, closed orders, ended
-# runs). See :meth:`BrokerStore.cleanup_old_data` for what is protected
-# from purging regardless of age.
+# Default retention window for historical rows (events, closed orders, ended
+# runs, retired spot rows; the sync engine applies it to the closed trades of
+# the strategy statistics at startup); a store takes its own from
+# ``brokers.toml`` (``BrokerDefaults.retention_days``).
+# See :meth:`BrokerStore.cleanup_old_data` for what is protected from purging
+# regardless of age.
 RETENTION_DAYS: Final[int] = 180
+# The closed trades of the strategy statistics a run lists at most, newest
+# first: the size of the in-memory history
+# (:attr:`~pynecore.core.broker.position.BrokerPosition.closed_trades`).
+STRATEGY_CLOSED_TRADES_LIMIT: Final[int] = 9000
 # The purge runs at ``open_run()`` and then at most once per this
 # interval, piggybacking on ``RunContext.heartbeat()`` — a bot that runs
 # for months never revisits ``open_run()``, so the heartbeat path is
@@ -757,6 +765,33 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         -- history (``BrokerPlugin.fetch_order_execution``).
         DROP TABLE operator_close_decisions;
     """),
+    (14, "strategy statistics tables", """
+        -- The strategy statistics of a LOGICAL run, so ``strategy.netprofit``,
+        -- ``strategy.closedtrades`` and the rest continue across restarts and
+        -- server moves. ``strategy_state`` holds the aggregates and the open
+        -- trades (one row per run, replaced in place, never purged: the
+        -- aggregates outlive every closed-trade row). ``strategy_closed_trades``
+        -- holds the closed-trade history, ``trade_no`` the trade's 1-based
+        -- place among every trade the run closed: the trades the engine still
+        -- keeps (the newest 9000 within the retention, and older ones a late
+        -- fee may still change). Both are written in the transaction of the
+        -- binding-book write that books the fills; the engine deletes the rows
+        -- of the trades it folded into the aggregates.
+        CREATE TABLE strategy_state (
+            run_id   TEXT PRIMARY KEY,
+            payload  TEXT NOT NULL,
+            ts_ms    INTEGER NOT NULL
+        );
+        CREATE TABLE strategy_closed_trades (
+            run_id        TEXT NOT NULL,
+            trade_no      INTEGER NOT NULL,
+            exit_time_ms  INTEGER NOT NULL,
+            payload       TEXT NOT NULL,
+            PRIMARY KEY (run_id, trade_no)
+        );
+        CREATE INDEX idx_strategy_closed_trades_exit
+            ON strategy_closed_trades (exit_time_ms);
+    """),
 ]
 
 
@@ -881,11 +916,23 @@ class BrokerStore:
     :param plugin_name: The BrokerPlugin's ``plugin_name`` attribute
         (e.g. ``"Capital.com"``). Every ``events`` / ``orders`` row
         carries this value so a multi-plugin workdir can be filtered.
+    :param retention_days: How many days historical rows are kept
+        (:meth:`cleanup_old_data`); ``brokers.toml``'s
+        ``retention_days``. At least 1.
+    :raises ValueError: When ``retention_days`` is below 1.
     """
 
-    def __init__(self, path: Path | str, *, plugin_name: str) -> None:
+    def __init__(self, path: Path | str, *, plugin_name: str,
+                 retention_days: int = RETENTION_DAYS) -> None:
+        if isinstance(retention_days, bool) or not isinstance(retention_days, int) \
+                or retention_days < 1:
+            raise ValueError(
+                f"retention_days must be a whole number of days, at least 1, "
+                f"got {retention_days!r}",
+            )
         self._path = Path(path)
         self._plugin_name = plugin_name
+        self._retention_days = retention_days
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # The connection is shared by the run thread and the broker
         # event-loop thread (``check_same_thread=False``). ``sqlite3``'s
@@ -931,6 +978,15 @@ class BrokerStore:
         self._configure_pragmas()
         _apply_migrations(self._conn)
         _heal_live_runs_view(self._conn)
+
+    @property
+    def retention_days(self) -> int:
+        """How many days historical rows are kept (:meth:`cleanup_old_data`)."""
+        return self._retention_days
+
+    def retention_cutoff_ms(self) -> int:
+        """The wall-clock time (epoch ms) a row older than which the retention purge drops."""
+        return _now_ms() - self._retention_days * 86_400_000
 
     def _configure_pragmas(self) -> None:
         """Configure WAL + crash-safety + FK + busy-timeout."""
@@ -1608,10 +1664,10 @@ class BrokerStore:
         return len(rows)
 
     # noinspection SqlResolve
-    def cleanup_old_data(self, retention_days: int = RETENTION_DAYS) -> int:
+    def cleanup_old_data(self, retention_days: int | None = None) -> int:
         """Purge historical rows past the retention window.
 
-        Five deletions in one transaction:
+        Seven deletions in one transaction:
 
         1. ``events`` older than the cutoff. Six kinds of rows are protected
            regardless of age: events whose ``client_order_id`` matches a
@@ -1648,21 +1704,42 @@ class BrokerStore:
            so a receipt leaves in the same purge as the row it belongs to.
         5. Ended ``runs`` rows older than the cutoff with no remaining
            child rows (orders / order_refs / events).
+        6. Retired ``spot_executions`` rows (flagged by a quarantine
+           recovery, out of every inventory fold) whose fill is older than the
+           cutoff and that were retired at least the retention window ago: a
+           later epoch of their run and product opened after the fill and
+           before the cutoff. A live row (``retired`` 0) is never purged,
+           however old: it is part of an open position's inventory.
+        7. Closed ``spot_inventory_epoch`` rows that a later epoch of their
+           run and product superseded before the cutoff. The newest epoch of a
+           run and product, and every epoch not ``closed`` (``active``,
+           ``quarantined``, ``taken``), are never purged.
 
         Freed pages are reused by SQLite, so the file stops growing
         even without VACUUM.
 
-        The spot inventory tables (``spot_executions``,
-        ``spot_inventory_epoch``, ``spot_asset_owner``) are exempt from
-        retention by design: a spot position's reconstructibility must
-        not expire while the position is open, however old its fills are.
-        The ``quarantines`` table is exempt too: an open latch must never
-        expire, and an ended one is the operator's audit trail.
+        The strategy statistics (``strategy_state``, ``strategy_closed_trades``)
+        are exempt: their closed-trade rows and the aggregates beside them must
+        change together, so the sync engine itself drops the rows of the trades
+        it folded into the aggregates (a trade older than the retention is
+        unlisted and folded on the first bar it is that old on, see
+        :meth:`~pynecore.core.broker.position.BrokerPosition.observe_bar`).
+
+        The rest of the spot inventory is exempt from retention by design:
+        a spot position's reconstructibility must not expire while the
+        position is open, however old its fills are. ``spot_asset_owner``
+        holds one lease per asset and is released by the run itself, so it
+        stays bounded without a purge. The ``quarantines`` table is exempt
+        too: an open latch must never expire, and an ended one is the
+        operator's audit trail.
 
         :param retention_days: Rows older than this many days are
-            eligible for purging.
+            eligible for purging; ``None`` takes the store's own
+            (:attr:`retention_days`).
         :return: Total number of deleted rows.
         """
+        if retention_days is None:
+            retention_days = self._retention_days
         cutoff = _now_ms() - retention_days * 86_400_000
         with self.transaction():
             deleted_events = self._conn.execute(
@@ -1722,15 +1799,38 @@ class BrokerStore:
                 "      WHERE e.run_instance_id = runs.run_instance_id)",
                 (cutoff,),
             ).rowcount
+            deleted_spot_executions = self._conn.execute(
+                "DELETE FROM spot_executions "
+                "WHERE retired = 1 AND ts_ms < ? "
+                "  AND EXISTS ("
+                "      SELECT 1 FROM spot_inventory_epoch e "
+                "      WHERE e.run_id = spot_executions.run_id "
+                "        AND e.product_id = spot_executions.product_id "
+                "        AND e.created_ts_ms > spot_executions.ts_ms "
+                "        AND e.created_ts_ms < ?)",
+                (cutoff, cutoff),
+            ).rowcount
+            deleted_spot_epochs = self._conn.execute(
+                "DELETE FROM spot_inventory_epoch "
+                "WHERE state = 'closed' "
+                "  AND EXISTS ("
+                "      SELECT 1 FROM spot_inventory_epoch later "
+                "      WHERE later.run_id = spot_inventory_epoch.run_id "
+                "        AND later.product_id = spot_inventory_epoch.product_id "
+                "        AND later.epoch_seq > spot_inventory_epoch.epoch_seq "
+                "        AND later.created_ts_ms < ?)",
+                (cutoff,),
+            ).rowcount
         total = (deleted_events + deleted_orders + deleted_refs + deleted_receipts
-                 + deleted_runs)
+                 + deleted_runs + deleted_spot_executions + deleted_spot_epochs)
         if total:
             _log.info(
                 "broker storage: retention purge removed %d row(s) "
                 "(events=%d, orders=%d, order_refs=%d, fill_receipts=%d, runs=%d, "
-                "retention=%d days)",
+                "spot_executions=%d, spot_inventory_epoch=%d, retention=%d days)",
                 total, deleted_events, deleted_orders, deleted_refs,
-                deleted_receipts, deleted_runs, retention_days,
+                deleted_receipts, deleted_runs,
+                deleted_spot_executions, deleted_spot_epochs, retention_days,
             )
         return total
 
@@ -3175,6 +3275,109 @@ class RunContext:
         """
         receipt = self.fill_receipt(fill_id)
         return receipt is not None and receipt.booked
+
+    # --- Strategy statistics -----------------------------------------------
+
+    @property
+    def retention_days(self) -> int:
+        """The store's retention window in days (:attr:`BrokerStore.retention_days`)."""
+        return self._store.retention_days
+
+    # noinspection SqlResolve
+    def strategy_state(self) -> dict[str, Any] | None:
+        """The stored strategy statistics of this logical run, ``None`` when none is stored.
+
+        What :meth:`write_strategy_state` wrote last, by any process instance
+        of the run (a restart, or the store copied to another host).
+
+        :raises ValueError: When the stored payload is not a JSON object.
+        """
+        with self._store.read_lock() as conn:
+            row = conn.execute(
+                "SELECT payload FROM strategy_state WHERE run_id = ?",
+                (self.run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row['payload'])
+        if not isinstance(payload, dict):
+            raise ValueError("the stored strategy state is not a JSON object")
+        return payload
+
+    # noinspection SqlResolve
+    def strategy_closed_trades(self, *, from_trade_no: int,
+                               since_ms: int) -> list[tuple[int, dict[str, Any]]]:
+        """The stored closed trades of this logical run, oldest first.
+
+        :param from_trade_no: The lowest trade number to return.
+        :param since_ms: Only trades that closed at or after this time (epoch
+            ms) are returned.
+        :return: ``(trade_no, payload)`` pairs in trade-number order.
+        :raises ValueError: When a stored payload is not a JSON object.
+        """
+        with self._store.read_lock() as conn:
+            rows = conn.execute(
+                "SELECT trade_no, payload FROM strategy_closed_trades "
+                "WHERE run_id = ? AND trade_no >= ? AND exit_time_ms >= ? "
+                "ORDER BY trade_no",
+                (self.run_id, from_trade_no, since_ms),
+            ).fetchall()
+        trades: list[tuple[int, dict[str, Any]]] = []
+        for row in rows:
+            payload = json.loads(row['payload'])
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"stored closed trade #{row['trade_no']} is not a JSON object")
+            trades.append((int(row['trade_no']), payload))
+        return trades
+
+    # noinspection SqlResolve
+    def write_strategy_state(
+            self, payload: Mapping[str, Any] | None,
+            closed_trades: Mapping[int, tuple[int, Mapping[str, Any]]],
+            *, keep_from_trade_no: int,
+    ) -> None:
+        """Write the strategy statistics of this logical run.
+
+        Engine-only: the sync engine calls it in the transaction of its
+        binding-book write (:meth:`~OrderSyncEngine._persist_entry_book`), so
+        it nests into the caller's :meth:`transaction` and lands with the
+        fills it booked, or not at all.
+
+        :param payload: The aggregates and open trades, replacing the stored
+            ones; ``None`` keeps them.
+        :param closed_trades: Trade number -> ``(exit time in epoch ms,
+            payload)`` of the closed trades to store, replacing stored ones of
+            the same number.
+        :param keep_from_trade_no: The run's stored closed trades numbered
+            below this are deleted (the window of the newest
+            :data:`STRATEGY_CLOSED_TRADES_LIMIT`); 1 or less deletes none.
+        """
+        now = _now_ms()
+        with self._store.transaction() as conn:
+            if payload is not None:
+                conn.execute(
+                    "INSERT INTO strategy_state (run_id, payload, ts_ms) VALUES (?, ?, ?) "
+                    "ON CONFLICT (run_id) DO UPDATE SET "
+                    "  payload = excluded.payload, ts_ms = excluded.ts_ms",
+                    (self.run_id, json.dumps(payload, sort_keys=True), now),
+                )
+            if closed_trades:
+                conn.executemany(
+                    "INSERT INTO strategy_closed_trades ("
+                    "  run_id, trade_no, exit_time_ms, payload"
+                    ") VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (run_id, trade_no) DO UPDATE SET "
+                    "  exit_time_ms = excluded.exit_time_ms, payload = excluded.payload",
+                    [(self.run_id, int(trade_no), int(exit_ms),
+                      json.dumps(trade, sort_keys=True))
+                     for trade_no, (exit_ms, trade) in closed_trades.items()],
+                )
+            if keep_from_trade_no > 1:
+                conn.execute(
+                    "DELETE FROM strategy_closed_trades WHERE run_id = ? AND trade_no < ?",
+                    (self.run_id, keep_from_trade_no),
+                )
 
     # --- Spot inventory: execution ledger ----------------------------------
 

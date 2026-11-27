@@ -140,12 +140,6 @@ class ClosedTradeStats:
         if self.first_entry_time is None or trade.entry_time < self.first_entry_time:
             self.first_entry_time = trade.entry_time
 
-        bar_length: int | None = None
-        if trade.exit_bar_index >= 0:
-            bar_length = trade.exit_bar_index - trade.entry_bar_index
-            self.bar_length_sum += bar_length
-            self.bar_length_count += 1
-
         if profit > 0.0:
             self.winning_count += 1
             self.winning_profit_sum += profit
@@ -156,9 +150,6 @@ class ClosedTradeStats:
             if profit > self.largest_winning_trade:
                 self.largest_winning_trade = profit
                 self.largest_winning_trade_percent = profit_percent
-            if bar_length is not None:
-                self.winning_bar_length_sum += bar_length
-                self.winning_bar_length_count += 1
         elif profit < 0.0:
             self.losing_count += 1
             self.losing_profit_sum += profit
@@ -169,14 +160,114 @@ class ClosedTradeStats:
             if profit < self.largest_losing_trade:
                 self.largest_losing_trade = profit
                 self.largest_losing_trade_percent = profit_percent
-            if bar_length is not None:
-                self.losing_bar_length_sum += bar_length
-                self.losing_bar_length_count += 1
         else:
             self.current_winning_streak = 0
             self.current_losing_streak = 0
 
         if trade.sign > 0.0:
-            self.long.add(profit, profit_percent, bar_length)
+            self.long.add(profit, profit_percent, None)
         elif trade.sign < 0.0:
-            self.short.add(profit, profit_percent, bar_length)
+            self.short.add(profit, profit_percent, None)
+
+        if trade.exit_bar_index >= 0:
+            self.add_bar_length(trade)
+
+    def add_bar_length(self, trade: 'Trade') -> None:
+        """Add the bar length of a closed trade already added without one.
+
+        :meth:`add` counts a trade's bar length only when its exit bar index is
+        known (``exit_bar_index >= 0``). A live run that restarted learns the
+        exit bar of a trade closed before its first bar later (see
+        :class:`~pynecore.core.broker.strategy_state.BarIndexRemap`), and adds
+        the length then.
+
+        :param trade: A closed trade :meth:`add` took, its ``exit_bar_index``
+            now known.
+        """
+        bar_length = trade.exit_bar_index - trade.entry_bar_index
+        profit = float(trade.profit)
+        self.bar_length_sum += bar_length
+        self.bar_length_count += 1
+        if profit > 0.0:
+            self.winning_bar_length_sum += bar_length
+            self.winning_bar_length_count += 1
+        elif profit < 0.0:
+            self.losing_bar_length_sum += bar_length
+            self.losing_bar_length_count += 1
+        side = self.long if trade.sign > 0.0 else self.short if trade.sign < 0.0 else None
+        if side is not None:
+            side.bar_length_sum += bar_length
+            side.bar_length_count += 1
+
+    def amend(self, trade: 'Trade', profit_delta: float, commission_delta: float) -> None:
+        """Move a trade these statistics already hold by a change of its profit.
+
+        For statistics that no longer have the trade list to rebuild from (the
+        trades folded into a live run's base, see
+        :attr:`~BrokerPosition._stats_base`). The
+        sums, the counts, the bar lengths and the monthly returns move exactly,
+        a trade that changes between winning, losing and even included; a
+        largest trade
+        moves when the new profit beats it, and the streaks stay as they are.
+
+        :param trade: The trade, its ``profit`` already the new one.
+        :param profit_delta: The new profit less the old one.
+        :param commission_delta: The commission added to the trade.
+        """
+        new = float(trade.profit)
+        old = new - profit_delta
+        self.commission += commission_delta
+        month = utc_month_index(trade.exit_time)
+        self.month_profit[month] = self.month_profit.get(month, 0.0) + profit_delta
+        if old > 0.0:
+            self.winning_count -= 1
+            self.winning_profit_sum -= old
+        elif old < 0.0:
+            self.losing_count -= 1
+            self.losing_profit_sum -= old
+        if new > 0.0:
+            self.winning_count += 1
+            self.winning_profit_sum += new
+            if new > self.largest_winning_trade:
+                self.largest_winning_trade = new
+                self.largest_winning_trade_percent = float(trade.profit_percent)
+        elif new < 0.0:
+            self.losing_count += 1
+            self.losing_profit_sum += new
+            if new < self.largest_losing_trade:
+                self.largest_losing_trade = new
+                self.largest_losing_trade_percent = float(trade.profit_percent)
+        if trade.exit_bar_index >= 0:
+            bar_length = trade.exit_bar_index - trade.entry_bar_index
+            if old > 0.0:
+                self.winning_bar_length_sum -= bar_length
+                self.winning_bar_length_count -= 1
+            elif old < 0.0:
+                self.losing_bar_length_sum -= bar_length
+                self.losing_bar_length_count -= 1
+            if new > 0.0:
+                self.winning_bar_length_sum += bar_length
+                self.winning_bar_length_count += 1
+            elif new < 0.0:
+                self.losing_bar_length_sum += bar_length
+                self.losing_bar_length_count += 1
+        side = self.long if trade.sign > 0.0 else self.short if trade.sign < 0.0 else None
+        if side is None:
+            return
+        side.net_profit += profit_delta
+        if old > 0.0:
+            side.winning_count -= 1
+            side.gross_profit -= old
+        elif old < 0.0:
+            side.gross_loss -= old
+        if new > 0.0:
+            side.winning_count += 1
+            side.gross_profit += new
+            if new > side.largest_winning_trade:
+                side.largest_winning_trade = new
+                side.largest_winning_trade_percent = float(trade.profit_percent)
+        elif new < 0.0:
+            side.gross_loss += new
+            if new < side.largest_losing_trade:
+                side.largest_losing_trade = new
+                side.largest_losing_trade_percent = float(trade.profit_percent)

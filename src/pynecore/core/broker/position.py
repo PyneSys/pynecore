@@ -8,14 +8,35 @@ prices, fees, and margin state.
 from __future__ import annotations
 
 import copy
+import json
 import math
+import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 from pynecore import lib
 from pynecore.core.broker.intent_builder import CLOSE_ALL_EXIT_ID, CLOSE_EXIT_ID_PREFIX
-from pynecore.core.broker.models import LegType
+from pynecore.core.broker.models import (
+    ExchangeOrder,
+    LegType,
+    OrderEvent,
+    OrderStatus,
+    OrderType,
+)
+from pynecore.core.broker.storage import STRATEGY_CLOSED_TRADES_LIMIT
+from pynecore.core.broker.strategy_state import (
+    STRATEGY_STATE_VERSION,
+    BarIndexRemap,
+    closed_trade_stats_from_payload,
+    closed_trade_stats_to_payload,
+    decode_float,
+    decode_int,
+    encode_float,
+    trade_anchor_of_payload,
+    trade_from_payload,
+    trade_to_payload,
+)
 from pynecore.core.closed_trade_stats import ClosedTradeStats
 from pynecore.lib.log import broker_error as _blog_error
 from pynecore.lib.log import broker_info as _blog_info
@@ -30,7 +51,6 @@ if TYPE_CHECKING:
     # noinspection PyProtectedMember
     from pynecore.lib.strategy import Order, _ExitOrderKey
     from pynecore.types.strategy import QtyType
-    from pynecore.core.broker.models import OrderEvent
 
 __all__ = ['BrokerPosition', 'CloseExcess', 'EntryBookSnapshot', 'ProvisionalClose',
            'RecoveredExecution']
@@ -50,6 +70,55 @@ _EXIT_LEG_TYPES = frozenset((
 _BOUND_LEG_TYPES = frozenset((
     LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP,
 ))
+
+# The aggregates of the strategy statistics a restart restores
+# (:meth:`BrokerPosition.strategy_state_payload`), by type. The size, the average
+# price, the open profit and the open commission are not among them: the venue
+# and the open trades give those.
+_STATE_FLOAT_FIELDS = (
+    'netprofit', 'grossprofit', 'grossloss',
+    'max_drawdown', 'max_drawdown_percent', 'max_runup', 'max_runup_percent',
+    'max_equity', 'min_equity',
+    'max_contracts_held_long', 'max_contracts_held_short',
+    'sum_profit_ratio', 'sum_win_profit_ratio', 'sum_loss_profit_ratio',
+    'risk_last_day_equity', 'risk_intraday_start_equity',
+)
+_STATE_INT_FIELDS = (
+    'eventrades', 'wintrades', 'losstrades', 'closed_trades_count',
+    'risk_cons_loss_days', 'risk_last_trading_day', 'risk_intraday_filled_orders',
+    'risk_halt_day',
+)
+# The aggregates the mark-to-market moves on every price, written at most once a
+# bar unless a fill changed the statistics too.
+_STATE_MARK_FIELDS = frozenset((
+    'max_drawdown', 'max_drawdown_percent', 'max_runup', 'max_runup_percent',
+    'max_equity', 'min_equity',
+))
+# A NaN or infinity is stored as ``null``: what it reads back as.
+_STATE_MISSING = {'max_equity': -float("inf"), 'min_equity': float("inf")}
+# The trade fields the mark-to-market moves.
+_TRADE_MARK_FIELDS = ('profit', 'profit_percent', 'bar_anchor')
+
+
+def _bar_index_at(time_ms: int) -> int | None:
+    """The index of the bar of this run that ``time_ms`` (epoch ms) falls in.
+
+    The last bar that opened at or before it, among the recent bars whose open
+    times the runner keeps (``lib._bar_opens``). ``None`` when no bar ran yet,
+    the time is in the current bar or later, or it is older than the bars
+    kept: the current bar then stands for it.
+    """
+    # noinspection PyProtectedMember
+    if int(lib._time) <= 0 or time_ms >= int(lib._time):
+        return None
+    current = int(getattr(lib, 'bar_index', 0))
+    # noinspection PyProtectedMember
+    opens, size = lib._bar_opens, lib._BAR_OPENS_SIZE
+    for index in range(current - 1, max(-1, current - size), -1):
+        opened = opens[index % size]
+        if 0 < opened <= time_ms:
+            return index
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +237,6 @@ class ProvisionalClose:
         carries no fee).
     :ivar profit: The realized profit the close is counted with in the win /
         loss counters, re-priced parts included.
-    :ivar stats_base: The closed-trade statistics before the close.
     :ivar count_base: :attr:`BrokerPosition.closed_trades_count` before the close.
     """
     price: float
@@ -176,7 +244,6 @@ class ProvisionalClose:
     unpriced: list[float]
     entry_commissions: list[float]
     profit: float
-    stats_base: ClosedTradeStats
     count_base: int
 
 
@@ -246,6 +313,29 @@ class BrokerPosition(PositionBase):
         'risk_intraday_filled_orders', 'risk_intraday_start_equity',
         '_current_price',
         'least_tradable_qty',
+        # === Strategy statistics persistence ===
+        # The lowest closed-trade number changed since the last store write
+        # (see :meth:`closed_trade_rows`):
+        '_closed_dirty_from',
+        # Restored trades the venue no longer holds, oldest first (see
+        # :meth:`book_restart_held_close`), and whether the startup adoption may
+        # still claim them (:meth:`reconstruct_parent_trade`):
+        '_restored_held', '_restore_claims_open', '_restored_rank',
+        # The restored trades whose bar indexes wait for the new numbering:
+        'bar_remap',
+        # The closed trades no longer listed in :attr:`closed_trades` that a
+        # later fee or re-price may still change, oldest first, and the
+        # statistics of every closed trade before them (see
+        # :meth:`_rebuild_closed_trade_stats`):
+        '_evicted', '_stats_base',
+        # id(trade) -> the fill ids whose fee target holds the trade:
+        '_fee_refs',
+        # Restored trades closed out at their entry price, waiting for the
+        # close fill that re-prices them (see :meth:`close_out_restored_held`):
+        '_held_closed_out',
+        # How long a closed trade stays listed after it closed (ms), ``None``
+        # for ever (see :meth:`observe_bar`):
+        'retention_ms',
     )
 
     def __init__(self) -> None:
@@ -281,7 +371,7 @@ class BrokerPosition(PositionBase):
         self.min_equity: float = float("inf")
 
         self.open_trades: list[Trade] = []
-        self.closed_trades: deque[Trade] = deque(maxlen=9000)
+        self.closed_trades: deque[Trade] = deque(maxlen=STRATEGY_CLOSED_TRADES_LIMIT)
         self.new_closed_trades: list[Trade] = []
         # The binding book, one binding per entry fill, oldest first. The trade
         # rows above settle FIFO; a binding settles by the origin of the closing
@@ -371,6 +461,19 @@ class BrokerPosition(PositionBase):
         self.risk_halt_day: int = -1
 
         self._current_price: float = 0.0
+
+        # === Strategy statistics persistence ===
+        self._closed_dirty_from: int | None = None
+        self._restored_held: list[Trade] = []
+        self._restore_claims_open: bool = False
+        # id(trade) -> its place among the restored trades, oldest first.
+        self._restored_rank: dict[int, int] = {}
+        self.bar_remap: BarIndexRemap | None = None
+        self._evicted: deque[Trade] = deque()
+        self._stats_base = ClosedTradeStats()
+        self._fee_refs: dict[int, list[str]] = {}
+        self._held_closed_out: list[ProvisionalClose] = []
+        self.retention_ms: int | None = None
 
     # === Pine API compatibility shims ======================================
     # Pine strategy.* functions read ``position.c`` / ``.o`` / ``.h`` / ``.l``
@@ -692,6 +795,14 @@ class BrokerPosition(PositionBase):
         :param commission: The entry commission the parent's open exposure
             paid in earlier processes; it reaches the trade's profit when the
             trade closes, like the commission of an entry this process booked.
+
+        While a restart's restored trades are open to claims
+        (:meth:`restore_strategy_state` until :meth:`finish_restore_claims`),
+        the parent is made of the restored open trades of ``entry_id`` on its
+        side, newest first (the venue closed the oldest ones FIFO), with their
+        entry prices, times, bar indexes and commissions; only what they do not
+        cover becomes a trade at ``entry_price``, with the part of
+        ``commission`` they do not carry.
         """
         if self.size > self.max_contracts_held_long:
             self.max_contracts_held_long = self.size
@@ -699,20 +810,26 @@ class BrokerPosition(PositionBase):
             self.max_contracts_held_short = -self.size
         if any(t.entry_id == entry_id for t in self.open_trades):
             return
-        # ``entry_equity`` stays 0.0: the parent opened in a prior process so
-        # its true entry equity is unknowable, and startup adoption runs in
-        # ``start_broker`` before the script is attached (``self.equity`` reads
-        # ``lib._script``, not yet set). The broker close path never divides by
-        # a trade's entry equity, so the placeholder is inert.
-        self.open_trades.append(Trade(
-            size=size,
-            entry_id=entry_id,
-            entry_bar_index=int(getattr(lib, 'bar_index', 0)),
-            entry_time=0,
-            entry_price=entry_price,
-            commission=commission,
-            entry_equity=0.0,
-        ))
+        claimed, missing = self._claim_restored(entry_id, size)
+        self.open_trades.extend(claimed)
+        if claimed:
+            # The restored trades carry their own entry commission.
+            commission = max(0.0, commission - sum(t.commission for t in claimed))
+        if missing > 1e-12 * max(1.0, abs(size)):
+            # ``entry_equity`` stays 0.0: the parent opened in a prior process so
+            # its true entry equity is unknowable, and startup adoption runs in
+            # ``start_broker`` before the script is attached (``self.equity`` reads
+            # ``lib._script``, not yet set). The broker close path never divides by
+            # a trade's entry equity, so the placeholder is inert.
+            self.open_trades.append(Trade(
+                size=math.copysign(missing, size),
+                entry_id=entry_id,
+                entry_bar_index=int(getattr(lib, 'bar_index', 0)),
+                entry_time=0,
+                entry_price=entry_price,
+                commission=commission,
+                entry_equity=0.0,
+            ))
         self.open_commission = float(sum(t.commission for t in self.open_trades))
         if not any(binding.entry_id == entry_id for binding in self._entry_book):
             self._bind_fill(entry_id, None, size, entry_price)
@@ -1007,10 +1124,34 @@ class BrokerPosition(PositionBase):
         """
         if not event.fill_id:
             return
+        old = self._fee_targets.get(event.fill_id)
+        if old is not None:
+            self._unindex_fee_target(event.fill_id, old)
         self._fee_targets[event.fill_id] = target
         self._fee_targets.move_to_end(event.fill_id)
+        self._index_fee_target(event.fill_id, target)
         while len(self._fee_targets) > _FEE_TARGETS_CAP:
-            self._fee_targets.popitem(last=False)
+            evicted_id, evicted = self._fee_targets.popitem(last=False)
+            self._unindex_fee_target(evicted_id, evicted)
+        self._fold_evicted()
+
+    def _index_fee_target(self, fill_id: str, target: _FeeTarget) -> None:
+        """Record in :attr:`_fee_refs` that ``fill_id``'s fee target holds its trades."""
+        for trade, _share, _opened in target.trades:
+            refs = self._fee_refs.setdefault(id(trade), [])
+            if fill_id not in refs:
+                refs.append(fill_id)
+
+    def _unindex_fee_target(self, fill_id: str, target: _FeeTarget) -> None:
+        """Drop ``fill_id`` from the :attr:`_fee_refs` of its fee target's trades."""
+        for trade, _share, _opened in target.trades:
+            refs = self._fee_refs.get(id(trade))
+            if refs is None:
+                continue
+            if fill_id in refs:
+                refs.remove(fill_id)
+            if not refs:
+                del self._fee_refs[id(trade)]
 
     def _split_fee_targets(self, trade: Trade, closed_piece: Trade, closed_share: float) -> None:
         """Hand the closed piece of a split open trade its share of the fees aimed at the trade.
@@ -1027,9 +1168,9 @@ class BrokerPosition(PositionBase):
         :param closed_piece: The closed piece.
         :param closed_share: The share of the trade's commission the piece took.
         """
-        for target in self._fee_targets.values():
-            if not any(held is trade for held, _share, _opened in target.trades):
-                continue
+        for fill_id in list(self._fee_refs.get(id(trade), ())):
+            target = self._fee_targets[fill_id]
+            self._unindex_fee_target(fill_id, target)
             split: list[tuple[Trade, float, bool]] = []
             for held, share, opened in target.trades:
                 if held is not trade:
@@ -1039,6 +1180,7 @@ class BrokerPosition(PositionBase):
                 if closed_share < 1.0:
                     split.append((trade, share * (1.0 - closed_share), opened))
             target.trades = split
+            self._index_fee_target(fill_id, target)
 
     def book_fill_fee(self, fill_id: str, amount: float, *, entry_id: str | None,
                       opening: bool) -> bool:
@@ -1110,6 +1252,8 @@ class BrokerPosition(PositionBase):
             self._count_close_profit(closing.close_profit, -1)
             closing.close_profit -= amount_for
             self._count_close_profit(closing.close_profit, 1)
+            # Its stored trades carry the fill's close profit too.
+            self._mark_trades_dirty(held for held, _share, _opened in closing.trades)
         if closed_amount:
             self._rebuild_closed_trade_stats()
         self.open_commission = float(sum(t.commission for t in self.open_trades))
@@ -1131,9 +1275,18 @@ class BrokerPosition(PositionBase):
 
     def _fallback_fee_parts(self, amount: float, entry_id: str | None,
                             opening: bool) -> list[tuple[Trade, float]]:
-        """The trades a fee of a fill the position did not book goes to (:meth:`book_fill_fee`)."""
+        """The trades a fee of a fill the position did not book goes to (:meth:`book_fill_fee`).
+
+        For an opening fill, the entry's open trades by size; when a restart
+        restored some of them from the store (:meth:`restore_strategy_state`),
+        only the others: the restored ones carry the commission of every fill
+        the store holds, so a fill it does not hold opened the rest.
+        """
         if opening:
             held = [trade for trade in self.open_trades if trade.entry_id == entry_id]
+            unrestored = [trade for trade in held if id(trade) not in self._restored_rank]
+            if unrestored and len(unrestored) < len(held):
+                held = unrestored
             total = sum(abs(trade.size) for trade in held)
             if held and total > 0.0:
                 return [(trade, amount * abs(trade.size) / total) for trade in held]
@@ -1162,25 +1315,81 @@ class BrokerPosition(PositionBase):
         trade.profit_percent = (trade.profit / entry_cost * 100.0) if entry_cost else 0.0
         self._book_profit_ratio(trade, 1)
         shifting = False
-        for closed in self.closed_trades:
+        first_no = self._first_kept_no()
+        for i, closed in enumerate(self._kept_closed()):
             if closed is trade:
                 shifting = True
+                self._mark_closed_dirty(first_no + i)
             if shifting:
                 closed.exit_equity -= part
 
     def _rebuild_closed_trade_stats(self) -> None:
-        """Rebuild the cumulative closed-trade statistics from the kept closed trades."""
-        if self.closed_trades_count != len(self.closed_trades):
-            _blog_error(
-                "a fee booked onto a closed trade: %s trades closed, %s kept — the "
-                "cumulative closed-trade statistics keep the fee out",
-                self.closed_trades_count, len(self.closed_trades),
-            )
-            return
-        stats = ClosedTradeStats()
+        """Rebuild the cumulative closed-trade statistics after a closed trade changed.
+
+        Exact without the whole trade list: the statistics of the trades
+        folded away (:attr:`_stats_base`) plus every trade still kept, in
+        closing order (:attr:`_evicted`, then :attr:`closed_trades`). A trade a
+        later fee or re-price can still reach is never folded
+        (:meth:`_fold_evicted`).
+        """
+        stats = copy.deepcopy(self._stats_base)
+        for trade in self._evicted:
+            stats.add(trade)
         for trade in self.closed_trades:
             stats.add(trade)
         self._closed_trade_stats = stats
+
+    def _kept_closed(self) -> list[Trade]:
+        """Every closed trade still kept, oldest first: :attr:`_evicted`, :attr:`closed_trades`."""
+        return [*self._evicted, *self.closed_trades]
+
+    def _first_kept_no(self) -> int:
+        """The trade number (1-based) of the oldest closed trade still kept."""
+        return self.closed_trades_count - len(self._evicted) - len(self.closed_trades) + 1
+
+    def _fold_evicted(self) -> None:
+        """Fold the oldest evicted trades nothing can change any more into :attr:`_stats_base`.
+
+        An evicted trade stays kept while a fee target holds it
+        (:attr:`_fee_refs`), a closed-out restored trade waits for its
+        re-price (:attr:`_held_closed_out`), or its bar indexes wait for the
+        restart's remap (:attr:`bar_remap`).
+        """
+        if not self._evicted:
+            return
+        pending = {id(trade) for close in self._held_closed_out for trade in close.trades}
+        remap = self.bar_remap
+        while self._evicted:
+            trade = self._evicted[0]
+            if (id(trade) in self._fee_refs or id(trade) in pending
+                    or (remap is not None and remap.waits_timed(trade))):
+                return
+            self._stats_base.add(self._evicted.popleft())
+
+    def _age_out_closed(self, cutoff_ms: int) -> None:
+        """Unlist the oldest listed closed trades that closed before ``cutoff_ms``.
+
+        They move to :attr:`_evicted`, unchanged, so every total stays; the
+        ones nothing can change any more fold into :attr:`_stats_base` and
+        their stored rows go with the next write (:meth:`_fold_evicted`).
+
+        :param cutoff_ms: The retention cutoff (epoch ms).
+        """
+        closed = self.closed_trades
+        if not closed or closed[0].exit_time >= cutoff_ms:
+            return
+        while closed and closed[0].exit_time < cutoff_ms:
+            self._evicted.append(closed.popleft())
+        self._fold_evicted()
+
+    def _mark_trades_dirty(self, trades: Iterable[Trade]) -> None:
+        """Note that some closed trades changed (:meth:`_mark_closed_dirty`)."""
+        ids = {id(trade) for trade in trades}
+        first_no = self._first_kept_no()
+        for i, trade in enumerate(self._kept_closed()):
+            if id(trade) in ids:
+                self._mark_closed_dirty(first_no + i)
+                return
 
     def _untradable_floor(self, residue: float, price: float, holders: int) -> float | None:
         """The venue's least tradable quantity, when a remainder falls below it.
@@ -1922,7 +2131,6 @@ class BrokerPosition(PositionBase):
         """
         if event.fee:
             raise ValueError("a provisional close carries no fee")
-        stats_base = copy.deepcopy(self._closed_trade_stats)
         count_base = self.closed_trades_count
         closed_before = len(self.new_closed_trades)
         self.record_fill(event)
@@ -1932,7 +2140,7 @@ class BrokerPosition(PositionBase):
             unpriced=[abs(trade.size) for trade in trades],
             entry_commissions=[trade.commission for trade in trades],
             profit=sum(trade.profit for trade in trades),
-            stats_base=stats_base, count_base=count_base,
+            count_base=count_base,
         )
 
     def reprice_provisional_closes(
@@ -1963,6 +2171,7 @@ class BrokerPosition(PositionBase):
         fee_rate = event.fee / fill_qty
         remaining = qty
         shifts: dict[int, float] = {}
+        changed: list[tuple[Trade, float]] = []
         for close in closes:
             if remaining <= 1e-12:
                 break
@@ -1981,6 +2190,7 @@ class BrokerPosition(PositionBase):
                 trade.exit_id = event.pine_id or ""
                 trade.exit_time = int(event.timestamp * 1000.0)
                 trade.commission += fee_rate * part
+                changed.append((trade, fee_rate * part))
                 trade.profit = (trade.exit_price - trade.entry_price) * trade.size - trade.commission
                 entry_cost = abs(trade.size) * trade.entry_price + close.entry_commissions[i]
                 trade.profit_percent = (trade.profit / entry_cost * 100.0) if entry_cost else 0.0
@@ -1994,33 +2204,38 @@ class BrokerPosition(PositionBase):
                 self._count_close_profit(old_profit, -1)
                 self._count_close_profit(close.profit, 1)
         if shifts:
-            self._replay_closed_since(closes[0], shifts)
+            self._replay_closed_since(closes[0], shifts, changed)
         return round(qty - max(remaining, 0.0), 12)
 
-    def _replay_closed_since(self, close: ProvisionalClose, shifts: dict[int, float]) -> None:
+    def _replay_closed_since(self, close: ProvisionalClose, shifts: dict[int, float],
+                             changed: Sequence[tuple[Trade, float]]) -> None:
         """Carry re-priced profits into the trades closed since ``close`` and the statistics.
 
         :param close: The oldest provisional close.
         :param shifts: The profit change of each re-priced trade, by ``id``.
+        :param changed: Each re-priced trade with the commission it took.
         """
         since = self.closed_trades_count - close.count_base
-        tail = list(self.closed_trades)[-since:] if since > 0 else []
-        stats: ClosedTradeStats | None = copy.deepcopy(close.stats_base)
-        if since > len(tail):
-            _blog_error(
-                "re-priced closed trades: %s trades closed since the estimate, more than "
-                "the %s kept — the cumulative closed-trade statistics keep the estimate",
-                since, len(tail),
+        kept = self._kept_closed()
+        tail = kept[-since:] if since > 0 else []
+        self._mark_closed_dirty(close.count_base + 1)
+        kept_ids = {id(trade) for trade in kept}
+        folded = [(trade, commission) for trade, commission in changed
+                  if id(trade) not in kept_ids]
+        for trade, commission in folded:
+            # Folded already (nothing held it any more): its change moves the base.
+            self._stats_base.amend(trade, shifts[id(trade)], commission)
+        if folded:
+            _blog_warning(
+                "re-priced %d closed trade(s) already folded into the statistics: their "
+                "sums and counts move, the streaks and the largest trades stay as they "
+                "were", len(folded),
             )
-            stats = None
         shift = 0.0
         for trade in tail:
             trade.exit_equity += shift
             shift += shifts.get(id(trade), 0.0)
-            if stats is not None:
-                stats.add(trade)
-        if stats is not None:
-            self._closed_trade_stats = stats
+        self._rebuild_closed_trade_stats()
 
     def _count_close_profit(self, profit: float, sign: int) -> None:
         """Book (``sign`` 1) or unbook (-1) a closing fill's realized profit and its counter."""
@@ -2263,13 +2478,581 @@ class BrokerPosition(PositionBase):
         self.openprofit = 0.0
         self.open_commission = 0.0
 
+    # === Strategy statistics persistence ===
+
+    @property
+    def bar_remap_pending(self) -> bool:
+        """Whether restored trades still wait for bars of this process (:meth:`observe_bar`)."""
+        return self.bar_remap is not None
+
+    def _mark_closed_dirty(self, trade_no: int) -> None:
+        """Note that closed trade ``trade_no`` (1-based) changed, and with it every later one."""
+        if self._closed_dirty_from is None or trade_no < self._closed_dirty_from:
+            self._closed_dirty_from = trade_no
+
+    def _bar_anchor_of(self, trade: Trade) -> tuple[int, int] | None:
+        """The bar a trade's stored bar indexes count against (:func:`trade_to_payload`)."""
+        remap = self.bar_remap
+        if remap is not None:
+            anchor = remap.trade_anchors.get(id(trade))
+            if anchor is not None:
+                return anchor
+            if remap.waits_timed(trade):
+                return None
+        # noinspection PyProtectedMember
+        bar_time = int(lib._time)
+        if bar_time <= 0:
+            return None
+        return int(getattr(lib, 'bar_index', 0)), bar_time
+
+    def strategy_state_payload(self) -> tuple[dict[str, Any], str, str]:
+        """The strategy statistics a restart restores (:meth:`restore_strategy_state`).
+
+        The aggregates every ``strategy.*`` total derives from, the cumulative
+        closed-trade statistics and those of the trades folded away
+        (:attr:`_stats_base`), the open trades, the restored trades the venue
+        no longer holds (:meth:`book_restart_held_close`) and the restored
+        trades closed out at their entry price (:meth:`close_out_restored_held`);
+        the closed trades themselves are stored row by row
+        (:meth:`closed_trade_rows`). A trade carries the fee targets that hold
+        it (``fee_refs``), so a fee reported after a restart lands where it
+        would have without one (:meth:`book_fill_fee`).
+
+        :return: The record; its key without what the mark-to-market moves on
+            every price, which changes only when a fill, a fee or a bar's risk
+            bookkeeping changed the statistics; and its key without the bar
+            anchors, which changes when any statistic did.
+        """
+        aggregates: dict[str, Any] = {}
+        for name in _STATE_FLOAT_FIELDS:
+            aggregates[name] = encode_float(getattr(self, name))
+        for name in _STATE_INT_FIELDS:
+            aggregates[name] = int(getattr(self, name))
+        aggregates['risk_halt_trading'] = bool(self.risk_halt_trading)
+        first_no = self._first_kept_no()
+        kept_no = {id(trade): first_no + i for i, trade in enumerate(self._kept_closed())}
+        payload: dict[str, Any] = {
+            'version': STRATEGY_STATE_VERSION,
+            'aggregates': aggregates,
+            'closed_trade_stats': closed_trade_stats_to_payload(self._closed_trade_stats),
+            'stats_base': closed_trade_stats_to_payload(self._stats_base),
+            'closed_kept_from': first_no,
+            'open_trades': [self._trade_record(t) for t in self.open_trades],
+            'held_trades': [self._trade_record(t) for t in self._restored_held],
+            'held_closed_out': [
+                {'trade_no': kept_no[id(close.trades[0])], 'price': encode_float(close.price),
+                 'unpriced': encode_float(close.unpriced[0]),
+                 'entry_commission': encode_float(close.entry_commissions[0]),
+                 'profit': encode_float(close.profit)}
+                for close in self._held_closed_out if id(close.trades[0]) in kept_no
+            ],
+        }
+        held = [{name: value for name, value in trade.items() if name != 'bar_anchor'}
+                for trade in payload['held_trades']]
+        key = {
+            **payload,
+            'aggregates': {name: value for name, value in aggregates.items()
+                           if name not in _STATE_MARK_FIELDS},
+            'open_trades': [{name: value for name, value in trade.items()
+                             if name not in _TRADE_MARK_FIELDS}
+                            for trade in payload['open_trades']],
+            'held_trades': held,
+        }
+        mark_key = {
+            **payload,
+            'open_trades': [{name: value for name, value in trade.items()
+                             if name != 'bar_anchor'}
+                            for trade in payload['open_trades']],
+            'held_trades': held,
+        }
+        return payload, json.dumps(key, sort_keys=True), json.dumps(mark_key, sort_keys=True)
+
+    def _trade_record(self, trade: Trade) -> dict[str, Any]:
+        """A trade's stored record: :func:`trade_to_payload` plus the fee targets holding it.
+
+        ``fee_refs`` lists ``[fill id, share, opened, close profit]`` for every
+        fee target (:attr:`_fee_targets`) that holds the trade.
+        """
+        record = trade_to_payload(trade, self._bar_anchor_of(trade))
+        refs: list[list[Any]] = []
+        for fill_id in self._fee_refs.get(id(trade), ()):
+            target = self._fee_targets[fill_id]
+            for held, share, opened in target.trades:
+                if held is trade:
+                    refs.append([fill_id, share, opened, target.close_profit])
+        record['fee_refs'] = refs
+        return record
+
+    def closed_trade_rows(self) -> tuple[dict[int, tuple[int, dict[str, Any]]], int, int | None]:
+        """The closed trades changed since the last store write, as store rows.
+
+        A newly closed trade, a fee booked onto a closed trade (which moves the
+        exit equity of every later one too) and a re-priced close mark their
+        trade and every later one. The store keeps the rows of every trade
+        still kept (:meth:`_kept_closed`): :attr:`closed_trades` (the newest
+        :data:`STRATEGY_CLOSED_TRADES_LIMIT`, at most) and the evicted trades a
+        later change may still reach.
+
+        :return: Trade number -> ``(exit time in epoch ms, record)`` of the
+            changed trades still kept, the lowest trade number the store keeps,
+            and the change mark to hand to :meth:`closed_trade_rows_written`
+            once the rows landed.
+        """
+        mark = self._closed_dirty_from
+        keep_from = self._first_kept_no()
+        if mark is None:
+            return {}, keep_from, None
+        kept = self._kept_closed()
+        rows: dict[int, tuple[int, dict[str, Any]]] = {}
+        for i in range(max(0, mark - keep_from), len(kept)):
+            trade = kept[i]
+            rows[keep_from + i] = (int(trade.exit_time), self._trade_record(trade))
+        return rows, keep_from, mark
+
+    def closed_trade_rows_written(self, mark: int | None) -> None:
+        """The rows of :meth:`closed_trade_rows` taken with ``mark`` are stored."""
+        if mark is not None and self._closed_dirty_from == mark:
+            self._closed_dirty_from = None
+
+    @staticmethod
+    def stored_closed_trades_count(payload: dict[str, Any]) -> int:
+        """The closed-trade count of a stored record of :meth:`strategy_state_payload`.
+
+        :raises ValueError: When the record holds no valid count.
+        """
+        aggregates = payload.get('aggregates')
+        if not isinstance(aggregates, dict):
+            raise ValueError("the strategy state holds no aggregates")
+        return decode_int(aggregates.get('closed_trades_count'))
+
+    @staticmethod
+    def stored_closed_kept_from(payload: dict[str, Any]) -> int:
+        """The lowest trade number a stored :meth:`strategy_state_payload` record keeps a row of.
+
+        :raises ValueError: When the record holds no valid number.
+        """
+        return decode_int(payload.get('closed_kept_from'))
+
+    def restore_strategy_state(self, payload: dict[str, Any],
+                               closed_rows: Sequence[tuple[int, dict[str, Any]]],
+                               since_ms: int) -> str:
+        """Restore the strategy statistics a previous process of the run stored.
+
+        Called once by the sync engine on a fresh position, before it books
+        anything. The aggregates and the cumulative closed-trade statistics
+        come back as they were stored, and so do those of the trades folded
+        away (:attr:`_stats_base`). The closed trades come back from the rows
+        (every kept trade, from the stored ``closed_kept_from`` to the stored
+        count): the newest :data:`STRATEGY_CLOSED_TRADES_LIMIT` that closed at
+        or after ``since_ms`` are listed (:attr:`closed_trades`), the older
+        ones are evicted (:attr:`_evicted`) and folded into the base unless a
+        fee target or a close-out still holds them (:meth:`_fold_evicted`).
+        The fee targets come back from the trades' ``fee_refs``. The stored
+        open trades, and the restored trades a previous restart still held,
+        wait in :attr:`_restored_held` (oldest first) until the startup
+        adoption claims the ones the venue still holds
+        (:meth:`reconstruct_parent_trade`) or a fill an earlier process
+        journaled closes them (:meth:`book_restart_held_close`). Every restored
+        trade waits for the bar-index remap (:attr:`bar_remap`).
+
+        :param payload: A record of :meth:`strategy_state_payload`.
+        :param closed_rows: ``(trade number, record)`` of the stored closed
+            trades from ``closed_kept_from`` on, in trade-number order.
+        :param since_ms: The retention cutoff (epoch ms): an older trade is
+            not listed.
+        :return: A summary for the log.
+        :raises ValueError: When the record is malformed, of another version,
+            or its rows do not run without a gap from ``closed_kept_from`` to
+            the count; nothing is restored then.
+        """
+        if payload.get('version') != STRATEGY_STATE_VERSION:
+            raise ValueError(f"unknown strategy state version {payload.get('version')!r}")
+        aggregates = payload.get('aggregates')
+        if not isinstance(aggregates, dict):
+            raise ValueError("the strategy state holds no aggregates")
+        values: dict[str, Any] = {}
+        try:
+            for name in _STATE_FLOAT_FIELDS:
+                values[name] = decode_float(aggregates[name], _STATE_MISSING.get(name, na_float))
+            for name in _STATE_INT_FIELDS:
+                values[name] = decode_int(aggregates[name])
+            halted = aggregates['risk_halt_trading']
+        except KeyError as exc:
+            raise ValueError(f"strategy state field {exc} is missing") from exc
+        if not isinstance(halted, bool):
+            raise ValueError(f"risk_halt_trading is not a bool: {halted!r}")
+        stats_payload = payload.get('closed_trade_stats')
+        if not isinstance(stats_payload, dict):
+            raise ValueError("the strategy state holds no closed-trade statistics")
+        stats = closed_trade_stats_from_payload(stats_payload)
+        base_payload = payload.get('stats_base')
+        if not isinstance(base_payload, dict):
+            raise ValueError("the strategy state holds no base statistics")
+        base = closed_trade_stats_from_payload(base_payload)
+        refs: list[tuple[Trade, list[Any]]] = []
+
+        def restored(record: Any, where: str) -> tuple[Trade, tuple[int, int] | None]:
+            if not isinstance(record, dict):
+                raise ValueError(f"a record of {where} is not an object")
+            trade = trade_from_payload(record)
+            fee_refs = record.get('fee_refs', [])
+            if not isinstance(fee_refs, list):
+                raise ValueError(f"the fee_refs of a record of {where} are not a list")
+            refs.append((trade, fee_refs))
+            return trade, trade_anchor_of_payload(record)
+
+        count = values['closed_trades_count']
+        kept_from = self.stored_closed_kept_from(payload)
+        kept: list[tuple[Trade, tuple[int, int] | None]] = []
+        for trade_no, record in closed_rows:
+            if trade_no > count:
+                continue
+            if trade_no != kept_from + len(kept):
+                raise ValueError(f"stored closed trade #{kept_from + len(kept)} is missing")
+            kept.append(restored(record, f"closed trade #{trade_no}"))
+        if kept_from + len(kept) != count + 1:
+            raise ValueError(f"stored closed trades end at #{kept_from + len(kept) - 1}, "
+                             f"the count is {count}")
+        held: list[tuple[Trade, tuple[int, int] | None]] = []
+        for key in ('held_trades', 'open_trades'):
+            records = payload.get(key)
+            if not isinstance(records, list):
+                raise ValueError(f"the strategy state holds no {key}")
+            held.extend(restored(record, key) for record in records)
+        closed_out_records = payload.get('held_closed_out')
+        if not isinstance(closed_out_records, list):
+            raise ValueError("the strategy state holds no held_closed_out")
+        closed_out: list[ProvisionalClose] = []
+        for record in closed_out_records:
+            if not isinstance(record, dict):
+                raise ValueError("a record of held_closed_out is not an object")
+            index = decode_int(record.get('trade_no')) - kept_from
+            if not 0 <= index < len(kept):
+                raise ValueError("a closed-out trade is not among the kept ones")
+            trade = kept[index][0]
+            closed_out.append(ProvisionalClose(
+                price=decode_float(record.get('price')), trades=[trade],
+                unpriced=[decode_float(record.get('unpriced'))],
+                entry_commissions=[decode_float(record.get('entry_commission'))],
+                profit=decode_float(record.get('profit')), count_base=kept_from + index - 1,
+            ))
+        targets: OrderedDict[str, _FeeTarget] = OrderedDict()
+        for trade, fee_refs in refs:
+            for ref in fee_refs:
+                if (not isinstance(ref, list) or len(ref) != 4 or not isinstance(ref[0], str)
+                        or not isinstance(ref[2], bool)):
+                    raise ValueError(f"malformed fee ref {ref!r}")
+                target = targets.setdefault(ref[0], _FeeTarget())
+                target.trades.append((trade, decode_float(ref[1]), ref[2]))
+                target.close_profit = None if ref[3] is None else decode_float(ref[3])
+        while len(targets) > _FEE_TARGETS_CAP:
+            targets.popitem(last=False)
+        listed = min(len(kept), STRATEGY_CLOSED_TRADES_LIMIT)
+        while listed > 0 and kept[len(kept) - listed][0].exit_time < since_ms:
+            listed -= 1
+
+        for name, value in values.items():
+            setattr(self, name, value)
+        self.risk_halt_trading = halted
+        self._closed_trade_stats = stats
+        self._stats_base = base
+        self._evicted = deque(trade for trade, _anchor in kept[:len(kept) - listed])
+        self.closed_trades = deque((trade for trade, _anchor in kept[len(kept) - listed:]),
+                                   maxlen=STRATEGY_CLOSED_TRADES_LIMIT)
+        self._fee_targets = targets
+        self._fee_refs = {}
+        for fill_id, target in targets.items():
+            self._index_fee_target(fill_id, target)
+        self._held_closed_out = closed_out
+        self._restored_held = [trade for trade, _anchor in held]
+        self._restored_rank = {id(trade): rank for rank, (trade, _anchor) in enumerate(held)}
+        self._restore_claims_open = True
+        self._closed_dirty_from = None
+        # Folded before the remap: a folded trade's two bar indexes still count
+        # in one numbering, so its bar length is right.
+        self.bar_remap = None
+        self._fold_evicted()
+        folded = len(kept) - listed - len(self._evicted)
+        remap = BarIndexRemap()
+        for trade, anchor in (*kept[folded:], *held):
+            if anchor is None:
+                remap.add_timed(trade)
+            else:
+                remap.add_anchored(trade, anchor)
+        self.bar_remap = None if remap.done else remap
+        return (f"{count} closed trade(s), {listed} of them listed, "
+                f"{len(held)} open trade(s), net profit {self.netprofit}")
+
+    def _claim_restored(self, entry_id: str, size: float) -> tuple[list[Trade], float]:
+        """Take the restored trades of ``entry_id`` that hold ``size``, newest first.
+
+        :param entry_id: The adopted parent's entry id.
+        :param size: The parent's signed size.
+        :return: The claimed trades, oldest first, and the quantity they do
+            not cover. A restored trade larger than what is still needed is
+            split: its newer part is claimed, the older part stays restored.
+        """
+        need = abs(size)
+        if not self._restore_claims_open or not self._restored_held or need <= 0.0:
+            return [], need
+        sign = 1.0 if size > 0.0 else -1.0
+        claimed: list[Trade] = []
+        for i in range(len(self._restored_held) - 1, -1, -1):
+            if need <= 1e-12 * max(1.0, abs(size)):
+                break
+            trade = self._restored_held[i]
+            if trade.entry_id != entry_id or trade.sign != sign:
+                continue
+            held = abs(trade.size)
+            if held <= need + 1e-12 * max(1.0, need):
+                del self._restored_held[i]
+                claimed.insert(0, trade)
+                need -= held
+                continue
+            older = self._split_restored(trade, held - need)
+            self._restored_held[i] = older
+            claimed.insert(0, trade)
+            need = 0.0
+        return claimed, max(0.0, need)
+
+    def _split_restored(self, trade: Trade, qty: float) -> Trade:
+        """Split ``qty`` off a restored trade into a new piece, the commission by quantity.
+
+        :return: The piece; ``trade`` keeps the rest.
+        """
+        held = abs(trade.size)
+        piece = copy.copy(trade)
+        piece.size = trade.sign * qty
+        piece.commission = trade.commission * (qty / held)
+        trade.size -= piece.size
+        trade.commission -= piece.commission
+        self._split_fee_targets(trade, piece, qty / held)
+        self._restored_rank[id(piece)] = self._restored_rank.get(id(trade), 0)
+        if self.bar_remap is not None:
+            self.bar_remap.follow(trade, piece)
+        return piece
+
+    def finish_restore_claims(self) -> None:
+        """End the startup adoption's claims of restored trades (:meth:`reconstruct_parent_trade`).
+
+        The claimed trades take the order they were stored in, ahead of the
+        trades the adoption made at the venue's price, so later closes walk
+        them FIFO as the previous process would have. What stays restored is
+        what the venue no longer holds (:meth:`book_restart_held_close`).
+        No-op once the claims ended.
+        """
+        if not self._restore_claims_open:
+            return
+        self._restore_claims_open = False
+        rank = self._restored_rank
+        last = len(rank)
+        self.open_trades.sort(key=lambda trade: rank.get(id(trade), last))
+        self.open_commission = float(sum(t.commission for t in self.open_trades))
+        if self._restored_held:
+            _blog_info(
+                "startup: %d restored trade(s) (%s) are no longer held by the venue — a "
+                "close an earlier process journaled books their profit when it is "
+                "delivered", len(self._restored_held),
+                ", ".join(f"{t.entry_id}={t.size}" for t in self._restored_held),
+            )
+
+    def book_restart_held_close(self, event: 'OrderEvent', fee: float) -> bool:
+        """Close restored trades with a closing fill an earlier process journaled.
+
+        The fill (:attr:`~pynecore.core.broker.models.OrderEvent.journaled_before_restart`)
+        is in the position this process started with, so nothing of the
+        position, the binding book or the fill cursors moves. What it closed
+        are restored trades the venue no longer holds
+        (:attr:`_restored_held`): those of the fill's ``from_entry`` (of its
+        ``pine_id`` for a bracket leg labelled with the parent's own id), any
+        on the closed side when none of the entry is held, oldest first. Each
+        piece closes at the fill's price with its share of ``fee``, on the bar
+        the fill's time falls in (the current bar when that bar is beyond the
+        runner's reach, see :func:`_bar_index_at`), and the
+        profit is booked like a closing fill's (:meth:`record_fill`): the net
+        profit, the win / loss counters, the percent sums, the closed-trade
+        statistics. A later fee of the fill goes to the same trades
+        (:meth:`book_fill_fee`). What no restored trade holds re-prices the
+        restored trades already closed out at their entry price
+        (:meth:`close_out_restored_held`), the same way: their exit price, fee
+        and profit become the fill's.
+
+        :param event: The closing fill.
+        :param fee: The part of the fill's commission not accounted yet.
+        :return: Whether a restored trade was closed or re-priced.
+        """
+        fill_qty = event.fill_qty or 0.0
+        fill_price = event.fill_price or 0.0
+        if (fill_qty <= 0.0 or fill_price <= 0.0
+                or not (self._restored_held or self._held_closed_out)):
+            return False
+        closed_sign = -1.0 if event.order.side == 'buy' else 1.0
+        entry_id = event.from_entry or (
+            event.pine_id if event.leg_type in _BOUND_LEG_TYPES else None)
+        candidates = [t for t in self._restored_held if t.sign == closed_sign
+                      and (entry_id is None or t.entry_id == entry_id)]
+        if not candidates and entry_id is not None:
+            candidates = [t for t in self._restored_held if t.sign == closed_sign]
+        remaining = fill_qty
+        profit = 0.0
+        target = _FeeTarget()
+        exit_bar = _bar_index_at(int(event.timestamp * 1000.0))
+        for trade in candidates:
+            if remaining <= 1e-12 * max(1.0, fill_qty):
+                break
+            held = abs(trade.size)
+            if held <= remaining + 1e-12 * max(1.0, remaining):
+                self._restored_held.remove(trade)
+                piece, part = trade, held
+            else:
+                piece, part = self._split_restored(trade, remaining), remaining
+                if self.bar_remap is not None:
+                    self.bar_remap.forget(piece)
+            self._close_trade(piece, fill_price, event, fee_share=fee * (part / fill_qty),
+                              exit_bar_index=exit_bar)
+            target.trades.append((piece, part / fill_qty, False))
+            profit += piece.profit
+            remaining -= part
+        if target.trades:
+            self._count_close_profit(profit, 1)
+            target.close_profit = profit
+            self._note_fee_target(event, target)
+        repriced = 0.0
+        if remaining > 1e-12 * max(1.0, fill_qty) and self._held_closed_out:
+            closes = [close for close in self._held_closed_out
+                      if close.trades[0].sign == closed_sign
+                      and (entry_id is None or close.trades[0].entry_id == entry_id)]
+            if not closes and entry_id is not None:
+                closes = [close for close in self._held_closed_out
+                          if close.trades[0].sign == closed_sign]
+            if closes:
+                repriced = self.reprice_provisional_closes(
+                    closes, remaining, replace(event, fee=fee))
+                remaining -= repriced
+                self._held_closed_out = [close for close in self._held_closed_out
+                                         if any(qty > 1e-12 for qty in close.unpriced)]
+                self._fold_evicted()
+        if not target.trades and repriced <= 0.0:
+            return False
+        if remaining > 1e-12 * max(1.0, fill_qty):
+            _blog_warning(
+                "journaled close %s (qty=%s) closed only %s of restored trades — the rest "
+                "closed exposure the restored statistics do not hold, its profit is not "
+                "booked", event.fill_id, fill_qty, fill_qty - remaining,
+            )
+        return True
+
+    def close_out_restored_held(self, timestamp: float) -> list[Trade]:
+        """Close out the restored trades the venue no longer holds that no close consumed.
+
+        The sync engine calls it once the venue has stayed on the book's size
+        for the fill-report grace after the restart with no close evidence for
+        them (:meth:`OrderSyncEngine._close_out_restored_held`): their close
+        happened while no bot ran and no plugin delivered it. Each closes at its
+        own entry price with no fee, so its realized profit is its entry
+        commission only (approximate), and waits in :attr:`_held_closed_out`
+        for the real close fill, which re-prices it to its own price and fee
+        (:meth:`book_restart_held_close`). Nothing of the position moves.
+
+        :param timestamp: The close-out's time (epoch seconds), its exit time.
+        :return: The trades closed out.
+        """
+        closed: list[Trade] = []
+        for trade in list(self._restored_held):
+            self._restored_held.remove(trade)
+            count_base = self.closed_trades_count
+            entry_commission = trade.commission
+            qty = abs(trade.size)
+            order = ExchangeOrder(
+                id='', symbol='', side='sell' if trade.sign > 0.0 else 'buy',
+                order_type=OrderType.MARKET, qty=qty, filled_qty=qty, remaining_qty=0.0,
+                price=None, stop_price=None, average_fill_price=trade.entry_price,
+                status=OrderStatus.FILLED, timestamp=timestamp, fee=0.0, fee_currency='',
+            )
+            event = OrderEvent(order=order, event_type='filled',
+                               fill_price=trade.entry_price, fill_qty=qty,
+                               timestamp=timestamp, leg_type=LegType.CLOSE,
+                               from_entry=trade.entry_id)
+            self._close_trade(trade, float(trade.entry_price), event, fee_share=0.0)
+            self._count_close_profit(trade.profit, 1)
+            self._held_closed_out.append(ProvisionalClose(
+                price=float(trade.entry_price), trades=[trade], unpriced=[qty],
+                entry_commissions=[entry_commission], profit=trade.profit,
+                count_base=count_base,
+            ))
+            closed.append(trade)
+        return closed
+
+    @property
+    def restored_held(self) -> Sequence[Trade]:
+        """The restored trades the venue no longer holds, oldest first; read-only for callers."""
+        return self._restored_held
+
+    @property
+    def restore_claims_open(self) -> bool:
+        """Whether the startup adoption may claim restored trades (:meth:`finish_restore_claims`)."""
+        return self._restore_claims_open
+
+    def observe_bar(self, bar_index: int, bar_time: int) -> None:
+        """Show a new bar of this process to the closed-trade window and the bar-index remap.
+
+        Called by the runner on every new bar, before the bar's script runs.
+        The listed closed trades that closed longer than :attr:`retention_ms`
+        ago leave :attr:`closed_trades` (:meth:`_age_out_closed`), so a run
+        that never stopped lists the same trades on every bar as one a restart
+        restored (:meth:`restore_strategy_state` applies the same cut).
+        While :attr:`bar_remap_pending`, the bar also goes to the restored
+        trades' remap (see :class:`BarIndexRemap`): a closed trade whose exit
+        index is placed now gets its bar length in the closed-trade
+        statistics, and its stored row is written again. Once nothing waits
+        the remap ends.
+
+        :param bar_index: The bar's index (``bar_index`` of the script).
+        :param bar_time: The bar's open time (epoch ms).
+        """
+        if self.retention_ms is not None:
+            self._age_out_closed(int(time.time() * 1000) - self.retention_ms)
+        remap = self.bar_remap
+        if remap is None:
+            return
+        placed = remap.observe(bar_index, bar_time)
+        if placed:
+            placed_ids = {id(trade) for trade in placed}
+            first_no = self._first_kept_no()
+            for i, trade in enumerate(self._kept_closed()):
+                if id(trade) in placed_ids:
+                    self._closed_trade_stats.add_bar_length(trade)
+                    self._mark_closed_dirty(first_no + i)
+        if remap.done:
+            self.bar_remap = None
+            self._fold_evicted()
+            _blog_info(
+                "restored trades renumbered to this run's bars%s",
+                " (some placed by the bar period: their bars predate this run's history "
+                "or are missing from it)" if remap.approximate else "",
+            )
+
     # === Internals ===
 
     def _close_trade(self, trade: Trade, fill_price: float,
-                     event: 'OrderEvent', fee_share: float) -> None:
-        """Move a (possibly split) Trade from open_trades to closed_trades."""
+                     event: 'OrderEvent', fee_share: float,
+                     exit_bar_index: int | None = None) -> None:
+        """Move a (possibly split) Trade from open_trades to closed_trades.
+
+        While a restart's bar-index remap waits (:attr:`bar_remap`), no bar of
+        this process ran yet: the trade takes the indexes of the bars its entry
+        and exit times fall in once the runner shows them, and its bar length
+        reaches the closed-trade statistics then (:meth:`observe_bar`).
+
+        :param exit_bar_index: The exit's bar, when it is not the current one.
+        """
         trade.exit_id = event.pine_id or ""
-        trade.exit_bar_index = int(getattr(lib, 'bar_index', 0))
+        if self.bar_remap is not None:
+            trade.exit_bar_index = -1
+        elif exit_bar_index is not None:
+            trade.exit_bar_index = exit_bar_index
+        else:
+            trade.exit_bar_index = int(getattr(lib, 'bar_index', 0))
         trade.exit_time = int(event.timestamp * 1000.0)
         trade.exit_price = fill_price
         trade.exit_comment = ''
@@ -2294,7 +3077,13 @@ class BrokerPosition(PositionBase):
             self.sum_loss_profit_ratio += profit_ratio
         if trade in self.open_trades:
             self.open_trades.remove(trade)
+        if self.bar_remap is not None:
+            self.bar_remap.add_timed(trade)
+        if len(self.closed_trades) == self.closed_trades.maxlen:
+            self._evicted.append(self.closed_trades[0])
         self.closed_trades.append(trade)
         self.new_closed_trades.append(trade)
         self.closed_trades_count += 1
         self._closed_trade_stats.add(trade)
+        self._mark_closed_dirty(self.closed_trades_count)
+        self._fold_evicted()

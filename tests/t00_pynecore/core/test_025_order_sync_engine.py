@@ -22640,14 +22640,14 @@ def _storage_fault_netting(tmp_path, fail_at: int | None) -> dict:
 
 
 @pytest.mark.parametrize('scenario,writes', [
-    (_storage_fault_hedging, 73),
-    (_storage_fault_partial_bracket, 72),
-    (_storage_fault_partial_bracket_unsent_close, 69),
-    (_storage_fault_partial_bracket_acked_fill, 72),
-    (_storage_fault_partial_bracket_acked_unfilled, 80),
-    (_storage_fault_partial_bracket_acked_partial, 81),
-    (_storage_fault_software_guard, 20),
-    (_storage_fault_netting, 61),
+    (_storage_fault_hedging, 83),
+    (_storage_fault_partial_bracket, 74),
+    (_storage_fault_partial_bracket_unsent_close, 71),
+    (_storage_fault_partial_bracket_acked_fill, 74),
+    (_storage_fault_partial_bracket_acked_unfilled, 82),
+    (_storage_fault_partial_bracket_acked_partial, 83),
+    (_storage_fault_software_guard, 22),
+    (_storage_fault_netting, 68),
 ], ids=['hedging', 'partial_bracket', 'partial_bracket_unsent_close',
         'partial_bracket_acked_fill', 'partial_bracket_acked_unfilled',
         'partial_bracket_acked_partial', 'software_guard', 'netting'])
@@ -23003,51 +23003,61 @@ def _run_adopted_commission_restart(tmp_path, *, receipted: tuple[str, ...],
 
 
 def __test_a_clean_restart_keeps_the_entry_commission_of_the_adopted_trade__(tmp_path):
-    """The adopted trade carries the receipted entry fees, and the closed trade's profit nets them.
+    """The adopted trades carry the receipted entry fees, and the closed trades' profit nets them.
 
-    Both entry fills were taken before the restart: the adoption restores
-    their 0.5 from the receipts, a redelivery of the fills or of fee events
-    books nothing on top, and the closed trade's net profit is the 2.0 gain
-    less the 0.5 entry commission.
+    Both entry fills were taken before the restart: the adoption takes the
+    two trades they opened back from the stored strategy statistics, each
+    with its own fee, a redelivery of the fills or of fee events books
+    nothing on top, and the closed trades' net profit is the 2.0 gain less
+    the 0.5 entry commission.
     """
     run = _run_adopted_commission_restart(tmp_path, receipted=("f-1", "f-2"), venue=2.0)
-    assert run['adopted'] == [("L", 2.0, pytest.approx(0.5))]
+    assert run['adopted'] == [("L", 1.0, pytest.approx(0.3)), ("L", 1.0, pytest.approx(0.2))]
     assert run['open_commission'] == pytest.approx(0.5)
-    assert run['closed'] == [("L", 2.0, pytest.approx(0.5))]
+    assert run['closed'] == [("L", 1.0, pytest.approx(0.3)), ("L", 1.0, pytest.approx(0.2))]
     assert run['netprofit'] == pytest.approx(2.0 - 0.5)
 
 
 def __test_a_crash_before_a_receipt_ends_at_the_clean_restart_commission__(tmp_path):
     """A fill the dead process journaled but never took adds its fee on the flagged redelivery.
 
-    The restart restores the receipted ``f-1``'s 0.3; the flagged ``f-2``
-    brings its 0.2: the same 0.5 as a clean restart, booked once.
+    The restart restores the receipted ``f-1``'s trade with its 0.3, the
+    rest of the venue position is adopted without commission, and the
+    flagged ``f-2`` brings its 0.2 to that rest: the same trades and the same
+    0.5 as a clean restart, booked once.
     """
     clean = _run_adopted_commission_restart(tmp_path, receipted=("f-1", "f-2"), venue=2.0)
     crashed = _run_adopted_commission_restart(tmp_path, receipted=("f-1",), venue=2.0)
-    assert crashed['adopted'] == [("L", 2.0, pytest.approx(0.3))]
+    assert crashed['adopted'] == [("L", 1.0, pytest.approx(0.3)), ("L", 1.0, 0.0)]
     assert crashed['open_commission'] == pytest.approx(clean['open_commission'])
     assert crashed['netprofit'] == pytest.approx(clean['netprofit'])
+    assert crashed['closed'] == clean['closed']
     nothing = _run_adopted_commission_restart(tmp_path, receipted=(), venue=2.0)
     assert nothing['adopted'] == [("L", 2.0, 0.0)]
     assert nothing['open_commission'] == pytest.approx(clean['open_commission'])
 
 
-@pytest.mark.parametrize('retired,venue', [(0.5, 1.5), (0.0, 1.0)],
-                         ids=['netted-by-the-plugin', 'trimmed-by-the-adoption'])
+@pytest.mark.parametrize('retired,venue,adopted', [
+    (0.5, 1.5, [("L", 0.5, 0.15), ("L", 1.0, 0.2)]),
+    (0.0, 1.0, [("L", 1.0, 0.2)]),
+], ids=['netted-by-the-plugin', 'trimmed-by-the-adoption'])
 def __test_an_adopted_entry_closed_in_part_keeps_its_share_of_the_commission__(
-        tmp_path, retired, venue):
+        tmp_path, retired, venue, adopted):
     """The part of the entry an earlier process closed took its share of the fee with it.
 
-    The row booked 2.0 for 0.5 of commission; the adoption holds ``venue`` of
-    it (the plugin netted the rest off the row, or the adoption trims a
-    reduction no fill attributes): the adopted trade carries 0.5 * venue / 2.
+    The fills ``f-1`` (1.0, fee 0.3) and ``f-2`` (1.0, fee 0.2) opened one
+    trade each; the adoption holds ``venue`` of them (the plugin netted the
+    rest off the row, or the adoption trims a reduction no fill attributes).
+    The venue closed FIFO, oldest trade first, as the earlier process would
+    have booked it: what stays open is the newest ``venue`` of the restored
+    trades, each with the commission of its own part.
     """
     run = _run_adopted_commission_restart(tmp_path, receipted=("f-1", "f-2"), venue=venue,
                                           retired=retired)
-    assert run['adopted'] == [("L", venue, pytest.approx(0.5 * venue / 2.0))]
-    assert run['open_commission'] == pytest.approx(0.5 * venue / 2.0)
-    assert run['netprofit'] == pytest.approx(venue * 1.0 - 0.5 * venue / 2.0)
+    assert run['adopted'] == [(entry, size, pytest.approx(fee)) for entry, size, fee in adopted]
+    commission = sum(fee for _entry, _size, fee in adopted)
+    assert run['open_commission'] == pytest.approx(commission)
+    assert run['netprofit'] == pytest.approx(venue * 1.0 - commission)
 
 
 def __test_a_fee_reported_without_its_fill_books_like_the_fill_carrying_it__(tmp_path):
@@ -23075,8 +23085,8 @@ def __test_a_fee_reported_without_its_fill_books_like_the_fill_carrying_it__(tmp
 
 
 @pytest.mark.parametrize('fees_on_fills,crash_at', [
-    *((False, crash_at) for crash_at in range(73)),
-    *((True, crash_at) for crash_at in range(71)),
+    *((False, crash_at) for crash_at in range(83)),
+    *((True, crash_at) for crash_at in range(78)),
 ])
 def __test_a_crash_at_any_hedging_store_write_redelivers_every_fill_once__(
         tmp_path, fees_on_fills, crash_at):
@@ -23097,7 +23107,7 @@ def __test_a_crash_at_any_hedging_store_write_redelivers_every_fill_once__(
     """
     base = _run_storage_fault_scenario(tmp_path, None, crash=True,
                                        fees_on_fills=fees_on_fills)
-    assert base['first_writes'] == (71 if fees_on_fills else 73) and not base['crashed']
+    assert base['first_writes'] == (78 if fees_on_fills else 83) and not base['crashed']
     run = _run_storage_fault_scenario(tmp_path, crash_at, crash=True,
                                       fees_on_fills=fees_on_fills)
     assert run['crashed'] and run['raised'] == []
@@ -23118,7 +23128,7 @@ def __test_a_crash_at_any_hedging_store_write_redelivers_every_fill_once__(
                for fill_id, _, fee in second['receipts'])
 
 
-@pytest.mark.parametrize('crash_at', range(14))
+@pytest.mark.parametrize('crash_at', range(16))
 def __test_a_crash_at_any_software_guard_store_write_never_loosens_the_trail__(
         tmp_path, crash_at):
     """The process of the software-guard scenario dies at each of its writes in turn.
@@ -23131,7 +23141,7 @@ def __test_a_crash_at_any_software_guard_store_write_never_loosens_the_trail__(
     is owed and the run goes on.
     """
     base = _run_software_guard_trail_scenario(tmp_path, None, crash=True)
-    assert base['first_writes'] == 14 and not base['crashed']
+    assert base['first_writes'] == 16 and not base['crashed']
     run = _run_software_guard_trail_scenario(tmp_path, crash_at, crash=True)
     assert run['crashed'] and run['raised'] == []
     sends = [write[1] for write in run['port_writes'] if write[0] in ('place', 'close')]
@@ -23145,7 +23155,7 @@ def __test_a_crash_at_any_software_guard_store_write_never_loosens_the_trail__(
     assert second['owed'] == [] and not second['quarantined']
 
 
-@pytest.mark.parametrize('crash_at', range(72))
+@pytest.mark.parametrize('crash_at', range(74))
 def __test_a_crash_at_any_partial_bracket_store_write_restarts_to_a_settled_end__(
         tmp_path, crash_at):
     """The process dies at each write of the partial-bracket scenario in turn.
@@ -23169,7 +23179,7 @@ def __test_a_crash_at_any_partial_bracket_store_write_restarts_to_a_settled_end_
         LEG_STATE_CANCEL_TENTATIVE, LEG_STATE_TRIGGERED_FAILED, LEG_STATE_TRIGGERED_UNKNOWN,
     )
     base = _run_partial_bracket_fault_scenario(tmp_path, None, crash=True)
-    assert base['writes'] == 72 and not base['crashed']
+    assert base['writes'] == 74 and not base['crashed']
     run = _run_partial_bracket_fault_scenario(tmp_path, crash_at, crash=True)
     assert run['crashed'] and run['raised'] == []
     if 'restart_size' in run:
@@ -23234,7 +23244,7 @@ def __test_the_bot_settles_a_held_close_no_journal_record_settles_from_the_venue
 #: The partial-bracket scenario's modes whose first TP close the venue
 #: acknowledges and settles only a bar later, with the store writes of their
 #: fault-free run (:func:`_run_partial_bracket_fault_scenario`).
-_ACKED_CLOSE_MODES = {'ack_then_fill': 72, 'ack_then_unfilled': 80, 'ack_then_partial': 81}
+_ACKED_CLOSE_MODES = {'ack_then_fill': 74, 'ack_then_unfilled': 82, 'ack_then_partial': 83}
 
 
 @pytest.mark.parametrize('close_journal,crash_at', [
@@ -24207,7 +24217,7 @@ def __test_a_held_close_of_the_whole_parent_leaves_its_native_stop_once_it_fills
     store.close()
 
 
-@pytest.mark.parametrize('crash_at', range(61))
+@pytest.mark.parametrize('crash_at', range(68))
 def __test_a_crash_at_any_netting_store_write_restarts_to_one_netted_side__(
         tmp_path, crash_at):
     """The first process of the netting scenario dies at each of its writes in turn.
@@ -24222,7 +24232,7 @@ def __test_a_crash_at_any_netting_store_write_restarts_to_one_netted_side__(
     net of 1.
     """
     base = _run_netting_fault_scenario(tmp_path, None, crash=True)
-    assert base['first_writes'] == 61 and not base['crashed']
+    assert base['first_writes'] == 68 and not base['crashed']
     run = _run_netting_fault_scenario(tmp_path, crash_at, crash=True)
     assert run['crashed'] and run['raised'] == []
     sends = [coid for coid, _leg_id, _volume in run['sent_closes']]

@@ -5,7 +5,7 @@ title: "Broker Run Management"
 description: "Manage quarantined live broker runs with the PyneCore CLI. Understand quarantine states, inspect what a bot continues to do and resume a run when appropriate."
 icon: "shield"
 date: "2026-10-14"
-lastmod: "2026-11-26"
+lastmod: "2026-11-27"
 draft: false
 toc: true
 categories: ["CLI"]
@@ -324,3 +324,85 @@ the venue holds 0.0 and the book 1.0: the position the handed-over execution(s) 
 
 The quarantine ends with the book flat like the venue. A close report that
 arrives later re-prices that close at the venue's price.
+
+## Strategy statistics across restarts
+
+`strategy.netprofit`, `strategy.closedtrades`, `strategy.wintrades`, the
+drawdown and run-up figures, the closed-trade averages and every other
+`strategy.*` statistic continue across restarts. The bot stores them in the
+broker store (`workdir/output/logs/broker.sqlite`) in the same transaction
+that books a fill and writes its fill receipt, so a crash can neither lose a
+booked trade nor count it twice. A restarted bot restores them before the
+script sees its first live bar, and a server move restores them too: copy
+or replicate the store to the new host (Litestream, a file copy of a
+stopped bot's store) and start the same run there.
+
+What comes back:
+
+- The totals and the cumulative statistics (net profit, gross profit and
+  loss, the win / loss / even counters, commission, the average and largest
+  trades, bar lengths, streaks, monthly returns, the maximum contracts held,
+  the `strategy.risk.*` counters and halts), however many trades there were.
+- The closed trades themselves, `strategy.closedtrades.*(i)`: the newest
+  9000, at most `retention_days` old on every bar (see below).
+  `strategy.closedtrades` still counts every trade, and
+  `strategy.closedtrades.first_index` is the number of the oldest one
+  listed. A fee the venue reports late for a trade no longer listed still
+  moves every total exactly: the bot keeps such a trade, unlisted, while a
+  fee can still reach it.
+- The open trades with their own entry prices, times, commissions and entry
+  ids, for the part of the position the venue still holds.
+
+A trade the venue closed while no bot ran is booked with its close's own
+price and fee once the broker plugin delivers that close, whether the plugin
+marks it as journaled before the restart (section 2a of the
+[Broker Plugin Authoring Guide](../development/broker-plugin-authoring.md))
+or delivers it as an ordinary fill the venue position already reflects. When
+no close of it arrives within the plugin's fill-report grace, while the venue
+stays on the bot's size with nothing in flight, the bot closes the trade out
+at its entry price (the realized P&L is the entry commission only,
+approximate) and logs it as one WARNING:
+
+```
+1 restored trade(s) [('L', 1.0, 50000.0)] are not held by the venue (0.0), and no close fill reported them within 120 s — closed out at their entry prices (realized P&L approximate until the plugin delivers the close's fill, which re-prices it)
+```
+
+with a `restored_trade_close_adopted` audit event in the broker store. The
+close the plugin delivers later re-prices that trade to its own price and
+fee, also after a further restart.
+
+The drawdown and run-up extremes follow the price on every tick, but they
+are stored at most once a bar unless a fill changes the statistics: a crash
+can lose the extremes of the last bar.
+
+Bar indexes are counted from the first bar of each run's warm-up history,
+so the same bar has another `bar_index` after a restart. A stored trade
+keeps the bar it was stored on, and the restarted bot renumbers its
+`entry_bar_index` and `exit_bar_index` when its warm-up reaches that bar:
+`bar_index - strategy.opentrades.entry_bar_index(0)` and the bar-length
+averages stay what they were. A bar older than the warm-up history (or
+missing from it) is placed by the bar period instead, which is an estimate
+on markets that skip bars (sessions, weekends); the bot logs it at INFO.
+Until the warm-up reaches its bar, a restored trade carries the old index.
+
+## Retention
+
+The broker store keeps historical rows for `retention_days` days (180 by
+default), set in `workdir/config/brokers.toml`:
+
+```toml
+retention_days = 180
+```
+
+It must be a whole number of days, at least 1; another value stops the
+start with an error. The bot purges older rows at startup and then once a
+day: events, closed orders, ended runs, fill receipts, retired spot ledger
+rows and superseded spot epochs. It never purges what a running bot still
+needs, however old: the state of an open position (its orders, its spot
+ledger and epoch, the binding book), the quarantine records, and the
+strategy totals. The closed trades of the strategy statistics older than
+`retention_days` are dropped by the bot itself, at the start of the first
+bar they are that old on (and when it starts): they leave the list and
+their stored rows go, while every total keeps counting them. A bot that
+was restarted lists the same trades on every bar as one that never stopped. The store keeps the rows of at most the newest 9000 closed trades,
+plus any trade a late fee may still reach.

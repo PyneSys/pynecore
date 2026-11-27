@@ -5,7 +5,7 @@ title: "Broker Plugin Authoring Guide"
 description: "Implement a PyneCore BrokerPlugin using the documented contract for live order handling. Review persistence requirements and the behavior broker authors must test."
 icon: "account_balance"
 date: "2026-07-12"
-lastmod: "2026-11-26"
+lastmod: "2026-11-27"
 draft: false
 toc: true
 categories: ["Development"]
@@ -546,8 +546,9 @@ How to deliver a fill again safely:
   record (yielding it again is ignored); otherwise yield it again with
   `OrderEvent.journaled_before_restart=True`, and drop the record once
   `fill_delivered` turns `True`. The engine gives such a fill its receipt
-  and books nothing, because the startup already holds it, except the fee
-  of an entry fill (see 2a).
+  and moves no position, because the startup already holds it; it books
+  only what the restored strategy statistics lack: the fee of an entry
+  fill, the profit of an exit-leg fill (see 2a).
 - A fill your journal does **not** hold yet (the dead process never wrote
   its row or its netting, e.g. a close whose retirement it never
   committed) is a new fill to this process: journal it and yield it as an
@@ -557,8 +558,9 @@ How to deliver a fill again safely:
 
 Retention: a receipt lives as long as a journal row of the run carries the
 fill's order (matched by the event's `ExchangeOrder.client_order_id` or its
-venue order id `ExchangeOrder.id`), and at least `RETENTION_DAYS` after it
-was written; the retention purge removes it together with that row. Keep
+venue order id `ExchangeOrder.id`), and at least the store's retention
+(`retention_days` in `brokers.toml`, 180 days by default) after it was
+written; the retention purge removes it together with that row. Keep
 your redelivery records no longer than the row they belong to: once the
 row is purged, so is the receipt, and a fill delivered again after that is
 booked as a new one.
@@ -595,19 +597,39 @@ with your total. A fee of a fill the engine holds for the venue's verdict
 is not booked (logged at WARNING); deliver it again once
 `fill_delivered(fill_id)` is `True`.
 
-The fee of a fill delivered again with `journaled_before_restart` takes
-the same channel. The trades a restart adopts carry no commission of the
-earlier process, so the fee of such an **entry** fill (its `fee`, less
-what a fee event of it already accounted) is booked onto the open trades
-of its entry by size, and the receipt records it, so delivering the fill
-or its fee again books nothing. Two limits follow from what a restart can
-recover. The fee of an **exit-leg** fill (a close, TP, SL or trailing
-stop) is not booked: it belonged to the trade that fill closed, which the
-earlier process held, and a restart does not rebuild that trade. Nor is
-the fee of an entry fill whose entry has no open trade any more (the
-position was closed meanwhile). In both cases the commission is missing
-from this process's trade history; the receipt still counts it as
-accounted.
+A fill delivered again with `journaled_before_restart` books what the
+restored strategy statistics do not hold yet. A restart restores the
+statistics the earlier process stored with its last book write (the
+totals, the closed trades and the open trades; see
+[Strategy statistics across restarts](../cli/broker.md#strategy-statistics-across-restarts)),
+and that write holds exactly the fills whose receipts it wrote, so a fill
+without a booked receipt is missing from them:
+
+- An **entry** fill: its fee (its `fee`, less what a fee event of it
+  already accounted) is booked onto the open trades of its entry by size,
+  through the fee channel above.
+- An **exit-leg** fill (a close, TP, SL or trailing stop) closes the
+  restored trades the venue no longer holds: those of its `from_entry` (of
+  its `pine_id` for a bracket leg labelled with the parent's own id), any
+  on the closed side when none of the entry is held, oldest first. They
+  close at the fill's `fill_price` with its fee (less what a fee event
+  already accounted), on the bar the event's `timestamp` falls in. The
+  realized profit, the win / loss counters and the closed-trade statistics
+  move; the position, the binding book and the fill cursors do not. Fill
+  `fill_qty`, `fill_price`, `fee`, `timestamp`, `order.side`, `leg_type` and
+  `from_entry` as on the live event. A close your journal does not hold yet,
+  delivered as an ordinary fill (see above), books the same way once the
+  engine finds the venue position already reflecting it. A restored trade no
+  close reaches within your `fill_report_grace_s` is closed out at its entry
+  price (`restored_trade_close_adopted`); the close you deliver later
+  re-prices it.
+
+The receipt records the fill in every case, so delivering the fill, or its
+fee, again books nothing. Nothing is booked, with a WARNING, when the
+restored statistics hold no trade for the fill: a run whose store holds no
+statistics (written before they were stored), an entry fill whose entry
+has no open trade, an exit fill whose trade the earlier process never
+stored.
 
 `journal_fill_qty` is the same slice in the unit your journal counts the
 order's `filled_qty` in: the amount this execution raises that row's
@@ -1663,10 +1685,15 @@ when the bot's net inventory is genuinely flat.
 The core `orders` table keeps only a cumulative `filled_qty` (no
 per-fill price, fee, fee currency or execution id), and the `events`
 table is purged by the retention cleanup — neither can reconstruct a
-position that has been open longer than the retention window. The
-`spot_executions` ledger is exempt from `cleanup_old_data` by design: an
-open position stays reconstructible for as long as it is open, however
-old its fills are.
+position that has been open longer than the retention window. The live
+rows of the `spot_executions` ledger are exempt from `cleanup_old_data`
+by design: an open position stays reconstructible for as long as it is
+open, however old its fills are. The purge takes only what no fold reads
+any more: a **retired** row (closed out by a quarantine recovery) whose
+fill is older than the retention and that a later epoch retired at least
+the retention ago, and a `closed` epoch that a later epoch superseded at
+least the retention ago. The newest epoch of a product, every epoch not
+`closed`, and the `spot_asset_owner` leases are never purged.
 
 ### The balance is pooled — the bot's own share decides
 

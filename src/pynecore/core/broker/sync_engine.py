@@ -1547,6 +1547,14 @@ def _trigger_close_executed_at_ack(ack: ExchangeOrder | CloseFanResult | None, q
             or ack.filled_qty >= qty * (1.0 - _HELD_CLOSE_SHARE_EPS))
 
 
+# What a book write stores of the strategy statistics
+# (:meth:`OrderSyncEngine._strategy_state_write`): the record or ``None``, its
+# key without bar anchors, its fill-driven key, the bar time it was taken on, the closed-trade rows,
+# the lowest kept trade number and the rows' change mark.
+_StrategyWrite = tuple[dict[str, Any] | None, str, str, int,
+                       dict[int, tuple[int, dict[str, Any]]], int, int | None]
+
+
 def _fill_fee_total(event: OrderEvent, receipt: FillReceipt | None) -> float:
     """The commission total a fill event reports, as far as it reports one.
 
@@ -1933,6 +1941,10 @@ class OrderSyncEngine:
         self._broker = broker
         self._position = position
         position.least_tradable_qty = getattr(broker, 'least_tradable_qty', None)
+        # The closed trades stay listed as long as the store keeps a run's rows
+        # (:meth:`BrokerPosition.observe_bar`); without a store, for ever.
+        position.retention_ms = (None if store_ctx is None
+                                 else store_ctx.retention_days * 86_400_000)
         self._symbol = symbol
         self._run_tag = run_tag
         # Venue client-id budget — stamped on every envelope so coid minting
@@ -2813,6 +2825,15 @@ class OrderSyncEngine:
         self._unbooked_exit_ids: list[str] = []
         # Their fill ids, whose receipts wait for the settlement.
         self._unbooked_exit_fill_ids: list[str] = []
+        # The held fills themselves: settled as already accounted for, they close
+        # the restored trades the venue no longer holds
+        # (:meth:`BrokerPosition.book_restart_held_close`).
+        self._unbooked_exit_events: list[OrderEvent] = []
+        # The restored trades the venue no longer holds
+        # (:attr:`BrokerPosition.restored_held`): the venue size seen while they
+        # wait and since when (monotonic), for their close-out
+        # (:meth:`_close_out_restored_held`).
+        self._restored_held_observed: tuple[float | None, float] | None = None
         self._unbooked_exit_observed: tuple[float | None, float] | None = None
         # The startup comparison of the venue with the journal waits for the
         # exit fills held at startup (:meth:`_report_startup_reduction`).
@@ -2833,6 +2854,18 @@ class OrderSyncEngine:
         # has, the empty book of the fresh process must not overwrite it.
         self._entry_book_persisted: str | None = None
         self._entry_book_judged = False
+        # The strategy statistics (:meth:`_restore_strategy_state`,
+        # :meth:`_strategy_state_write`): whether the stored ones were read
+        # (until then nothing is written over them), whether this process
+        # must not write them at all (the stored ones could not be restored
+        # into a position that already booked), and what was written last
+        # (the record's key without bar anchors, its fill-driven key and the bar
+        # it was taken on).
+        self._strategy_state_restored = False
+        self._strategy_state_frozen = False
+        self._strategy_state_persisted: str | None = None
+        self._strategy_key_persisted: str | None = None
+        self._strategy_bar_persisted: int | None = None
         # The fill cursors as the store holds them, one keyed event each
         # (:data:`~pynecore.core.broker.storage.ENTRY_BOOK_CURSOR_EVENT_KIND`),
         # so a book write stores only the cursors that changed; ``None`` until
@@ -4634,6 +4667,9 @@ class OrderSyncEngine:
         never the run: it latches its quarantine
         (:meth:`_quarantine_intervention`).
         """
+        # The startup adoption is over: what it did not claim of the restored
+        # trades is what the venue no longer holds.
+        self._position.finish_restore_claims()
         try:
             try:
                 self._sync_cycle(bar_ts_ms, last_price=last_price)
@@ -7250,6 +7286,7 @@ class OrderSyncEngine:
             if m.entry_id in self._replayed_defensive_close_entry_ids
         ]
         self._settle_unbooked_exit_fills(exch_pos)
+        self._close_out_restored_held(exch_pos)
         self._settle_held_reduction_fills(exch_pos)
         self._settle_startup_reduction_recovery(exch_pos)
         if is_startup and drained_mutated_position:
@@ -7491,6 +7528,8 @@ class OrderSyncEngine:
                 replayed_close=(not drained_mutated_position
                                 and bool(replayed_markers_to_consider) and new_size != 0.0),
             )
+        if is_startup:
+            self._position.finish_restore_claims()
         self._enforce_reduce_coverage_invariant(exch_pos)
 
     def _note_unbooked_exit_fill(self, event: OrderEvent) -> None:
@@ -7511,6 +7550,7 @@ class OrderSyncEngine:
         signed = qty if event.order.side == 'buy' else -qty
         self._unbooked_exit_delta = round(self._unbooked_exit_delta + signed, 12)
         self._unbooked_exit_ids.append(event.from_entry or event.pine_id or '')
+        self._unbooked_exit_events.append(event)
         if event.fill_id:
             self._unbooked_exit_fill_ids.append(event.fill_id)
             self._defer_fill_receipt(event.fill_id)
@@ -7538,8 +7578,11 @@ class OrderSyncEngine:
         nothing of ours is in flight, and the venue has reported the same size
         for that long, the venue decides between the two possible cases:
 
-        - The venue holds the book: the fills were already accounted for and are
-          dropped.
+        - The venue holds the book: the fills were already accounted for. They
+          move no position; a fill that closed a trade a restart restored but
+          the venue no longer holds closes that trade with its own price and
+          fee (:meth:`BrokerPosition.book_restart_held_close`), and its receipt
+          lands with the statistics, so it is booked once.
         - The venue holds the book plus the fills: an earlier fill was booked out
           of order, so the book takes that size, its parent trades rebuilt from
           the order ledger as at startup; a parent it no longer holds has its
@@ -7571,18 +7614,26 @@ class OrderSyncEngine:
         delta = self._unbooked_exit_delta
         target = round(book + delta, 12)
         entry_ids = sorted(set(self._unbooked_exit_ids))
+        events = self._unbooked_exit_events
         self._unbooked_exit_delta = 0.0
         self._unbooked_exit_ids = []
+        self._unbooked_exit_events = []
         self._unbooked_exit_observed = None
         for fill_id in self._unbooked_exit_fill_ids:
             self._release_fill_receipt(fill_id)
         self._unbooked_exit_fill_ids = []
         if venue is not None and _sizes_match(venue, book):
             outcome = 'already_booked'
+            # A restart started from a venue that already holds these closes:
+            # the trades they closed are the restored ones it no longer holds.
+            booked = [event for event in events
+                      if self._position.book_restart_held_close(event, event.fee)]
             _blog_info(
                 "unbooked exit fill(s) of %s settled: the venue holds the book's %s, "
-                "so they were already accounted for",
+                "so they were already accounted for%s",
                 entry_ids, book,
+                (f" — {len(booked)} of them closed restored trades with their own price "
+                 f"and fee" if booked else ""),
             )
         elif (venue is not None and _sizes_match(venue, target)
               and not self._venue_shared_with_other_runs()):
@@ -7651,6 +7702,65 @@ class OrderSyncEngine:
             self._startup_reduction_deferred = False
             if venue is not None and self._store_ctx is not None:
                 self._report_startup_reduction(venue, self._durable_owned_signed_size())
+
+    def _close_out_restored_held(self, exch_pos: ExchangePosition | None) -> None:
+        """Close out restored trades the venue no longer holds when no close of them arrives.
+
+        A restart restores the open trades the previous process stored; the
+        ones the venue no longer holds (:attr:`BrokerPosition.restored_held`)
+        were closed while no bot ran, and wait for that close: a fill an
+        earlier process journaled, delivered again, or one the venue already
+        accounts for (:meth:`_settle_unbooked_exit_fills`). When none came by
+        the time the startup's claims ended, no fill routed for
+        :meth:`_fill_report_grace_s`, nothing of ours is in flight, no held
+        exit fill waits and the venue has held the book's size for the grace,
+        the bot closes them out at their entry price
+        (:meth:`BrokerPosition.close_out_restored_held`): the trades are
+        closed, not lost, with a realized profit of their entry commission
+        only, which is approximate. It is expected, so it is a WARNING and an
+        audit (``restored_trade_close_adopted``), like the close-out of a
+        handed-over execution (:meth:`_close_out_handed_over_exposure`). The
+        close fill a plugin delivers later re-prices them to its own price and
+        fee, once (its receipt).
+
+        :param exch_pos: The venue position this reconcile pass read.
+        """
+        position = self._position
+        if not position.restored_held or position.restore_claims_open:
+            self._restored_held_observed = None
+            return
+        now = time.monotonic()
+        grace = self._fill_report_grace_s()
+        venue = self._venue_signed_size(exch_pos)
+        if (self._unbooked_exit_ids or now - self._last_position_fill_monotonic < grace
+                or self._position_work_in_flight()
+                or venue is None or not _sizes_match(venue, position.size)):
+            self._restored_held_observed = None
+            return
+        observed = self._restored_held_observed
+        if observed is None or observed[0] != venue:
+            self._restored_held_observed = (venue, now)
+            return
+        if now - observed[1] < grace:
+            return
+        self._restored_held_observed = None
+        held = [(trade.entry_id, float(trade.size), float(trade.entry_price))
+                for trade in position.restored_held]
+        closed = position.close_out_restored_held(time.time())
+        _blog_warning(
+            "%d restored trade(s) %s are not held by the venue (%s), and no close fill "
+            "reported them within %.0f s — closed out at their entry prices (realized "
+            "P&L approximate until the plugin delivers the close's fill, which "
+            "re-prices it)",
+            len(closed), held, venue, grace, single_line=True,
+        )
+        if self._store_ctx is not None:
+            self._log_store_event(
+                'restored_trade_close_adopted', client_order_id=None, intent_key=None,
+                payload={'venue_size': venue, 'book_size': position.size,
+                         'trades': [{'entry_id': entry_id, 'size': size, 'price': price}
+                                    for entry_id, size, price in held]},
+            )
 
     def _defer_fill_receipt(self, fill_id: str) -> None:
         """Hold a fill's receipt back until the venue's verdict settles the fill.
@@ -7828,6 +7938,9 @@ class OrderSyncEngine:
         with the book unchanged (a fill that moved nothing, a fee) they are
         written alone. Until they land they stay pending, and a restart before
         that finds the fill without a receipt, like the book without the fill.
+        The strategy statistics that changed (:meth:`_strategy_state_write`)
+        are written in the same transaction too, so the stored statistics hold
+        exactly the fills that have a receipt.
 
         Only the newest book of the run is ever read, so a landed write then
         deletes the run's older ones
@@ -7876,6 +7989,7 @@ class OrderSyncEngine:
             book, cursors = self._entry_book_parts()
             encoded = json.dumps(book, sort_keys=True)
         receipts = dict(self._pending_fill_receipts)
+        strategy = self._strategy_state_write()
         try:
             with self._store_ctx.transaction():
                 persisted = self._entry_book_cursors_persisted
@@ -7892,6 +8006,7 @@ class OrderSyncEngine:
                     self._store_ctx.replace_keyed_events(
                         ENTRY_BOOK_CURSOR_EVENT_KIND, changed, removed)
                 self._write_fill_receipts(receipts)
+                self._write_strategy_state(strategy)
         except Exception as exc:  # noqa: BLE001 -- the book must not depend on the disk
             _blog_warning(
                 "binding book could not be written to the store (%s) — retried on "
@@ -7903,6 +8018,7 @@ class OrderSyncEngine:
         self._book_write_failures.pop('book', None)
         self._book_write_failures.pop('receipts', None)
         self._forget_written_fill_receipts(receipts)
+        self._strategy_state_written(strategy)
         self._entry_book_persisted = encoded
         self._entry_book_cursors_persisted = cursors
         try:
@@ -7917,18 +8033,23 @@ class OrderSyncEngine:
         """Write the pending fill receipts on their own, the book being stored already.
 
         Part of :meth:`_persist_entry_book` for the case the book did not
-        change. A failed write keeps them pending, is reported and retried
+        change. The strategy statistics that changed since their last write
+        (:meth:`_strategy_state_write`) go in the same transaction: a fee
+        booked onto a closed trade moves them with the receipt that accounts
+        it. A failed write keeps them pending, is reported and retried
         with the next change check; while it stays failed, every sync that
         ends counts toward the storage quarantine of :meth:`sync`.
         """
         assert self._store_ctx is not None
         receipts = dict(self._pending_fill_receipts)
-        if not receipts:
+        strategy = self._strategy_state_write()
+        if not receipts and strategy is None:
             self._book_write_failures.pop('receipts', None)
             return
         try:
             with self._store_ctx.transaction():
                 self._write_fill_receipts(receipts)
+                self._write_strategy_state(strategy)
         except Exception as exc:  # noqa: BLE001 -- the receipts must not depend on the disk
             _blog_warning(
                 "fill receipts of %s could not be written to the store (%s) — retried "
@@ -7938,6 +8059,125 @@ class OrderSyncEngine:
             return
         self._book_write_failures.pop('receipts', None)
         self._forget_written_fill_receipts(receipts)
+        self._strategy_state_written(strategy)
+
+    def _restore_strategy_state(self) -> None:
+        """Restore the strategy statistics an earlier process of the run stored, once.
+
+        Runs before the first event of the process is routed (the top of
+        :meth:`_drain_events`, which the startup :meth:`reconcile` calls before
+        it adopts the venue position), so the position is still fresh: the
+        aggregates, the cumulative closed-trade statistics, the newest
+        :data:`~pynecore.core.broker.storage.STRATEGY_CLOSED_TRADES_LIMIT`
+        closed trades that closed within the store's retention window (the
+        older kept ones evicted), the fee targets and the open trades come
+        back (:meth:`BrokerPosition.restore_strategy_state`).
+        The open trades wait for the startup adoption to claim the ones the
+        venue still holds (:meth:`BrokerPosition.reconstruct_parent_trade`).
+
+        A failed store read is reported and retried with the next drain;
+        nothing of the statistics is written until the read succeeded, so the
+        stored ones are never overwritten unread. Should the position have
+        booked something before a retry succeeds, the stored statistics cannot
+        be restored into it any more: this process then leaves them as they
+        are and writes none (reported at ERROR). A malformed record is
+        reported at ERROR and the statistics start from zero.
+        """
+        if self._strategy_state_restored or self._store_ctx is None:
+            return
+        cutoff = int(time.time() * 1000) - self._store_ctx.retention_days * 86_400_000
+        try:
+            payload = self._store_ctx.strategy_state()
+            rows: list[tuple[int, dict[str, Any]]] = []
+            if payload is not None:
+                rows = self._store_ctx.strategy_closed_trades(
+                    from_trade_no=self._position.stored_closed_kept_from(payload), since_ms=0)
+        except sqlite3.Error as exc:
+            _blog_warning(
+                "strategy statistics could not be read from the store (%s) — retried "
+                "with the next drain; none are written until then", exc,
+            )
+            return
+        except ValueError as exc:
+            self._strategy_state_restored = True
+            _blog_error(
+                "the stored strategy statistics are malformed (%s) — they start from "
+                "zero", exc,
+            )
+            return
+        self._strategy_state_restored = True
+        if payload is None:
+            return
+        position = self._position
+        if position.closed_trades_count or position.open_trades:
+            self._strategy_state_frozen = True
+            _blog_error(
+                "the stored strategy statistics could not be restored: this process "
+                "booked trades before the store could be read — the stored statistics "
+                "are kept as they are, and this process writes none",
+            )
+            return
+        try:
+            summary = position.restore_strategy_state(payload, rows, cutoff)
+        except ValueError as exc:
+            _blog_error(
+                "the stored strategy statistics are malformed (%s) — they start from "
+                "zero", exc,
+            )
+            return
+        _blog_info("strategy statistics restored from the store: %s", summary)
+
+    def _strategy_state_write(self) -> _StrategyWrite | None:
+        """What of the strategy statistics the next book write stores, ``None`` for nothing.
+
+        The record (:meth:`BrokerPosition.strategy_state_payload`) is written
+        when a fill, a fee or the risk bookkeeping changed it, and once a bar
+        when only the mark-to-market moved it (the drawdown and run-up
+        extremes, the open trades' profit); a new bar alone (the trades' bar
+        anchors) writes nothing; the closed trades whenever one
+        closed or changed (:meth:`BrokerPosition.closed_trade_rows`). Nothing
+        is written before the stored statistics were read
+        (:meth:`_restore_strategy_state`), nor by a process that could not
+        restore them.
+
+        :return: ``(record or None, its key without bar anchors, its
+            fill-driven key, the bar time, rows, lowest kept trade number, row
+            mark)`` for
+            :meth:`_write_strategy_state` and :meth:`_strategy_state_written`.
+        """
+        if (self._store_ctx is None or not self._strategy_state_restored
+                or self._strategy_state_frozen):
+            return None
+        payload, key, mark_key = self._position.strategy_state_payload()
+        # noinspection PyProtectedMember
+        bar_time = int(lib._time)
+        record: dict[str, Any] | None = payload
+        if mark_key == self._strategy_state_persisted or (
+                key == self._strategy_key_persisted and bar_time == self._strategy_bar_persisted):
+            record = None
+        rows, keep_from, mark = self._position.closed_trade_rows()
+        if record is None and not rows:
+            return None
+        return record, mark_key, key, bar_time, rows, keep_from, mark
+
+    def _write_strategy_state(self, strategy: _StrategyWrite | None) -> None:
+        """Write what :meth:`_strategy_state_write` returned, in the caller's transaction."""
+        if strategy is None:
+            return
+        assert self._store_ctx is not None
+        record, _encoded, _key, _bar_time, rows, keep_from, _mark = strategy
+        self._store_ctx.write_strategy_state(record, rows, keep_from_trade_no=keep_from)
+
+    def _strategy_state_written(self, strategy: _StrategyWrite | None) -> None:
+        """Note that what :meth:`_strategy_state_write` returned landed in the store."""
+        if strategy is None:
+            return
+        record, encoded, key, bar_time, _rows, _keep_from, mark = strategy
+        if record is not None:
+            self._strategy_state_persisted = encoded
+            self._strategy_key_persisted = key
+            self._strategy_bar_persisted = bar_time
+        self._position.closed_trade_rows_written(mark)
 
     def _write_fill_receipts(self, receipts: dict[str, FillReceipt]) -> None:
         """Write fill receipts and the netting counts of their fills, in the caller's transaction.
@@ -10136,6 +10376,7 @@ class OrderSyncEngine:
     # === Event routing ===
 
     def _drain_events(self) -> None:
+        self._restore_strategy_state()
         self._route_positive_evidence_awaiting_intent()
         self._route_closes_awaiting_execution()
         drained_any = False
@@ -10248,7 +10489,7 @@ class OrderSyncEngine:
             return None
         seen = event.fill_id is not None and event.fill_id in self._seen_fill_ids
         return (seen, self._position.size, len(self._position.open_trades),
-                len(self._position.closed_trades), len(self._held_reduction_fills))
+                self._position.closed_trades_count, len(self._held_reduction_fills))
 
     def _keep_unbooked_fill_for_retry(
             self, event: OrderEvent, pos: int,
@@ -10300,7 +10541,7 @@ class OrderSyncEngine:
         seen, size, open_count, closed_count, held_count = mark
         if (self._position.size != size
                 or len(self._position.open_trades) != open_count
-                or len(self._position.closed_trades) != closed_count
+                or self._position.closed_trades_count != closed_count
                 or len(self._held_reduction_fills) != held_count):
             return
         if not seen and event.fill_id is not None:
@@ -10407,8 +10648,9 @@ class OrderSyncEngine:
         - A fill delivered with
           :attr:`~OrderEvent.journaled_before_restart`
           and no receipt is in the position this process started with: it is
-          given its receipt and routed no further; only the fee of an entry
-          fill is booked, onto the entry's adopted open trades
+          given its receipt and routed no further; the fee of an entry fill
+          is booked onto the entry's adopted open trades, and an exit-leg
+          fill closes the restored trades it closed, with its price and fee
           (:meth:`_book_restart_held_fill_fee`).
         - Any other fill is routed, with its fee less the commission a fee
           event already accounted for it, and gets its receipt once its
@@ -10471,8 +10713,10 @@ class OrderSyncEngine:
                 "the position this process started with holds it — receipt recorded, "
                 "%s",
                 event.event_type, event.order.id, fill_id, event.pine_id,
-                "its fee booked onto the entry's open trades" if fee_booked
-                else "nothing booked",
+                ("nothing booked" if not fee_booked
+                 else "its fee booked onto the entry's open trades"
+                 if event.leg_type is LegType.ENTRY
+                 else "the restored trades it closed booked with its price and fee"),
             )
             return
         routed = event
@@ -10754,34 +10998,49 @@ class OrderSyncEngine:
 
     def _book_restart_held_fill_fee(self, event: OrderEvent,
                                     receipt: FillReceipt | None) -> bool:
-        """Book the fee of an entry fill an earlier process journaled onto its adopted trades.
+        """Book what a fill an earlier process journaled adds to the strategy statistics.
 
         The position this process started with holds the fill
-        (:attr:`~OrderEvent.journaled_before_restart`), and the trades the
-        startup adopted for it carry the commission of the receipted entry
-        fills only (:meth:`_adopted_entry_commissions`): a fill delivered so
-        has no booked receipt, its fee is not in them. The fill's fee, less
-        what a fee event of it already accounted (its receipt's
-        :attr:`~FillReceipt.fee`), goes to the open trades of its entry by
-        size, the way the fee channel books a fee of a fill this process did
-        not book (:meth:`BrokerPosition.book_fill_fee`).
+        (:attr:`~OrderEvent.journaled_before_restart`), so nothing of the
+        position moves. Its fee, less what a fee event of it already
+        accounted (its receipt's :attr:`~FillReceipt.fee`), is the part of its
+        commission not accounted yet.
 
-        Nothing is booked for an exit-leg fill (its commission belonged to the
-        trade it closed, which the earlier process held and the restart does
-        not recover) or when the entry has no open trade: the closed trade the
-        fill belongs to is not recoverable either. The caller's receipt
-        records the fee as accounted in every case, so a redelivery books
-        nothing.
+        - An **entry** fill: the trades the startup adopted for it carry the
+          commission of the receipted entry fills only
+          (:meth:`_adopted_entry_commissions`, or the restored trades'
+          own), and a fill delivered so has no booked receipt, so its fee is
+          not in them. It goes to the open trades of its entry by size, the
+          way the fee channel books a fee of a fill this process did not book
+          (:meth:`BrokerPosition.book_fill_fee`). Nothing is booked when the
+          entry has no open trade.
+        - An **exit-leg** fill (a close, TP, SL or trailing stop) closed
+          trades the earlier process held: the restored trades the venue no
+          longer holds (:meth:`BrokerPosition.book_restart_held_close`). They
+          close at the fill's price with its fee, and the realized profit is
+          booked. Nothing is booked when no restored trade is held for it (no
+          stored statistics, or they never held the trade).
+
+        The caller's receipt records the fill as taken in every case, so a
+        redelivery books nothing.
 
         :param event: The fill, flagged ``journaled_before_restart``.
         :param receipt: The fill's receipt before this delivery, if any.
-        :return: Whether a fee was booked.
+        :return: Whether anything was booked.
         """
-        if event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
-                              LegType.TRAILING_STOP, LegType.CLOSE):
-            return False
         fee_total = _fill_fee_total(event, receipt)
         amount = fee_total - (receipt.fee if receipt is not None else 0.0)
+        if not math.isfinite(amount):
+            amount = 0.0
+        if event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                              LegType.TRAILING_STOP, LegType.CLOSE):
+            if self._position.book_restart_held_close(event, amount):
+                return True
+            _blog_warning(
+                "close %s (pine=%r), journaled before the restart, holds no restored "
+                "trade: its profit and fee are not booked", event.fill_id, event.pine_id,
+            )
+            return False
         if not math.isfinite(amount) or abs(amount) <= 1e-12 * max(1.0, abs(fee_total)):
             return False
         if not any(trade.entry_id == event.pine_id for trade in self._position.open_trades):

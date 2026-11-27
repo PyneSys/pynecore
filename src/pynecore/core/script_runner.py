@@ -2463,6 +2463,10 @@ class ScriptRunner:
         # it costs nothing once.
         broker_mode: bool = self._order_sync_engine is not None
         sim_position = cast('SimPosition', position)
+        # The live tracker, shown every new bar (``BrokerPosition.observe_bar``):
+        # its closed-trade window ages out, and its restored trades take this
+        # run's bar numbering bar by bar while it waits for them.
+        broker_position = cast('BrokerPosition', position) if broker_mode else None
 
         # --- Security contexts setup ---
         # Imported library modules can call request.security() too: merge their
@@ -3880,6 +3884,8 @@ class ScriptRunner:
                     exec_candle, self.bar_index, self.tz, last_index,
                     (self.last_bar_time if stf is None else stf.last_bar_time),
                 )
+                if broker_position is not None:
+                    broker_position.observe_bar(self.bar_index, exec_candle.timestamp)
                 # The peek the last-bar detection above already holds: HTF
                 # security confirmation reads it to recognize a session that
                 # ended EARLY (see ``core/security.py::_get_confirmed_time``).
@@ -4210,6 +4216,8 @@ class ScriptRunner:
                     barstate.isnew = is_new_bar
 
                     _set_lib_properties(candle, self.bar_index, self.tz)
+                    if is_new_bar and broker_position is not None:
+                        broker_position.observe_bar(self.bar_index, candle.timestamp)
                     # Live: no next bar exists, so HTF confirmation keeps the
                     # session schedule instead of the chart-grid peek.
                     lib._next_time = 0

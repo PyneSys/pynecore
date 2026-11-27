@@ -1349,6 +1349,7 @@ def run(
             store_path = app_state.workdir / "output" / "logs" / "broker.sqlite"
             broker_store = BrokerStore(
                 store_path, plugin_name=broker_plugin.plugin_name,
+                retention_days=broker_defaults.retention_days,
             )
             identity = RunIdentity(
                 strategy_id=script.stem,

@@ -394,14 +394,16 @@ class OrderEvent:
     that delivers such a fill again (from its own record of fills it
     journaled, when :meth:`~pynecore.core.broker.storage.RunContext.fill_delivered`
     is ``False`` for it) sets ``journaled_before_restart``: the engine then
-    records its receipt and books nothing but the fee of an entry fill (a
-    fill whose receipt exists is ignored either way). The trades the startup
-    adopts carry no commission of the earlier process, so an entry fill's
-    ``fee`` (less what a fee event of it already accounted) goes to the open
-    trades of its entry by size, like a fee event of a fill this process did
-    not book. The fee of an exit-leg fill, and of an entry fill whose entry
-    holds no open trade, is not booked: the trade it belonged to was the
-    earlier process's and is not recovered. A fill whose exposure the
+    records its receipt and moves no position (a fill whose receipt exists
+    is ignored either way). It books only what the strategy statistics the
+    restart restored lack, since they hold exactly the receipted fills: an
+    entry fill's ``fee`` (less what a fee event of it already accounted)
+    goes to the open trades of its entry by size, like a fee event of a
+    fill this process did not book; an exit-leg fill closes the restored
+    trades the venue no longer holds (its ``from_entry``'s first) at its
+    ``fill_price`` with that fee, on the bar its ``timestamp`` falls in,
+    booking the realized profit. Nothing is booked when the restored
+    statistics hold no trade for the fill. A fill whose exposure the
     journal does NOT hold (its rows still own the exposure the fill removed,
     e.g. a close whose retirement the earlier process never wrote) is
     delivered as an ordinary fill. Never set the flag on a fill this process journaled: the engine

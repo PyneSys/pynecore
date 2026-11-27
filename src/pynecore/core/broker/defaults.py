@@ -76,6 +76,18 @@ class BrokerDefaults:
     latter would trade on corrupt books).
     """
 
+    retention_days: int = 180
+    """How many days the broker store keeps historical rows (whole days, at least 1).
+
+    The daily retention purge of ``output/logs/broker.sqlite`` drops what is
+    older: events, closed orders, ended runs, fill receipts, retired spot
+    rows. A restart lists at most the newest 9000 closed trades that closed
+    within this window and drops the older ones; the aggregates behind
+    ``strategy.netprofit`` and the other totals are never dropped. The state
+    an open position, a binding book or a quarantine needs is kept however
+    old it is.
+    """
+
 
 def load_broker_defaults(config_dir: Path) -> BrokerDefaults:
     """Load :class:`BrokerDefaults` from ``<config_dir>/brokers.toml``.
@@ -90,7 +102,9 @@ def load_broker_defaults(config_dir: Path) -> BrokerDefaults:
 
     :param config_dir: The ``workdir/config`` directory.
     :return: A populated :class:`BrokerDefaults` instance.
-    :raises ValueError: If a loaded value falls outside its allowed set.
+    :raises ValueError: If a loaded value falls outside its allowed set
+        (a policy outside its list, a ``retention_days`` below 1 or not a
+        whole number).
     """
     instance = ensure_config(BrokerDefaults, config_dir / 'brokers.toml')
     assert isinstance(instance, BrokerDefaults)
@@ -105,5 +119,11 @@ def load_broker_defaults(config_dir: Path) -> BrokerDefaults:
             f"brokers.toml: on_inventory_conflict must be one of "
             f"{sorted(VALID_INVENTORY_CONFLICT_POLICIES)}, got "
             f"{instance.on_inventory_conflict!r}",
+        )
+    retention = instance.retention_days
+    if isinstance(retention, bool) or not isinstance(retention, int) or retention < 1:
+        raise ValueError(
+            f"brokers.toml: retention_days must be a whole number of days, at least 1, "
+            f"got {retention!r}",
         )
     return instance
