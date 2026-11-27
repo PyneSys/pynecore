@@ -753,8 +753,9 @@ def aggregate(
 
         try:
             # Use data timezone from TOML for correct day/week/month boundaries,
-            # and the session opens so intraday bars anchor to the session the
-            # way TradingView does (no-op for on-hour / 24-7 markets). The
+            # and TradingView's session starts (the explicit anchors, else the ones
+            # derived from the session opens and opening hours) so intraday bars
+            # anchor to the session the way TradingView does. The
             # symbol type and opening hours drive the multi-period (nD/nW/nM)
             # scheduled grid (see the resampler module docs).
             data_tz = parse_timezone(syminfo.timezone or 'UTC')
@@ -762,7 +763,8 @@ def aggregate(
                 source, out_path, timeframe, tz=data_tz,
                 session_starts=syminfo.session_starts,
                 opening_hours=syminfo.opening_hours,
-                sym_type=syminfo.type, source_tf=source_tf, prefix=syminfo.prefix)
+                sym_type=syminfo.type, source_tf=source_tf, prefix=syminfo.prefix,
+                session_anchors=syminfo.session_anchors if syminfo.session == 'regular' else None)
         except Exception as e:
             secho(f"Error during aggregation: {e}", err=True, fg=colors.RED)
             raise Exit(1)

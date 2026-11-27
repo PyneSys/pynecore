@@ -81,7 +81,7 @@ from .errors import PyneError, RUNTIME_ROOTS
 from ..errorcodes import ProviderUnavailableError
 from .security import (
     BarCalendar, DEV_BATCH_CLOSED, DEV_BATCH_CLOSED_FROM_FEED, DEV_BATCH_DEVELOPING,
-    actual_bar_close,
+    actual_bar_close, calendar_session_anchors,
     create_security_protocol, inject_protocol, iter_dev_batch_records,
     same_calendar,
 )
@@ -1189,6 +1189,7 @@ def security_process_main(
         session_starts=tuple(syminfo.session_starts or ()),
         corrections=syminfo.session_corrections or None,
         grid_mode=_grid_mode(syminfo.type, syminfo.opening_hours, syminfo.prefix),
+        **calendar_session_anchors(syminfo),
     )
     own_timeframe = str(syminfo.period)
     registry = dict(registry or {})

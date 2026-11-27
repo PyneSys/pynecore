@@ -7,7 +7,7 @@ from .session import regular
 
 from ..errorcodes import SyminfoMemberMissingError as _SyminfoMemberMissingError
 from ..core.module_property import module_function_property
-from ..core.syminfo import SymInfoSession, SymInfoInterval
+from ..core.syminfo import SymInfoSession, SymInfoInterval, SymInfoAnchor
 
 __all__ = [
     "prefix", "description", "ticker", "root", "tickerid", "main_tickerid", "currency", "basecurrency",
@@ -36,6 +36,7 @@ _regular_corrections: dict | None = None
 opening_hours: list[SymInfoInterval]
 session_starts: list[SymInfoSession]
 session_ends: list[SymInfoSession]
+session_anchors: list[SymInfoAnchor]
 extended_hours: list[SymInfoInterval]
 avg_spread: float
 taker_fee: float

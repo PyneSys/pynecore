@@ -2892,6 +2892,9 @@
     "Session": {
       "type": "variable"
     },
+    "SymInfoAnchor": {
+      "type": "variable"
+    },
     "SymInfoInterval": {
       "type": "variable"
     },
@@ -2998,6 +3001,9 @@
       "type": "variable"
     },
     "session": {
+      "type": "variable"
+    },
+    "session_anchors": {
       "type": "variable"
     },
     "session_ends": {
@@ -3496,9 +3502,6 @@
     "change": {
       "type": "variable"
     },
-    "datetime": {
-      "type": "variable"
-    },
     "from_seconds": {
       "type": "variable"
     },
@@ -3545,9 +3548,6 @@
       "type": "property"
     },
     "pine_int": {
-      "type": "variable"
-    },
-    "timedelta": {
       "type": "variable"
     }
   },

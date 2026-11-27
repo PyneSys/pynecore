@@ -12,10 +12,10 @@ untransformed at full speed.
 For daily/weekly/monthly timeframes ``change`` is equivalent to
 ``ta.change(time(timeframe))`` on the year-reset scheduled grid (see the
 ``core.resampler`` module docs): it returns ``true`` on the first chart bar
-of each new period. Intraday timeframes replay virtual candles against the
-session template to find period starts within the session.
+of each new period. For intraday timeframes it is ``ta.change(time(timeframe))``
+on the grid anchored at TradingView's session start.
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from pynecore import lib
 from pynecore.lib import syminfo as _syminfo
@@ -36,8 +36,6 @@ def change(timeframe: str = "") -> bool:
     :param timeframe: The timeframe to check; omitted or empty uses the chart timeframe.
     :return: Returns true on the first bar of a `timeframe`, false otherwise.
     """
-    last_dt: Persistent[datetime | None] = None
-    last_signal: Persistent[datetime | None] = None
     last_period: Persistent[object] = None
 
     # An empty timeframe string is the chart's own timeframe (measured: over a
@@ -57,46 +55,17 @@ def change(timeframe: str = "") -> bool:
     assert _modifier != 'T', "Ticks are not (yet) supported!"
 
     if _modifier == '' or _modifier == 'S':
-        # Intraday: replay virtual candles (even those missing from the
-        # dataset) and anchor period starts to the session start
-        dt: datetime = lib._datetime
-
-        if last_dt is None:
-            last_dt = dt - timedelta(seconds=xchg_tf_sec)
-            # The anchor point is the session start, even when the data starts mid-session
-            session_start = _timeframe._last_session_start(dt)
-            if session_start is not None:
-                last_signal = session_start.replace(minute=0, second=0, microsecond=0)
-            else:
-                last_signal = last_dt
-
-        # Every virtual candle up to the current bar is replayed, so a session
-        # start inside a gap moves the anchor even if an earlier candle of the
-        # gap already starts a new period
-        is_change = False
-        while last_dt < dt:
-            prev_dt = last_dt
-            last_dt = last_dt + timedelta(seconds=xchg_tf_sec)
-
-            # The anchor point is the session start
-            if _timeframe._is_new_session(last_dt, prev_dt, xchg_tf_sec):
-                # We need to round the session start to the nearest hour
-                last_signal = last_dt.replace(minute=0, second=0, microsecond=0)
-
-            # A virtual candle starts a new period when a period boundary lies in
-            # (prev_dt, last_dt], also when the requested timeframe is not a
-            # multiple of the chart's and no candle opens on the boundary itself
-            if ((last_dt - last_signal).total_seconds() // tf_sec
-                    != (prev_dt - last_signal).total_seconds() // tf_sec):
-                is_change = True
-
-        last_dt = dt
-        return is_change and lib.bar_index > 0
+        # Intraday: true where time(timeframe) moves on. MEASURED (TradingView,
+        # 2026-11-27, 1-minute charts of CAPITALCOM:US30, NSE:NIFTY, HKEX:700,
+        # NASDAQ:AAPL, TSE:7203 and a 5-minute CAPITALCOM:EURUSD chart, "45", "60"
+        # and "240"): timeframe.change fires exactly on the bars where time() of the
+        # timeframe changes, on the grid anchored at TradingView's session start
+        key = lib._intraday_change_key(timeframe)
 
     # Daily/Weekly/Monthly: true on the first chart bar of a new period of
     # the scheduled grid — the period identity changing is exactly
     # ``ta.change(time(timeframe))`` on the verified grid
-    if _multiplier > 1:
+    elif _multiplier > 1:
         if (_modifier, _multiplier) == _timeframe._process_tf(str(_syminfo.period)):
             # The chart's own bars are the requested grid: every bar starts one
             key = lib._time

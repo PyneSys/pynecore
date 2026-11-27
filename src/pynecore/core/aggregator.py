@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from ..errorcodes import DecimalInvalidError
 from .ohlcv import OHLCVWriter
 from .ohlcv import OHLCVReader
+from .syminfo import SymInfoAnchor, resolve_session_anchors
 from .resampler import (
     Resampler, ObservedDayCounter, grid_mode, overnight_opens, trading_day,
 )
@@ -185,6 +186,7 @@ def aggregate_ohlcv(
         source_tf: str | None = None,
         prefix: str | None = None,
         volume_error: tuple[str, str] = VOLUME_ERROR_AGGREGATE,
+        session_anchors: list[SymInfoAnchor] | None = None,
 ) -> tuple[int, int]:
     """
     Aggregate OHLCV data from a lower timeframe file to a higher timeframe file.
@@ -198,9 +200,10 @@ def aggregate_ohlcv(
                files aggregate identically on every machine.
     :param session_starts: Per-trading-day primary opens for intraday session
                anchoring and multi-period grids. When given, intraday bars align
-               to the session open (TradingView behaviour) instead of the UTC
-               clock; ``None`` keeps the pure clock-floor.
-               See :meth:`Resampler.get_bar_time`.
+               to TradingView's session start instead of the UTC clock (with
+               ``opening_hours`` a provider's reopening after a short pause is
+               resolved to it, see :meth:`Resampler.get_bar_time`); ``None`` keeps
+               the pure clock-floor.
     :param opening_hours: ``SymInfo.opening_hours`` — trading-day roll source
                for multi-period (nD/nW/nM) grids.
     :param sym_type: ``SymInfo.type`` for :func:`grid_mode` classification of
@@ -219,6 +222,8 @@ def aggregate_ohlcv(
                has no exchange calendar and stays on the weekday grid.
     :param volume_error: The ``function`` and ``why`` of the error of a volume sum
                that holds both +inf and -inf (see :func:`_merge_candles`)
+    :param session_anchors: ``SymInfo.session_anchors``: TradingView's session starts,
+               which replace the ones derived from ``session_starts``
     :return: Tuple of (source_candles_read, target_candles_written)
     :raises ValueError: If ``target_path`` is the source file (also via a symlink
                or hard link) — truncating it would destroy the input before it is read
@@ -255,6 +260,17 @@ def aggregate_ohlcv(
             session_starts, opening_hours, bar_end, day_step, volume_error)
 
     resampler = Resampler.get_resampler(target_tf)
+    # Explicit TradingView session anchors: the intraday grid origins (a grid aligned
+    # before the open stamps the first bar at the open) and the opens of D/W/M bars
+    grid_starts = session_starts
+    grid_opens = None
+    if session_anchors:
+        opens, grid = resolve_session_anchors(session_anchors, session_starts, opening_hours)
+        if modifier in ('', 'S'):
+            grid_starts = grid
+            grid_opens = opens if opens != grid else None
+        else:
+            grid_starts = opens
 
     source_count = 0
     target_count = 0
@@ -277,8 +293,8 @@ def aggregate_ohlcv(
                 bar_time = resampler.get_bar_time(
                     candle.timestamp if bar_end is None else bar_end.last_ms(candle.timestamp),
                     tz=tz,
-                    session_starts=session_starts,
-                    opening_hours=opening_hours, mode=mode)
+                    session_starts=grid_starts,
+                    opening_hours=opening_hours, mode=mode, session_opens=grid_opens)
 
                 if current_bar_time is not None and bar_time != current_bar_time:
                     # New bar boundary — flush the window

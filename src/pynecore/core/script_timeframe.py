@@ -56,7 +56,9 @@ from ..types.na import na_float
 from ..lib import timeframe as tf_module
 from .htf_aggregator import HTFAggregator
 from .resampler import Resampler, grid_mode
-from .security import BarCalendar, actual_bar_close, resolve_session_anchor
+from .security import (
+    BarCalendar, actual_bar_close, calendar_session_anchors, resolve_session_anchor,
+)
 
 if TYPE_CHECKING:
     from zoneinfo import ZoneInfo
@@ -154,6 +156,7 @@ class ScriptTimeframe:
             session_starts=tuple(self._session_starts or syminfo.session_starts or ()),
             corrections=getattr(syminfo, 'session_corrections', None) or None,
             grid_mode=self._grid_mode,
+            **calendar_session_anchors(syminfo),
         )
         # Nominal chart bar span; 0 for a D/W/M chart, which has none. Only a
         # cheap pre-filter in :meth:`feed` -- the decision is the real close.

@@ -4,7 +4,6 @@ if TYPE_CHECKING:
     from pynecore.types.type_checker import *
 
 from functools import lru_cache
-from datetime import datetime, timedelta
 
 from ..errorcodes import (InvalidTimeframeError as _InvalidTimeframeError,
                      TickTimeframeError as _TickTimeframeError)
@@ -88,91 +87,6 @@ def _current_period() -> str:
     if lib._main_timeframe is None and lib._script_timeframe:
         return lib._script_timeframe
     return str(_syminfo.period)
-
-
-# noinspection PyProtectedMember
-def _is_new_session(current_dt: datetime, prev_dt: datetime | None = None, tf_sec: int | None = None) -> bool:
-    """
-    Check if current bar starts a new session.
-
-    :param current_dt: Current candle datetime (in local exchange timezone)
-    :param prev_dt: Previous candle datetime (in local exchange timezone)
-    :param tf_sec: Timeframe width in seconds
-    :return: True if this is the first candle of a new session
-    """
-    if tf_sec is None:
-        tf_sec: int = _in_seconds(_syminfo.period)
-    if prev_dt is None:
-        prev_dt: datetime = current_dt - timedelta(seconds=tf_sec)
-
-    current_weekday = current_dt.weekday()
-    prev_weekday = prev_dt.weekday()
-
-    # Get all possible session starts:
-    # 1. Current day sessions
-    # 2. If previous day different, then previous day's overnight sessions
-    session_starts = [
-        ss for day, ss in _syminfo._session_starts
-        if day == current_weekday
-    ]
-
-    if prev_weekday != current_weekday:
-        prev_day_starts = [
-            (ss, se) for day, ss, se in _syminfo._opening_hours
-            if day == prev_weekday and se < ss  # Only overnight sessions
-        ]
-        # Add overnight session starts to check
-        for ss, se in prev_day_starts:
-            session_starts.append(ss)
-
-    # For each session start
-    for start_time in session_starts:
-        session_start = current_dt.replace(
-            hour=start_time.hour,
-            minute=start_time.minute,
-            second=start_time.second,
-            microsecond=0
-        )
-
-        # If it crosses the day boundary, we set it to the previous day
-        if prev_weekday != current_weekday and start_time > current_dt.time():
-            session_start = session_start - timedelta(days=1)
-
-        # If session starts in this bar
-        if (current_dt <= session_start < current_dt + timedelta(seconds=tf_sec) and
-                session_start > prev_dt):
-            return True
-
-    return False
-
-
-def _last_session_start(dt: datetime) -> datetime | None:
-    """
-    Find the latest session start at or before a datetime.
-
-    :param dt: Datetime in the local exchange timezone
-    :return: The latest session start not after ``dt``, or None if the symbol has no session starts
-    """
-    session_starts = _syminfo._session_starts
-    if not session_starts:
-        return None
-
-    # A week back always reaches a session start of the weekly template
-    for days_back in range(8):
-        day_dt = dt - timedelta(days=days_back)
-        weekday = day_dt.weekday()
-        latest = None
-        for day, start_time in session_starts:
-            if day != weekday:
-                continue
-            start = day_dt.replace(hour=start_time.hour, minute=start_time.minute,
-                                   second=start_time.second, microsecond=0)
-            if start <= dt and (latest is None or start > latest):
-                latest = start
-        if latest is not None:
-            return latest
-
-    return None
 
 
 @lru_cache(maxsize=128)

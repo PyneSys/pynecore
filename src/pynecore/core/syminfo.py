@@ -10,6 +10,11 @@ from pynecore.core.errors import PyneError
 
 SymInfoInterval = NamedTuple("SymInfoInterval", [('day', int), ('start', time), ('end', time)])
 SymInfoSession = NamedTuple("SymInfoSession", [('day', int), ('time', time)])
+SymInfoAnchor = NamedTuple("SymInfoAnchor", [('day', int), ('time', time), ('align', time | None)])
+"""TradingView's session start of one trading day (see :attr:`SymInfo.session_anchors`):
+``time`` is the session open, ``align`` the start of the intraday bar grid when it lies
+before the open (``None``: the grid starts at the open)."""
+SymInfoAnchor.__new__.__defaults__ = (None,)
 SymInfoScheduleVariant = NamedTuple("SymInfoScheduleVariant", [
     ('effective_from', date),
     ('opening_hours', list[SymInfoInterval]),
@@ -71,6 +76,40 @@ _SESSION_SCHEDULE_EXAMPLE_COMMENT = """\
 # day = 0
 # time = "23:00:00\""""
 
+# Commented TOML appended by ``save_toml`` when a symbol has no explicit session anchors
+_SESSION_ANCHOR_EXAMPLE_COMMENT = """\
+# TradingView session starts (optional). TradingView cuts intraday bars from its own
+# session start, which can differ from the provider's opening: CAPITALCOM:US30
+# reopens at 17:05 New York, its TradingView session starts at 17:00. Without this
+# block the start is derived from session_starts and opening_hours. `align` (optional)
+# starts the bar grid before the open (HKEX: open 09:30, grid 09:00).
+#
+# [[session_anchors]]
+# day = 0
+# time = "17:00:00\""""
+
+# Grid of the derived session anchor: TradingView's session starts lie on quarter hours
+_ANCHOR_GRID_MINUTES = 15
+
+
+class SessionAnchors(list):
+    """
+    Session anchors :func:`resolve_session_anchors` returned: a weekday-sorted list of
+    :data:`SymInfoSession`. A consumer that resolves its ``session_starts`` itself
+    (:meth:`~pynecore.core.resampler.Resampler.get_bar_time`) uses these unchanged, so
+    an explicit anchor is never moved by the derivation meant for provider opens.
+
+    The grid origins of a grid that starts before the open carry those opens in
+    :attr:`opens` (``None`` otherwise), so every consumer that is handed the grid as
+    its ``session_starts`` stamps the session's first bar at the open.
+    """
+    __slots__ = ('opens',)
+
+    def __init__(self, iterable=(), opens: 'list[SymInfoSession] | None' = None):
+        super().__init__(iterable)
+        #: The session opens of a grid aligned before them, else ``None``
+        self.opens = opens
+
 
 def default_mincontract(sym_type: str, basecurrency: str | None = None) -> float:
     """
@@ -126,6 +165,17 @@ class SymInfo:
     opening_hours: list[SymInfoInterval]
     session_starts: list[SymInfoSession]
     session_ends: list[SymInfoSession]
+    session_anchors: list[SymInfoAnchor] = field(default_factory=list)
+    """TradingView's own session start of each trading day, in the exchange timezone.
+    TradingView cuts intraday bars from these instants, not from the hours the data
+    provider trades: CAPITALCOM:US30 reopens at 17:05 New York after a five-minute
+    pause, while TradingView's session -- and so its 2-minute grid and its daily bar
+    stamp -- starts at 17:00. An entry's ``align`` is the start of the intraday grid
+    when TradingView aligns it before the open (HKEX opens at 09:30 on a grid that
+    starts at 09:00). The entries replace :attr:`session_starts` as the grid origin
+    entirely, so a reopening after an intraday break that is not listed continues
+    the grid. Empty: derived from :attr:`session_starts` and :attr:`opening_hours`
+    (see :func:`resolve_session_anchors`). Describes the regular hours."""
     session_schedules: list[SymInfoScheduleVariant] = field(default_factory=list)
     """Optional effective-dated session history (oldest first). When non-empty the
     flat ``opening_hours`` / ``session_starts`` / ``session_ends`` mirror the
@@ -278,6 +328,11 @@ class SymInfo:
                 time=parse_time(s['time'])
             ))
 
+        session_anchors = [
+            SymInfoAnchor(day=parse_day(a['day']), time=parse_time(a['time']),
+                          align=parse_time(a['align']) if 'align' in a else None)
+            for a in data.get('session_anchors', [])]
+
         # Effective-dated session history (optional). Each variant is a
         # self-contained schedule taking effect on its ``effective_from``
         # exchange-local trading day. The list is sorted ascending and, when
@@ -386,6 +441,7 @@ class SymInfo:
             opening_hours=opening_hours,
             session_starts=session_starts,
             session_ends=session_ends,
+            session_anchors=session_anchors,
             session_schedules=session_schedules,
             session_corrections=session_corrections,
             extended_hours=extended_hours,
@@ -523,6 +579,20 @@ class SymInfo:
             lines.append(f'time = "{time_to_str(s.time)}"')
             lines.append("")
 
+        if self.session_anchors:
+            lines.append("# TradingView session starts: the intraday bar grid starts here (or")
+            lines.append("# at `align`) and daily bars are stamped here")
+            for a in self.session_anchors:
+                lines.append("[[session_anchors]]")
+                lines.append(f"day = {a.day}")
+                lines.append(f'time = "{time_to_str(a.time)}"')
+                if a.align is not None:
+                    lines.append(f'align = "{time_to_str(a.align)}"')
+                lines.append("")
+        else:
+            lines.append(_SESSION_ANCHOR_EXAMPLE_COMMENT)
+            lines.append("")
+
         # Effective-dated session history, or a commented example when absent.
         if self.session_schedules:
             lines.append("# Effective-dated session history (oldest first). The flat")
@@ -592,6 +662,18 @@ class SymInfo:
         # Write to file
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
+
+    def resolved_session_anchors(self) -> tuple[list[SymInfoSession], list[SymInfoSession]]:
+        """
+        TradingView's session opens and intraday grid origins of this symbol.
+
+        The explicit :attr:`session_anchors` describe the regular hours, so a symbol
+        loaded with its extended hours derives them from its own (extended) session.
+
+        :return: ``(opens, grid)`` from :func:`resolve_session_anchors`
+        """
+        explicit = self.session_anchors if self.session == 'regular' else None
+        return resolve_session_anchors(explicit, self.session_starts, self.opening_hours)
 
     @property
     def has_schedule_history(self) -> bool:
@@ -695,3 +777,90 @@ def tick_grid(mintick: float) -> tuple[int, int]:
     if minmove >= 1 << 32 or pricescale >= 1 << 32:
         raise ValueError(f"mintick {mintick!r} needs a tick grid wider than 32 bits")
     return minmove, pricescale
+
+
+def _trades_between(opening_hours: list[SymInfoInterval], day: int, lo: time, hi: time) -> bool:
+    """
+    Whether the weekly template trades at any instant of ``[lo, hi)`` on weekday ``day``.
+
+    :param opening_hours: Weekly template; an interval ending at or before its start
+                          runs into the next day
+    :param day: Weekday, ``0`` = Monday
+    :param lo: Start of the probed span
+    :param hi: End of the probed span (exclusive), after ``lo`` on the same day
+    :return: ``True`` when an interval overlaps the span
+    """
+    lo_s = lo.hour * 3600 + lo.minute * 60 + lo.second
+    hi_s = hi.hour * 3600 + hi.minute * 60 + hi.second
+    for iv_day, start, end in opening_hours:
+        a = start.hour * 3600 + start.minute * 60 + start.second
+        b = end.hour * 3600 + end.minute * 60 + end.second
+        if iv_day == day:
+            # An overnight interval holds the rest of its opening day
+            if a < hi_s and (86_400 if b <= a else b) > lo_s:
+                return True
+        elif (iv_day + 1) % 7 == day and b <= a and b > lo_s:
+            # The next-day part of an overnight interval
+            return True
+    return False
+
+
+def resolve_session_anchors(
+        session_anchors: list[SymInfoAnchor] | None,
+        session_starts: list[SymInfoSession] | None,
+        opening_hours: list[SymInfoInterval] | None,
+) -> tuple[list[SymInfoSession], list[SymInfoSession]]:
+    """
+    TradingView's session opens and intraday grid origins of a symbol.
+
+    The result is a :class:`SessionAnchors`, which a consumer that resolves its input
+    itself uses unchanged, so a caller may hand it on as that consumer's
+    ``session_starts``. Derived anchors also resolve to themselves.
+
+    MEASURED (TradingView, 2026-11-27, 29 symbols on 2-240 minute charts, regular and
+    extended hours, and ``time(tf)`` / ``request.security`` / ``timeframe.change`` on
+    1-minute charts): every intraday bar grid starts at TradingView's own session start
+    of the trading day -- not at the provider's reopening, the hour, midnight or the UTC
+    epoch -- and runs on through data gaps and lunch breaks; daily bars are stamped at
+    that start. Explicit ``session_anchors`` give it. Without them each session start is
+    moved back to the latest quarter hour before it when the market does not trade in
+    between: a provider's reopening after a short pause (17:05 after a 17:00 close)
+    becomes TradingView's 17:00, while an open that is itself a quarter hour (09:15,
+    09:30, 18:00) stays. Scored against the same measurement, the rule changes no
+    symbol whose session starts already are TradingView's, and it cannot recover an
+    anchor that no provider boundary marks (a CFD on an exchange index that
+    TradingView opens 20 minutes before the provider): those need the explicit field.
+
+    :param session_anchors: :attr:`SymInfo.session_anchors`
+    :param session_starts: :attr:`SymInfo.session_starts`
+    :param opening_hours: :attr:`SymInfo.opening_hours`
+    :return: ``(opens, grid)``: the session opens, which stamp daily bars, and the
+             intraday grid origins (the ``align`` of an anchor that has one), both as
+             weekday-sorted :class:`SessionAnchors`; empty without a template. A grid
+             that differs from the opens carries them in :attr:`SessionAnchors.opens`.
+    """
+    if session_anchors:
+        opens = SessionAnchors(sorted({SymInfoSession(a.day, a.time) for a in session_anchors}))
+        grid = SessionAnchors(sorted({SymInfoSession(a.day, a.time if a.align is None else a.align)
+                                      for a in session_anchors}))
+        if grid != opens:
+            grid.opens = opens
+        return opens, grid
+    if not session_starts:
+        return SessionAnchors(), SessionAnchors()
+    if not opening_hours:
+        starts = SessionAnchors(sorted(set(session_starts)))
+        return starts, starts
+    step = _ANCHOR_GRID_MINUTES * 60
+    anchors: set[SymInfoSession] = set()
+    for day, start in session_starts:
+        sec = start.hour * 3600 + start.minute * 60 + start.second
+        floor = sec - sec % step
+        anchor = start
+        if floor < sec:
+            candidate = time(floor // 3600, floor % 3600 // 60)
+            if not _trades_between(opening_hours, day, candidate, start):
+                anchor = candidate
+        anchors.add(SymInfoSession(day, anchor))
+    result = SessionAnchors(sorted(anchors))
+    return result, result

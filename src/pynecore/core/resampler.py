@@ -4,9 +4,40 @@ from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 from ..lib import timeframe as tf_module
+# noinspection PyProtectedMember
+from .syminfo import SessionAnchors, resolve_session_anchors, _trades_between
 
 if TYPE_CHECKING:
     from .syminfo import SymInfoSession, SymInfoInterval
+
+# Resolved session anchors per (session_starts, opening_hours) template, matched by
+# identity: ``id`` keys with the template objects held, so an id is never reused
+_ANCHOR_MEMO: dict[tuple[int, int], tuple[object, object, list]] = {}
+_ANCHOR_MEMO_MAX = 64
+
+
+def _resolved_anchors(session_starts: 'list[SymInfoSession]',
+                      opening_hours: 'list[SymInfoInterval]') -> 'list[SymInfoSession]':
+    """
+    TradingView's session anchors of a template, derived once per template object.
+
+    :param session_starts: ``SymInfo.session_starts``, or :class:`SessionAnchors`
+                           resolved already, which are returned unchanged
+    :param opening_hours: ``SymInfo.opening_hours``
+    :return: The anchors, see :func:`~pynecore.core.syminfo.resolve_session_anchors`
+    """
+    if isinstance(session_starts, SessionAnchors):
+        # Resolved already: an explicit anchor on a provider's reopening stays put
+        return session_starts
+    key = (id(session_starts), id(opening_hours))
+    hit = _ANCHOR_MEMO.get(key)
+    if hit is not None and hit[0] is session_starts and hit[1] is opening_hours:
+        return hit[2]
+    _, grid = resolve_session_anchors(None, list(session_starts), list(opening_hours))
+    if len(_ANCHOR_MEMO) >= _ANCHOR_MEMO_MAX:
+        _ANCHOR_MEMO.clear()
+    _ANCHOR_MEMO[key] = (session_starts, opening_hours, grid)
+    return grid
 
 
 @lru_cache(maxsize=512)
@@ -200,6 +231,10 @@ def overnight_opens(
     is an evening open of the next trading day (true for every overnight market
     we know — CME 17:00, FX 17:00 — while day sessions open in the morning).
 
+    With both, a session start in the closed span right before a rolling open (a
+    resolved session anchor, see :func:`~pynecore.core.syminfo.resolve_session_anchors`)
+    takes its place.
+
     :param opening_hours: ``SymInfo.opening_hours`` (preferred source)
     :param session_starts: ``SymInfo.session_starts`` fallback
     :return: weekday -> earliest rolling open time
@@ -211,6 +246,15 @@ def overnight_opens(
                 cur = res.get(day)
                 if cur is None or start < cur:
                     res[day] = start
+        if session_starts:
+            # A session anchor in the pause before the rolling open starts the trading
+            # day already (TradingView's 17:00 session start of a 17:05 reopening)
+            for day, start in list(res.items()):
+                earlier = [t for d, t in session_starts
+                           if d == day and t < start
+                           and not _trades_between(opening_hours, day, t, start)]
+                if earlier and (day, start) not in session_starts:
+                    res[day] = max(earlier)
     elif session_starts:
         for day, start in session_starts:
             if start.hour >= 12:
@@ -745,7 +789,8 @@ class Resampler:
                      tz: ZoneInfo | dt_timezone | None = None,
                      session_starts: 'list[SymInfoSession] | None' = None,
                      opening_hours: 'list[SymInfoInterval] | None' = None,
-                     mode: str | None = None) -> int:
+                     mode: str | None = None,
+                     session_opens: 'list[SymInfoSession] | None' = None) -> int:
         """
         Calculate the bar opening time for the current timeframe.
 
@@ -765,6 +810,14 @@ class Resampler:
         that open on a ``tf`` boundary the two are identical; callers therefore
         pass ``session_starts`` only when the open is actually off-grid, so the
         common case keeps the zero-overhead fast path.
+
+        With ``opening_hours`` the session starts are first resolved to TradingView's
+        session anchors (:func:`~pynecore.core.syminfo.resolve_session_anchors`): a
+        provider's reopening after a short pause anchors the grid, and stamps the daily
+        bar, at the quarter hour TradingView's session starts at (17:05 -> 17:00).
+        Anchors a caller resolved already (a
+        :class:`~pynecore.core.syminfo.SessionAnchors`, e.g. from explicit
+        ``session_anchors``) pass through unchanged.
 
         Multi-period timeframes (nD/nW/nM with n > 1) live on the year-reset
         scheduled grid (see the module docs): periods count scheduled trading
@@ -792,6 +845,12 @@ class Resampler:
         :param mode: Scheduled-grid mode from :func:`grid_mode`; ``None`` infers
                    'calendar' when the session template covers all 7 days,
                    'weekday' otherwise. Only multi-period timeframes use it.
+        :param session_opens: Session opens of an intraday grid that starts before
+                   them (TradingView's ``A`` alignment, HKEX: grid 09:00, open 09:30):
+                   the session's first bar is stamped at the open. Intraday only.
+                   Defaults to the :attr:`~pynecore.core.syminfo.SessionAnchors.opens`
+                   of a resolved grid passed as ``session_starts``; an empty sequence
+                   gives the plain grid slot.
         :return: Bar opening time in milliseconds
         """
         if self._windowed:
@@ -817,24 +876,40 @@ class Resampler:
         modifier = self._modifier
         multiplier = self._multiplier
 
+        # TradingView's session anchors: the grid origins of intraday bars and the opens
+        # that stamp D/W/M bars. The template itself still decides the trading-day roll.
+        if session_starts and opening_hours:
+            starts = _resolved_anchors(session_starts, opening_hours)
+        else:
+            starts = session_starts
+
         if modifier in ('S', ''):  # Seconds / minutes (intraday)
-            if session_starts is None:
+            if starts is None:
                 # Pure UTC-epoch clock-floor — session-unaware fast path
                 bar_start_sec = (current_time_sec // tf_seconds) * tf_seconds
             else:
                 # Session-anchored grid. Anchor and step in absolute epoch
                 # seconds so the boundaries stay correct across DST transitions.
-                anchor_sec = _session_anchor_sec(current_time_sec, tz, session_starts)
+                anchor_sec = _session_anchor_sec(current_time_sec, tz, starts)
                 bar_start_sec = anchor_sec + (
                     (current_time_sec - anchor_sec) // tf_seconds) * tf_seconds
+                if session_opens is None and isinstance(starts, SessionAnchors):
+                    session_opens = starts.opens
+                if session_opens:
+                    # A grid aligned before the open stamps the session's first bar at
+                    # the open. MEASURED (TradingView, HKEX:700, 2026-11-27): 60-minute
+                    # bars 09:30, 10:00, 11:00 on a grid from 09:00
+                    open_sec = _session_anchor_sec(current_time_sec, tz, session_opens)
+                    if bar_start_sec < open_sec and anchor_sec <= open_sec:
+                        bar_start_sec = open_sec
 
         elif modifier in ('D', 'W', 'M') and multiplier > 1:
             # Multi-period: year-reset scheduled grid stamped at session opens
-            on = overnight_opens(opening_hours, session_starts)
+            on = overnight_opens(opening_hours, starts)
             if mode in ('calendar', 'weekday'):
                 gmode = mode
             else:
-                day_set = {day for day, _t in session_starts} if session_starts else set()
+                day_set = {day for day, _t in starts} if starts else set()
                 gmode = 'calendar' if len(day_set) == 7 else 'weekday'
             td = trading_day(current_time_sec, tz, on)
 
@@ -858,9 +933,9 @@ class Resampler:
                     # First scheduled day of the period's first month
                     slot += timedelta(days=7 - slot.weekday())
 
-            bar_start_sec = trading_day_open_sec(slot, tz, session_starts, on)
+            bar_start_sec = trading_day_open_sec(slot, tz, starts, on)
 
-        elif modifier in ('D', 'W', 'M') and session_starts:
+        elif modifier in ('D', 'W', 'M') and starts:
             # Single-period D/W/M on a market with a known session template. The
             # period is the trading day (week/month) the timestamp belongs to, and
             # it opens at that period's session open — for an overnight market the
@@ -868,7 +943,7 @@ class Resampler:
             # open 17:00 New York, not at New York midnight). Identical to the
             # local-midnight branch below whenever the session opens at 00:00, so
             # 24/7 and midnight-opening markets are unaffected.
-            on = overnight_opens(opening_hours, session_starts)
+            on = overnight_opens(opening_hours, starts)
             td = trading_day(current_time_sec, tz, on)
             first_td = td
             # Of the thresholds the instant is compared against below, the latest one it
@@ -895,7 +970,7 @@ class Resampler:
                 # is the previous SCHEDULED day's — skipping weekend days the
                 # template has no open for, so no phantom period is invented.
                 for _ in range(8):
-                    day_open = scheduled_day_open_sec(td, tz, session_starts, on)
+                    day_open = scheduled_day_open_sec(td, tz, starts, on)
                     if day_open is not None and current_time_sec >= day_open:
                         reached = day_open
                         break
@@ -912,13 +987,13 @@ class Resampler:
             else:  # 'M'
                 slot = date(td.year, td.month, 1)
                 if slot.weekday() >= 5:
-                    day_set = {day for day, _t in session_starts}
+                    day_set = {day for day, _t in starts}
                     if len(day_set) != 7:
                         # Weekday market: the period starts on the month's first
                         # scheduled day, not on a weekend calendar first.
                         slot += timedelta(days=7 - slot.weekday())
 
-            bar_start_sec = trading_day_open_sec(slot, tz, session_starts, on)
+            bar_start_sec = trading_day_open_sec(slot, tz, starts, on)
 
             # Validity window. The instant enters the computation above in two ways only:
             # through its trading day, and through which side of each compared threshold

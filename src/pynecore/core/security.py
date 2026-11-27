@@ -35,6 +35,7 @@ from .errors import PyneError, RUNTIME_ROOTS
 from .import_hook import security_dev_skip_disabled
 from .lookahead import ALLOW_LOOKAHEAD
 from .security_mp import mp_context
+from .syminfo import SessionAnchors, resolve_session_anchors
 from .security_shm import (
     SyncBlock, ResultBlock, ResultReader, INITIAL_RESULT_SIZE,
     FLAG_IS_DEVELOPING, FLAG_CLOSED_OVERRIDE, FLAG_DEV_HISTORICAL,
@@ -3832,14 +3833,21 @@ def resolve_session_anchor(
     Returns ``(session_starts, session_tz, opening_hours)`` to store on the
     ``SecurityState`` so ``_get_confirmed_time`` anchors HTF bars to the session
     open, or all-``None`` when the market opens on the ``timeframe`` grid (the
-    clock-floor fast path). ``session_tz`` is the security's own exchange
+    clock-floor fast path). The session starts returned are TradingView's session
+    anchors (:meth:`~pynecore.core.syminfo.SymInfo.resolved_session_anchors`). ``session_tz`` is the security's own exchange
     timezone — correct even for a cross-symbol HTF in a different session.
 
     :param si: The security's own ``SymInfo`` (``None`` → no anchoring).
     :param timeframe: The resolved HTF string (e.g. ``"60"``).
     :param fallback_tz: Timezone used if the syminfo timezone is missing/invalid.
     """
-    if si is None or not getattr(si, 'session_starts', None):
+    if si is None:
+        return None, None, None
+    # TradingView's session anchors, not the provider's reopenings (17:00 for a 17:05
+    # reopening): the intraday grid origins, the opens of a daily or longer bar. Explicit
+    # anchors anchor even a symbol without ``session_starts``.
+    opens, grid = si.resolved_session_anchors()
+    if not opens:
         return None, None, None
     if si.timezone:
         try:
@@ -3852,8 +3860,16 @@ def resolve_session_anchor(
             si_tz = fallback_tz
     else:
         si_tz = fallback_tz
-    if _needs_session_anchor(si.session_starts, si_tz, timeframe):
-        return si.session_starts, si_tz, getattr(si, 'opening_hours', None) or None
+    # Local import: ``core`` <-> ``lib`` would otherwise form an import cycle
+    from ..lib import timeframe as tf_module
+    # noinspection PyProtectedMember
+    anchors = grid if tf_module._process_tf(timeframe)[0] in ('S', '') else opens
+    # A grid aligned before the open (HKEX: 09:00 grid, 09:30 open) carries the opens,
+    # which stamp the session's first bar even where the grid itself lies on the clock
+    stamps = getattr(anchors, 'opens', None)
+    if (_needs_session_anchor(anchors, si_tz, timeframe)
+            or (stamps and _needs_session_anchor(stamps, si_tz, timeframe))):
+        return anchors, si_tz, getattr(si, 'opening_hours', None) or None
     return None, None, None
 
 
@@ -3863,6 +3879,8 @@ def _session_bar_closes(
         opening_hours: list[SymInfoInterval],
         period_ms: int,
         corrections: dict[date, tuple[SymInfoInterval, ...]] | None = None,
+        anchors: 'list[SymInfoSession] | None' = None,
+        bucket_ends: 'list[int] | None' = None,
 ) -> list[int] | None:
     """
     Close instant (epoch ms) of each intraday HTF bar: the earlier of its period
@@ -3894,6 +3912,14 @@ def _session_bar_closes(
     :param opening_hours: The security's ``SymInfo.opening_hours`` intervals.
     :param period_ms: The HTF period length in milliseconds.
     :param corrections: The security's ``SymInfo.session_corrections``, or ``None``.
+    :param anchors: The security's intraday grid origins
+        (:meth:`~pynecore.core.syminfo.SymInfo.resolved_session_anchors`): on an
+        anchored grid a bar closes with the last session trading inside its bucket,
+        even one opening after its stamp (:func:`_bucket_session_end`).
+    :param bucket_ends: A parallel list of each bar's effective bucket end, ``None`` for
+        a full period after every open. A bar ends before a full period at a clipped
+        grid slot's end or at the next bar's open, and only the sessions trading before
+        that end belong to it.
     :return: A parallel list of close instants (epoch ms), or ``None`` if any open
         has no containing interval — the schedule does not fully describe the
         feed, so the caller keeps the arithmetic grid clamp rather than risk a
@@ -3908,7 +3934,17 @@ def _session_bar_closes(
     # cache is local to this walk, so it cannot outlive the schedule it was
     # built from.
     prepared: 'dict[date, tuple[tuple[time | None, time | None, int], ...]]' = {}
-    for open_ms in opens:
+    bucket_bounds: 'dict[date, tuple[tuple[int, ...], tuple[tuple[int, int], ...]]]' = {}
+
+    def day_bounds(day: date) -> 'tuple[tuple[int, ...], tuple[tuple[int, int], ...]]':
+        found = bucket_bounds.get(day)
+        if found is None:
+            found = bucket_bounds[day] = _day_bucket_bounds(
+                day, tz, opening_hours, corrections, anchors or ())
+        return found
+
+    for i, open_ms in enumerate(opens):
+        span_ms = bucket_ends[i] - open_ms if bucket_ends is not None else period_ms
         open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
         open_date = open_dt.date()
         ends = prepared.get(open_date)
@@ -3920,11 +3956,13 @@ def _session_bar_closes(
                 for lo, hi, end in _day_session_ends(open_date, tz, opening_hours, corrections))
             prepared[open_date] = ends
         end_ms = _match_session_end(open_dt.time(), ends)
+        if anchors:
+            end_ms = _bucket_session_end(open_ms, span_ms, end_ms, day_bounds, tz)
         if end_ms is None:
             return None
-        # Whichever comes first: the bar's own period end, or the session end (a
+        # Whichever comes first: the bar's own bucket end, or the session end (a
         # non-trading gap before the next session must not delay confirmation).
-        closes.append(min(open_ms + period_ms, end_ms))
+        closes.append(min(open_ms + span_ms, end_ms))
     return closes
 
 
@@ -3933,6 +3971,8 @@ def _session_end_of_open(
         tz: ZoneInfo | None,
         opening_hours: 'list[SymInfoInterval]',
         corrections: 'dict[date, tuple[SymInfoInterval, ...]] | None' = None,
+        period_ms: int = 0,
+        anchors: 'list[SymInfoSession] | tuple[SymInfoSession, ...] | None' = None,
 ) -> int | None:
     """
     Scheduled end instant (epoch ms) of the session that contains ``open_ms``.
@@ -3945,13 +3985,23 @@ def _session_end_of_open(
     :param tz: The security's exchange timezone.
     :param opening_hours: The security's ``SymInfo.opening_hours`` intervals.
     :param corrections: The security's ``SymInfo.session_corrections``, or ``None``.
+    :param period_ms: The bar's period, see :func:`_bucket_session_end`.
+    :param anchors: The intraday grid origins; with them the bar takes the last session
+        trading inside its bucket, even one opening after ``open_ms``
+        (:func:`_bucket_session_end`), without them only a session that contains
+        ``open_ms`` matches.
     :return: The session end in epoch ms, or ``None`` when no interval contains
         ``open_ms`` (the schedule does not describe this instant).
     """
     open_dt = datetime.fromtimestamp(open_ms / 1000, tz=tz)
-    return _match_session_end(
-        open_dt.time(),
-        _day_session_ends(open_dt.date(), tz, opening_hours, corrections))
+    ends = _day_session_ends(open_dt.date(), tz, opening_hours, corrections)
+    end_ms = _match_session_end(open_dt.time(), ends)
+    if anchors and period_ms:
+        end_ms = _bucket_session_end(
+            open_ms, period_ms, end_ms,
+            partial(_day_bucket_bounds, tz=tz, opening_hours=opening_hours,
+                    corrections=corrections, anchors=anchors), tz)
+    return end_ms
 
 
 def _day_session_ends(
@@ -4046,12 +4096,105 @@ def _match_session_end(
     return end_ms
 
 
+def _day_bucket_bounds(
+        day: date,
+        tz: ZoneInfo | None,
+        opening_hours: 'list[SymInfoInterval]',
+        corrections: 'dict[date, tuple[SymInfoInterval, ...]] | None',
+        anchors: 'list[SymInfoSession] | tuple[SymInfoSession, ...]',
+) -> 'tuple[tuple[int, ...], tuple[tuple[int, int], ...]]':
+    """
+    The grid origins and the sessions opening on one exchange-local date, as instants.
+
+    The per-DATE half of :func:`_bucket_session_end`: a walk over a whole feed prepares
+    it once per date. A date listed in ``corrections`` opens its own sessions instead of
+    its weekday's; an overnight interval ends on the following date.
+
+    :param day: The exchange-local calendar date.
+    :param tz: The security's exchange timezone.
+    :param opening_hours: The security's ``SymInfo.opening_hours`` intervals.
+    :param corrections: The security's ``SymInfo.session_corrections``, or ``None``.
+    :param anchors: The intraday grid origins.
+    :return: ``(anchor instants, ((session open, exclusive session end), ...))`` in ms.
+    """
+    from .resampler import crosses_midnight
+    weekday = day.weekday()
+    origins = tuple(
+        int(datetime.combine(day, anchor.time, tzinfo=tz).timestamp() * 1000)
+        for anchor in anchors if anchor.day == weekday)
+    hours = corrections.get(day, opening_hours) if corrections else opening_hours
+    sessions = []
+    for interval in hours:
+        if interval.day != weekday:
+            continue
+        end_day = day + timedelta(days=1 if crosses_midnight(interval.start, interval.end) else 0)
+        sessions.append((
+            int(datetime.combine(day, interval.start, tzinfo=tz).timestamp() * 1000),
+            _exclusive_session_end(
+                int(datetime.combine(end_day, interval.end, tzinfo=tz).timestamp() * 1000), tz),
+        ))
+    return origins, tuple(sessions)
+
+
+def _bucket_session_end(
+        open_ms: int,
+        period_ms: int,
+        contained_end: int | None,
+        bounds: 'Callable[[date], tuple[tuple[int, ...], tuple[tuple[int, int], ...]]]',
+        tz: ZoneInfo | None,
+) -> int | None:
+    """
+    The end of the last session trading inside an anchored grid bar.
+
+    An intraday grid runs from TradingView's session anchor through the pauses of the
+    trading day, so one bar can hold more than one session: a session opening after the
+    stamp but inside the bar's bucket trades into the same bar. The stamp may lie where
+    nothing trades yet -- before the open of an anchor that lies before it (a derived
+    17:00 anchor of a 17:05 reopening, an explicit 16:45 one), or in a lunch break when
+    the grid slot reaches past the reopening (12:45 on a 45-minute grid with a 13:00
+    reopening) -- and the bucket can span a break (11:30 to 14:00 on a 150-minute HKEX
+    grid) or midnight (23:30 holding a 00:05 reopening). The bucket ends a period after
+    the stamp or at the next grid origin, whichever comes first, because a grid origin
+    starts a new bar. The bar closes with the latest session end among the session
+    containing the stamp and every session opening inside the bucket, but never after
+    the bucket end: a grid origin inside a continuous session closes the bar there. A
+    bucket that nothing trades in has no session.
+
+    :param open_ms: The bar's open in epoch ms.
+    :param period_ms: The bar's period in milliseconds.
+    :param contained_end: The end of the session containing the stamp, or ``None``.
+    :param bounds: The date's grid origins and sessions (:func:`_day_bucket_bounds`).
+    :param tz: The security's exchange timezone.
+    :return: The session end in epoch ms, or ``None`` when no session trades in the bar.
+    """
+    limit = open_ms + period_ms
+    day = datetime.fromtimestamp(open_ms / 1000, tz=tz).date()
+    last_day = datetime.fromtimestamp((limit - 1) / 1000, tz=tz).date()
+    days = []
+    while day <= last_day:
+        days.append(bounds(day))
+        day += timedelta(days=1)
+    for origins, _sessions in days:
+        for origin in origins:
+            if open_ms < origin < limit:
+                limit = origin
+    end_ms = contained_end
+    for _origins, sessions in days:
+        for start, end in sessions:
+            if open_ms < start < limit and (end_ms is None or end > end_ms):
+                end_ms = end
+    if end_ms is not None and end_ms > limit:
+        end_ms = limit
+    return end_ms
+
+
 def _dated_session_bar_closes(
         opens: list[int],
         tz: ZoneInfo | None,
         si: SymInfo,
         period_ms: int,
         overnight: dict[int, time],
+        bucket_ends: 'list[int] | None' = None,
 ) -> list[int] | None:
     """
     Close instants for an HTF feed whose exchange changed its session hours within
@@ -4081,6 +4224,7 @@ def _dated_session_bar_closes(
     :param period_ms: The HTF period length in milliseconds.
     :param overnight: Per-weekday rolling opens from ``overnight_opens``, used to
         roll each open to its trading day.
+    :param bucket_ends: Each bar's effective bucket end, see :func:`_session_bar_closes`.
     :return: A parallel list of close instants, or ``None`` if any variant fails to
         describe its bars.
     """
@@ -4095,8 +4239,13 @@ def _dated_session_bar_closes(
         j = i
         while j < n and idx[j] == k:
             j += 1
-        oh = si.session_schedules[k].opening_hours
-        seg = _session_bar_closes(opens[i:j], tz, oh, period_ms, si.session_corrections)
+        variant = si.session_schedules[k]
+        _opens, grid = resolve_session_anchors(
+            si.session_anchors if si.session == 'regular' else None,
+            variant.session_starts, variant.opening_hours)
+        seg = _session_bar_closes(opens[i:j], tz, variant.opening_hours, period_ms,
+                                  si.session_corrections, grid,
+                                  bucket_ends[i:j] if bucket_ends is not None else None)
         if seg is None:
             return None
         closes.extend(seg)
@@ -4123,6 +4272,23 @@ class BarCalendar:
     session_starts: 'tuple[SymInfoSession, ...]' = ()
     corrections: 'dict[date, tuple[SymInfoInterval, ...]] | None' = None
     grid_mode: str | None = None
+    #: TradingView's intraday grid origins (:func:`calendar_session_anchors`)
+    session_grid: 'tuple[SymInfoSession, ...]' = ()
+    #: The session opens of a grid that starts before them (HKEX: grid 09:00, open
+    #: 09:30), else empty: the session's first bar is stamped at the open
+    session_opens: 'tuple[SymInfoSession, ...]' = ()
+
+
+def calendar_session_anchors(si: 'SymInfo') -> dict[str, 'tuple[SymInfoSession, ...]']:
+    """
+    The :class:`BarCalendar` anchor fields of a symbol.
+
+    :param si: The context's ``SymInfo``.
+    :return: ``session_grid`` and ``session_opens`` keyword arguments.
+    """
+    opens, grid = si.resolved_session_anchors()
+    return {'session_grid': tuple(grid),
+            'session_opens': tuple(opens) if opens != grid else ()}
 
 
 def chart_bar_calendar(chart_syminfo: 'SymInfo | None', tz: ZoneInfo | None) -> BarCalendar:
@@ -4150,6 +4316,7 @@ def chart_bar_calendar(chart_syminfo: 'SymInfo | None', tz: ZoneInfo | None) -> 
         corrections=chart_syminfo.session_corrections or None,
         grid_mode=grid_mode(chart_syminfo.type, chart_syminfo.opening_hours,
                             chart_syminfo.prefix),
+        **calendar_session_anchors(chart_syminfo),
     )
 
 
@@ -4340,12 +4507,18 @@ def actual_bar_close(open_ms: int, next_open_ms: int, cal: BarCalendar,
 
     if modifier not in ('D', 'W', 'M'):
         # noinspection PyProtectedMember
-        close = open_ms + tf_module._in_seconds(timeframe) * 1000
+        span_ms = tf_module._in_seconds(timeframe) * 1000
+        close = open_ms + span_ms
+        if cal.session_opens:
+            close = _aligned_slot_end(open_ms, cal, timeframe, span_ms, next_open_ms)
         if next_open_ms and next_open_ms < close:
             close = next_open_ms
         if cal.opening_hours:
+            # The sessions trading in the bar are those inside its effective bucket,
+            # which a clipped slot or the next bar's open can end before a full period
             session_end = _session_end_of_open(
-                open_ms, cal.tz, list(cal.opening_hours), cal.corrections)
+                open_ms, cal.tz, list(cal.opening_hours), cal.corrections, close - open_ms,
+                cal.session_grid)
             if session_end is not None:
                 session_end = _exclusive_session_end(session_end, cal.tz)
                 if session_end < close:
@@ -4353,6 +4526,72 @@ def actual_bar_close(open_ms: int, next_open_ms: int, cal: BarCalendar,
         return close
 
     return dwm_session_close(open_ms, dwm_period_end(open_ms, cal, timeframe), cal)
+
+
+def _bar_bucket_ends(opens: list[int], cal: BarCalendar, timeframe: str,
+                     span_ms: int) -> list[int]:
+    """
+    The effective bucket end of every intraday bar of a feed, as in :func:`actual_bar_close`.
+
+    A bar's bucket ends a period after its open, earlier at the next bar's open (HKEX:
+    the 09:30 bar of a 60-minute grid from 09:00 closes at 10:00), and an opening stamp
+    on a grid aligned before the session open ends at its slot's end unless its
+    successor shows a provider's cadence (:func:`_aligned_slot_end`). Only the sessions
+    trading before that end belong to the bar.
+
+    :param opens: The feed's bar opens in epoch ms, ascending.
+    :param cal: The feed's calendar.
+    :param timeframe: The feed's intraday timeframe string.
+    :param span_ms: The timeframe's period in ms.
+    :return: A parallel list of bucket ends in epoch ms.
+    """
+    ends: list[int] = []
+    last = len(opens) - 1
+    for i, open_ms in enumerate(opens):
+        next_open_ms = opens[i + 1] if i < last else 0
+        end = (_aligned_slot_end(open_ms, cal, timeframe, span_ms, next_open_ms)
+               if cal.session_opens else open_ms + span_ms)
+        if next_open_ms and next_open_ms < end:
+            end = next_open_ms
+        ends.append(end)
+    return ends
+
+
+def _aligned_slot_end(open_ms: int, cal: BarCalendar, timeframe: str, span_ms: int,
+                      next_open_ms: int = 0) -> int:
+    """
+    Nominal close of an intraday bar on a grid aligned before the session open.
+
+    The session's first bar is stamped at the open (HKEX: 09:30 on a 60-minute grid
+    from 09:00) and closes at its grid slot's end (10:00), not a full period after its
+    stamp. Every other bar -- one on the grid, or a provider's bar stamped off it (an
+    hourly feed at 10:30) -- closes a period after its stamp, so its close never
+    precedes trades it holds. A provider's opening bar can carry the same stamp as the
+    clipped one; its successor tells them apart: a successor after the slot end that
+    is itself off the grid (10:30 after 09:30) shows the provider's cadence, so that
+    bar keeps its full period too. Without a successor the stamp alone decides.
+
+    :param open_ms: The bar's open in epoch ms.
+    :param cal: The bar's calendar, with :attr:`BarCalendar.session_opens`.
+    :param timeframe: The bar's intraday timeframe string.
+    :param span_ms: The timeframe's period in ms.
+    :param next_open_ms: Open of the following bar in epoch ms, ``0`` when unknown.
+    :return: The bar's nominal close in epoch ms.
+    """
+    from .resampler import Resampler
+    resampler = Resampler.get_resampler(timeframe)
+    grid = SessionAnchors(cal.session_grid)
+    hours = list(cal.opening_hours) or None
+    opens = list(cal.session_opens)
+    slot = resampler.get_bar_time(open_ms, cal.tz, grid, hours, session_opens=())
+    if slot < open_ms and resampler.get_bar_time(
+            open_ms, cal.tz, grid, hours, session_opens=opens) == open_ms:
+        slot_end = slot + span_ms
+        if next_open_ms > slot_end and resampler.get_bar_time(
+                next_open_ms, cal.tz, grid, hours, session_opens=opens) != next_open_ms:
+            return open_ms + span_ms
+        return slot_end
+    return open_ms + span_ms
 
 
 def dwm_session_close(open_ms: int, period_end: int, cal: BarCalendar) -> int:
@@ -4510,6 +4749,14 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         sec_starts = si.session_starts or None
         sec_hours = si.opening_hours or None
         mode = grid_mode(si.type, si.opening_hours, si.prefix)
+        state.calendar = BarCalendar(
+            tz=sec_tz,
+            opening_hours=tuple(sec_hours or ()),
+            session_starts=tuple(sec_starts or ()),
+            corrections=si.session_corrections,
+            grid_mode=mode,
+            **calendar_session_anchors(si),
+        )
 
         # Session-bounded intraday feed (e.g. a futures contract's day/night
         # sessions, or an equity whose 09:30 open puts its bars off the chart's
@@ -4520,6 +4767,7 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
         # only their offset comes from the session, not from the period length.
         if not is_dwm and sec_hours:
             period_ms = tf_module._in_seconds(state.timeframe) * 1000
+            bucket_ends = _bar_bucket_ends(opens, state.calendar, state.timeframe, period_ms)
             if si.has_schedule_history:
                 # The trading-day roll keys off the flat (newest) session opens;
                 # this Core path assumes the session OPEN / trading-day attribution
@@ -4561,18 +4809,14 @@ def load_htf_bar_opens(state: SecurityState, data_path: str) -> None:
                             "across that range.",
                             si.prefix, si.ticker, earliest, first_td)
                 state.bar_closes = _dated_session_bar_closes(
-                    opens, sec_tz, si, period_ms, overnight)
+                    opens, sec_tz, si, period_ms, overnight, bucket_ends)
             else:
                 state.bar_closes = _session_bar_closes(
-                    opens, sec_tz, sec_hours, period_ms, si.session_corrections)
+                    opens, sec_tz, sec_hours, period_ms, si.session_corrections,
+                    si.resolved_session_anchors()[1], bucket_ends)
 
-    state.calendar = BarCalendar(
-        tz=sec_tz,
-        opening_hours=tuple(sec_hours or ()),
-        session_starts=tuple(sec_starts or ()),
-        corrections=(si.session_corrections if si is not None else None),
-        grid_mode=mode,
-    )
+    if si is None:
+        state.calendar = BarCalendar(tz=sec_tz)
     state.is_dwm = is_dwm
 
     if state.bar_closes is None:

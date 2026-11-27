@@ -7323,6 +7323,10 @@
    "kind": "value",
    "ty": "o:lib#Session"
   },
+  "syminfo.session_anchors": {
+   "kind": "value",
+   "ty": "o"
+  },
   "syminfo.session_ends": {
    "kind": "value",
    "ty": "o"

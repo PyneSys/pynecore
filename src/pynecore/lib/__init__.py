@@ -55,6 +55,7 @@ from ..core.resampler import (
     scheduled_day_open_sec as _scheduled_day_open_sec,
     observed_week_key as _observed_week_key, first_monday as _first_monday,
 )
+from ..core.syminfo import resolve_session_anchors as _resolve_session_anchors
 
 # The interned typeless na: bare ``na`` in compiled scripts evaluates through
 # ``is_na()`` on every bar, so its result must be a constant, not an allocation
@@ -2108,7 +2109,32 @@ def _session_bar_bounds(chart_time_ms: int, session_infos: 'tuple[SessionInfo, .
     return start_ms, min(start_ms + step_ms, occurrence[1])
 
 
-def _session_grid_args() -> tuple:
+# Resolved session anchors of the current symbol, matched by identity of their sources
+_anchor_guard: tuple | None = None
+_anchor_lists: tuple[list, list] = ([], [])
+
+
+# noinspection PyProtectedMember
+def _session_anchors() -> tuple[list, list]:
+    """
+    TradingView's session opens and intraday grid origins of the current symbol.
+
+    :return: ``(opens, grid)`` from :func:`~pynecore.core.syminfo.resolve_session_anchors`,
+             two empty lists without a session template
+    """
+    global _anchor_guard, _anchor_lists
+    explicit = getattr(syminfo, 'session_anchors', None)
+    ss = syminfo._session_starts
+    oh = syminfo._opening_hours
+    regular = str(getattr(syminfo, 'session', 'regular')) == 'regular'
+    if (_anchor_guard is None or _anchor_guard[0] is not explicit or _anchor_guard[1] is not ss
+            or _anchor_guard[2] is not oh or _anchor_guard[3] != regular):
+        _anchor_lists = _resolve_session_anchors(explicit if regular else None, ss, oh)
+        _anchor_guard = (explicit, ss, oh, regular)
+    return _anchor_lists
+
+
+def _session_grid_args(intraday: bool) -> tuple:
     """
     Build the session arguments of :meth:`Resampler.get_bar_time` for an intraday or a
     single-period weekly/monthly timeframe.
@@ -2123,15 +2149,24 @@ def _session_grid_args() -> tuple:
     (TradingView week/month boundaries are exchange-local), not in the machine's local
     time.
 
-    :return: ``(tz, session_starts, opening_hours)`` with a session template,
-             ``(tz,)`` without one, ``()`` when the timezone is unknown too.
+    The grid and the opens are TradingView's session anchors (:func:`_session_anchors`):
+    an intraday grid starts at its anchor, and when that lies before the open the
+    session's first bar is stamped at the open; a week or month opens at its first
+    trading day's anchor.
+
+    :param intraday: The arguments of an intraday timeframe, else of a weekly or monthly
+    :return: ``(tz, session_starts, opening_hours, mode, session_opens)`` with a session
+             template, ``(tz,)`` without one, ``()`` when the timezone is unknown too.
     """
     tz_name = getattr(syminfo, 'timezone', None)
     tz = _parse_timezone(tz_name) if tz_name else None
-    session_starts = getattr(syminfo, '_session_starts', None)
-    if not session_starts:
+    opens, grid = _session_anchors()
+    if not opens:
         return (tz,) if tz is not None else ()
-    return tz, session_starts, getattr(syminfo, '_opening_hours', None) or None
+    oh = getattr(syminfo, '_opening_hours', None) or None
+    if intraday:
+        return tz, grid, oh, None, (opens if opens != grid else None)
+    return tz, opens, oh, None, None
 
 
 # Multi-period (nD/nW/nM) scheduled-grid tracker. TradingView counts scheduled
@@ -2266,6 +2301,52 @@ def _dg_on_roll(ts: float) -> None:
             break
     else:
         _dg_next_roll = ts + 86_400
+
+
+def _intraday_change_key(timeframe: str) -> int:
+    """
+    Period identity of the current bar on an intraday timeframe's grid -- the
+    ``timeframe.change`` helper: ``time(timeframe)`` of the bar, the grid anchored at
+    TradingView's session start (:func:`_session_grid_args`).
+
+    :param timeframe: The requested intraday timeframe string
+    :return: The period's opening time in milliseconds
+    """
+    bar_ms = int(_datetime.timestamp() * 1000)
+    return Resampler.get_resampler(timeframe).get_bar_time(bar_ms, *_session_grid_args(True))
+
+
+def _intraday_nominal_close_ms(bar_start_ms: int, timeframe: str, next_open_ms: int = 0) -> int:
+    """
+    Nominal close of an intraday bar, before the trading-day cap: a timeframe after its
+    stamp. A session's first bar stamped at the open of a grid aligned before it (HKEX:
+    open 09:30, 60-minute grid from 09:00) closes at its grid slot's end instead
+    (10:00); a provider's bar stamped off that grid (10:30) keeps its full timeframe.
+    A provider's opening bar shares the clipped stamp; a known successor after the slot
+    end that is itself off the grid (10:30 after 09:30) shows the provider's cadence, so
+    that bar keeps its full timeframe too, as in ``core.security._aligned_slot_end``.
+
+    :param bar_start_ms: The bar's open time in milliseconds
+    :param timeframe: The bar's intraday timeframe string
+    :param next_open_ms: Open of the following bar of this feed in milliseconds, ``0``
+                         when unknown (a requested timeframe, the last or a live bar)
+    :return: The nominal close time in milliseconds
+    """
+    tf_ms = timeframe_module._in_seconds(timeframe) * 1000
+    args = _session_grid_args(True)
+    if len(args) == 5 and args[4]:
+        resampler = Resampler.get_resampler(timeframe)
+        # The grid slot holding the stamp, without moving its start to the open
+        slot = resampler.get_bar_time(bar_start_ms, *args[:4], session_opens=())
+        # Only the open stamp of its slot is clipped; a provider's off-grid stamp is not
+        if slot < bar_start_ms and resampler.get_bar_time(
+                bar_start_ms, *args[:4], session_opens=args[4]) == bar_start_ms:
+            slot_end = slot + tf_ms
+            if next_open_ms > slot_end and resampler.get_bar_time(
+                    next_open_ms, *args[:4], session_opens=args[4]) != next_open_ms:
+                return bar_start_ms + tf_ms
+            return slot_end
+    return bar_start_ms + tf_ms
 
 
 def _dwm_change_key(timeframe: str, modifier: str, multiplier: int) -> int:
@@ -2461,8 +2542,10 @@ def _dbt_rebuild(opening_hours: list | None, session_starts: list | None) -> Non
     global _dbt_guard, _dbt_tz, _dbt_on, _dbt_starts
     tz_name = getattr(syminfo, 'timezone', None)
     _dbt_tz = _parse_timezone(tz_name) if tz_name else None
-    _dbt_on = _overnight_opens(opening_hours or None, session_starts or None)
-    _dbt_starts = session_starts or None
+    # Daily bars open at TradingView's session anchor (17:00 for a 17:05 reopening)
+    opens = _session_anchors()[0] if session_starts else []
+    _dbt_on = _overnight_opens(opening_hours or None, opens or None)
+    _dbt_starts = opens or None
     _dbt_years.clear()
     _dbt_guard = (opening_hours, session_starts)
 
@@ -2782,7 +2865,8 @@ def _requested_bar_time(resampler: Resampler, modifier: str, multiplier: int,
             # 09:30 even on a holiday Monday), a month at its first scheduled day's open
             # (EURUSD January 2016: Thursday 2015-12-31 17:00, BTCUSD February 2026:
             # Saturday 01-31 17:00).
-            bar_time = resampler.get_bar_time(current_time_ms, *_session_grid_args())
+            bar_time = resampler.get_bar_time(
+                current_time_ms, *_session_grid_args(modifier in ('', 'S')))
         if steps == 0:
             return bar_time
         if steps < 0:
@@ -3344,8 +3428,8 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
             if chart_mod in ('D', 'W', 'M'):
                 close_ms = _dwm_close_ms(_time, run_tf)
             else:
-                close_ms = _time + timeframe_module._in_seconds(run_tf) * 1000
-                close_ms = _tdc_cap_ms(_time, close_ms)
+                close_ms = _tdc_cap_ms(
+                    _time, _intraday_nominal_close_ms(_time, run_tf, _next_time))
         except (ValueError, AssertionError):
             return na_int
         return pine_int(close_ms)
@@ -3397,9 +3481,8 @@ def time_close(timeframe: str | None = None, session: str | int | None = None,
                 bar_start_time, timeframe,
                 chart_modifier in ('', 'S') and (modifier != 'D' or multiplier > 1))
         else:
-            tf_seconds = timeframe_module._in_seconds(timeframe)
-            bar_close_time = _tdc_cap_ms(bar_start_time,
-                                         bar_start_time + (tf_seconds * 1000))
+            bar_close_time = _tdc_cap_ms(
+                bar_start_time, _intraday_nominal_close_ms(bar_start_time, timeframe))
     except (ValueError, AssertionError):
         return na_int
 
